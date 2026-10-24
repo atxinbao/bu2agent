@@ -1,5 +1,7 @@
 # 个人 Agent 平台（首期）——项目文档
 
+[![CI](https://github.com/atxinbao/bu2agent/actions/workflows/ci.yml/badge.svg)](https://github.com/atxinbao/bu2agent/actions/workflows/ci.yml)
+
 - 目标记录：`goal_a083c94c3d89`（bu2agent；2026-10-24 由旧目标 `goal_33244669e730` 重建，slug 统一为 bu2agent）
 - 最终目标（2026-10-24 用户确认）：逆向 Muse app，做一个完全一样的个人 Agent 客户端，并为此构建底层架构；首期先按 Rust 客户端 + TS 前端 + Mock Gateway 跑通主线，底层架构按契约先行、可替换设计。
 - 基线文档：《Muse macOS 8.0 逆向工程与重建规格》（2026-10-24）
@@ -221,9 +223,9 @@ bu2agent/
 
 ## 23. 进展：进 GitHub（进行中，用户定公开）
 
-- 公开前审计（2026-10-24）：根目录与 `TOOLS-INTEGRATION.md`、`ARCHITECTURE.md`、`README.md`、各 `run-*.command` 均无凭证、无设备标识、无私人内容（只有通用的 `/Users/mac` 路径与应用名）；`.gitignore` 已覆盖 `/target`、`**/target`、`/mock-files`、`node_modules/`、`apps/web/dist`，本轮又加了 `.DS_Store`；`target/` 与 `mock-files/` 这类生成物不会进仓库；`Cargo.lock`（根与壳）会进仓库，供 CI 复现构建。
+- 公开前审计（2026-10-24）：根目录与 `TOOLS-INTEGRATION.md`、`ARCHITECTURE.md`、`README.md`、各 `run-*.command` 均无凭证、无设备标识、无私人内容（只有通用的 `/Users/mac` 路径与应用名）；`.gitignore` 已覆盖 `/target`、`**/target`、`/mock-files`、`node_modules/`、`apps/web/dist`，本轮又加了 `.DS_Store`；首 commit 前又排除了 Tauri 生成的 `apps/shell/src-tauri/gen/`；`target/` 与 `mock-files/` 这类生成物不会进仓库；`Cargo.lock`（根与壳）会进仓库，供 CI 复现构建。
 - CI 扩展（2026-10-24）：`ci.yml` 改为三任务——Rust workspace 测试 + Clippy（三系统）、前端全量构建（`apps/web` 里 `npm install && npm run build`，取代原来只列 7 个域文件的 tsc 调用，那份旧清单漏了 invoke 客户端、视图与 App.tsx）、macOS 壳测试任务（起一次性 Mock、跑 `cargo test -- --test-threads=1`、always 清场；壳是独立 workspace，workspace 任务覆盖不到它，所以单列）；新 YAML 已在 VM 用解析器验证通过（3 个任务、runner 与步数无误）。
-- 建仓受阻（2026-10-24）：经 GitHub 连接器建公开仓 `atxinbao/bu2agent` 时 GitHub 返回 403 `Resource not accessible by integration`——审批卡已通过，但集成令牌本身没有建仓权限，不是授权问题；没有换路绕过。用户随后在 github.com 上建好公开仓 `atxinbao/bu2agent`（建仓时选了 GPL-3.0 协议，远端已有 1 个提交、仅含 LICENSE 文件，无 README、无 .gitignore）；推送前须先 `git pull --rebase origin main` 把 LICENSE 提交接进来（绝不用 force-push 盖掉它），再跑 `git add -A` 与 `git status --short` 贴回核对，确认文件清单干净后再 commit 推送，CI 首跑随后看。
+- 建仓受阻（2026-10-24）：经 GitHub 连接器建公开仓 `atxinbao/bu2agent` 时 GitHub 返回 403 `Resource not accessible by integration`——审批卡已通过，但集成令牌本身没有建仓权限，不是授权问题；没有换路绕过。用户随后在 github.com 上建好公开仓 `atxinbao/bu2agent`（建仓时选了 GPL-3.0 协议，远端已有 1 个提交、仅含 LICENSE 文件，无 README、无 .gitignore）；推送前须先 `git pull --rebase origin main` 把 LICENSE 提交接进来（绝不用 force-push 盖掉它），再跑 `git add -A` 与 `git status --short` 贴回核对，确认文件清单干净后再 commit 推送；CI 首跑已于同日跑通（见顶部徽标）。
 
 ## 24. 命名统一（2026-10-24，用户定 bu2agent）
 
