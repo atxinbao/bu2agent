@@ -52,13 +52,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Build first: on a cold runner `cargo run` spends minutes
+      # compiling before the server listens, while the health
+      # poll below only waits seconds. Starting the already
+      # built binary keeps the wait honest (and makes
+      # SERVER_PID the server itself, not cargo).
+      - name: Build mock-gateway
+        run: cargo build -q -p mock-gateway
       - name: Start throwaway mock-gateway
         run: |
           FILES_ROOT=$(mktemp -d)
           echo "FILES_ROOT=$FILES_ROOT" >> "$GITHUB_ENV"
-          MOCK_FILES_ROOT="$FILES_ROOT" cargo run -q -p mock-gateway > /tmp/mock-gateway-ci.log 2>&1 &
+          MOCK_FILES_ROOT="$FILES_ROOT" ./target/debug/mock-gateway > /tmp/mock-gateway-ci.log 2>&1 &
           echo "SERVER_PID=$!" >> "$GITHUB_ENV"
-          for i in $(seq 1 20); do
+          for i in $(seq 1 60); do
             if curl -s http://127.0.0.1:3001/health > /dev/null 2>&1; then break; fi
             sleep 1
           done
