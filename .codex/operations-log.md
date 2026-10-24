@@ -1,0 +1,24 @@
+# 操作日志
+
+- 日期：2026-10-24；执行者：Codex。
+- 在错误目录执行 `cargo run -p mock-gateway`，发现 Cargo workspace 位于 `web-agent/`。
+- 在 `web-agent/` 启动时发现 `SubscriptionRecord` 缺少 `serde::Deserialize`，导致 `chat_client` 编译失败。
+- 为 `apps/desktop/src/gateway.rs` 的 `SubscriptionRecord` 补充现有 Serde `Serialize/Deserialize` 派生。
+- 重新启动 `cargo run -p mock-gateway`，服务监听 `127.0.0.1:3001`。
+- `curl http://127.0.0.1:3001/health` 返回 `{"status":"ok"}`。
+- `cargo test --workspace`：全部通过。
+- 设置 `run-files.command` 为可执行并运行一次文件主线演示；先停止旧的 3001 服务避免误连。
+- 演示通过：列目录、审批写入、分块读取、无审批写入被拒、审批删除、再次列目录；脚本退出时服务已停止。
+- 设置 `run-agent.command` 为可执行并运行一次 Agent 主线演示；echo、pending 审批、审批写、读回、拒绝写和内容不变检查均通过，脚本退出时服务已停止。
+- 设置 `run-connectors.command` 为可执行并运行一次连接器主线演示；假数据列表、pending 新建、审批新建、域外邮件拒绝、域内审批发送和新进程凭据为空均通过，脚本退出时服务已停止。
+- 设置 `run-package.command` 为可执行并运行 release 打包冒烟；构建成功，列出 4 个 CLI 与 `mock-gateway` 二进制，无参数运行均快速退出且未挂起。
+- 安装 Tauri CLI：`cargo install tauri-cli --locked --version '^2'`，安装 `tauri-cli 2.12.4`。
+- 首次 `run-shell.command` 暴露壳 workspace 定位问题；将壳改为独立 workspace（`apps/shell/src-tauri/Cargo.toml` 增加空 `[workspace]`），根 workspace 保持不收录壳。
+- 完整 Tauri 编译继续发现缺少图标；新增 32×32 `apps/shell/src-tauri/icons/icon.png`。
+- Vite 暴露 `App.tsx` 第 152 行弯引号导致的 JSX 语法错误；修正后 `npm run build` 通过。
+- 再次运行 `run-shell.command`：Tauri shell 编译并运行，Mock Gateway 健康检查和 Vite 可访问；随后手动停止开发进程并确认 3001/5173 已释放。
+- `cargo check --manifest-path apps/shell/src-tauri/Cargo.toml` 通过。
+- Mac 复核：重跑 `run-shell.command`，Rust/Tauri 壳成功重建并运行；网关健康检查与 Vite 可访问，invoke transport wiring 已确认。
+- `apps/web` 全量 `npm run build` 首次暴露 App.tsx 第 162 行弯引号，修正为合法 JSX 字符串后再次构建通过。
+- 按用户要求启动 `run-shell.command`；壳成功编译并运行，四个标签页与 invoke client wiring 已在源码核对，网关/Vite 进程正常启动。当前 CUA 原生应用清单未暴露 `web-agent-shell` 窗口，无法自动读取窗口文本或代替用户点击各标签页；已停止进程并确认端口释放。
+- 设置 `run-shell-tests.command` 为可执行并运行；3 个 shell command roundtrip 测试全部通过，脚本清理临时文件根并释放 3001。

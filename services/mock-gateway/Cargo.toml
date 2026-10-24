@@ -1,0 +1,18 @@
+[package]
+name = "mock-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "Mock Gateway state machine (chat first). Pure logic, no HTTP server yet: the Axum transport that serves it lands after the state machine is tested."
+
+[lib]
+name = "mock_gateway"
+path = "src/lib.rs"
+
+[dependencies]
+agent-desktop = { path = "../../apps/desktop" }
+axum = "0.8"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }

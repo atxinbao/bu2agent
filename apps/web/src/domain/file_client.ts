@@ -1,0 +1,234 @@
+// File gateway client for the TS Domain Store (Phase 2).
+//
+// Same rules as the Rust file gateway client, in the same order:
+// - Paths are relative to the server's scoped root. Absolute
+//   paths and `..` are rejected client-side, before any request.
+// - Reads (list / read) may retry at most once on 401, after
+//   calling the caller's refresh callback once.
+// - Writes and deletes are NEVER retried on 401: a retry could
+//   duplicate a write. They also require approval: without it,
+//   the client refuses before sending anything.
+// - Chunked reads loop until EOF and refuse files larger than
+//   maxTotal. Base64 is the wire form; text is decoded with
+//   TextDecoder, never lossily.
+
+export interface GatewayFileEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  sizeBytes: number;
+}
+
+export interface FileChunk {
+  data: Uint8Array;
+  eof: boolean;
+  totalSize: number;
+  bytesRead: number;
+}
+
+interface ServerFileEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size_bytes: number;
+}
+
+interface ServerReadResponse {
+  path: string;
+  offset: number;
+  content_base64: string;
+  eof: boolean;
+  total_size: number;
+  bytes_read: number;
+}
+
+function checkRelative(path: string): void {
+  if (path.startsWith("/") || path.split("/").includes("..")) {
+    throw new Error("file path must not escape the root");
+  }
+}
+
+function decodeBase64(text: string): Uint8Array {
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function encodeBase64(data: Uint8Array): string {
+  let binary = "";
+  for (const byte of data) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
+
+// Transport-neutral surface used by the Files view. The HTTP
+// client below and the invoke client both implement it, so the
+// view never knows which transport it runs on.
+export interface FileGateway {
+  list(path?: string): Promise<GatewayFileEntry[]>;
+  readText(path: string, chunkLen: number, maxTotal: number): Promise<string>;
+  write(path: string, text: string, approved: boolean, append?: boolean): Promise<number>;
+  delete(path: string, approved: boolean): Promise<void>;
+}
+
+export class FileGatewayClient implements FileGateway {
+  private readonly baseUrl: string;
+
+  constructor(baseUrl: string) {
+    this.baseUrl = baseUrl.replace(/\/$/, "");
+  }
+
+  private async requestWithRetry<T>(
+    path: string,
+    init: RequestInit | undefined,
+    refresh: (() => Promise<void>) | undefined,
+    allowRetry: boolean,
+  ): Promise<T> {
+    let retried = false;
+    for (;;) {
+      const response = await fetch(`${this.baseUrl}${path}`, init);
+      if (response.status === 401 && allowRetry && !retried && refresh) {
+        retried = true;
+        await refresh();
+        continue;
+      }
+      if (!response.ok) {
+        throw new Error(`mock gateway returned HTTP ${response.status}`);
+      }
+      return (await response.json()) as T;
+    }
+  }
+
+  async list(
+    path = "",
+    refresh?: () => Promise<void>,
+  ): Promise<GatewayFileEntry[]> {
+    if (path !== "") {
+      checkRelative(path);
+    }
+    const query = path === "" ? "/files/list" : `/files/list?path=${path}`;
+    const entries = await this.requestWithRetry<ServerFileEntry[]>(
+      query,
+      undefined,
+      refresh,
+      true,
+    );
+    return entries.map((e) => ({
+      name: e.name,
+      path: e.path,
+      isDir: e.is_dir,
+      sizeBytes: e.size_bytes,
+    }));
+  }
+
+  async readChunk(
+    path: string,
+    offset: number,
+    len: number,
+    refresh?: () => Promise<void>,
+  ): Promise<FileChunk> {
+    checkRelative(path);
+    const result = await this.requestWithRetry<ServerReadResponse>(
+      `/files/read?path=${path}&offset=${offset}&len=${len}`,
+      undefined,
+      refresh,
+      true,
+    );
+    return {
+      data: decodeBase64(result.content_base64),
+      eof: result.eof,
+      totalSize: result.total_size,
+      bytesRead: result.bytes_read,
+    };
+  }
+
+  async readAll(
+    path: string,
+    chunkLen: number,
+    maxTotal: number,
+    refresh?: () => Promise<void>,
+  ): Promise<Uint8Array> {
+    checkRelative(path);
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    let offset = 0;
+    for (;;) {
+      const chunk = await this.readChunk(path, offset, chunkLen, refresh);
+      if (total + chunk.bytesRead > maxTotal) {
+        throw new Error("file exceeds maxTotal");
+      }
+      total += chunk.bytesRead;
+      offset += chunk.bytesRead;
+      parts.push(chunk.data);
+      if (chunk.eof || chunk.bytesRead === 0) {
+        break;
+      }
+    }
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const part of parts) {
+      out.set(part, at);
+      at += part.length;
+    }
+    return out;
+  }
+
+  async readText(
+    path: string,
+    chunkLen: number,
+    maxTotal: number,
+    refresh?: () => Promise<void>,
+  ): Promise<string> {
+    const bytes = await this.readAll(path, chunkLen, maxTotal, refresh);
+    return new TextDecoder().decode(bytes);
+  }
+
+  async write(
+    path: string,
+    text: string,
+    approved: boolean,
+    append = false,
+  ): Promise<number> {
+    if (!approved) {
+      throw new Error("file write requires approval");
+    }
+    checkRelative(path);
+    const data = new TextEncoder().encode(text);
+    const result = await this.requestWithRetry<{ size_bytes: number }>(
+      "/files/write",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          path,
+          content_base64: encodeBase64(data),
+          append,
+        }),
+      },
+      undefined,
+      false,
+    );
+    return result.size_bytes;
+  }
+
+  async delete(path: string, approved: boolean): Promise<void> {
+    if (!approved) {
+      throw new Error("file delete requires approval");
+    }
+    checkRelative(path);
+    await this.requestWithRetry<{ deleted: boolean }>(
+      "/files/delete",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      },
+      undefined,
+      false,
+    );
+  }
+}

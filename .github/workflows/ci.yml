@@ -1,0 +1,74 @@
+# Continuous integration for the web-agent workspace (Phase 5 + shell).
+#
+# Runs on every push and pull request:
+# - Rust workspace tests + clippy on macOS, Linux, Windows.
+# - Full frontend build (tsc strict + vite) on Ubuntu. This
+#   replaced the earlier hand-listed tsc file list, which did
+#   not cover the invoke clients, the views, or App.tsx.
+# - Shell command tests on macOS only: they call the Tauri
+#   commands against a throwaway Mock Gateway, and Tauri
+#   needs a macOS (or system-lib-equipped Linux) runner to
+#   build. The workspace jobs do not cover the shell crate
+#   because it is its own workspace, not a member.
+# This does not build a signed installer -- that is still
+# pending (see packaging/README.md).
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run tests
+        run: cargo test --workspace
+      - name: Clippy (warnings deny)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+  typescript:
+    name: frontend build (tsc strict + vite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install and build
+        run: |
+          cd apps/web
+          npm install
+          npm run build
+  shell-tests:
+    name: shell command tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Start throwaway mock-gateway
+        run: |
+          FILES_ROOT=$(mktemp -d)
+          echo "FILES_ROOT=$FILES_ROOT" >> "$GITHUB_ENV"
+          MOCK_FILES_ROOT="$FILES_ROOT" cargo run -q -p mock-gateway > /tmp/mock-gateway-ci.log 2>&1 &
+          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 20); do
+            if curl -s http://127.0.0.1:3001/health > /dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -s -f http://127.0.0.1:3001/health
+      - name: Run shell tests
+        run: |
+          cd apps/shell/src-tauri
+          cargo test -- --test-threads=1
+      - name: Stop mock-gateway
+        if: always()
+        run: |
+          kill "$SERVER_PID" 2>/dev/null || true
+          rm -rf "$FILES_ROOT"

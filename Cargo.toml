@@ -1,0 +1,6 @@
+[workspace]
+# Workspace root for the hybrid test loop: Mac is the canonical project
+# home, the VM runs the same workspace from a temporary mirror to
+# pre-screen pure-logic tests before the Mac final verification.
+members = ["apps/desktop", "services/mock-gateway"]
+resolver = "2"

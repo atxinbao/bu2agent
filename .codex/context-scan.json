@@ -1,0 +1,11 @@
+{
+  "date": "2026-10-24",
+  "executor": "Codex",
+  "scope": "启动并验证 mock-gateway",
+  "location": "services/mock-gateway 与 apps/desktop",
+  "current_state": "mock-gateway 依赖 agent-desktop；SubscriptionRecord 被 HTTP 客户端反序列化响应使用",
+  "similar_cases": ["services/mock-gateway/src/server.rs", "apps/desktop/src/chat_client.rs"],
+  "stack": ["Rust", "Axum", "Tokio", "Serde"],
+  "tests": ["cargo test --workspace", "curl http://127.0.0.1:3001/health"],
+  "observation": "首次启动因 SubscriptionRecord 缺少 Deserialize 无法编译；补齐现有类型的 Serde 派生后服务正常启动。"
+}

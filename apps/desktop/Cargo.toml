@@ -1,0 +1,18 @@
+[package]
+name = "agent-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Rust client shell for the personal Agent client (Muse reverse-engineering baseline). Skeleton only: types, traits and state machines. Phase 1 wires MockTransport and contract tests."
+
+[lib]
+name = "agent_desktop"
+path = "src/lib.rs"
+
+[dependencies]
+# Phase 1 chat mainline: the Rust client talks HTTP to the Mock
+# Gateway (localhost only, no TLS -- the real gateway adapter
+# will add TLS later). serde_json is the only new runtime dep;
+# the HTTP client itself is std TcpStream, no reqwest yet.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
