@@ -108,14 +108,17 @@ fn io_error() -> UnifiedError {
 /// Absolute paths and `..` are rejected before joining.
 pub fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf> {
     let rel_path = Path::new(rel);
-    if rel_path.is_absolute() {
-        return Err(invalid("file path must be relative to the root"));
-    }
-    if rel_path
-        .components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
-        return Err(invalid("file path must not escape the root"));
+    for component in rel_path.components() {
+        match component {
+            // 在 Windows 上 `/tmp/x` 是 rooted 但不是 absolute，必须同样拒绝。
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(invalid("file path must be relative to the root"));
+            }
+            Component::ParentDir => {
+                return Err(invalid("file path must not escape the root"));
+            }
+            Component::CurDir | Component::Normal(_) => {}
+        }
     }
     Ok(root.join(rel_path))
 }
