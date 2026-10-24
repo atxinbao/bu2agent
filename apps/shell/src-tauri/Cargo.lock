@@ -188,6 +188,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bu2agent-shell"
+version = "0.1.0"
+dependencies = [
+ "agent-desktop",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3753,17 +3764,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
-]
-
-[[package]]
-name = "web-agent-shell"
-version = "0.1.0"
-dependencies = [
- "agent-desktop",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
 ]
 
 [[package]]
