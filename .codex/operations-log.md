@@ -22,3 +22,5 @@
 - `apps/web` 全量 `npm run build` 首次暴露 App.tsx 第 162 行弯引号，修正为合法 JSX 字符串后再次构建通过。
 - 按用户要求启动 `run-shell.command`；壳成功编译并运行，四个标签页与 invoke client wiring 已在源码核对，网关/Vite 进程正常启动。当前 CUA 原生应用清单未暴露 `web-agent-shell` 窗口，无法自动读取窗口文本或代替用户点击各标签页；已停止进程并确认端口释放。
 - 设置 `run-shell-tests.command` 为可执行并运行；3 个 shell command roundtrip 测试全部通过，脚本清理临时文件根并释放 3001。
+- GitHub Actions run `40097236894` 暴露 Windows `phase2_test` 的 `/tmp/evil.txt` 越界写断言失败；根因为 Windows rooted path 不是 `Path::is_absolute()`。在 `resolve_in_root` 中统一拒绝 `Component::Prefix`、`RootDir` 和 `ParentDir`，提交 `6b81968`。
+- 本地 `cargo test --workspace`、Clippy、`apps/web/npm run build` 通过；GitHub Actions run `40097846468` 五个任务全部成功。

@@ -16,3 +16,4 @@
 - 前端严格检查：`apps/web/npm run build` 通过，包含 `tsc --noEmit` 与 Vite production build。
 - Mac 交互轮：`run-shell.command` 成功运行 `target/debug/web-agent-shell`；源码确认 Chat/Files/Agent/Connectors 四标签及 invoke clients/commands 已注册，网关与 Vite 可访问。原生窗口未出现在 CUA 可访问应用清单，因此未伪造逐项点击结果。
 - Shell command 测试：`chmod +x run-shell-tests.command && ./run-shell-tests.command`，PASS；`agent_commands_roundtrip`、`connector_commands_roundtrip`、`file_commands_roundtrip` 共 3 项通过，0 失败。运行时 JS 键名到 Rust 参数绑定仍属于静态检查边界。
+- Windows 回归修复（2026-10-24）：修正 `ScopedFileClient` 对 rooted/prefix 路径的判断，避免 Windows 将 `/tmp/evil.txt` 误当作相对路径；本地 `cargo test --workspace`、Clippy、`apps/web/npm run build` 通过。GitHub Actions run `40097846468` 的 Windows、Ubuntu、macOS Rust、前端构建和 macOS shell command tests 全部成功。
