@@ -20,7 +20,7 @@ if [ ! -d apps/web/node_modules ]; then
   (cd apps/web && npm install) || exit 1
 fi
 echo "Starting mock-gateway on http://127.0.0.1:3001 ..."
-MOCK_APPROVALS_PATH="$PWD/mock-approvals.jsonl" MOCK_TASKS_PATH="$PWD/mock-tasks.jsonl" MOCK_DEVICE_ACTIONS_PATH="$PWD/mock-device-actions.jsonl" cargo run -q -p mock-gateway > /tmp/mock-gateway-shell.log 2>&1 &
+MOCK_APPROVALS_PATH="$PWD/mock-approvals.jsonl" MOCK_TASKS_PATH="$PWD/mock-tasks.jsonl" MOCK_DEVICE_ACTIONS_PATH="$PWD/mock-device-actions.jsonl" MOCK_LOOPS_PATH="$PWD/mock-loops.jsonl" cargo run -q -p mock-gateway > /tmp/mock-gateway-shell.log 2>&1 &
 SERVER_PID=$!
 echo "Starting Vite dev server on http://localhost:5173 ..."
 (cd apps/web && npm run dev > /tmp/vite-shell.log 2>&1) &

@@ -19,8 +19,7 @@ async fn main() {
         mock_gateway::deepseek::DeepSeekConfig::from_env_and_keychain()
     };
     println!("chat backend: {}", if config.api_key.is_some() { "deepseek" } else { "mock echo (no key configured or test mode)" });
-    let state = mock_gateway::server::new_state()
-        .with_deepseek(mock_gateway::deepseek::DeepSeekClient::new(config));
+    let state = mock_gateway::server::AppState::from_deepseek_config(config);
     let addr =
         std::env::var("MOCK_GATEWAY_ADDR").unwrap_or_else(|_| "127.0.0.1:3001".to_string());
     let listener = tokio::net::TcpListener::bind(&addr)

@@ -58,6 +58,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::approval_store::{append_record, load_records, next_id_number, ApprovalFileRecord};
+use crate::loop_engine::{ApprovalBinding, LoopEngine, LoopError, LoopModel, LoopTools, Timeouts, ToolOutcome, ErrorCode};
 use crate::device_backend::{
     execute_set, resolve_unknown, AuthorizationStatus, ExecuteOutcome, FakeReminderBackend,
     Reminder, ReminderBackend, ResolveOutcome,
@@ -163,9 +164,12 @@ struct StreamState {
     last_applied: u64,
 }
 
+#[derive(Clone)]
 struct ApprovalState {
     tool: String,
     status: ApprovalStatus,
+    binding: Option<ApprovalBinding>,
+    consumed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -200,6 +204,7 @@ fn seed_messages() -> Vec<MockMessage> {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub(crate) loops: Arc<LoopEngine>,
     deepseek: DeepSeekClient,
     streams: Arc<Mutex<HashMap<String, StreamState>>>,
     files_root: PathBuf,
@@ -222,9 +227,19 @@ pub struct AppState {
 
 impl Default for AppState {
     fn default() -> Self {
+        Self::from_deepseek_config(DeepSeekConfig::disabled())
+    }
+}
+
+impl AppState {
+    /// 正常启动共用一次凭据解析结果；测试构造器不读取环境凭据。
+    pub fn from_deepseek_config(config: DeepSeekConfig) -> Self {
         let root = std::env::var("MOCK_FILES_ROOT").unwrap_or_else(|_| "mock-files".to_string());
         let approvals_path = std::env::var("MOCK_APPROVALS_PATH").ok().map(PathBuf::from);
         let mut state = AppState::with_files_root_and_approvals(PathBuf::from(root), approvals_path);
+        let loops_path = std::env::var("MOCK_LOOPS_PATH").ok().map(PathBuf::from);
+        state = state.with_deepseek_backends(config, loops_path)
+            .expect("invalid loop configuration or audit");
         if let Ok(tasks_path) = std::env::var("MOCK_TASKS_PATH") {
             state = state.with_tasks_path(PathBuf::from(tasks_path));
         }
@@ -273,7 +288,7 @@ impl AppState {
                     Some(status) => {
                         approvals.insert(
                             record.tool_call_id.clone(),
-                            ApprovalState { tool: record.tool.clone(), status },
+                            ApprovalState { tool: record.tool.clone(), status, binding: record.binding.clone(), consumed: record.consumed },
                         );
                     }
                     None => {
@@ -288,6 +303,7 @@ impl AppState {
             next_approval_id = next_id_number(&records);
         }
         AppState {
+            loops: Arc::new(LoopEngine::new(&root, None, None, None, Timeouts::default()).expect("memory loop engine")),
             deepseek: DeepSeekClient::new(DeepSeekConfig::disabled()),
             streams: Arc::new(Mutex::new(HashMap::new())),
             files_root: root,
@@ -313,6 +329,180 @@ impl AppState {
     pub fn with_deepseek(mut self, client: DeepSeekClient) -> Self {
         self.deepseek = client;
         self
+    }
+
+    /// 聊天与循环共用配置；缺少 key 时聊天回显、循环不可用。
+    pub fn with_deepseek_backends(self, config: DeepSeekConfig, path: Option<PathBuf>) -> Result<Self, String> {
+        let model = crate::deepseek_loop::DeepSeekLoopModel::new(config.clone())?
+            .map(|m| Arc::new(m) as Arc<dyn LoopModel>);
+        self.with_deepseek(DeepSeekClient::new(config))
+            .with_loop_backends(path, model, None, Timeouts::default())
+    }
+
+    /// 测试可注入循环模型和工具；未配置模型时 start 返回 503。
+    pub fn with_loop_backends(
+        mut self,
+        path: Option<PathBuf>,
+        model: Option<Arc<dyn LoopModel>>,
+        tools: Option<Arc<dyn LoopTools>>,
+        timeouts: Timeouts,
+    ) -> Result<Self, String> {
+        self.loops = Arc::new(LoopEngine::new(
+            &self.files_root,
+            path,
+            model,
+            tools,
+            timeouts,
+        )?);
+        Ok(self)
+    }
+
+    pub(crate) fn request_loop_approval(
+        &self,
+        binding: ApprovalBinding,
+    ) -> Result<String, LoopError> {
+        let mut next = self.next_approval_id.lock().unwrap();
+        let id = format!("approval-{}", *next);
+        *next += 1;
+        let record = ApprovalState {
+            tool: binding.tool.clone(),
+            status: ApprovalStatus::Pending,
+            binding: Some(binding),
+            consumed: false,
+        };
+        let mut approvals = self.approvals.lock().unwrap();
+        persist_approval(self, &id, &record)
+            .map_err(|_| LoopError(500, "approval_audit_failed"))?;
+        approvals.insert(id.clone(), record);
+        Ok(id)
+    }
+
+    pub(crate) fn loop_approval_status(
+        &self,
+        id: &str,
+        binding: &ApprovalBinding,
+    ) -> Result<ApprovalStatus, LoopError> {
+        let approvals = self.approvals.lock().unwrap();
+        let record = approvals
+            .get(id)
+            .ok_or(LoopError(403, "approval_required"))?;
+        if record.binding.as_ref() != Some(binding)
+            || record.tool != binding.tool
+            || record.consumed
+        {
+            return Err(LoopError(403, "approval_binding_mismatch"));
+        }
+        Ok(record.status)
+    }
+
+    pub(crate) fn consume_loop_approval(
+        &self,
+        id: &str,
+        binding: &ApprovalBinding,
+    ) -> Result<(), LoopError> {
+        let mut approvals = self.approvals.lock().unwrap();
+        let record = approvals
+            .get_mut(id)
+            .ok_or(LoopError(403, "approval_required"))?;
+        if record.binding.as_ref() != Some(binding)
+            || record.status != ApprovalStatus::Approved
+            || record.consumed
+        {
+            return Err(LoopError(403, "approval_binding_mismatch"));
+        }
+        record.consumed = true;
+        persist_approval(self, id, record).map_err(|_| LoopError(500, "approval_audit_failed"))
+    }
+
+    /// 循环与 POST /agent/tool/call 共用服务端分派。绑定凭据不能从公共端点重放。
+    pub(crate) async fn execute_loop_tool(
+        &self,
+        tool: String,
+        args: std::collections::BTreeMap<String, String>,
+        approval_id: Option<String>,
+        binding: Option<ApprovalBinding>,
+        backend: Option<Arc<dyn LoopTools>>,
+    ) -> ToolOutcome {
+        if tool == "fs.write" {
+            let valid = {
+                let approvals = self.approvals.lock().unwrap();
+                approval_id
+                    .as_ref()
+                    .and_then(|id| approvals.get(id))
+                    .is_some_and(|record| {
+                        record.status == ApprovalStatus::Approved
+                            && record.consumed
+                            && record.binding == binding
+                            && binding.as_ref().is_some_and(|b| {
+                                b.tool == tool
+                                    && b.args_sha256
+                                        == crate::loop_engine::args_digest(&tool, &args)
+                            })
+                    })
+            };
+            if !valid {
+                return ToolOutcome::failed(ErrorCode::InvalidArguments);
+            }
+        }
+        if let Some(backend) = backend {
+            return backend.execute(tool, args).await;
+        }
+        // 真实文件分派继续限制单根；拒绝路径中的符号链接，不能用链接绕开参数校验。
+        let mut checked = self.files_root.clone();
+        for component in Path::new(&args["path"]).components() {
+            checked.push(component);
+            if std::fs::symlink_metadata(&checked).is_ok_and(|m| m.file_type().is_symlink()) {
+                return ToolOutcome::failed(ErrorCode::InvalidArguments);
+            }
+        }
+        let state = self.clone();
+        let write_target =
+            (tool == "fs.write").then(|| (args["path"].clone(), args["text"].clone()));
+        let response = tokio::task::spawn_blocking(move || {
+            let response = dispatch_agent_tool(
+                &state,
+                ToolCallDto {
+                    tool,
+                    args: args.into_iter().collect(),
+                    tool_call_id: approval_id,
+                },
+            );
+            if response.status().is_success() {
+                if let Some((path, text)) = write_target {
+                    // 写入和重读都在同一阻塞任务内，等待预算才能覆盖两者。
+                    if std::fs::read_to_string(state.files_root.join(path))
+                        .ok()
+                        .as_deref()
+                        != Some(&text)
+                    {
+                        return Err(ToolOutcome::unknown());
+                    }
+                }
+            }
+            Ok(response)
+        })
+        .await;
+        let response = match response {
+            Ok(Ok(response)) => response,
+            Ok(Err(outcome)) => return outcome,
+            Err(_) => return ToolOutcome::unknown(),
+        };
+        if !response.status().is_success() {
+            return ToolOutcome::failed(ErrorCode::ToolFailed);
+        }
+        match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+            Ok(bytes) => {
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                let result = &value["result"];
+                ToolOutcome::success(
+                    result
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| result.to_string()),
+                )
+            }
+            Err(_) => ToolOutcome::unknown(),
+        }
     }
 
     /// Test seam: load task records from a JSONL file, so
@@ -700,11 +890,10 @@ async fn approval_request(
     let mut next = state.next_approval_id.lock().expect("approval id lock");
     let id = format!("approval-{}", *next);
     *next += 1;
-    state.approvals.lock().expect("approval lock").insert(
-        id.clone(),
-        ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending },
-    );
-    persist_approval(&state, &id, &req.tool, ApprovalStatus::Pending);
+    let record = ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending, binding: None, consumed: false };
+    let mut approvals = state.approvals.lock().expect("approval lock");
+    if let Err(detail) = persist_approval(&state, &id, &record) { eprintln!("warning: approval persistence failed: {detail}"); }
+    approvals.insert(id.clone(), record);
     Json(ApprovalRequestResponse {
         tool_call_id: Some(id),
         requires_approval: true,
@@ -727,25 +916,30 @@ async fn approval_decide(
     let Some(record) = approvals.get_mut(&req.tool_call_id) else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown tool_call_id" }))).into_response();
     };
+    if record.binding.is_some() && (record.consumed || record.status != ApprovalStatus::Pending || status == ApprovalStatus::Edited) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({"error":"loop_approval_already_decided_or_invalid"}))).into_response();
+    }
     record.status = status;
-    let tool = record.tool.clone();
-    persist_approval(&state, &req.tool_call_id, &tool, status);
+    if let Err(detail) = persist_approval(&state, &req.tool_call_id, record) {
+        if record.binding.is_some() { record.status = ApprovalStatus::Pending; return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"approval_audit_failed"}))).into_response(); }
+        eprintln!("warning: approval persistence failed: {detail}");
+    }
     Json(serde_json::json!({ "tool_call_id": req.tool_call_id, "status": req.status })).into_response()
 }
 
 /// Append one approval record to the persistence file, when
 /// configured. Best-effort: a failure is logged to stderr and
 /// the in-memory record (authoritative for this run) is kept.
-fn persist_approval(state: &AppState, tool_call_id: &str, tool: &str, status: ApprovalStatus) {
-    let Some(path) = &state.approvals_path else { return };
+fn persist_approval(state: &AppState, tool_call_id: &str, approval: &ApprovalState) -> Result<(), String> {
+    let Some(path) = &state.approvals_path else { return Ok(()) };
     let record = ApprovalFileRecord {
         tool_call_id: tool_call_id.to_string(),
-        tool: tool.to_string(),
-        status: approval_status_name(status).to_string(),
+        tool: approval.tool.clone(),
+        status: approval_status_name(approval.status).to_string(),
+        binding: approval.binding.clone(),
+        consumed: approval.consumed,
     };
-    if let Err(detail) = append_record(path, &record) {
-        eprintln!("warning: approval persistence failed: {detail}");
-    }
+    append_record(path, &record)
 }
 
 /// Reverse of `parse_approval_status`: the string form stored in
@@ -778,7 +972,7 @@ fn check_approval(
     let Some(record) = approvals.get(id) else {
         return Err(Box::new((StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "approval_required" }))).into_response()));
     };
-    if record.tool != tool || !may_execute_tool(record.status, true) {
+    if record.binding.is_some() || record.tool != tool || !may_execute_tool(record.status, true) {
         let error = if record.status == ApprovalStatus::Rejected {
             "approval_rejected"
         } else {
@@ -801,6 +995,10 @@ async fn agent_tool_call(
             return *response;
         }
     }
+    dispatch_agent_tool(&state, req)
+}
+
+fn dispatch_agent_tool(state: &AppState, req: ToolCallDto) -> axum::response::Response {
     let arg = |name: &str| req.args.get(name).cloned();
     let result: Result<serde_json::Value, axum::response::Response> = match req.tool.as_str() {
         "echo" => Ok(serde_json::json!(arg("text").unwrap_or_default())),
@@ -1421,6 +1619,62 @@ async fn devices_authorization_request(
     })
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoopIdDto {
+    loop_id: String,
+}
+
+fn loop_response(
+    state: &AppState,
+    result: Result<crate::loop_engine::LoopView, LoopError>,
+) -> axum::response::Response {
+    match result {
+        Ok(mut view) => {
+            if view.pending_write.is_some() {
+                if let Some(call) = view.record.calls.get(view.record.queue_position) {
+                    if let (Some(id), Some(binding)) = (&call.approval_id, &call.binding) {
+                        view.approval_status = state.loop_approval_status(id, binding).ok()
+                            .map(|status| approval_status_name(status).to_string());
+                    }
+                }
+            }
+            Json(view).into_response()
+        },
+        Err(LoopError(status, code)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            Json(serde_json::json!({"error":code})),
+        )
+            .into_response(),
+    }
+}
+
+async fn loop_start(
+    State(state): State<AppState>,
+    Json(req): Json<crate::loop_engine::StartLoop>,
+) -> axum::response::Response {
+    loop_response(&state, state.loops.start(req))
+}
+async fn loop_get(
+    State(state): State<AppState>,
+    Query(req): Query<LoopIdDto>,
+) -> axum::response::Response {
+    loop_response(&state, state.loops.get(&req.loop_id))
+}
+async fn loop_resume(
+    State(state): State<AppState>,
+    Json(req): Json<crate::loop_engine::ResumeLoop>,
+) -> axum::response::Response {
+    let engine = Arc::clone(&state.loops);
+    loop_response(&state, engine.resume(state.clone(), req).await)
+}
+async fn loop_cancel(
+    State(state): State<AppState>,
+    Json(req): Json<LoopIdDto>,
+) -> axum::response::Response {
+    loop_response(&state, state.loops.cancel(&req.loop_id))
+}
+
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -1436,6 +1690,10 @@ pub fn app(state: AppState) -> Router {
         .route("/approval/request", post(approval_request))
         .route("/approval/decide", post(approval_decide))
         .route("/agent/tool/call", post(agent_tool_call))
+        .route("/agent/loop/start", post(loop_start))
+        .route("/agent/loop/get", get(loop_get))
+        .route("/agent/loop/resume", post(loop_resume))
+        .route("/agent/loop/cancel", post(loop_cancel))
         .route("/connectors/notes/list", get(notes_list))
         .route("/connectors/notes/create", post(notes_create))
         .route("/connectors/mail/list", get(mail_list))
