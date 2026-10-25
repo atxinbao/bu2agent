@@ -653,6 +653,43 @@ async fn invalid_proposals_count_without_reaching_tool_backend() {
     }
 }
 
+#[test]
+fn normalization_rejects_rooted_paths_and_preserves_relative_paths() {
+    for tool in ["fs.list", "fs.read", "fs.write"] {
+        for path in [
+            "/",
+            "/absolute",
+            "//server/share",
+            "../outside",
+            "dir\\file",
+        ] {
+            let mut args = json!({"path":path});
+            if tool == "fs.write" {
+                args["text"] = json!("never written");
+            }
+            assert!(normalize(tool, &args).is_err(), "{tool}: {path}");
+        }
+        let mut args = json!({"path":"./demo//report.md"});
+        if tool == "fs.write" {
+            args["text"] = json!("unchanged text");
+        }
+        let normalized = normalize(tool, &args).unwrap();
+        assert_eq!(normalized["path"], "demo/report.md");
+        if tool == "fs.write" {
+            assert_eq!(normalized["text"], "unchanged text");
+        }
+    }
+    assert_eq!(
+        normalize("fs.list", &json!({"path":""})).unwrap()["path"],
+        ""
+    );
+    // 盘符前缀的解释依赖宿主平台；Windows 仍应拒绝盘符相对路径。
+    #[cfg(windows)]
+    for path in ["C:/absolute", "C:relative", "\\rooted"] {
+        assert!(normalize("fs.read", &json!({"path":path})).is_err());
+    }
+}
+
 #[tokio::test]
 async fn model_failure_ends_without_retry_and_charges_time() {
     let h = Harness::new(vec![]).await;

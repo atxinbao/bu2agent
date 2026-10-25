@@ -447,8 +447,10 @@ pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, E
         None if tool == "fs.list" => "",
         _ => return Err(ErrorCode::InvalidArguments),
     };
+    // Windows 的 /path 有根但没有盘符，is_absolute 不会拒绝它。
+    // 必须在规范化丢弃 RootDir 前拒绝所有带根路径。
     if raw.contains(['\0', '\\'])
-        || Path::new(raw).is_absolute()
+        || Path::new(raw).has_root()
         || Path::new(raw)
             .components()
             .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
