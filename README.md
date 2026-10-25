@@ -2,6 +2,22 @@
 
 [![CI](https://github.com/atxinbao/bu2agent/actions/workflows/ci.yml/badge.svg)](https://github.com/atxinbao/bu2agent/actions/workflows/ci.yml)
 
+## 当前能力与边界（2026-10-25，Codex 更新）
+
+下文编号章节保留阶段推进历史；其中“未实现”“待跑”等描述是当时状态，当前以本节及所链接的专项文档为准。
+
+- 本地单机、单用户：Tauri 2 窗口与网关运行在同一台 Mac，默认网关地址为 `127.0.0.1:3001`。尚未交付局域网访问、外部鉴权、OAuth、多用户或 Noise。回环监听限制网络入口，不意味着本机其它进程不能访问。
+- 已有 Chat / Files / Agent / Connectors / Tasks / Devices / Loops 七个视图。窗口使用 Rust invoke；浏览器开发预览使用 HTTP。连接器演示不能等同于真实邮件或 OAuth 接入。
+- 任务闭环已验收：读取材料、生成草稿、审批写入、查看产物，普通停服重启后任务和产物恢复。
+- B 层已验收 Fake 与 EventKit 提醒事项闭环；只验证过专用提醒的显式完成状态修改，不代表任意设备均已接通。见 [设备契约与验收](services/mock-gateway/DEVICES.md)。
+- 模型循环已验收真实 DeepSeek 成功/拒绝/取消/重启，以及假模型驱动的 unknown、重复未知写、工具在途取消；只开放文件列目录、读取、写入。见 [循环协议](services/mock-gateway/LOOP.md)。
+- 凭据支持 OS Keychain，审批、任务、设备动作、循环审计使用各自 JSONL。循环审计不存提示、读写正文或最终回答；不承诺断电耐久。
+- 有本地 Tauri `.app`/安装包构建入口，但独立网关未作为完整日常安装方案交付；TCC 权限归属、Swift 运行库分发、签名与公证仍需独立核验。见 [打包现状与验证](packaging/README.md)。
+
+开发启动：`bash run-shell.command`。Mac 本地验证入口为 `run-tests.command`、`run-shell-tests.command` 和 `apps/web` 下的 `npm run build`。壳回归需要 3001 空闲，不与运行窗口共用服务。
+
+已观测的 CI 基线为 `0524158`（5 个任务全绿）；后续本地提交不能沿用这次 CI 结果。
+
 - 目标记录：`goal_a083c94c3d89`（bu2agent；2026-10-24 由旧目标 `goal_33244669e730` 重建，slug 统一为 bu2agent）
 - 最终目标（2026-10-24 用户确认）：逆向 Muse app，做一个完全一样的个人 Agent 客户端，并为此构建底层架构；首期先按 Rust 客户端 + TS 前端 + Mock Gateway 跑通主线，底层架构按契约先行、可替换设计。
 - 基线文档：《Muse macOS 8.0 逆向工程与重建规格》（2026-10-24）

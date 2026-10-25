@@ -13,10 +13,9 @@
 # - the eventkit crate compiles and the real binary can read
 #   its own authorization status;
 # - whether a system prompt appears, and what status results;
-# - which process the binary runs under (parent chain), i.e.
-#   the permission attribution the design doc requires.
-# It does NOT create, modify, or delete any real reminder:
-# the EventKit backend's set path is fail-closed this round.
+# - 父进程链仅是启动方式旁证，不独立证明 TCC 负责进程归属。
+# 本脚本只调用授权与读取端点，不创建、修改或删除提醒。
+# 当前 EventKit 后端已有真实写路径；本脚本不调用该路径。
 # It does NOT prove a bundled gateway would hold its own
 # permission: a bare binary run from Terminal inherits its
 # responsible process's permission (see the crate docs).
