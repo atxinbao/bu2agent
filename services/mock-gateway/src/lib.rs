@@ -15,6 +15,7 @@
 pub mod approval_store;
 pub mod deepseek;
 pub mod server;
+pub mod task_store;
 
 use agent_desktop::approval::{self, ApprovalStatus};
 use agent_desktop::gateway::SubscriptionRecord;

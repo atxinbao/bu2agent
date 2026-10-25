@@ -25,9 +25,15 @@ import {
   type ConnectorGateway,
 } from "./domain/connector_client";
 import { InvokeConnectorClient } from "./domain/invoke_connector_client";
+import {
+  TaskClient,
+  type TaskGateway,
+} from "./domain/task_client";
+import { InvokeTaskClient } from "./domain/invoke_task_client";
 import { FilesView } from "./views/FilesView";
 import { AgentView } from "./views/AgentView";
 import { ConnectorsView } from "./views/ConnectorsView";
+import { TasksView } from "./views/TasksView";
 
 // Browser-preview fallback: plain HTTP to the Mock Gateway.
 // In a Tauri window the invoke clients below replace them, so
@@ -51,15 +57,17 @@ interface Clients {
   files: FileGateway;
   agent: AgentGateway;
   connectors: ConnectorGateway;
+  tasks: TaskGateway;
 }
 
-type Tab = "chat" | "files" | "agent" | "connectors";
+type Tab = "chat" | "files" | "agent" | "connectors" | "tasks";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "chat", label: "Chat" },
   { id: "files", label: "Files" },
   { id: "agent", label: "Agent" },
   { id: "connectors", label: "Connectors" },
+  { id: "tasks", label: "Tasks" },
 ];
 
 export function App() {
@@ -98,6 +106,7 @@ export function App() {
           files: new InvokeFileClient(),
           agent: new InvokeAgentClient(),
           connectors: new InvokeConnectorClient(),
+          tasks: new InvokeTaskClient(),
         };
         transportName = "invoke (Rust client)";
       } catch {
@@ -109,6 +118,7 @@ export function App() {
           files: new FileGatewayClient(MOCK_BASE_URL),
           agent: new AgentClient(MOCK_BASE_URL),
           connectors: new ConnectorClient(MOCK_BASE_URL),
+          tasks: new TaskClient(MOCK_BASE_URL),
         };
         transportName = "http (browser preview)";
       }
@@ -250,6 +260,17 @@ export function App() {
           <p className="empty">Choosing transport…</p>
         ) : (
           <ConnectorsView client={clients.connectors} />
+        ))}
+      {tab === "tasks" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : (
+          <TasksView
+            chat={clients.chat}
+            files={clients.files}
+            agent={clients.agent}
+            tasks={clients.tasks}
+          />
         ))}
     </div>
   );

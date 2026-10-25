@@ -59,7 +59,11 @@ fn main() {
             tool_commands::connector_notes_list,
             tool_commands::connector_mail_list,
             tool_commands::connector_notes_create,
-            tool_commands::connector_mail_send
+            tool_commands::connector_mail_send,
+            tool_commands::task_create,
+            tool_commands::task_list,
+            tool_commands::task_get,
+            tool_commands::task_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

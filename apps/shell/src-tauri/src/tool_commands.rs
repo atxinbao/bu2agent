@@ -22,6 +22,7 @@ use serde::Serialize;
 
 use agent_desktop::agent_client::{AgentClient, AgentError, ToolDecision, ToolResult};
 use agent_desktop::connector_client::{ConnectorClient, MockMessage, MockNote};
+use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry};
 use agent_desktop::{ErrorCode, UnifiedError, UserAction};
 
@@ -97,7 +98,7 @@ pub fn file_list(path: String) -> Result<Vec<GatewayFileEntry>, String> {
     file_client()?.list(&path).map_err(|e| err_string(&e))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn file_read_text(
     path: String,
     chunk_len: u64,
@@ -146,7 +147,7 @@ pub fn agent_request_approval(tool: String) -> Result<ApprovalRequestOut, String
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn agent_decide_approval(
     tool_call_id: String,
     decision: String,
@@ -160,7 +161,7 @@ pub fn agent_decide_approval(
         .map_err(agent_err_string)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn agent_call_tool(
     tool: String,
     args: HashMap<String, String>,
@@ -220,4 +221,57 @@ pub fn connector_mail_send(
     connector_client()?
         .mail_send(&to, &subject, &body, decision)
         .map_err(agent_err_string)
+}
+
+// --- Tasks (deterministic task loop) ---
+
+#[derive(Debug, Serialize)]
+pub struct TaskOut {
+    pub task_id: String,
+    pub directory: String,
+    pub artifact_path: Option<String>,
+    pub status: String,
+}
+
+impl From<TaskRecord> for TaskOut {
+    fn from(value: TaskRecord) -> Self {
+        TaskOut {
+            task_id: value.task_id,
+            directory: value.directory,
+            artifact_path: value.artifact_path,
+            status: value.status,
+        }
+    }
+}
+
+fn task_client() -> Result<TaskClient, String> {
+    TaskClient::new(MOCK_BASE_URL).map_err(|e| err_string(&e))
+}
+
+#[tauri::command]
+pub fn task_create(directory: String) -> Result<TaskOut, String> {
+    task_client()?.create(&directory).map_err(|e| err_string(&e)).map(TaskOut::from)
+}
+
+#[tauri::command]
+pub fn task_list() -> Result<Vec<TaskOut>, String> {
+    let records = task_client()?.list().map_err(|e| err_string(&e))?;
+    Ok(records.into_iter().map(TaskOut::from).collect())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_get(task_id: String) -> Result<TaskOut, String> {
+    task_client()?.get(&task_id).map_err(|e| err_string(&e)).map(TaskOut::from)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_update(
+    task_id: String,
+    status: String,
+    artifact_path: Option<String>,
+) -> Result<TaskOut, String> {
+    task_client()?
+        .update(&task_id, &status, artifact_path.as_deref())
+        .map_err(|e| err_string(&e))
+        .map(TaskOut::from)
 }

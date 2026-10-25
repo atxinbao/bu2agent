@@ -57,6 +57,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::approval_store::{append_record, load_records, next_id_number, ApprovalFileRecord};
+use crate::task_store::{append_task, load_tasks, next_task_number, TaskFileRecord};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
 
@@ -195,6 +196,9 @@ pub struct AppState {
     approvals: Arc<Mutex<HashMap<String, ApprovalState>>>,
     next_approval_id: Arc<Mutex<u64>>,
     approvals_path: Option<PathBuf>,
+    tasks: Arc<Mutex<HashMap<String, TaskFileRecord>>>,
+    next_task_id: Arc<Mutex<u64>>,
+    tasks_path: Option<PathBuf>,
     notes: Arc<Mutex<Vec<MockNote>>>,
     messages: Arc<Mutex<Vec<MockMessage>>>,
     next_note_id: Arc<Mutex<u64>>,
@@ -205,7 +209,11 @@ impl Default for AppState {
     fn default() -> Self {
         let root = std::env::var("MOCK_FILES_ROOT").unwrap_or_else(|_| "mock-files".to_string());
         let approvals_path = std::env::var("MOCK_APPROVALS_PATH").ok().map(PathBuf::from);
-        AppState::with_files_root_and_approvals(PathBuf::from(root), approvals_path)
+        let mut state = AppState::with_files_root_and_approvals(PathBuf::from(root), approvals_path);
+        if let Ok(tasks_path) = std::env::var("MOCK_TASKS_PATH") {
+            state = state.with_tasks_path(PathBuf::from(tasks_path));
+        }
+        state
     }
 }
 
@@ -252,6 +260,9 @@ impl AppState {
             approvals: Arc::new(Mutex::new(approvals)),
             next_approval_id: Arc::new(Mutex::new(next_approval_id)),
             approvals_path,
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            next_task_id: Arc::new(Mutex::new(1)),
+            tasks_path: None,
             notes: Arc::new(Mutex::new(seed_notes())),
             messages: Arc::new(Mutex::new(seed_messages())),
             next_note_id: Arc::new(Mutex::new(3)),
@@ -262,6 +273,21 @@ impl AppState {
     /// 注入模型客户端；基础构造器不读取凭据，正常启动在 main 中加载 env 与 Keychain。
     pub fn with_deepseek(mut self, client: DeepSeekClient) -> Self {
         self.deepseek = client;
+        self
+    }
+
+    /// Test seam: load task records from a JSONL file, so
+    /// persistence tests can point at a temp path. Production
+    /// state reads MOCK_TASKS_PATH in Default.
+    pub fn with_tasks_path(mut self, path: PathBuf) -> Self {
+        let records = load_tasks(&path);
+        let mut tasks = HashMap::new();
+        for record in &records {
+            tasks.insert(record.task_id.clone(), record.clone());
+        }
+        self.next_task_id = Arc::new(Mutex::new(next_task_number(&records)));
+        self.tasks = Arc::new(Mutex::new(tasks));
+        self.tasks_path = Some(path);
         self
     }
 }
@@ -881,6 +907,115 @@ fn cors_layer() -> CorsLayer {
         .allow_headers([header::CONTENT_TYPE])
 }
 
+// --- Tasks (deterministic task loop, first cut) ---
+//
+// A task is a directory + a report artifact. The frontend drives the
+// fixed steps (read -> generate -> approve -> write); the gateway only
+// stores task records. Records persist as JSONL when MOCK_TASKS_PATH is
+// set, mirroring the approval store.
+
+#[derive(Debug, Deserialize)]
+struct TaskCreateDto {
+    directory: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskGetQuery {
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskUpdateDto {
+    task_id: String,
+    status: String,
+    artifact_path: Option<String>,
+}
+
+fn valid_task_status(status: &str) -> bool {
+    matches!(status, "created" | "draft_ready" | "completed" | "rejected" | "failed")
+}
+
+/// Append one task record to the persistence file, when configured.
+/// Best-effort, mirroring persist_approval.
+fn persist_task(state: &AppState, record: &TaskFileRecord) {
+    let Some(path) = &state.tasks_path else { return };
+    append_task(path, record);
+}
+
+fn task_number(task_id: &str) -> u64 {
+    task_id.strip_prefix("task-").and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)
+}
+
+async fn tasks_create(
+    State(state): State<AppState>,
+    Json(req): Json<TaskCreateDto>,
+) -> impl IntoResponse {
+    if ensure_root(&state.files_root).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot create file root" }))).into_response();
+    }
+    let resolved = match resolve_file(&state.files_root, &req.directory) {
+        Ok(full) => full,
+        Err(_) => return bad_request("path escapes file root"),
+    };
+    if !resolved.is_dir() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "directory not found" }))).into_response();
+    }
+    let mut next = state.next_task_id.lock().expect("task id lock");
+    let id = format!("task-{}", *next);
+    *next += 1;
+    let record = TaskFileRecord {
+        task_id: id,
+        directory: req.directory,
+        artifact_path: None,
+        status: "created".to_string(),
+    };
+    state.tasks.lock().expect("task lock").insert(record.task_id.clone(), record.clone());
+    persist_task(&state, &record);
+    Json(record).into_response()
+}
+
+async fn tasks_list(State(state): State<AppState>) -> Json<Vec<TaskFileRecord>> {
+    let mut records: Vec<TaskFileRecord> =
+        state.tasks.lock().expect("task lock").values().cloned().collect();
+    records.sort_by_key(|r| task_number(&r.task_id));
+    Json(records)
+}
+
+async fn tasks_get(
+    State(state): State<AppState>,
+    Query(query): Query<TaskGetQuery>,
+) -> impl IntoResponse {
+    match state.tasks.lock().expect("task lock").get(&query.task_id) {
+        Some(record) => Json(record.clone()).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" }))).into_response(),
+    }
+}
+
+async fn tasks_update(
+    State(state): State<AppState>,
+    Json(req): Json<TaskUpdateDto>,
+) -> impl IntoResponse {
+    if !valid_task_status(&req.status) {
+        return bad_request("unknown task status");
+    }
+    if let Some(path) = &req.artifact_path {
+        if resolve_file(&state.files_root, path).is_err() {
+            return bad_request("path escapes file root");
+        }
+    }
+    let mut tasks = state.tasks.lock().expect("task lock");
+    let Some(record) = tasks.get_mut(&req.task_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" }))).into_response();
+    };
+    record.status = req.status;
+    if let Some(path) = req.artifact_path {
+        record.artifact_path = Some(path);
+    }
+    let updated = record.clone();
+    persist_task(&state, &updated);
+    Json(updated).into_response()
+}
+
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -900,6 +1035,10 @@ pub fn app(state: AppState) -> Router {
         .route("/connectors/notes/create", post(notes_create))
         .route("/connectors/mail/list", get(mail_list))
         .route("/connectors/mail/send", post(mail_send))
+        .route("/tasks/create", post(tasks_create))
+        .route("/tasks/list", get(tasks_list))
+        .route("/tasks/get", get(tasks_get))
+        .route("/tasks/update", post(tasks_update))
         .layer(cors_layer())
         .with_state(state)
 }

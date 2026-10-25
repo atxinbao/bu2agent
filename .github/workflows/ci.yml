@@ -69,12 +69,12 @@ jobs:
         run: |
           FILES_ROOT=$(mktemp -d)
           echo "FILES_ROOT=$FILES_ROOT" >> "$GITHUB_ENV"
-          # Keep the approvals file out of the served file root:
+          # Keep the approvals and tasks files out of the served file root:
           # the shell file test asserts the root starts empty,
           # and approval requests from the earlier tests would
           # otherwise leave approvals.jsonl in the listing.
           mkdir -p "$FILES_ROOT/files"
-          MOCK_FILES_ROOT="$FILES_ROOT/files" MOCK_APPROVALS_PATH="$FILES_ROOT/approvals.jsonl" ./target/debug/mock-gateway > /tmp/mock-gateway-ci.log 2>&1 &
+          MOCK_FILES_ROOT="$FILES_ROOT/files" MOCK_APPROVALS_PATH="$FILES_ROOT/approvals.jsonl" MOCK_TASKS_PATH="$FILES_ROOT/tasks.jsonl" ./target/debug/mock-gateway > /tmp/mock-gateway-ci.log 2>&1 &
           echo "SERVER_PID=$!" >> "$GITHUB_ENV"
           for i in $(seq 1 60); do
             if curl -s http://127.0.0.1:3001/health > /dev/null 2>&1; then break; fi

@@ -167,3 +167,96 @@ fn connector_commands_roundtrip() {
         "outside-domain mail must be refused"
     );
 }
+
+#[test]
+fn task_commands_roundtrip() {
+    let task = task_create("".to_string()).expect("create task");
+    assert!(task.task_id.starts_with("task-"), "task id: {}", task.task_id);
+    assert_eq!(task.status, "created");
+    assert_eq!(task.artifact_path, None);
+    let tasks = task_list().expect("list tasks");
+    assert!(tasks.iter().any(|t| t.task_id == task.task_id));
+    let fetched = task_get(task.task_id.clone()).expect("get task");
+    assert_eq!(fetched.directory, "");
+    let draft = task_update(task.task_id.clone(), "draft_ready".to_string(), None)
+        .expect("draft ready");
+    assert_eq!(draft.status, "draft_ready");
+    let done = task_update(
+        task.task_id.clone(),
+        "completed".to_string(),
+        Some("report.md".to_string()),
+    )
+    .expect("complete");
+    assert_eq!(done.status, "completed");
+    assert_eq!(done.artifact_path, Some("report.md".to_string()));
+    assert!(
+        task_update(task.task_id.clone(), "bogus".to_string(), None).is_err(),
+        "unknown status must be refused"
+    );
+    assert!(
+        task_get("task-999999".to_string()).is_err(),
+        "unknown task must be refused"
+    );
+}
+
+/// 使用前端实际传入的字段名，覆盖任务流程依赖的文件、审批和任务 IPC。
+#[test]
+fn task_workflow_invoke_roundtrip() {
+    let app = tauri::test::mock_builder()
+        .invoke_handler(tauri::generate_handler![
+            file_write, file_read_text, file_delete,
+            agent_request_approval, agent_decide_approval, agent_call_tool,
+            task_create, task_get, task_update,
+        ])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("build mock shell");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build().unwrap();
+    let invoke = |cmd: &str, body: serde_json::Value| {
+        tauri::test::get_ipc_response(&webview, tauri::webview::InvokeRequest {
+            cmd: cmd.to_string(),
+            callback: tauri::ipc::CallbackFn(0),
+            error: tauri::ipc::CallbackFn(1),
+            url: "tauri://localhost".parse().unwrap(),
+            body: tauri::ipc::InvokeBody::Json(body),
+            headers: Default::default(),
+            invoke_key: tauri::test::INVOKE_KEY.to_string(),
+        }).unwrap_or_else(|err| panic!("{cmd}: {err:?}"))
+            .deserialize::<serde_json::Value>().unwrap()
+    };
+    let path = "shell-task-invoke.txt";
+    let text = "任务材料：\"引号\"\n第二行";
+    invoke("file_write", serde_json::json!({
+        "path": path, "text": text, "approved": true, "append": false
+    }));
+    assert_eq!(invoke("file_read_text", serde_json::json!({
+        "path": path, "chunk_len": 7, "max_total": 1048576
+    })), text);
+    let task = invoke("task_create", serde_json::json!({"directory": ""}));
+    let id = task["task_id"].as_str().unwrap();
+    assert_eq!(invoke("task_get", serde_json::json!({"task_id": id})), task);
+    let draft = invoke("task_update", serde_json::json!({
+        "task_id": id, "status": "draft_ready", "artifact_path": null
+    }));
+    assert_eq!(draft["status"], "draft_ready");
+    let approval = invoke("agent_request_approval", serde_json::json!({"tool":"fs.write"}));
+    let approval_id = &approval["tool_call_id"];
+    invoke("agent_decide_approval", serde_json::json!({
+        "tool_call_id": approval_id, "decision": "approve"
+    }));
+    let written = invoke("agent_call_tool", serde_json::json!({
+        "tool": "fs.write", "args": {"path": path, "text": "生成的报告"},
+        "tool_call_id": approval_id
+    }));
+    assert_eq!(written["result"]["size_bytes"], "生成的报告".len());
+    let done = invoke("task_update", serde_json::json!({
+        "task_id": id, "status": "completed", "artifact_path": path
+    }));
+    assert_eq!(done["status"], "completed");
+    assert_eq!(done["artifact_path"], path);
+    assert_eq!(invoke("task_get", serde_json::json!({"task_id": id})), done);
+    assert_eq!(invoke("file_read_text", serde_json::json!({
+        "path": path, "chunk_len": 4096, "max_total": 1048576
+    })), "生成的报告");
+    invoke("file_delete", serde_json::json!({"path":path,"approved":true}));
+}
