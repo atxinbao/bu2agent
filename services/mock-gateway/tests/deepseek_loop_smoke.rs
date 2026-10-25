@@ -235,6 +235,98 @@ fn results(request: &Value) -> Vec<(String, Value)> {
 }
 
 #[tokio::test]
+async fn indexed_non_stream_calls_keep_array_order_ids_and_write_approval() {
+    let mut items = vec![
+        call("indexed-list", "fs_list", json!({})),
+        call("indexed-read", "fs_read", json!({"path":"seed"})),
+        call(
+            "indexed-write",
+            "fs_write",
+            json!({"path":"report","text":"indexed write body"}),
+        ),
+    ];
+    // 元数据不参与重排；实际执行顺序必须仍是响应数组顺序。
+    for (item, index) in items.iter_mut().zip([7, 2, 0]) {
+        item["index"] = json!(index);
+    }
+    let h = Harness::new(vec![calls(items), final_reply()]).await;
+    h.tools
+        .files
+        .lock()
+        .unwrap()
+        .insert("seed".into(), "indexed read body".into());
+    let id = h.start().await;
+    assert_eq!(h.step(&id).await["proposal_count"], 3);
+    h.step(&id).await;
+    h.step(&id).await;
+    let waiting = h.step(&id).await;
+    assert_eq!(waiting["status"], "awaiting_approval");
+    assert_eq!(waiting["calls"][2]["tool"], "fs.write");
+    assert_eq!(h.tools.executions.load(Ordering::SeqCst), 2);
+    assert!(!h.tools.files.lock().unwrap().contains_key("report"));
+    h.decide(&waiting, "approved").await;
+    assert_eq!(h.step(&id).await["status"], "completed");
+    assert_eq!(
+        h.tools.files.lock().unwrap()["report"],
+        "indexed write body"
+    );
+    let requests = h.requests();
+    let returned = results(&requests[1]);
+    assert_eq!(
+        returned
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["indexed-list", "indexed-read", "indexed-write"]
+    );
+    assert_eq!(returned[1].1["body"], "indexed read body");
+    for wire in requests[1]["messages"][2]["tool_calls"].as_array().unwrap() {
+        assert!(wire.get("index").is_none());
+    }
+    for private in ["indexed-list", "indexed read body", "indexed write body"] {
+        assert!(!h.audit().contains(private));
+    }
+}
+
+#[tokio::test]
+async fn invalid_index_and_unknown_envelope_fields_still_fail_without_execution() {
+    let mut items = Vec::new();
+    for (i, index) in [Value::Null, json!("0"), json!(-1), json!(0.5)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut item = call(&format!("bad-index-{i}"), "fs_read", json!({"path":"seed"}));
+        item["index"] = index;
+        items.push(item);
+    }
+    let mut extra = call(
+        "extra-envelope",
+        "fs_write",
+        json!({"path":"out","text":"never"}),
+    );
+    extra["index"] = json!(0);
+    extra["unexpected"] = json!(true);
+    items.push(extra);
+    let h = Harness::new(vec![calls(items), final_reply()]).await;
+    let id = h.start().await;
+    h.step(&id).await;
+    for _ in 0..5 {
+        h.step(&id).await;
+    }
+    let result = h.step(&id).await;
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["proposal_count"], 5);
+    for item in result["calls"].as_array().unwrap() {
+        assert_eq!(item["error"], "invalid_arguments");
+        assert!(item["approval_id"].is_null());
+    }
+    assert_eq!(h.tools.executions.load(Ordering::SeqCst), 0);
+    assert!(results(&h.requests()[1])
+        .iter()
+        .all(|(_, r)| r["error"] == "invalid_arguments"));
+}
+
+#[tokio::test]
 async fn multi_call_ids_history_schema_and_bound_write_roundtrip() {
     let h = Harness::new(vec![
         calls(vec![

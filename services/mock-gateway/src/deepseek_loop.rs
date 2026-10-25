@@ -203,10 +203,13 @@ fn parse_response(value: Value) -> Result<ModelReply, ModelError> {
             "fs_write" => "fs.write",
             _ => "invalid_tool",
         };
+        // 真实非流式响应也可能携带 index；它仅是供应商排序元数据。
+        // 执行仍按数组顺序，结果仍按原始 ID 配对，不用 index 授权或重排。
         let valid_envelope = call["type"] == "function"
+            && call.get("index").is_none_or(|v| v.as_u64().is_some())
             && call.as_object().is_some_and(|o| {
                 o.keys()
-                    .all(|k| matches!(k.as_str(), "id" | "type" | "function"))
+                    .all(|k| matches!(k.as_str(), "id" | "type" | "function" | "index"))
             })
             && function
                 .as_object()
