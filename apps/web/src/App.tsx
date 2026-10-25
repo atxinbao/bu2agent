@@ -40,6 +40,9 @@ import { AgentView } from "./views/AgentView";
 import { ConnectorsView } from "./views/ConnectorsView";
 import { TasksView } from "./views/TasksView";
 import { DevicesView } from "./views/DevicesView";
+import { LoopClient, type LoopGateway } from "./domain/loop_client";
+import { InvokeLoopClient } from "./domain/invoke_loop_client";
+import { LoopsView } from "./views/LoopsView";
 
 // Browser-preview fallback: plain HTTP to the Mock Gateway.
 // In a Tauri window the invoke clients below replace them, so
@@ -65,9 +68,10 @@ interface Clients {
   connectors: ConnectorGateway;
   tasks: TaskGateway;
   devices: DeviceGateway;
+  loops: LoopGateway;
 }
 
-type Tab = "chat" | "files" | "agent" | "connectors" | "tasks" | "devices";
+type Tab = "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "chat", label: "Chat" },
@@ -76,6 +80,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "connectors", label: "Connectors" },
   { id: "tasks", label: "Tasks" },
   { id: "devices", label: "Devices" },
+  { id: "loops", label: "Loops" },
 ];
 
 export function App() {
@@ -116,6 +121,7 @@ export function App() {
           connectors: new InvokeConnectorClient(),
           tasks: new InvokeTaskClient(),
           devices: new InvokeDeviceClient(),
+          loops: new InvokeLoopClient(),
         };
         transportName = "invoke (Rust client)";
       } catch {
@@ -129,6 +135,7 @@ export function App() {
           connectors: new ConnectorClient(MOCK_BASE_URL),
           tasks: new TaskClient(MOCK_BASE_URL),
           devices: new DeviceClient(MOCK_BASE_URL),
+          loops: new LoopClient(MOCK_BASE_URL),
         };
         transportName = "http (browser preview)";
       }
@@ -288,6 +295,7 @@ export function App() {
         ) : (
           <DevicesView agent={clients.agent} devices={clients.devices} />
         ))}
+      {tab === "loops" && clients && <LoopsView loops={clients.loops} agent={clients.agent} />}
     </div>
   );
 }

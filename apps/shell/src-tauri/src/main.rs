@@ -12,6 +12,7 @@
 
 mod gateway_commands;
 mod tool_commands;
+mod loop_commands;
 
 #[cfg(test)]
 mod shell_tests;
@@ -39,6 +40,7 @@ fn app_info() -> AppInfo {
 
 fn main() {
     tauri::Builder::default()
+        .manage(loop_commands::LoopTransport::default())
         .invoke_handler(tauri::generate_handler![
             ping,
             app_info,
@@ -70,7 +72,11 @@ fn main() {
             tool_commands::device_action_mark_rejected,
             tool_commands::device_action_refresh,
             tool_commands::device_actions_list,
-            tool_commands::device_action_get
+            tool_commands::device_action_get,
+            loop_commands::loop_start,
+            loop_commands::loop_get,
+            loop_commands::loop_resume,
+            loop_commands::loop_cancel
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

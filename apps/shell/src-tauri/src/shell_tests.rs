@@ -5,6 +5,110 @@ use std::collections::HashMap;
 
 use crate::tool_commands::*;
 
+/// 本地假 HTTP 响应验证真实 IPC 与桌面 DTO；状态机语义由网关集成测试负责。
+#[test]
+fn loop_workflow_invoke_roundtrip() {
+    use crate::loop_commands::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use serde_json::{json, Value};
+    let binding = json!({"loop_id":"loop-8","call_id":1,"tool":"fs.write","args_sha256":"hash"});
+    let mut view = json!({
+        "loop_id":"loop-8","prompt_digest":{"sha256":"prompt-hash","bytes":6},"model":"fixture",
+        "status":"created","error":null,"max_calls":3,"proposal_count":0,"model_attempts":0,
+        "budget_ms":45000,"used_ms":0,"created_at_ms":1,"updated_at_ms":1,"queue_position":0,
+        "calls":[],"unknown_writes":[],"unknown_reads":[],"late_model_arrivals_ms":[],"final_digest":null,
+        "in_flight":false,"remaining_ms":45000,"final_text":null,"pending_write":null,"approval_status":null
+    });
+    let created = view.clone();
+    view["status"] = json!("awaiting_approval");
+    view["proposal_count"] = json!(1);
+    view["calls"] = json!([{"call_id":1,"tool":"fs.write","path":"out","args_sha256":"hash",
+        "content_digest":{"sha256":"content-hash","bytes":6},"status":"awaiting_approval","error":null,
+        "approval_id":"approval-9","binding":binding,"submitted":false,"duplicate_of":null,"result":null,"late":null}]);
+    view["pending_write"] = json!({"call_id":1,"path":"out","text":"你好","args_sha256":"hash"});
+    view["approval_status"] = json!("pending");
+    let waiting = view.clone();
+    view["status"] = json!("completed");
+    view["pending_write"] = Value::Null;
+    view["approval_status"] = Value::Null;
+    view["final_text"] = json!("完成");
+    let completed = view.clone();
+    view["status"] = json!("cancelled");
+    let cancelled = view;
+    let expectations = vec![
+        ("POST", "/agent/loop/start", json!({"prompt":"你好","max_calls":3,"budget_ms":45000}), created.clone()),
+        ("POST", "/agent/loop/resume", json!({"loop_id":"loop-8","approval_id":null,"binding":null}), waiting.clone()),
+        ("GET", "/agent/loop/get?loop_id=loop-8", Value::Null, waiting.clone()),
+        ("POST", "/agent/loop/resume", json!({"loop_id":"loop-8","approval_id":"approval-9","binding":binding}), completed.clone()),
+        ("POST", "/agent/loop/cancel", json!({"loop_id":"loop-8"}), cancelled.clone()),
+    ];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for (method, path, expected, response) in expectations {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut bytes = Vec::new();
+            let (header_end, len) = loop {
+                let mut chunk = [0; 1024];
+                let n = socket.read(&mut chunk).unwrap();
+                assert!(n > 0); bytes.extend_from_slice(&chunk[..n]);
+                if let Some(i) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..i]);
+                    assert!(headers.starts_with(&format!("{method} {path} HTTP/1.1")));
+                    let len = headers.lines().find_map(|s| s.strip_prefix("Content-Length: ")).unwrap_or("0").parse::<usize>().unwrap();
+                    break (i + 4, len);
+                }
+            };
+            while bytes.len() < header_end + len {
+                let mut chunk = [0; 1024]; let n = socket.read(&mut chunk).unwrap(); assert!(n > 0); bytes.extend_from_slice(&chunk[..n]);
+            }
+            let body: Value = if len == 0 { Value::Null } else { serde_json::from_slice(&bytes[header_end..header_end + len]).unwrap() };
+            assert_eq!(body, expected);
+            let body = response.to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        }
+    });
+    let app = tauri::test::mock_builder().manage(LoopTransport { base_url })
+        .invoke_handler(tauri::generate_handler![loop_start, loop_get, loop_resume, loop_cancel])
+        .build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+    let invoke = |cmd: &str, body: Value| {
+        tauri::test::get_ipc_response(&webview, tauri::webview::InvokeRequest {
+            cmd:cmd.into(),callback:tauri::ipc::CallbackFn(0),error:tauri::ipc::CallbackFn(1),
+            url:"tauri://localhost".parse().unwrap(),body:tauri::ipc::InvokeBody::Json(body),
+            headers:Default::default(),invoke_key:tauri::test::INVOKE_KEY.into(),
+        }).unwrap_or_else(|e| panic!("{cmd}: {e:?}")).deserialize::<Value>().unwrap()
+    };
+    assert_eq!(invoke("loop_start", json!({"prompt":"你好","max_calls":3,"budget_ms":45000})), created);
+    assert_eq!(invoke("loop_resume", json!({"loop_id":"loop-8","approval_id":null,"binding":null})), waiting);
+    assert_eq!(invoke("loop_get", json!({"loop_id":"loop-8"})), waiting);
+    assert_eq!(invoke("loop_resume", json!({"loop_id":"loop-8","approval_id":"approval-9","binding":binding})), completed);
+    assert_eq!(invoke("loop_cancel", json!({"loop_id":"loop-8"})), cancelled);
+    server.join().unwrap();
+}
+
+/// 真实 Mock 网关未配置循环模型时，错误经异步 IPC 返回，不能变成回显成功。
+#[test]
+fn loop_unconfigured_invoke_errors() {
+    use crate::loop_commands::*;
+    let app = tauri::test::mock_builder().manage(LoopTransport::default())
+        .invoke_handler(tauri::generate_handler![loop_start, loop_get])
+        .build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+    let error = |cmd: &str, body: serde_json::Value| {
+        tauri::test::get_ipc_response(&webview, tauri::webview::InvokeRequest {
+            cmd:cmd.into(),callback:tauri::ipc::CallbackFn(0),error:tauri::ipc::CallbackFn(1),
+            url:"tauri://localhost".parse().unwrap(),body:tauri::ipc::InvokeBody::Json(body),
+            headers:Default::default(),invoke_key:tauri::test::INVOKE_KEY.into(),
+        }).unwrap_err().to_string()
+    };
+    assert!(error("loop_start", serde_json::json!({"prompt":"test","max_calls":5,"budget_ms":120000})).contains("503"));
+    assert!(error("loop_get", serde_json::json!({"loop_id":"loop-999999"})).contains("404"));
+    assert!(error("loop_get", serde_json::json!({"loopId":"loop-1"})).contains("loop_id"));
+}
+
 /// 经过真正的 invoke 参数解码，避免直接调用 Rust 函数遗漏桥接字段名错误。
 #[test]
 fn chat_invoke_roundtrip() {

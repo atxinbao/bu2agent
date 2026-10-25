@@ -121,6 +121,7 @@ body {
 
 .tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   border-bottom: 1px solid #e5e5e5;
   padding-bottom: 8px;
@@ -253,3 +254,13 @@ body {
   font-size: 14px;
   margin: 0;
 }
+
+/* 循环审批的全文预览与摘要分开，窄窗口也能完整滚动阅读。 */
+.loop-options { flex-wrap: wrap; }
+.loop-options input { width: 78px; padding: 6px; }
+.loop-approval { padding: 12px; border: 1px solid #e2ca7e; border-radius: 8px; background: #fff8e1; }
+.loop-approval details { margin: 10px 0; }
+.loop-approval summary { cursor: pointer; }
+.loop-approval pre { max-height: 320px; overflow: auto; }
+.loop-calls { padding-left: 24px; }
+.loop-calls li { margin: 10px 0; overflow-wrap: anywhere; }

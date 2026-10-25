@@ -37,6 +37,7 @@ pub mod tools;
 pub mod transport;
 pub mod task_client;
 pub mod device_client;
+pub mod loop_client;
 
 /// Unified error shape. Mirrors the JSON Schema `UnifiedError`.
 /// Raw Rust errors, stack traces and system paths must never be
