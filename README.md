@@ -12,16 +12,16 @@
 - B 层已验收 Fake 与 EventKit 提醒事项闭环；只验证过专用提醒的显式完成状态修改，不代表任意设备均已接通。见 [设备契约与验收](services/mock-gateway/DEVICES.md)。
 - 模型循环已验收真实 DeepSeek 成功/拒绝/取消/重启，以及假模型驱动的 unknown、重复未知写、工具在途取消；只开放文件列目录、读取、写入。见 [循环协议](services/mock-gateway/LOOP.md)。
 - 凭据支持 OS Keychain，审批、任务、设备动作、循环审计使用各自 JSONL。循环审计不存提示、读写正文或最终回答；不承诺断电耐久。
-- 有本地 Tauri `.app`/安装包构建入口，但独立网关未作为完整日常安装方案交付；TCC 权限归属、Swift 运行库分发、签名与公证仍需独立核验。见 [打包现状与验证](packaging/README.md)。
+- 有本地 Tauri `.app`/安装包构建入口，但独立网关未作为完整日常安装方案交付；TCC 权限归属已由独立实验包端到端验证闭合（见设备契约），Swift 运行库分发、签名与公证、升级授权延续、安装与生命周期仍需独立核验。见 [打包现状与验证](packaging/README.md)。
 
 开发启动：`bash run-shell.command`。Mac 本地验证入口为 `run-tests.command`、`run-shell-tests.command` 和 `apps/web` 下的 `npm run build`。壳回归需要 3001 空闲，不与运行窗口共用服务。
 
-已观测的 CI 基线为 `0524158`（5 个任务全绿）；后续本地提交不能沿用这次 CI 结果。
+已观测的 CI 基线为 `b8e61ac`（用户报告 5 个任务全绿）；后续本地提交不能沿用这次 CI 结果。
 
 - 目标记录：`goal_a083c94c3d89`（bu2agent；2026-10-24 由旧目标 `goal_33244669e730` 重建，slug 统一为 bu2agent）
 - 最终目标（2026-10-24 用户确认）：逆向 Muse app，做一个完全一样的个人 Agent 客户端，并为此构建底层架构；首期先按 Rust 客户端 + TS 前端 + Mock Gateway 跑通主线，底层架构按契约先行、可替换设计。
 - 基线文档：《Muse macOS 8.0 逆向工程与重建规格》（2026-10-24）
-- 详细规划：`~/workspace/goals/web-agent/files/phase1-foundation-architecture-and-plan.md`
+- 详细规划：`~/workspace/goals/bu2agent/files/phase1-foundation-architecture-and-plan.md`
 - 本目录是 Mac 本地项目家目录：/Users/mac/Documents/bu2agent，先放项目文档与 Phase 0 契约骨架，代码实现按 Phase 0 → Phase 5 推进。
 - 语言：本文新写内容使用 zh-CN。
 

@@ -26,8 +26,8 @@ macOS 上显式设置 MOCK_DEVICE_BACKEND=eventkit 才使用 EventKit；通过 M
 
 历史设计稿 goals/bu2agent/files/device-loop-design.md 不在本次 Mac 仓库中，未假装回填该外部文件；本页是仓库内现行契约与验收结论。
 
-## 尚未闭合的打包事项
+## 打包事项（归属已闭合，发行项仍待核验）
 
-独立 bundle 身份与 Info.plist 的临时网关已完成只读实验，但结论仍为 NOT_CONFIRMED：授权状态与读取正常，系统权限列表未见独立网关条目，弹窗申请者名称未被可靠记录。父进程链、包内可执行路径与读取成功均不能单独证明 TCC 归属。下一次新身份授权实验须用户事前批准，结合系统应用查找、提示名称及权限列表判断。参见 [打包验证](../../packaging/README.md)。
+独立实验网关包的 TCC 归属已由端到端直接验证闭合（结论 CONFIRMED_FOR_THIS_EXPERIMENTAL_BUNDLE）：Finder 发现后 bundle ID 可解析、not_determined→authorized、权限列表独立 R2 条目离开重进仍在、TCC 日志 subject/responsible 同为新 ID。弹窗因工具限制未直接读取，通过依据是独立条目，不补猜名称；R1 历史 NOT_CONFIRMED 不追改，不写成已完成根因唯一归因。实验包已清理，R2 权限条目保留未撤销。正式发行前仍需各自完成：稳定发行签名身份、版本升级后授权延续、Swift 运行库分发、安装与生命周期管理、公证、正式发布包自身验证。参见 [打包验证](../../packaging/README.md)。
 
 macOS 14+ 使用 NSRemindersFullAccessUsageDescription；兼容 macOS 13 时保留 NSRemindersUsageDescription。Swift 桥当前使用工具链 rpath，开发机可运行不代表目标用户机器已具备运行库。

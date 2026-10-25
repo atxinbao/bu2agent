@@ -7,21 +7,21 @@
 - Tauri 2 窗口与七个视图已实现。run-build.command 先构建 apps/web，再生成 Tauri release 包；本机开发包可用 cargo tauri build --debug --bundles app 构建。
 - run-package.command 仅构建 workspace 的 CLI 与 mock-gateway，不等于完整桌面安装方案。
 - 窗口与网关仍分开启动；run-shell.command 启动本地网关、Vite 与开发窗口。现有 .app 本身不负责安装或管理独立网关。
-- OS Keychain、EventKit 提醒事项已有本机验证。签名发行、公证、自动更新、跨机器 Swift 运行库交付、独立网关权限归属未据此宣告完成。
+- OS Keychain、EventKit 提醒事项已有本机验证。签名发行、公证、自动更新、跨机器 Swift 运行库交付未据此宣告完成；独立网关权限归属已由独立实验包端到端验证闭合（见下节），但正式发行包自身验证仍待完成。
 
 ## 已有验证与限制
 
-0524158 的 GitHub Actions 五个任务成功：三平台 workspace 测试与 Clippy、前端构建、macOS 壳 10/10。这证明该提交的构建/测试结果，不证明其它提交或所有平台的安装包都可用。
+b8e61ac 的 GitHub Actions 五个任务成功（用户报告全绿）：三平台 workspace 测试与 Clippy、前端构建、macOS 壳 10/10。这证明该提交的构建/测试结果，不证明其它提交或所有平台的安装包都可用。
 
 当前网关通过 build.rs 给开发产物加入活动 Swift 工具链 runtimeLibraryPaths 的 rpath，解决开发机加载问题。该路径可能只在构建机存在；发布前需要单独验证系统运行库或捆绑运行库方案，不能把本机启动当成无 Xcode 用户机器通过。
 
-## 独立网关只读验证
+## 独立网关归属验证（已闭合，实验包范围）
 
-当前结论为 **NOT_CONFIRMED**。临时独立包已完成启动、授权状态与数量读取，普通重启后仍可读取；实验包和临时文件已清理。签名 ID 与 bundle ID 一致，ad-hoc 验签通过并绑定 Info.plist，但系统权限列表未见独立网关条目，授权弹窗申请者名称也未可靠记录，因此不满足独立归属通过标准。
+当前结论为 **CONFIRMED_FOR_THIS_EXPERIMENTAL_BUNDLE**。端到端直接验证：Finder 发现后 bundle ID 可解析、not_determined→authorized、权限列表独立 R2 条目离开重进仍在、TCC 日志 subject/responsible 同为新 ID；实验包和临时文件已清理，R2 权限条目保留未撤销。弹窗因工具限制未直接读取，通过依据是独立条目，不补猜名称；签名 ID 与 bundle ID 一致，ad-hoc 验签通过并绑定 Info.plist。
 
-后续只读排查发现：Launch Services 历史日志有注册成功记录，系统隐私界面随后却报按该 bundle ID 查找应用失败。两者同时存在，根因仍未确认，不能直接归因为未注册、ad-hoc 签名或借用了其它应用权限。新的 bundle ID 授权实验须用户事前明确批准；不得重置 TCC、切换既有权限开关或修改提醒来制造通过。
+R1 历史记录：Launch Services 历史日志有注册成功记录，系统隐私界面随后却报按该 bundle ID 查找应用失败。两者同时存在；直接验证闭合的是独立实验包的归属项，不单独证明 R1 异常的唯一原因，R1 历史 NOT_CONFIRMED 不追改。后续任何新身份授权实验仍须用户事前明确批准；不得重置 TCC、切换既有权限开关或修改提醒来制造通过。
 
-实验方法如下，不提前决定正式安装路径或后台常驻机制：
+R1 实验方法（历史记录；直接验证按端到端方案执行，见 .codex/bundle-permission-validation/direct-run/report.md），不提前决定正式安装路径或后台常驻机制：
 
 1. 将当前网关 Mach-O 放入独立 .app/Contents/MacOS，使用独立 CFBundleIdentifier、CFBundleExecutable 与显示名；补充提醒事项用途字符串。为实验副本做本地 ad-hoc 签名并核验 Info.plist 绑定，不替换原始二进制，不申请发行证书。
 2. 经 Launch Services 启动该 .app，而非在终端直接执行内部二进制。独立设置回环地址、临时文件根与日志路径；不连接真实模型、不读取真实模型凭据。

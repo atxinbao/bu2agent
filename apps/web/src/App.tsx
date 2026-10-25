@@ -164,6 +164,38 @@ export function App() {
     };
   }, []);
 
+  // 启动检查失败可能只是网关尚未就绪，不能让 unreachable 一直保留。
+  // 仅失败时每两秒复查；成功或卸载后停止，网关未启动时仍显示不可达。
+  useEffect(() => {
+    if (gatewayOk !== false) {
+      return;
+    }
+    let cancelled = false;
+    let inFlight = false;
+    const timer = setInterval(() => {
+      if (inFlight) {
+        return;
+      }
+      inFlight = true;
+      (async () => {
+        try {
+          const ok = await clientsRef.current?.chat.health();
+          if (!cancelled && ok) {
+            setGatewayOk(true);
+          }
+        } catch {
+          // 两种传输失败时均返回 false；这里兜底处理意外抛错。
+        } finally {
+          inFlight = false;
+        }
+      })();
+    }, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [gatewayOk]);
+
   async function send() {
     const input = inputRef.current;
     const gateway = clientsRef.current?.chat ?? null;
