@@ -8,10 +8,7 @@
 //! sees the gateway URL. The plain HTTP client stays as the
 //! fallback for a browser preview without a shell.
 //!
-//! Commands are synchronous: Tauri runs them on its command
-//! thread pool, and the localhost calls are millisecond-scale
-//! with the client's 10 s timeouts, so no spawn_blocking is
-//! needed at this stage.
+//! 聊天生成可能等待模型数十秒，通过 spawn_blocking 运行同步客户端，避免阻塞窗口。
 //!
 //! Error strings are safe to surface: `UnifiedError` is
 //! redacted by construction (bodies never land in it, only
@@ -91,15 +88,15 @@ pub fn gateway_history() -> Result<Vec<HistoryMessage>, String> {
 }
 
 #[tauri::command]
-pub fn gateway_stream_start(
+pub async fn gateway_stream_start(
     stream_id: String,
     turn_id: String,
     text: String,
 ) -> Result<Vec<StreamRecordDto>, String> {
-    let records = client()?
-        .start_stream(&stream_id, &turn_id, &text)
-        .map_err(err_string)?;
-    Ok(records.into_iter().map(StreamRecordDto::from).collect())
+    tauri::async_runtime::spawn_blocking(move || {
+        let records = client()?.start_stream(&stream_id, &turn_id, &text).map_err(err_string)?;
+        Ok(records.into_iter().map(StreamRecordDto::from).collect())
+    }).await.map_err(|_| "聊天任务执行失败".to_string())?
 }
 
 #[tauri::command]

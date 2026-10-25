@@ -102,7 +102,8 @@ pub struct ChatClient {
 
 impl ChatClient {
     pub fn new(base_url: &str) -> Result<Self> {
-        Ok(Self { http: HttpClient::new(base_url)? })
+        // 网关模型调用上限 30 秒；保留 70 秒桌面等待，预留返回和解码时间。
+        Ok(Self { http: HttpClient::with_timeout(base_url, 70_000)? })
     }
 
     pub fn health(&self) -> Result<bool> {

@@ -13,6 +13,7 @@
 //! - unapproved sensitive calls are refused, even if the UI is bypassed
 
 pub mod approval_store;
+pub mod deepseek;
 pub mod server;
 
 use agent_desktop::approval::{self, ApprovalStatus};
@@ -56,10 +57,10 @@ fn record(stream_id: &str, sequence: u64, event_type: &str, payload: &str, curso
 /// agent_status(completed), message_done. Sequences 1..=4.
 pub fn start_stream(stream_id: &str, turn_id: &str, text: &str) -> Vec<SubscriptionRecord> {
     vec![
-        record(stream_id, 1, events::TURN_START, &format!("{{\"turnId\":\"{turn_id}\"}}"), Some("cursor-1")),
-        record(stream_id, 2, events::TEXT_APPEND, &format!("{{\"turnId\":\"{turn_id}\",\"text\":\"{text}\"}}"), Some("cursor-2")),
-        record(stream_id, 3, events::AGENT_STATUS, &format!("{{\"turnId\":\"{turn_id}\",\"status\":\"completed\"}}"), Some("cursor-3")),
-        record(stream_id, 4, events::MESSAGE_DONE, &format!("{{\"turnId\":\"{turn_id}\"}}"), None),
+        record(stream_id, 1, events::TURN_START, &serde_json::json!({"turnId": turn_id}).to_string(), Some("cursor-1")),
+        record(stream_id, 2, events::TEXT_APPEND, &serde_json::json!({"turnId": turn_id, "text": text}).to_string(), Some("cursor-2")),
+        record(stream_id, 3, events::AGENT_STATUS, &serde_json::json!({"turnId": turn_id, "status": "completed"}).to_string(), Some("cursor-3")),
+        record(stream_id, 4, events::MESSAGE_DONE, &serde_json::json!({"turnId": turn_id}).to_string(), None),
     ]
 }
 

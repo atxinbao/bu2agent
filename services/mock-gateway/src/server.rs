@@ -6,7 +6,7 @@
 //! change any of those rules. If a rule needs to change, change
 //! `lib.rs` and its unit tests first, then re-check this module.
 //!
-//! Endpoints (all local, Mock only, no real auth):
+//! 聊天：无 key 时 Mock 回显；配置 key 后（env DEEPSEEK_API_KEY 或 Keychain deepseek）调用 DeepSeek deepseek-flash，失败返回 502。
 //! - GET  /health                -> {"status":"ok"}
 //! - GET  /chat/history          -> seed history
 //! - POST /chat/stream/start    -> stream records 1..=4 for a turn
@@ -57,6 +57,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::approval_store::{append_record, load_records, next_id_number, ApprovalFileRecord};
+use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
 
 #[derive(Debug, Clone, Serialize)]
@@ -188,6 +189,7 @@ fn seed_messages() -> Vec<MockMessage> {
 
 #[derive(Clone)]
 pub struct AppState {
+    deepseek: DeepSeekClient,
     streams: Arc<Mutex<HashMap<String, StreamState>>>,
     files_root: PathBuf,
     approvals: Arc<Mutex<HashMap<String, ApprovalState>>>,
@@ -244,6 +246,7 @@ impl AppState {
             next_approval_id = next_id_number(&records);
         }
         AppState {
+            deepseek: DeepSeekClient::new(DeepSeekConfig::disabled()),
             streams: Arc::new(Mutex::new(HashMap::new())),
             files_root: root,
             approvals: Arc::new(Mutex::new(approvals)),
@@ -254,6 +257,12 @@ impl AppState {
             next_note_id: Arc::new(Mutex::new(3)),
             next_message_id: Arc::new(Mutex::new(3)),
         }
+    }
+
+    /// 注入模型客户端；基础构造器不读取凭据，正常启动在 main 中加载 env 与 Keychain。
+    pub fn with_deepseek(mut self, client: DeepSeekClient) -> Self {
+        self.deepseek = client;
+        self
     }
 }
 
@@ -438,14 +447,32 @@ async fn history() -> Json<Vec<HistoryMessage>> {
 async fn stream_start(
     State(state): State<AppState>,
     Json(req): Json<StartRequest>,
-) -> Json<Vec<StreamRecordDto>> {
-    let records = start_stream(&req.stream_id, &req.turn_id, &req.text);
+) -> impl IntoResponse {
+    // DeepSeek: key presence enables the model reply; no key
+    // keeps the Mock echo, and a failed model call returns
+    // 502, never a silent echo.
+    let reply = match state.deepseek.reply(&req.text).await {
+        DeepseekOutcome::Disabled => req.text.clone(),
+        DeepseekOutcome::Replied(text) => text,
+        DeepseekOutcome::Failed(status) => {
+            eprintln!("warning: deepseek request failed: status {status:?}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "deepseek request failed",
+                    "status": status,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let records = start_stream(&req.stream_id, &req.turn_id, &reply);
     let mut streams = state.streams.lock().expect("stream state lock");
     streams.insert(
         req.stream_id.clone(),
         StreamState { stream: CancellableStream::new(), last_applied: 0 },
     );
-    Json(records.into_iter().map(StreamRecordDto::from).collect())
+    Json(records.into_iter().map(StreamRecordDto::from).collect::<Vec<_>>()).into_response()
 }
 
 async fn stream_apply(

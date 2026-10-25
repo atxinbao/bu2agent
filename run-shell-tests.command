@@ -24,7 +24,8 @@ FILES_ROOT="$TEST_ROOT/files"
 mkdir -p "$FILES_ROOT"
 echo "Starting throwaway mock-gateway on http://127.0.0.1:3001 ..."
 echo "File root: $FILES_ROOT (deleted when this script exits)"
-MOCK_FILES_ROOT="$FILES_ROOT" MOCK_APPROVALS_PATH="$TEST_ROOT/approvals.jsonl" cargo run -q -p mock-gateway > /tmp/mock-gateway-shell-tests.log 2>&1 &
+# 回归服务不读取 env 或 Keychain 中的真实模型凭据。
+MOCK_FILES_ROOT="$FILES_ROOT" MOCK_APPROVALS_PATH="$TEST_ROOT/approvals.jsonl" cargo run -q -p mock-gateway -- --mock-chat > /tmp/mock-gateway-shell-tests.log 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null; rm -rf "$TEST_ROOT"' EXIT
 for i in $(seq 1 20); do

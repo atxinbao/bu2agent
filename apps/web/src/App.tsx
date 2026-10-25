@@ -229,9 +229,7 @@ export function App() {
           </footer>
           {error !== null && <p className="error">{error}</p>}
           <p className="note">
-            Mock note: the Mock Gateway returns all stream records at once, so the
-            assistant reply appears whole. True token-by-token streaming arrives
-            with a real gateway.
+            当前聊天在回复完成后一次显示全部内容。每次提问独立处理，不携带前文。
           </p>
         </>
       )}

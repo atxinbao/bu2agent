@@ -234,3 +234,37 @@ bu2agent/
 - VM 预筛：改名后 6 文件 TOML/JSON 解析通过、新名字样齐全、旧名字符串清零、`main.rs` 在补齐同目录模块后 rustfmt 解析通过；壳的真正编译仍由 Mac 承载（VM 缺 gdk-3.0）。
 - Mac 待验：跑 `run-shell-tests.command`（新包名下壳编译 + 3 项测试）与 `run-tests.command`（workspace 未动，36 项回归）；改名后首次构建会刷新 `apps/shell/src-tauri/Cargo.lock` 里的包名，属预期变化，推送时一并提交。
 - 目标 slug 未改：目标记录的 slug `web-agent` 建好后没有改名接口（见目标记录），Goals 标签页显示的是标题不是 slug，留着不影响使用；如坚持要改，只能重建目标（时间线会丢），待用户定。
+# DeepSeek 本地网关聊天
+
+更新：2026-10-25，Codex。
+
+网关优先使用 `DEEPSEEK_API_KEY`，否则读取 Keychain 中 `bu2agent` 服务的 `deepseek` 条目。
+有 key 即调用模型；没有可用 key 时打印启动提示并保持回显。直接从项目根目录执行：
+
+```bash
+bash run-shell.command
+```
+
+先关闭原来的壳与网关，确保 3001、5173 未占用。凭据只由网关读取，前端和聊天请求都不携带 key。
+可在本机用 `connector-cli cred show --keychain --handle deepseek` 检查掩码；不要把真实 key 放进聊天、文档或源码。
+网关日志见 `/tmp/mock-gateway-shell.log`。`BU2AGENT_CHAT_BACKEND` 已废弃。
+key 已配置但请求失败时不会回显，以免把输入误认为模型答案。
+
+默认调用 `https://api.deepseek.com/chat/completions`，模型为 `deepseek-flash`。
+可用 `DEEPSEEK_BASE_URL` 覆盖基础地址、`DEEPSEEK_MODEL` 覆盖模型；路径在基础地址后追加
+`/chat/completions`。每次仅发送当前提问，不携带前文，不自动调用工具。
+全文通过原有四条事件返回；并非逐 token 流式输出。历史接口保留演示种子，
+窗口新会话仅保存在内存，刷新或重启不恢复。审批持久化不受影响。
+
+网关请求超时 30 秒，连接超时 10 秒，桌面等待 70 秒。模型失败统一返回 502，
+只带 provider 状态（传输或解析失败为 null），不返回 key 或上游正文。
+截断、空内容也按失败处理，不自动重试付费请求。取消沿用现有状态机：仅对已建立的 stream
+阻止后续 apply，不中止进行中的模型请求，不承诺免计费。
+
+本地假服务验证：`cargo test -p mock-gateway --test deepseek_smoke`。5 项测试使用显式假配置，
+覆盖模型回复、无 key 回显、401 转 502、截断和空内容。基础状态构造器不读取真实凭据，
+正常服务启动时再加载 env 与 Keychain；壳回归脚本通过专用 `--mock-chat` 参数跳过凭据读取。
+真实 Keychain 凭据读取和 DeepSeek 窗口联网实测需由用户在本机完成，假服务通过不代表真实账户调用已验证。
+
+接口依据：[DeepSeek 官方入门](https://api-docs.deepseek.com/)、
+[Chat Completions 文档](https://api-docs.deepseek.com/api/create-chat-completion/)。
