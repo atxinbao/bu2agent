@@ -87,7 +87,7 @@ pub fn gateway_history() -> Result<Vec<HistoryMessage>, String> {
     client()?.history().map_err(err_string)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn gateway_stream_start(
     stream_id: String,
     turn_id: String,
@@ -99,7 +99,7 @@ pub async fn gateway_stream_start(
     }).await.map_err(|_| "聊天任务执行失败".to_string())?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn gateway_stream_apply(
     stream_id: String,
     records: Vec<StreamRecordDto>,
@@ -119,7 +119,7 @@ pub fn gateway_stream_apply(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn gateway_stream_cancel(stream_id: String) -> Result<bool, String> {
     client()?.cancel_stream(&stream_id).map_err(err_string)
 }

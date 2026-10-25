@@ -16,6 +16,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+
 # This crate is deliberately NOT a member of the workspace rooted
 # at the project root (which covers apps/desktop and
 # services/mock-gateway). The empty [workspace] table marks it

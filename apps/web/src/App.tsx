@@ -166,7 +166,7 @@ export function App() {
     } catch (err) {
       // Domain clients surface only the HTTP status, never the
       // response body, so this message is safe to display.
-      setError(err instanceof Error ? err.message : "send failed");
+      setError(err instanceof Error ? err.message : typeof err === "string" ? err : "send failed");
     } finally {
       setBusy(false);
     }

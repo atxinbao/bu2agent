@@ -5,6 +5,37 @@ use std::collections::HashMap;
 
 use crate::tool_commands::*;
 
+/// 经过真正的 invoke 参数解码，避免直接调用 Rust 函数遗漏桥接字段名错误。
+#[test]
+fn chat_invoke_roundtrip() {
+    use crate::gateway_commands::*;
+    let app = tauri::test::mock_builder()
+        .invoke_handler(tauri::generate_handler![gateway_stream_start, gateway_stream_apply, gateway_stream_cancel])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("build mock shell");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+    let invoke = |cmd: &str, body: serde_json::Value| {
+        tauri::test::get_ipc_response(&webview, tauri::webview::InvokeRequest {
+            cmd: cmd.to_string(),
+            callback: tauri::ipc::CallbackFn(0),
+            error: tauri::ipc::CallbackFn(1),
+            url: "tauri://localhost".parse().unwrap(),
+            body: tauri::ipc::InvokeBody::Json(body),
+            headers: Default::default(),
+            invoke_key: tauri::test::INVOKE_KEY.to_string(),
+        }).expect("invoke response").deserialize::<serde_json::Value>().unwrap()
+    };
+    let records = invoke("gateway_stream_start", serde_json::json!({
+        "stream_id": "shell-invoke-chat", "turn_id": "shell-invoke-turn", "text": "桥接测试\n\"你好\""
+    }));
+    assert_eq!(records.as_array().unwrap().len(), 4);
+    let applied = invoke("gateway_stream_apply", serde_json::json!({"stream_id":"shell-invoke-chat", "records":records}));
+    assert_eq!(applied["kept"].as_array().unwrap().len(), 4);
+    let payload: serde_json::Value = serde_json::from_str(applied["kept"][1]["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["text"], "桥接测试\n\"你好\"");
+    assert_eq!(invoke("gateway_stream_cancel", serde_json::json!({"stream_id":"shell-invoke-chat"})), true);
+}
+
 fn args(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
 }
