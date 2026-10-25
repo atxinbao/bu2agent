@@ -169,7 +169,7 @@ export function LoopsView({ loops, agent }: { loops: LoopGateway; agent: AgentGa
         {item.error && <span> · {item.error}</span>}
         {item.duplicate_of !== null && <span> · 复用 #{item.duplicate_of}（未再次执行）</span>}
         {item.result && <p>结果：{item.result.status} · 原正文 {item.result.body_digest.bytes} 字节{item.result.truncated ? " · 回传已截断" : ""}</p>}
-        {item.late && <p>迟到结果：{item.late.result.status}（仅归档，不改变已回传的未知结果）</p>}
+        {item.late && <p>迟到结果：{item.late.result.status}（仅归档，不回传模型、不推进循环）{item.status === "unknown" && "；原调用仍为 unknown。"}</p>}
       </li>)}</ol>
       {!!current.late_model_arrivals_ms.length && <p>迟到模型响应 {current.late_model_arrivals_ms.length} 次，仅保留到达元数据，未触发工具。</p>}
     </>}
