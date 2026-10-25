@@ -12,6 +12,7 @@
 //! - cancel stops the stream: later records are not applied
 //! - unapproved sensitive calls are refused, even if the UI is bypassed
 
+pub mod approval_store;
 pub mod server;
 
 use agent_desktop::approval::{self, ApprovalStatus};

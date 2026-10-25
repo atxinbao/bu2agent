@@ -29,6 +29,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # keyring's Linux backend (sync-secret-service) links
+      # libdbus-1; without it the ubuntu build fails in the
+      # libdbus-sys build script. macOS/Windows need no step.
+      - name: Install Linux secret-service build deps
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: Run tests
         run: cargo test --workspace
       - name: Clippy (warnings deny)
@@ -63,7 +69,12 @@ jobs:
         run: |
           FILES_ROOT=$(mktemp -d)
           echo "FILES_ROOT=$FILES_ROOT" >> "$GITHUB_ENV"
-          MOCK_FILES_ROOT="$FILES_ROOT" ./target/debug/mock-gateway > /tmp/mock-gateway-ci.log 2>&1 &
+          # Keep the approvals file out of the served file root:
+          # the shell file test asserts the root starts empty,
+          # and approval requests from the earlier tests would
+          # otherwise leave approvals.jsonl in the listing.
+          mkdir -p "$FILES_ROOT/files"
+          MOCK_FILES_ROOT="$FILES_ROOT/files" MOCK_APPROVALS_PATH="$FILES_ROOT/approvals.jsonl" ./target/debug/mock-gateway > /tmp/mock-gateway-ci.log 2>&1 &
           echo "SERVER_PID=$!" >> "$GITHUB_ENV"
           for i in $(seq 1 60); do
             if curl -s http://127.0.0.1:3001/health > /dev/null 2>&1; then break; fi

@@ -18,12 +18,15 @@ if curl -s -f http://127.0.0.1:3001/health > /dev/null 2>&1; then
   read -r _
   exit 1
 fi
-FILES_ROOT=$(mktemp -d /tmp/web-agent-shell-tests.XXXXXX)
+TEST_ROOT=$(mktemp -d /tmp/web-agent-shell-tests.XXXXXX)
+# 审批日志与业务文件分开，避免日志污染文件列表断言。
+FILES_ROOT="$TEST_ROOT/files"
+mkdir -p "$FILES_ROOT"
 echo "Starting throwaway mock-gateway on http://127.0.0.1:3001 ..."
 echo "File root: $FILES_ROOT (deleted when this script exits)"
-MOCK_FILES_ROOT="$FILES_ROOT" cargo run -q -p mock-gateway > /tmp/mock-gateway-shell-tests.log 2>&1 &
+MOCK_FILES_ROOT="$FILES_ROOT" MOCK_APPROVALS_PATH="$TEST_ROOT/approvals.jsonl" cargo run -q -p mock-gateway > /tmp/mock-gateway-shell-tests.log 2>&1 &
 SERVER_PID=$!
-trap 'kill $SERVER_PID 2>/dev/null; rm -rf "$FILES_ROOT"' EXIT
+trap 'kill $SERVER_PID 2>/dev/null; rm -rf "$TEST_ROOT"' EXIT
 for i in $(seq 1 20); do
   if curl -s http://127.0.0.1:3001/health > /dev/null 2>&1; then
     break

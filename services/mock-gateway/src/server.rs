@@ -30,6 +30,14 @@
 //! The server binds to 127.0.0.1:3001 by default (see `main.rs`,
 //! overridable with MOCK_GATEWAY_ADDR). It is a Mock, never a
 //! production gateway, and must not be exposed beyond localhost.
+//!
+//! Approval persistence (stage 2): when MOCK_APPROVALS_PATH is set,
+//! approval records are appended as JSONL (one object per line)
+//! on every request and decision, and reloaded at startup, so a
+//! restart keeps approved records usable. When unset, records
+//! stay memory-only: that keeps unit tests and throwaway runs
+//! isolated. Append/load failures are stderr warnings, never
+//! fatal; the in-memory map stays authoritative for the run.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -48,6 +56,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+use crate::approval_store::{append_record, load_records, next_id_number, ApprovalFileRecord};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
 
 #[derive(Debug, Clone, Serialize)]
@@ -183,6 +192,7 @@ pub struct AppState {
     files_root: PathBuf,
     approvals: Arc<Mutex<HashMap<String, ApprovalState>>>,
     next_approval_id: Arc<Mutex<u64>>,
+    approvals_path: Option<PathBuf>,
     notes: Arc<Mutex<Vec<MockNote>>>,
     messages: Arc<Mutex<Vec<MockMessage>>>,
     next_note_id: Arc<Mutex<u64>>,
@@ -192,16 +202,8 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         let root = std::env::var("MOCK_FILES_ROOT").unwrap_or_else(|_| "mock-files".to_string());
-        Self {
-            streams: Arc::new(Mutex::new(HashMap::new())),
-            files_root: PathBuf::from(root),
-            approvals: Arc::new(Mutex::new(HashMap::new())),
-            next_approval_id: Arc::new(Mutex::new(1)),
-            notes: Arc::new(Mutex::new(seed_notes())),
-            messages: Arc::new(Mutex::new(seed_messages())),
-            next_note_id: Arc::new(Mutex::new(3)),
-            next_message_id: Arc::new(Mutex::new(3)),
-        }
+        let approvals_path = std::env::var("MOCK_APPROVALS_PATH").ok().map(PathBuf::from);
+        AppState::with_files_root_and_approvals(PathBuf::from(root), approvals_path)
     }
 }
 
@@ -210,15 +212,48 @@ pub fn new_state() -> AppState {
 }
 
 pub fn new_state_with_files_root(root: PathBuf) -> AppState {
-    AppState {
-        streams: Arc::new(Mutex::new(HashMap::new())),
-        files_root: root,
-        approvals: Arc::new(Mutex::new(HashMap::new())),
-        next_approval_id: Arc::new(Mutex::new(1)),
-        notes: Arc::new(Mutex::new(seed_notes())),
-        messages: Arc::new(Mutex::new(seed_messages())),
-        next_note_id: Arc::new(Mutex::new(3)),
-        next_message_id: Arc::new(Mutex::new(3)),
+    AppState::with_files_root_and_approvals(root, None)
+}
+
+impl AppState {
+    /// Build state, reloading persisted approvals when a path is
+    /// given. Unknown-status lines are skipped with a warning;
+    /// the id counter continues past the largest persisted id.
+    pub fn with_files_root_and_approvals(root: PathBuf, approvals_path: Option<PathBuf>) -> AppState {
+        let mut approvals = HashMap::new();
+        let mut next_approval_id: u64 = 1;
+        if let Some(path) = &approvals_path {
+            let records = load_records(path);
+            for record in &records {
+                match parse_approval_status(&record.status) {
+                    Some(status) => {
+                        approvals.insert(
+                            record.tool_call_id.clone(),
+                            ApprovalState { tool: record.tool.clone(), status },
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "warning: skipping approval record with unknown status {} in {}",
+                            record.status,
+                            path.display()
+                        );
+                    }
+                }
+            }
+            next_approval_id = next_id_number(&records);
+        }
+        AppState {
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            files_root: root,
+            approvals: Arc::new(Mutex::new(approvals)),
+            next_approval_id: Arc::new(Mutex::new(next_approval_id)),
+            approvals_path,
+            notes: Arc::new(Mutex::new(seed_notes())),
+            messages: Arc::new(Mutex::new(seed_messages())),
+            next_note_id: Arc::new(Mutex::new(3)),
+            next_message_id: Arc::new(Mutex::new(3)),
+        }
     }
 }
 
@@ -533,8 +568,9 @@ async fn approval_request(
     *next += 1;
     state.approvals.lock().expect("approval lock").insert(
         id.clone(),
-        ApprovalState { tool: req.tool, status: ApprovalStatus::Pending },
+        ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending },
     );
+    persist_approval(&state, &id, &req.tool, ApprovalStatus::Pending);
     Json(ApprovalRequestResponse {
         tool_call_id: Some(id),
         requires_approval: true,
@@ -558,7 +594,36 @@ async fn approval_decide(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown tool_call_id" }))).into_response();
     };
     record.status = status;
+    let tool = record.tool.clone();
+    persist_approval(&state, &req.tool_call_id, &tool, status);
     Json(serde_json::json!({ "tool_call_id": req.tool_call_id, "status": req.status })).into_response()
+}
+
+/// Append one approval record to the persistence file, when
+/// configured. Best-effort: a failure is logged to stderr and
+/// the in-memory record (authoritative for this run) is kept.
+fn persist_approval(state: &AppState, tool_call_id: &str, tool: &str, status: ApprovalStatus) {
+    let Some(path) = &state.approvals_path else { return };
+    let record = ApprovalFileRecord {
+        tool_call_id: tool_call_id.to_string(),
+        tool: tool.to_string(),
+        status: approval_status_name(status).to_string(),
+    };
+    if let Err(detail) = append_record(path, &record) {
+        eprintln!("warning: approval persistence failed: {detail}");
+    }
+}
+
+/// Reverse of `parse_approval_status`: the string form stored in
+/// the JSONL file. Every variant must round-trip through parse.
+fn approval_status_name(status: ApprovalStatus) -> &'static str {
+    match status {
+        ApprovalStatus::NotRequired => "not_required",
+        ApprovalStatus::Pending => "pending",
+        ApprovalStatus::Approved => "approved",
+        ApprovalStatus::Rejected => "rejected",
+        ApprovalStatus::Edited => "edited",
+    }
 }
 
 /// Shared approval gate for agent tools and connector writes:

@@ -1,5 +1,5 @@
 //! Mock connector demo CLI: Rust shell -> Mock Gateway connectors,
-//! plus the memory-only credential store and the egress policy.
+//! plus the credential store (memory or OS keychain) and the egress policy.
 //!
 //! Usage (with the Mock Gateway running on localhost:3001):
 //! ```sh
@@ -9,21 +9,34 @@
 //! cargo run -p agent-desktop --bin connector-cli -- mail send --to a@mock.local --subject "S" --body "B" --approve
 //! cargo run -p agent-desktop --bin connector-cli -- cred store --handle mock --secret mock-token-1234
 //! cargo run -p agent-desktop --bin connector-cli -- cred show --handle mock
+//! cargo run -p agent-desktop --bin connector-cli -- cred store --keychain --handle mock --secret mock-token-1234
+//! cargo run -p agent-desktop --bin connector-cli -- cred show --keychain --handle mock
+//! cargo run -p agent-desktop --bin connector-cli -- cred remove --keychain --handle mock
 //! ```
 //! All connector data is fake (Mock only). The credential store
-//! is memory-only: `cred show` prints only the redacted form,
-//! never the secret. Mail outside `mock.local` is refused by
-//! the egress policy before any request is sent.
+//! is memory-only by default; `--keychain` switches it to the OS
+//! keychain, which survives across processes. `cred show` prints
+//! only the redacted form, never the secret. Mail outside
+//! `mock.local` is refused by the egress policy before any request
+//! is sent.
 
 use agent_desktop::agent_client::{AgentError, ToolDecision};
 use agent_desktop::connector_client::ConnectorClient;
-use agent_desktop::credential_store::{CredentialStore, MemoryCredentialStore};
+use agent_desktop::credential_store::{CredentialStore, KeychainCredentialStore, MemoryCredentialStore};
 
 fn arg_value(args: &[String], name: &str, default: &str) -> String {
     args.windows(2)
         .find(|w| w[0] == name)
         .map(|w| w[1].clone())
         .unwrap_or_else(|| default.to_string())
+}
+
+fn cred_store(use_keychain: bool) -> Box<dyn CredentialStore> {
+    if use_keychain {
+        Box::new(KeychainCredentialStore::new())
+    } else {
+        Box::new(MemoryCredentialStore::new())
+    }
 }
 
 fn main() {
@@ -38,14 +51,19 @@ fn main() {
     } else {
         ToolDecision::Ask
     };
+    let use_keychain = args.iter().any(|a| a == "--keychain");
     let code = match (group.as_str(), command.as_str()) {
         ("cred", "store") => {
-            let store = MemoryCredentialStore::new();
+            let store = cred_store(use_keychain);
             let handle = arg_value(&args, "--handle", "mock");
             let secret = arg_value(&args, "--secret", "");
             match store.store(&handle, &secret) {
                 Ok(()) => {
-                    println!("stored credential handle={handle} (memory only, secret never printed)");
+                    if use_keychain {
+                        println!("stored credential handle={handle} (keychain, persists across processes)");
+                    } else {
+                        println!("stored credential handle={handle} (memory only, secret never printed)");
+                    }
                     0
                 }
                 Err(err) => {
@@ -55,9 +73,7 @@ fn main() {
             }
         }
         ("cred", "show") => {
-            // A fresh store is empty by design: this proves the
-            // memory-only rule (no persistence across processes).
-            let store = MemoryCredentialStore::new();
+            let store = cred_store(use_keychain);
             let handle = arg_value(&args, "--handle", "mock");
             match store.redacted(&handle) {
                 Ok(display) => {
@@ -65,8 +81,26 @@ fn main() {
                     0
                 }
                 Err(_) => {
-                    println!("credential {handle}: not stored in this process (memory only)");
+                    if use_keychain {
+                        println!("credential {handle}: not stored in keychain");
+                    } else {
+                        println!("credential {handle}: not stored in this process (memory only)");
+                    }
                     0
+                }
+            }
+        }
+        ("cred", "remove") => {
+            let store = cred_store(use_keychain);
+            let handle = arg_value(&args, "--handle", "mock");
+            match store.remove(&handle) {
+                Ok(()) => {
+                    println!("removed credential handle={handle}");
+                    0
+                }
+                Err(err) => {
+                    eprintln!("connector-cli failed: {} ({:?})", err.redacted_detail, err.code);
+                    1
                 }
             }
         }
@@ -75,7 +109,7 @@ fn main() {
         }
         _ => {
             eprintln!("unknown connector-cli command: {group} {command}");
-            eprintln!("usage: notes list | notes create | mail list | mail send | cred store | cred show");
+            eprintln!("usage: notes list | notes create | mail list | mail send | cred store | cred show | cred remove [--keychain]");
             2
         }
     };

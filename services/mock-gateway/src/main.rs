@@ -3,6 +3,8 @@
 //!
 //! Localhost only by default. Override with MOCK_GATEWAY_ADDR,
 //! e.g. `MOCK_GATEWAY_ADDR=127.0.0.1:3001 cargo run -p mock-gateway`.
+//! Approval records persist to MOCK_APPROVALS_PATH (JSONL) when
+//! set; when unset, records stay memory-only (see server.rs).
 //! Ctrl-C stops the server gracefully (see server::serve).
 
 #[tokio::main]

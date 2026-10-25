@@ -16,3 +16,8 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+# Stage 2 persistence: OS keychain via keyring 3. Features are
+# per-store and mandatory: apple-native (macOS), windows-native
+# (Windows), sync-secret-service (Linux). Without them Entry::new
+# has no store to talk to.
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
