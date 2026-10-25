@@ -30,10 +30,16 @@ import {
   type TaskGateway,
 } from "./domain/task_client";
 import { InvokeTaskClient } from "./domain/invoke_task_client";
+import {
+  DeviceClient,
+  type DeviceGateway,
+} from "./domain/device_client";
+import { InvokeDeviceClient } from "./domain/invoke_device_client";
 import { FilesView } from "./views/FilesView";
 import { AgentView } from "./views/AgentView";
 import { ConnectorsView } from "./views/ConnectorsView";
 import { TasksView } from "./views/TasksView";
+import { DevicesView } from "./views/DevicesView";
 
 // Browser-preview fallback: plain HTTP to the Mock Gateway.
 // In a Tauri window the invoke clients below replace them, so
@@ -58,9 +64,10 @@ interface Clients {
   agent: AgentGateway;
   connectors: ConnectorGateway;
   tasks: TaskGateway;
+  devices: DeviceGateway;
 }
 
-type Tab = "chat" | "files" | "agent" | "connectors" | "tasks";
+type Tab = "chat" | "files" | "agent" | "connectors" | "tasks" | "devices";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "chat", label: "Chat" },
@@ -68,6 +75,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "agent", label: "Agent" },
   { id: "connectors", label: "Connectors" },
   { id: "tasks", label: "Tasks" },
+  { id: "devices", label: "Devices" },
 ];
 
 export function App() {
@@ -107,6 +115,7 @@ export function App() {
           agent: new InvokeAgentClient(),
           connectors: new InvokeConnectorClient(),
           tasks: new InvokeTaskClient(),
+          devices: new InvokeDeviceClient(),
         };
         transportName = "invoke (Rust client)";
       } catch {
@@ -119,6 +128,7 @@ export function App() {
           agent: new AgentClient(MOCK_BASE_URL),
           connectors: new ConnectorClient(MOCK_BASE_URL),
           tasks: new TaskClient(MOCK_BASE_URL),
+          devices: new DeviceClient(MOCK_BASE_URL),
         };
         transportName = "http (browser preview)";
       }
@@ -271,6 +281,12 @@ export function App() {
             agent={clients.agent}
             tasks={clients.tasks}
           />
+        ))}
+      {tab === "devices" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : (
+          <DevicesView agent={clients.agent} devices={clients.devices} />
         ))}
     </div>
   );

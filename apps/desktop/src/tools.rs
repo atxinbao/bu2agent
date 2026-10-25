@@ -5,8 +5,10 @@
 //! only. Phase 4 adds the Mock connector tools (notes.list,
 //! notes.create, mail.list, mail.send) -- Mock only, fake
 //! data, never real accounts; real mail / messages / notes /
-//! reminders / browser / screen / dictation tools are still
-//! deferred, not stubbed as working.
+//! browser / screen / dictation tools are still deferred,
+//! not stubbed as working. Reminders reads were verified on
+//! 2026-10-25; real reminders writes stay deferred pending
+//! EventKit verification (the gateway device set is Fake only).
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
@@ -41,6 +43,7 @@ impl ToolRegistry {
         registry.tools.push(ToolSpec { name: "notes.create".to_string(), requires_approval: true, capability: "notes".to_string() });
         registry.tools.push(ToolSpec { name: "mail.list".to_string(), requires_approval: false, capability: "mail".to_string() });
         registry.tools.push(ToolSpec { name: "mail.send".to_string(), requires_approval: true, capability: "mail".to_string() });
+        registry.tools.push(ToolSpec { name: "reminders.set_completed".to_string(), requires_approval: true, capability: "reminders".to_string() });
         registry
     }
 
@@ -49,7 +52,8 @@ impl ToolRegistry {
     }
 }
 
-/// Connection status as verified on the user's Mac on 2026-10-24.
+/// Connection status as verified on the user's Mac (2026-10-24
+/// baseline; reminders reads re-verified 2026-10-25).
 /// This is a snapshot, not a live permission check: the Rust client
 /// must re-check PermissionSnapshot at call time. Content from
 /// verification probes is never stored here -- only status.
@@ -87,7 +91,8 @@ pub fn full_inventory() -> Vec<ToolInventory> {
         ToolInventory { name: "notes.write".to_string(), capability: "notes".to_string(), connection: ToolConnection::ApprovalGated, requires_approval: true },
         ToolInventory { name: "calendar".to_string(), capability: "calendar".to_string(), connection: ToolConnection::PermissionDenied, requires_approval: false },
         ToolInventory { name: "contacts".to_string(), capability: "contacts".to_string(), connection: ToolConnection::PermissionDenied, requires_approval: false },
-        ToolInventory { name: "reminders".to_string(), capability: "reminders".to_string(), connection: ToolConnection::PermissionDenied, requires_approval: false },
+        ToolInventory { name: "reminders".to_string(), capability: "reminders".to_string(), connection: ToolConnection::ConnectedRead, requires_approval: false },
+        ToolInventory { name: "reminders.write".to_string(), capability: "reminders".to_string(), connection: ToolConnection::ApprovalGated, requires_approval: true },
         ToolInventory { name: "whatsapp.read".to_string(), capability: "whatsapp".to_string(), connection: ToolConnection::ConnectedRead, requires_approval: false },
         ToolInventory { name: "browser.computer_use".to_string(), capability: "browser".to_string(), connection: ToolConnection::ApprovalGated, requires_approval: true },
         ToolInventory { name: "screen".to_string(), capability: "screen".to_string(), connection: ToolConnection::ApprovalGated, requires_approval: true },

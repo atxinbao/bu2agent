@@ -17,3 +17,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
+
+# EventKit backend: macOS only. Other platforms (including CI's
+# ubuntu/windows jobs) compile without it; the gateway keeps the
+# Fake backend there.
+[target.'cfg(target_os = "macos")'.dependencies]
+eventkit = "0.4"
+
+# The build script queries the Swift toolchain for its runtime
+# library paths (macOS only). serde_json is already a main
+# dependency, so this adds no new package to the lockfile.
+[build-dependencies]
+serde_json = "1"

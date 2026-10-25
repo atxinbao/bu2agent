@@ -3,7 +3,7 @@
 # First-time setup only: chmod +x run-shell-tests.command
 # Double-clicking starts a throwaway Mock Gateway on
 # localhost:3001 with a fresh temp file root, runs the shell
-# crate's unit tests (they call the 16 Tauri commands in
+# crate's unit tests (they call the 23 Tauri commands in
 # tool_commands.rs directly against that gateway), then stops
 # the server and deletes the temp root. No Tauri window opens.
 # If port 3001 is already healthy (run-shell is up), this
@@ -25,7 +25,7 @@ mkdir -p "$FILES_ROOT"
 echo "Starting throwaway mock-gateway on http://127.0.0.1:3001 ..."
 echo "File root: $FILES_ROOT (deleted when this script exits)"
 # 回归服务不读取 env 或 Keychain 中的真实模型凭据。
-MOCK_FILES_ROOT="$FILES_ROOT" MOCK_APPROVALS_PATH="$TEST_ROOT/approvals.jsonl" MOCK_TASKS_PATH="$TEST_ROOT/tasks.jsonl" cargo run -q -p mock-gateway -- --mock-chat > /tmp/mock-gateway-shell-tests.log 2>&1 &
+MOCK_FILES_ROOT="$FILES_ROOT" MOCK_APPROVALS_PATH="$TEST_ROOT/approvals.jsonl" MOCK_TASKS_PATH="$TEST_ROOT/tasks.jsonl" MOCK_DEVICE_ACTIONS_PATH="$TEST_ROOT/actions.jsonl" cargo run -q -p mock-gateway -- --mock-chat > /tmp/mock-gateway-shell-tests.log 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null; rm -rf "$TEST_ROOT"' EXIT
 for i in $(seq 1 20); do

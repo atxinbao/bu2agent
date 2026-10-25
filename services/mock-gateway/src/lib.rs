@@ -16,6 +16,13 @@ pub mod approval_store;
 pub mod deepseek;
 pub mod server;
 pub mod task_store;
+pub mod device_store;
+pub mod device_backend;
+
+// EventKit backend: macOS only. Other platforms compile without
+// it; the gateway keeps the Fake backend there.
+#[cfg(target_os = "macos")]
+pub mod eventkit_backend;
 
 use agent_desktop::approval::{self, ApprovalStatus};
 use agent_desktop::gateway::SubscriptionRecord;
@@ -71,7 +78,7 @@ pub fn start_stream(stream_id: &str, turn_id: &str, text: &str) -> Vec<Subscript
 pub fn tool_requires_approval(name: &str) -> Option<bool> {
     match name {
         "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" => Some(false),
-        "fs.write" | "fs.delete" | "notes.create" | "mail.send" => Some(true),
+        "fs.write" | "fs.delete" | "notes.create" | "mail.send" | "reminders.set_completed" => Some(true),
         _ => None,
     }
 }
@@ -190,6 +197,7 @@ mod tests {
         assert_eq!(tool_requires_approval("mail.list"), Some(false));
         assert_eq!(tool_requires_approval("notes.create"), Some(true));
         assert_eq!(tool_requires_approval("mail.send"), Some(true));
+        assert_eq!(tool_requires_approval("reminders.set_completed"), Some(true));
         assert_eq!(tool_requires_approval("no.such.tool"), None);
     }
 

@@ -3,7 +3,7 @@
 // The frontend (apps/web, React) talks to the Mock Gateway
 // through invoke commands backed by the Rust client
 // (apps/desktop): gateway_commands.rs for the chat line,
-// tool_commands.rs for the file, agent, and connector views.
+// tool_commands.rs for the file, agent, connector, task, and device views.
 // In a plain browser preview the frontend falls back to HTTP;
 // inside this shell, invoke is the transport. The two commands
 // below exist to prove the bridge works end to end: the
@@ -63,7 +63,14 @@ fn main() {
             tool_commands::task_create,
             tool_commands::task_list,
             tool_commands::task_get,
-            tool_commands::task_update
+            tool_commands::task_update,
+            tool_commands::device_reminders_list,
+            tool_commands::device_actions_create,
+            tool_commands::device_reminder_set,
+            tool_commands::device_action_mark_rejected,
+            tool_commands::device_action_refresh,
+            tool_commands::device_actions_list,
+            tool_commands::device_action_get
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

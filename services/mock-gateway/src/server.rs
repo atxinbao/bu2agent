@@ -42,6 +42,7 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agent_desktop::approval::ApprovalStatus;
 use agent_desktop::gateway::SubscriptionRecord;
@@ -57,6 +58,15 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::approval_store::{append_record, load_records, next_id_number, ApprovalFileRecord};
+use crate::device_backend::{
+    execute_set, resolve_unknown, AuthorizationStatus, ExecuteOutcome, FakeReminderBackend,
+    Reminder, ReminderBackend, ResolveOutcome,
+};
+#[cfg(target_os = "macos")]
+use crate::eventkit_backend::EventKitReminderBackend;
+use crate::device_store::{
+    append_action, load_actions, next_action_number, DeviceActionRecord,
+};
 use crate::task_store::{append_task, load_tasks, next_task_number, TaskFileRecord};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
@@ -199,6 +209,11 @@ pub struct AppState {
     tasks: Arc<Mutex<HashMap<String, TaskFileRecord>>>,
     next_task_id: Arc<Mutex<u64>>,
     tasks_path: Option<PathBuf>,
+    actions: Arc<Mutex<HashMap<String, DeviceActionRecord>>>,
+    next_action_id: Arc<Mutex<u64>>,
+    actions_path: Option<PathBuf>,
+    device_backend: Arc<dyn ReminderBackend>,
+    device_reminder_pin: Option<String>,
     notes: Arc<Mutex<Vec<MockNote>>>,
     messages: Arc<Mutex<Vec<MockMessage>>>,
     next_note_id: Arc<Mutex<u64>>,
@@ -212,6 +227,25 @@ impl Default for AppState {
         let mut state = AppState::with_files_root_and_approvals(PathBuf::from(root), approvals_path);
         if let Ok(tasks_path) = std::env::var("MOCK_TASKS_PATH") {
             state = state.with_tasks_path(PathBuf::from(tasks_path));
+        }
+        if let Ok(actions_path) = std::env::var("MOCK_DEVICE_ACTIONS_PATH") {
+            state = state.with_actions_path(PathBuf::from(actions_path));
+        }
+        if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
+            state = state.with_device_reminder_pin(pin);
+        }
+        // EventKit backend selection: only the production Default
+        // reads this env var, never the test constructors (which
+        // always start from the Fake backend). On non-macOS the
+        // var is ignored with a warning: the EventKit backend
+        // does not exist there.
+        #[cfg(target_os = "macos")]
+        if std::env::var("MOCK_DEVICE_BACKEND").as_deref() == Ok("eventkit") {
+            state = state.with_device_backend(Arc::new(EventKitReminderBackend));
+        }
+        #[cfg(not(target_os = "macos"))]
+        if std::env::var("MOCK_DEVICE_BACKEND").as_deref() == Ok("eventkit") {
+            eprintln!("warning: eventkit backend is macOS-only; using the Fake backend");
         }
         state
     }
@@ -263,6 +297,11 @@ impl AppState {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             next_task_id: Arc::new(Mutex::new(1)),
             tasks_path: None,
+            actions: Arc::new(Mutex::new(HashMap::new())),
+            next_action_id: Arc::new(Mutex::new(1)),
+            actions_path: None,
+            device_backend: default_device_backend(),
+            device_reminder_pin: None,
             notes: Arc::new(Mutex::new(seed_notes())),
             messages: Arc::new(Mutex::new(seed_messages())),
             next_note_id: Arc::new(Mutex::new(3)),
@@ -290,6 +329,48 @@ impl AppState {
         self.tasks_path = Some(path);
         self
     }
+
+    /// Test seam: load action records from a JSONL file, mirroring
+    /// with_tasks_path. Production state reads MOCK_DEVICE_ACTIONS_PATH.
+    pub fn with_actions_path(mut self, path: PathBuf) -> Self {
+        let records = load_actions(&path);
+        let mut actions = HashMap::new();
+        for record in &records {
+            actions.insert(record.action_id.clone(), record.clone());
+        }
+        self.next_action_id = Arc::new(Mutex::new(next_action_number(&records)));
+        self.actions = Arc::new(Mutex::new(actions));
+        self.actions_path = Some(path);
+        self
+    }
+
+    /// Test seam: replace the device backend (Fake by default).
+    pub fn with_device_backend(mut self, backend: Arc<dyn ReminderBackend>) -> Self {
+        self.device_backend = backend;
+        self
+    }
+
+    /// Pin the single allowed test reminder id. When set, create/set
+    /// for any other id are refused; when unset, any existing
+    /// reminder may be used (the view only ever uses the recorded id).
+    pub fn with_device_reminder_pin(mut self, pin: String) -> Self {
+        self.device_reminder_pin = Some(pin);
+        self
+    }
+}
+
+/// Default device backend: a Fake seeded with one demo reminder, so the
+/// wiring-phase window flow has something to operate on. This is Mock
+/// demo data, never a real reminder; the EventKit backend replaces it
+/// in the read-only verification phase.
+fn default_device_backend() -> Arc<dyn ReminderBackend> {
+    let backend = FakeReminderBackend::new();
+    backend.add_reminder(Reminder {
+        id: "reminder-demo".to_string(),
+        title: "bu2agent 设备验证（演示）".to_string(),
+        completed: false,
+    });
+    Arc::new(backend)
 }
 
 // --- File endpoints (Phase 2) ---
@@ -1016,6 +1097,330 @@ async fn tasks_update(
     Json(updated).into_response()
 }
 
+// --- Device loop (B-layer single-device validation) ---
+//
+// The gateway owns the device backend (Fake for now, EventKit later)
+// and the action records. The frontend drives the fixed steps
+// (create -> approve -> set -> re-query); the gateway only stores
+// action records and executes approved sets. Records persist as
+// JSONL when MOCK_DEVICE_ACTIONS_PATH is set, mirroring tasks.
+//
+// The view drives actions sequentially; concurrent set/reject on
+// one action is out of scope for this Mock.
+
+const DEVICE_ID: &str = "mac-reminders";
+const DEVICE_ACTION: &str = "reminders.set_completed";
+const DEVICE_TIMEOUT_SECS: u64 = 10;
+
+#[derive(Debug, Serialize)]
+struct ReminderDto {
+    id: String,
+    title: String,
+    completed: bool,
+}
+
+impl From<&Reminder> for ReminderDto {
+    fn from(r: &Reminder) -> Self {
+        Self { id: r.id.clone(), title: r.title.clone(), completed: r.completed }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ActionCreateDto {
+    reminder_id: String,
+    target_completed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceSetDto {
+    action_id: String,
+    tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActionRejectDto {
+    action_id: String,
+    tool_call_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActionRefreshDto {
+    action_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActionGetQuery {
+    action_id: String,
+}
+
+/// Append one action record to the persistence file, when
+/// configured. Best-effort, mirroring persist_task.
+fn persist_action(state: &AppState, record: &DeviceActionRecord) {
+    let Some(path) = &state.actions_path else { return };
+    append_action(path, record);
+}
+
+fn action_number(action_id: &str) -> u64 {
+    action_id.strip_prefix("action-").and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)
+}
+
+/// Allowlist pin: when a test reminder id is pinned, any other id
+/// is refused. Returns Some(error response) on refusal, None when ok.
+fn device_pin_error(state: &AppState, reminder_id: &str) -> Option<axum::response::Response> {
+    if let Some(pin) = &state.device_reminder_pin {
+        if pin != reminder_id {
+            return Some(
+                (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "reminder_not_allowed" })))
+                    .into_response(),
+            );
+        }
+    }
+    None
+}
+
+async fn reminders_list(State(state): State<AppState>) -> impl IntoResponse {
+    match state.device_backend.list() {
+        Ok(reminders) => {
+            Json(reminders.iter().map(ReminderDto::from).collect::<Vec<_>>()).into_response()
+        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn actions_create(
+    State(state): State<AppState>,
+    Json(req): Json<ActionCreateDto>,
+) -> impl IntoResponse {
+    if let Some(response) = device_pin_error(&state, &req.reminder_id) {
+        return response;
+    }
+    let mut next = state.next_action_id.lock().expect("action id lock");
+    let id = format!("action-{}", *next);
+    *next += 1;
+    let record = DeviceActionRecord {
+        action_id: id,
+        device: DEVICE_ID.to_string(),
+        action: DEVICE_ACTION.to_string(),
+        reminder_id: req.reminder_id,
+        target_completed: req.target_completed,
+        status: "requested".to_string(),
+        detail: None,
+    };
+    state.actions.lock().expect("action lock").insert(record.action_id.clone(), record.clone());
+    persist_action(&state, &record);
+    Json(record).into_response()
+}
+
+async fn device_set(
+    State(state): State<AppState>,
+    Json(req): Json<DeviceSetDto>,
+) -> impl IntoResponse {
+    if let Err(response) = check_approval(&state, DEVICE_ACTION, &req.tool_call_id) {
+        return *response;
+    }
+    let (reminder_id, target) = {
+        let mut actions = state.actions.lock().expect("action lock");
+        let Some(record) = actions.get_mut(&req.action_id) else {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown action" })))
+                .into_response();
+        };
+        if record.status != "requested" {
+            return bad_request("action is not requested");
+        }
+        if let Some(response) = device_pin_error(&state, &record.reminder_id) {
+            return response;
+        }
+        record.status = "approved".to_string();
+        let approved = record.clone();
+        persist_action(&state, &approved);
+        (record.reminder_id.clone(), record.target_completed)
+    };
+    let backend = Arc::clone(&state.device_backend);
+    let outcome = tokio::task::spawn_blocking(move || {
+        execute_set(&backend, &reminder_id, target, Duration::from_secs(DEVICE_TIMEOUT_SECS))
+    })
+    .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "device execution failed" })),
+            )
+                .into_response();
+        }
+    };
+    let mut actions = state.actions.lock().expect("action lock");
+    let Some(record) = actions.get_mut(&req.action_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown action" })))
+            .into_response();
+    };
+    match outcome {
+        ExecuteOutcome::Completed(_) => {
+            record.status = "completed".to_string();
+            record.detail = None;
+        }
+        ExecuteOutcome::Failed(e) => {
+            record.status = "failed".to_string();
+            record.detail = Some(e.to_string());
+        }
+        ExecuteOutcome::Unknown => {
+            record.status = "unknown".to_string();
+            record.detail =
+                Some("write submitted but target state not confirmed by readback".to_string());
+        }
+        ExecuteOutcome::AwaitingAuthorization => {
+            record.status = "awaiting_authorization".to_string();
+            record.detail = Some("waiting for authorization".to_string());
+        }
+    }
+    let updated = record.clone();
+    persist_action(&state, &updated);
+    Json(updated).into_response()
+}
+
+async fn actions_mark_rejected(
+    State(state): State<AppState>,
+    Json(req): Json<ActionRejectDto>,
+) -> impl IntoResponse {
+    // The approval itself must be rejected: no device call happens here.
+    let approval_status = {
+        let approvals = state.approvals.lock().expect("approval lock");
+        approvals.get(&req.tool_call_id).map(|r| r.status)
+    };
+    let Some(status) = approval_status else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown tool_call_id" })))
+            .into_response();
+    };
+    if status != ApprovalStatus::Rejected {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "approval_not_rejected" })),
+        )
+            .into_response();
+    }
+    let mut actions = state.actions.lock().expect("action lock");
+    let Some(record) = actions.get_mut(&req.action_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown action" })))
+            .into_response();
+    };
+    if record.status != "requested" {
+        return bad_request("action is not requested");
+    }
+    if let Some(response) = device_pin_error(&state, &record.reminder_id) {
+        return response;
+    }
+    record.status = "rejected".to_string();
+    let updated = record.clone();
+    persist_action(&state, &updated);
+    Json(updated).into_response()
+}
+
+async fn actions_refresh(
+    State(state): State<AppState>,
+    Json(req): Json<ActionRefreshDto>,
+) -> impl IntoResponse {
+    let current = {
+        let actions = state.actions.lock().expect("action lock");
+        let Some(record) = actions.get(&req.action_id) else {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown action" })))
+                .into_response();
+        };
+        record.clone()
+    };
+    if current.status != "unknown" {
+        return Json(current).into_response();
+    }
+    let outcome =
+        resolve_unknown(&state.device_backend, &current.reminder_id, current.target_completed);
+    let mut actions = state.actions.lock().expect("action lock");
+    let Some(record) = actions.get_mut(&req.action_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown action" })))
+            .into_response();
+    };
+    match outcome {
+        ResolveOutcome::Completed(_) => {
+            record.status = "completed".to_string();
+            record.detail = None;
+        }
+        ResolveOutcome::Failed(e) => {
+            record.status = "failed".to_string();
+            record.detail = Some(e.to_string());
+        }
+        ResolveOutcome::StillUnknown(maybe_err) => {
+            record.detail = Some(match maybe_err {
+                Some(e) => e.to_string(),
+                None => "state unchanged; write may still be in flight".to_string(),
+            });
+        }
+    }
+    let updated = record.clone();
+    persist_action(&state, &updated);
+    Json(updated).into_response()
+}
+
+async fn actions_list(State(state): State<AppState>) -> Json<Vec<DeviceActionRecord>> {
+    let mut records: Vec<DeviceActionRecord> =
+        state.actions.lock().expect("action lock").values().cloned().collect();
+    records.sort_by_key(|r| action_number(&r.action_id));
+    Json(records)
+}
+
+async fn actions_get(
+    State(state): State<AppState>,
+    Query(query): Query<ActionGetQuery>,
+) -> impl IntoResponse {
+    match state.actions.lock().expect("action lock").get(&query.action_id) {
+        Some(record) => Json(record.clone()).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown action" })))
+            .into_response(),
+    }
+}
+
+fn authorization_status_name(status: AuthorizationStatus) -> &'static str {
+    match status {
+        AuthorizationStatus::Authorized => "authorized",
+        AuthorizationStatus::Denied => "denied",
+        AuthorizationStatus::NotDetermined => "not_determined",
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AuthorizationStatusDto {
+    status: String,
+}
+
+/// Read-only: report the backend's current reminders authorization.
+/// No approval needed: this reads permission state, it writes nothing.
+async fn devices_authorization(State(state): State<AppState>) -> Json<AuthorizationStatusDto> {
+    Json(AuthorizationStatusDto {
+        status: authorization_status_name(state.device_backend.authorization_status()).to_string(),
+    })
+}
+
+/// Ask the system for reminders access and report the resulting
+/// status. This is the one endpoint that may show the OS prompt
+/// (only when the status is NotDetermined). It writes no reminder:
+/// it only requests the permission precondition. The request runs
+/// on a blocking thread because the synchronous EventKit request
+/// waits up to 30 seconds for an answer; a JoinError fails closed
+/// to Denied (a panicked request proves nothing, never Authorized).
+async fn devices_authorization_request(
+    State(state): State<AppState>,
+) -> Json<AuthorizationStatusDto> {
+    let backend = Arc::clone(&state.device_backend);
+    let status = tokio::task::spawn_blocking(move || backend.request_authorization())
+        .await
+        .unwrap_or(AuthorizationStatus::Denied);
+    Json(AuthorizationStatusDto {
+        status: authorization_status_name(status).to_string(),
+    })
+}
+
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -1039,6 +1444,15 @@ pub fn app(state: AppState) -> Router {
         .route("/tasks/list", get(tasks_list))
         .route("/tasks/get", get(tasks_get))
         .route("/tasks/update", post(tasks_update))
+        .route("/devices/reminders/list", get(reminders_list))
+        .route("/devices/actions/create", post(actions_create))
+        .route("/devices/reminders/set", post(device_set))
+        .route("/devices/actions/mark_rejected", post(actions_mark_rejected))
+        .route("/devices/actions/refresh", post(actions_refresh))
+        .route("/devices/actions/list", get(actions_list))
+        .route("/devices/actions/get", get(actions_get))
+        .route("/devices/authorization", get(devices_authorization))
+        .route("/devices/authorization/request", post(devices_authorization_request))
         .layer(cors_layer())
         .with_state(state)
 }

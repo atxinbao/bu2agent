@@ -1,4 +1,4 @@
-//! Tauri commands for the file, agent, and connector views.
+//! Tauri commands for the file, agent, connector, task, and device views.
 //!
 //! Same pattern as gateway_commands.rs: each command builds its
 //! Rust client per call against the localhost Mock Gateway, and
@@ -22,6 +22,7 @@ use serde::Serialize;
 
 use agent_desktop::agent_client::{AgentClient, AgentError, ToolDecision, ToolResult};
 use agent_desktop::connector_client::{ConnectorClient, MockMessage, MockNote};
+use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry};
 use agent_desktop::{ErrorCode, UnifiedError, UserAction};
@@ -274,4 +275,109 @@ pub fn task_update(
         .update(&task_id, &status, artifact_path.as_deref())
         .map_err(|e| err_string(&e))
         .map(TaskOut::from)
+}
+
+// --- Devices (B-layer single-device validation) ---
+
+#[derive(Debug, Serialize)]
+pub struct DeviceReminderOut {
+    pub id: String,
+    pub title: String,
+    pub completed: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeviceActionOut {
+    pub action_id: String,
+    pub device: String,
+    pub action: String,
+    pub reminder_id: String,
+    pub target_completed: bool,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+impl From<DeviceReminder> for DeviceReminderOut {
+    fn from(value: DeviceReminder) -> Self {
+        DeviceReminderOut { id: value.id, title: value.title, completed: value.completed }
+    }
+}
+
+impl From<DeviceActionRecord> for DeviceActionOut {
+    fn from(value: DeviceActionRecord) -> Self {
+        DeviceActionOut {
+            action_id: value.action_id,
+            device: value.device,
+            action: value.action,
+            reminder_id: value.reminder_id,
+            target_completed: value.target_completed,
+            status: value.status,
+            detail: value.detail,
+        }
+    }
+}
+
+fn device_client() -> Result<DeviceClient, String> {
+    DeviceClient::new(MOCK_BASE_URL).map_err(|e| err_string(&e))
+}
+
+#[tauri::command]
+pub fn device_reminders_list() -> Result<Vec<DeviceReminderOut>, String> {
+    let reminders = device_client()?.list_reminders().map_err(|e| err_string(&e))?;
+    Ok(reminders.into_iter().map(DeviceReminderOut::from).collect())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn device_actions_create(
+    reminder_id: String,
+    target_completed: bool,
+) -> Result<DeviceActionOut, String> {
+    device_client()?
+        .create_action(&reminder_id, target_completed)
+        .map_err(|e| err_string(&e))
+        .map(DeviceActionOut::from)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn device_reminder_set(
+    action_id: String,
+    tool_call_id: String,
+) -> Result<DeviceActionOut, String> {
+    device_client()?
+        .set_reminder(&action_id, &tool_call_id)
+        .map_err(|e| err_string(&e))
+        .map(DeviceActionOut::from)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn device_action_mark_rejected(
+    action_id: String,
+    tool_call_id: String,
+) -> Result<DeviceActionOut, String> {
+    device_client()?
+        .mark_rejected(&action_id, &tool_call_id)
+        .map_err(|e| err_string(&e))
+        .map(DeviceActionOut::from)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn device_action_refresh(action_id: String) -> Result<DeviceActionOut, String> {
+    device_client()?
+        .refresh_action(&action_id)
+        .map_err(|e| err_string(&e))
+        .map(DeviceActionOut::from)
+}
+
+#[tauri::command]
+pub fn device_actions_list() -> Result<Vec<DeviceActionOut>, String> {
+    let records = device_client()?.list_actions().map_err(|e| err_string(&e))?;
+    Ok(records.into_iter().map(DeviceActionOut::from).collect())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn device_action_get(action_id: String) -> Result<DeviceActionOut, String> {
+    device_client()?
+        .get_action(&action_id)
+        .map_err(|e| err_string(&e))
+        .map(DeviceActionOut::from)
 }

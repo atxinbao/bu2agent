@@ -260,3 +260,102 @@ fn task_workflow_invoke_roundtrip() {
     })), "生成的报告");
     invoke("file_delete", serde_json::json!({"path":path,"approved":true}));
 }
+
+#[test]
+fn device_commands_roundtrip() {
+    let reminders = device_reminders_list().expect("list reminders");
+    let demo = reminders.iter().find(|r| r.id == "reminder-demo").expect("demo reminder");
+    let target = !demo.completed;
+    let action = device_actions_create(demo.id.clone(), target).expect("create action");
+    assert!(action.action_id.starts_with("action-"), "action id: {}", action.action_id);
+    assert_eq!(action.status, "requested");
+    assert_eq!(action.reminder_id, "reminder-demo");
+    assert_eq!(action.target_completed, target);
+    let request =
+        agent_request_approval("reminders.set_completed".to_string()).expect("request approval");
+    assert!(request.requires_approval);
+    let id = request.tool_call_id.expect("approval id");
+    agent_decide_approval(id.clone(), "approve".to_string()).expect("decide approved");
+    let done = device_reminder_set(action.action_id.clone(), id).expect("set reminder");
+    assert_eq!(done.status, "completed");
+    let fetched = device_action_get(action.action_id.clone()).expect("get action");
+    assert_eq!(fetched.status, "completed");
+    let reminders = device_reminders_list().expect("relist reminders");
+    let demo = reminders.iter().find(|r| r.id == "reminder-demo").expect("demo reminder");
+    assert_eq!(demo.completed, target);
+    let actions = device_actions_list().expect("list actions");
+    assert!(actions.iter().any(|a| a.action_id == action.action_id));
+    // Rejection path: a second action, rejected, never changes the device.
+    let second =
+        device_actions_create("reminder-demo".to_string(), !target).expect("create second action");
+    let request2 =
+        agent_request_approval("reminders.set_completed".to_string()).expect("request second approval");
+    let id2 = request2.tool_call_id.expect("second approval id");
+    agent_decide_approval(id2.clone(), "reject".to_string()).expect("decide rejected");
+    let rejected =
+        device_action_mark_rejected(second.action_id.clone(), id2).expect("mark rejected");
+    assert_eq!(rejected.status, "rejected");
+    let reminders = device_reminders_list().expect("relist after rejection");
+    let demo = reminders.iter().find(|r| r.id == "reminder-demo").expect("demo reminder");
+    assert_eq!(demo.completed, target, "rejection must not touch the device");
+    // Refresh on a non-unknown action returns it unchanged.
+    let refreshed = device_action_refresh(action.action_id.clone()).expect("refresh completed");
+    assert_eq!(refreshed.status, "completed");
+    assert!(
+        device_action_get("action-999999".to_string()).is_err(),
+        "unknown action must be refused"
+    );
+}
+
+/// 使用前端实际传入的字段名，覆盖设备流程依赖的提醒、审批和动作 IPC。
+#[test]
+fn device_workflow_invoke_roundtrip() {
+    let app = tauri::test::mock_builder()
+        .invoke_handler(tauri::generate_handler![
+            device_reminders_list, device_actions_create, device_reminder_set,
+            device_action_mark_rejected, device_action_refresh, device_actions_list,
+            device_action_get, agent_request_approval, agent_decide_approval,
+        ])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("build mock shell");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build().unwrap();
+    let invoke = |cmd: &str, body: serde_json::Value| {
+        tauri::test::get_ipc_response(&webview, tauri::webview::InvokeRequest {
+            cmd: cmd.to_string(),
+            callback: tauri::ipc::CallbackFn(0),
+            error: tauri::ipc::CallbackFn(1),
+            url: "tauri://localhost".parse().unwrap(),
+            body: tauri::ipc::InvokeBody::Json(body),
+            headers: Default::default(),
+            invoke_key: tauri::test::INVOKE_KEY.to_string(),
+        }).unwrap_or_else(|err| panic!("{cmd}: {err:?}"))
+            .deserialize::<serde_json::Value>().unwrap()
+    };
+    let reminders = invoke("device_reminders_list", serde_json::json!({}));
+    let demo = reminders.as_array().unwrap().iter().find(|r| r["id"] == "reminder-demo").expect("demo reminder");
+    let current = demo["completed"].as_bool().unwrap();
+    let target = !current;
+    let action = invoke("device_actions_create", serde_json::json!({"reminder_id": "reminder-demo", "target_completed": target}));
+    let action_id = action["action_id"].as_str().unwrap();
+    assert_eq!(action["status"], "requested");
+    let approval = invoke("agent_request_approval", serde_json::json!({"tool": "reminders.set_completed"}));
+    let approval_id = &approval["tool_call_id"];
+    invoke("agent_decide_approval", serde_json::json!({"tool_call_id": approval_id, "decision": "approve"}));
+    let done = invoke("device_reminder_set", serde_json::json!({"action_id": action_id, "tool_call_id": approval_id}));
+    assert_eq!(done["status"], "completed");
+    assert_eq!(invoke("device_action_get", serde_json::json!({"action_id": action_id})), done);
+    let reminders = invoke("device_reminders_list", serde_json::json!({}));
+    let demo = reminders.as_array().unwrap().iter().find(|r| r["id"] == "reminder-demo").expect("demo reminder");
+    assert_eq!(demo["completed"], target);
+    assert_eq!(invoke("device_action_refresh", serde_json::json!({"action_id": action_id}))["status"], "completed");
+    let action2 = invoke("device_actions_create", serde_json::json!({"reminder_id": "reminder-demo", "target_completed": current}));
+    let action2_id = action2["action_id"].as_str().unwrap();
+    let approval2 = invoke("agent_request_approval", serde_json::json!({"tool": "reminders.set_completed"}));
+    let approval2_id = &approval2["tool_call_id"];
+    invoke("agent_decide_approval", serde_json::json!({"tool_call_id": approval2_id, "decision": "reject"}));
+    let rejected = invoke("device_action_mark_rejected", serde_json::json!({"action_id": action2_id, "tool_call_id": approval2_id}));
+    assert_eq!(rejected["status"], "rejected");
+    let list = invoke("device_actions_list", serde_json::json!({}));
+    assert!(list.as_array().unwrap().iter().any(|a| a["action_id"] == action_id));
+}
