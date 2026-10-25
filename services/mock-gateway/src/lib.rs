@@ -14,6 +14,7 @@
 
 pub mod approval_store;
 pub mod loop_engine;
+pub mod loop_fault;
 pub mod loop_store;
 pub mod deepseek;
 pub mod deepseek_loop;

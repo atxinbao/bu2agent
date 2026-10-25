@@ -114,6 +114,32 @@ struct Harness {
 }
 
 impl Harness {
+    async fn use_fault_dispatch(
+        &mut self,
+        mode: mock_gateway::loop_fault::FaultMode,
+        timeout: Duration,
+    ) {
+        self.server.abort();
+        let fault =
+            mock_gateway::loop_fault::LoopFault::new(&self.root, mode, Some(timeout)).unwrap();
+        let timeouts = fault.timeouts();
+        let state = AppState::with_files_root_and_approvals(
+            self.root.clone(),
+            Some(self.dir.join("approvals.jsonl")),
+        )
+        .with_loop_fault(fault)
+        .with_loop_backends(
+            Some(self.dir.join("loops.jsonl")),
+            Some(self.model.clone()),
+            None,
+            timeouts,
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        self.url = format!("http://{}", listener.local_addr().unwrap());
+        self.server = tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+    }
+
     async fn use_existing_file_dispatch(&mut self) {
         self.server.abort();
         let state = AppState::with_files_root_and_approvals(
@@ -258,6 +284,157 @@ fn calls(items: Vec<Proposal>) -> ModelReply {
 }
 fn done() -> ModelReply {
     ModelReply::Final("finished".into())
+}
+
+#[tokio::test]
+async fn delayed_real_dispatch_times_out_then_read_observation_keeps_unknown() {
+    use mock_gateway::loop_fault::FaultMode;
+    let mut h = Harness::new(vec![
+        calls(vec![write("out", "private delayed content")]),
+        calls(vec![read("out")]),
+        done(),
+    ])
+    .await;
+    h.use_fault_dispatch(
+        FaultMode::WriteDelay(Duration::from_millis(300)),
+        Duration::from_millis(50),
+    )
+    .await;
+    let id = h.start().await;
+    h.step(&id).await;
+    let pending = h.step(&id).await;
+    let unknown = h.approve(&pending, "approved").await;
+    assert_eq!(unknown["calls"][0]["status"], "unknown");
+    assert_eq!(unknown["status"], "running");
+    assert!(!h.root.join("out").exists());
+    // 等真正迟到写落地并归档后才读；迟到成功不能反写已投递的 unknown。
+    let mut arrived = false;
+    for _ in 0..200 {
+        if h.get(&id).await["calls"][0]["late"].is_object() {
+            arrived = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(arrived);
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("out")).unwrap(),
+        "private delayed content"
+    );
+    h.step(&id).await;
+    let observed = h.step(&id).await;
+    assert_eq!(observed["calls"][1]["status"], "succeeded");
+    assert_eq!(observed["calls"][0]["status"], "unknown");
+    let final_view = h.step(&id).await;
+    assert_eq!(final_view["status"], "needs_review");
+    assert_eq!(final_view["unknown_writes"], json!([1]));
+    assert!(!std::fs::read_to_string(h.dir.join("loops.jsonl"))
+        .unwrap()
+        .contains("private delayed content"));
+}
+
+#[tokio::test]
+async fn missing_readback_real_dispatch_and_duplicate_keep_unknown_without_reexecution() {
+    use mock_gateway::loop_fault::FaultMode;
+    let mut h = Harness::new(vec![
+        calls(vec![write("out", "private missing content")]),
+        calls(vec![read("out")]),
+        calls(vec![write("out", "private missing content")]),
+        done(),
+    ])
+    .await;
+    h.use_fault_dispatch(FaultMode::RemoveBeforeReadback, Duration::from_secs(2))
+        .await;
+    let id = h.start().await;
+    h.step(&id).await;
+    let pending = h.step(&id).await;
+    let binding = pending["calls"][0]["binding"].clone();
+    let unknown = h.approve(&pending, "approved").await;
+    assert_eq!(unknown["calls"][0]["status"], "unknown");
+    assert_eq!(unknown["calls"][0]["binding"], binding);
+    assert!(!h.root.join("out").exists());
+    h.step(&id).await;
+    let observed = h.step(&id).await;
+    assert_eq!(observed["calls"][1]["status"], "failed");
+    assert_eq!(observed["calls"][0]["status"], "unknown");
+    // 外部观测哨兵：若重复写被执行，它会覆盖并删除此内容。
+    std::fs::write(h.root.join("out"), "sentinel unchanged").unwrap();
+    let approvals = std::fs::read(h.dir.join("approvals.jsonl")).unwrap();
+    h.step(&id).await;
+    let duplicate = h.step(&id).await;
+    assert_eq!(duplicate["calls"][2]["status"], "duplicate");
+    assert_eq!(duplicate["calls"][2]["result"]["status"], "unknown");
+    assert_eq!(duplicate["calls"][2]["duplicate_of"], 1);
+    assert_eq!(duplicate["calls"][2]["submitted"], false);
+    assert!(duplicate["calls"][2]["approval_id"].is_null());
+    assert_eq!(
+        std::fs::read(h.dir.join("approvals.jsonl")).unwrap(),
+        approvals
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("out")).unwrap(),
+        "sentinel unchanged"
+    );
+    let final_view = h.step(&id).await;
+    assert_eq!(final_view["status"], "needs_review");
+    assert_eq!(final_view["unknown_writes"], json!([1]));
+    let audit = std::fs::read_to_string(h.dir.join("loops.jsonl")).unwrap();
+    for private in [
+        "private missing content",
+        "private task prompt",
+        "sentinel unchanged",
+    ] {
+        assert!(!audit.contains(private));
+    }
+}
+
+#[tokio::test]
+async fn fault_is_scoped_to_loop_dispatch_not_public_files_agent_or_chat() {
+    use mock_gateway::loop_fault::FaultMode;
+    let mut h = Harness::new(vec![calls(vec![write("out", "no write without approval")])]).await;
+    h.use_fault_dispatch(FaultMode::RemoveBeforeReadback, Duration::from_secs(2))
+        .await;
+    let id = h.start().await;
+    h.step(&id).await;
+    let pending = h.step(&id).await;
+    let mut wrong = pending["calls"][0]["binding"].clone();
+    wrong["args_sha256"] = json!("wrong");
+    assert_eq!(
+        h.post(
+            "/agent/loop/resume",
+            json!({"loop_id":id,"approval_id":pending["calls"][0]["approval_id"],"binding":wrong})
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        h.approve(&pending, "rejected").await["calls"][0]["status"],
+        "rejected"
+    );
+    assert!(!h.root.join("out").exists());
+    h.ok(
+        "/files/write",
+        json!({"path":"raw","content_base64":"cmF3","append":false}),
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(h.root.join("raw")).unwrap(), "raw");
+    let approval = h.ok("/approval/request", json!({"tool":"fs.write"})).await;
+    h.ok(
+        "/approval/decide",
+        json!({"tool_call_id":approval["tool_call_id"],"status":"approved"}),
+    )
+    .await;
+    h.ok("/agent/tool/call",json!({"tool":"fs.write","args":{"path":"public","text":"public write"},"tool_call_id":approval["tool_call_id"]})).await;
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("public")).unwrap(),
+        "public write"
+    );
+    h.ok(
+        "/chat/stream/start",
+        json!({"stream_id":"fault-isolation","turn_id":"turn","text":"hello"}),
+    )
+    .await;
 }
 
 #[tokio::test]

@@ -205,6 +205,7 @@ fn seed_messages() -> Vec<MockMessage> {
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) loops: Arc<LoopEngine>,
+    loop_fault: crate::loop_fault::LoopFault,
     deepseek: DeepSeekClient,
     streams: Arc<Mutex<HashMap<String, StreamState>>>,
     files_root: PathBuf,
@@ -237,6 +238,8 @@ impl AppState {
         let root = std::env::var("MOCK_FILES_ROOT").unwrap_or_else(|_| "mock-files".to_string());
         let approvals_path = std::env::var("MOCK_APPROVALS_PATH").ok().map(PathBuf::from);
         let mut state = AppState::with_files_root_and_approvals(PathBuf::from(root), approvals_path);
+        state.loop_fault = crate::loop_fault::LoopFault::from_env(&state.files_root)
+            .expect("invalid test-only loop fault configuration");
         let loops_path = std::env::var("MOCK_LOOPS_PATH").ok().map(PathBuf::from);
         state = state.with_deepseek_backends(config, loops_path)
             .expect("invalid loop configuration or audit");
@@ -303,6 +306,7 @@ impl AppState {
             next_approval_id = next_id_number(&records);
         }
         AppState {
+            loop_fault: crate::loop_fault::LoopFault::default(),
             loops: Arc::new(LoopEngine::new(&root, None, None, None, Timeouts::default()).expect("memory loop engine")),
             deepseek: DeepSeekClient::new(DeepSeekConfig::disabled()),
             streams: Arc::new(Mutex::new(HashMap::new())),
@@ -335,8 +339,15 @@ impl AppState {
     pub fn with_deepseek_backends(self, config: DeepSeekConfig, path: Option<PathBuf>) -> Result<Self, String> {
         let model = crate::deepseek_loop::DeepSeekLoopModel::new(config.clone())?
             .map(|m| Arc::new(m) as Arc<dyn LoopModel>);
+        let timeouts = self.loop_fault.timeouts();
         self.with_deepseek(DeepSeekClient::new(config))
-            .with_loop_backends(path, model, None, Timeouts::default())
+            .with_loop_backends(path, model, None, timeouts)
+    }
+
+    /// 测试显式装配，不修改环境；仅影响循环的默认文件分派。
+    pub fn with_loop_fault(mut self, fault: crate::loop_fault::LoopFault) -> Self {
+        self.loop_fault = fault;
+        self
     }
 
     /// 测试可注入循环模型和工具；未配置模型时 start 返回 503。
@@ -459,14 +470,15 @@ impl AppState {
         let write_target =
             (tool == "fs.write").then(|| (args["path"].clone(), args["text"].clone()));
         let response = tokio::task::spawn_blocking(move || {
-            let response = dispatch_agent_tool(
+            let write_path = write_target.as_ref().map(|(path, _)| state.files_root.join(path));
+            let response = state.loop_fault.dispatch(write_path.as_deref(), || dispatch_agent_tool(
                 &state,
                 ToolCallDto {
                     tool,
                     args: args.into_iter().collect(),
                     tool_call_id: approval_id,
                 },
-            );
+            ));
             if response.status().is_success() {
                 if let Some((path, text)) = write_target {
                     // 写入和重读都在同一阻塞任务内，等待预算才能覆盖两者。
