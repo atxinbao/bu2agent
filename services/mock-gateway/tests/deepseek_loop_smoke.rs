@@ -138,7 +138,10 @@ impl Harness {
             Some(Arc::new(tools.clone())),
             timeouts,
         )
-        .unwrap();
+        .unwrap()
+        // Single-step assertions: the driver stays off here and
+        // is covered by driver_smoke with the flag on.
+        .with_auto_drive(false);
         let (url, gateway) = serve(app(state)).await;
         Self {
             dir,
@@ -822,7 +825,8 @@ async fn configured_production_builder_enables_loop_and_keeps_chat_request_uncha
     let mut h = Harness::new(vec![final_reply(), final_reply()]).await;
     let state = AppState::with_files_root_and_approvals(h.dir.join("files"), None)
         .with_deepseek_backends(h.config.clone(), Some(h.dir.join("production-loops.jsonl")))
-        .unwrap();
+        .unwrap()
+        .with_auto_drive(false);
     let (url, server) = serve(app(state)).await;
     h.url = url;
     h.servers.push(server);

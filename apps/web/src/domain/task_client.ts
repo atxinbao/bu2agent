@@ -15,6 +15,20 @@ export interface TaskRecord {
   directory: string;
   artifactPath: string | null;
   status: string;
+  // Runner-only fields (Round 3b); manual tasks carry null.
+  error: string | null;
+  approvalId: string | null;
+  draftSha256: string | null;
+  draftBytes: number | null;
+}
+
+// A gateway-run task's draft, fetched separately: the record
+// never carries the body, only its digest and byte count.
+export interface TaskDraft {
+  taskId: string;
+  draft: string;
+  draftSha256: string | null;
+  draftBytes: number | null;
 }
 
 interface ServerTaskRecord {
@@ -22,6 +36,17 @@ interface ServerTaskRecord {
   directory: string;
   artifact_path: string | null;
   status: string;
+  error: string | null;
+  approval_id: string | null;
+  draft_sha256: string | null;
+  draft_bytes: number | null;
+}
+
+interface ServerTaskDraft {
+  task_id: string;
+  draft: string;
+  draft_sha256: string | null;
+  draft_bytes: number | null;
 }
 
 function toRecord(server: ServerTaskRecord): TaskRecord {
@@ -30,6 +55,19 @@ function toRecord(server: ServerTaskRecord): TaskRecord {
     directory: server.directory,
     artifactPath: server.artifact_path,
     status: server.status,
+    error: server.error,
+    approvalId: server.approval_id,
+    draftSha256: server.draft_sha256,
+    draftBytes: server.draft_bytes,
+  };
+}
+
+function toDraft(server: ServerTaskDraft): TaskDraft {
+  return {
+    taskId: server.task_id,
+    draft: server.draft,
+    draftSha256: server.draft_sha256,
+    draftBytes: server.draft_bytes,
   };
 }
 
@@ -45,6 +83,17 @@ export interface TaskGateway {
     status: string,
     artifactPath?: string | null,
   ): Promise<TaskRecord>;
+  // Round 3b runner endpoints. run only starts the runner;
+  // draft fetches the sidecar body; execute consumes the bound
+  // approval and writes; reject decides it rejected; resume
+  // restarts an interrupted task; cancel stops a running or
+  // draft_ready task.
+  run(taskId: string): Promise<TaskRecord>;
+  draft(taskId: string): Promise<TaskDraft>;
+  execute(taskId: string): Promise<TaskRecord>;
+  reject(taskId: string): Promise<TaskRecord>;
+  resume(taskId: string): Promise<TaskRecord>;
+  cancel(taskId: string): Promise<TaskRecord>;
 }
 
 export class TaskClient implements TaskGateway {
@@ -98,5 +147,41 @@ export class TaskClient implements TaskGateway {
       }),
     });
     return toRecord(record);
+  }
+
+  private async postTaskId(path: string, taskId: string): Promise<TaskRecord> {
+    const record = await this.request<ServerTaskRecord>(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: taskId }),
+    });
+    return toRecord(record);
+  }
+
+  async run(taskId: string): Promise<TaskRecord> {
+    return this.postTaskId("/tasks/run", taskId);
+  }
+
+  async draft(taskId: string): Promise<TaskDraft> {
+    const draft = await this.request<ServerTaskDraft>(
+      `/tasks/draft?task_id=${taskId}`,
+    );
+    return toDraft(draft);
+  }
+
+  async execute(taskId: string): Promise<TaskRecord> {
+    return this.postTaskId("/tasks/execute", taskId);
+  }
+
+  async reject(taskId: string): Promise<TaskRecord> {
+    return this.postTaskId("/tasks/reject", taskId);
+  }
+
+  async resume(taskId: string): Promise<TaskRecord> {
+    return this.postTaskId("/tasks/resume", taskId);
+  }
+
+  async cancel(taskId: string): Promise<TaskRecord> {
+    return this.postTaskId("/tasks/cancel", taskId);
   }
 }

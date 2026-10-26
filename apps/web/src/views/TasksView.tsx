@@ -18,6 +18,14 @@ import type { TaskGateway, TaskRecord } from "../domain/task_client";
 // Rejection records the task as rejected and writes nothing.
 // Any step failure marks the task failed.
 //
+// Round 3b: a task can also run on the gateway (create -> run
+// -> draft_ready -> approve -> execute). Gateway-run tasks keep
+// their draft in a server sidecar, so closing the window loses
+// nothing; their approval binds the record's artifact path, so
+// the path is shown read-only and the manual write path is not
+// used for them. The frontend-driven flow above stays for
+// manual tasks.
+//
 // Honest boundary, same as the chat line: without a model key
 // the generate step returns the echo, so the loop runs
 // mechanically but a real report needs a configured key.
@@ -66,6 +74,10 @@ export function TasksView({
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // Resume is accepted, not completed: the record it returns is
+  // still interrupted. While this is true, polling continues
+  // until the runner leaves interrupted.
+  const [resuming, setResuming] = useState(false);
 
   async function refreshTasks() {
     try {
@@ -79,6 +91,39 @@ export function TasksView({
     void refreshTasks();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // While the gateway runner is working, poll the current task
+  // only. Landing on draft_ready fetches the server draft, so
+  // the approval block appears without re-selecting the task.
+  // A resumed task polls too: resume returns the pre-run
+  // interrupted snapshot, so polling must continue until the
+  // runner leaves interrupted, not just while running.
+  useEffect(() => {
+    if (!current) return;
+    const polling = current.status === "running"
+      || (current.status === "interrupted" && resuming);
+    if (!polling) return;
+    const id = current.taskId;
+    const timer = setInterval(async () => {
+      try {
+        const next = await tasks.get(id);
+        setCurrent(next);
+        if (next.status !== "interrupted") setResuming(false);
+        if (next.status === "draft_ready" && next.approvalId) {
+          try {
+            setDraft((await tasks.draft(id)).draft);
+          } catch (e) {
+            setError(`网关草稿读取失败：${errText(e)}`);
+          }
+        }
+      } catch {
+        // A failed poll leaves the last snapshot; the user can
+        // refresh the list explicitly.
+      }
+    }, 2000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [current?.taskId, current?.status, resuming]);
 
   async function failCurrent(task: TaskRecord, reason: string) {
     try {
@@ -126,6 +171,73 @@ export function TasksView({
       await refreshTasks();
     } catch (e) {
       setError(`任务创建失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRun() {
+    if (!current) return;
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      const updated = await tasks.run(current.taskId);
+      setCurrent(updated);
+      setMessage("网关正在运行，关窗不丢进度；到审批点后在此批准。");
+      await refreshTasks();
+    } catch (e) {
+      setError(`运行失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleResume() {
+    if (!current) return;
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      const updated = await tasks.resume(current.taskId);
+      setCurrent(updated);
+      if (updated.status === "draft_ready" && updated.approvalId) {
+        try {
+          setDraft((await tasks.draft(updated.taskId)).draft);
+        } catch (e) {
+          setError(`网关草稿读取失败：${errText(e)}`);
+        }
+      } else if (updated.status === "interrupted") {
+        // Accepted, not completed: keep polling until the runner
+        // leaves interrupted.
+        setResuming(true);
+        setMessage("恢复已接受，正在跟进运行结果。");
+      } else {
+        setMessage("已恢复运行。");
+      }
+      await refreshTasks();
+    } catch (e) {
+      setError(`恢复失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCancel() {
+    if (!current) return;
+    const wasDraftReady = current.status === "draft_ready";
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      const updated = await tasks.cancel(current.taskId);
+      setCurrent(updated);
+      setMessage(wasDraftReady
+        ? "已取消；该任务的待审批已同时标记拒绝，无法再执行写入。"
+        : "已取消。");
+      await refreshTasks();
+    } catch (e) {
+      setError(`取消失败：${errText(e)}`);
     } finally {
       setBusy(false);
     }
@@ -188,6 +300,17 @@ export function TasksView({
     setMessage("");
     setBusy(true);
     try {
+      // Gateway-run tasks (approvalId set) never use the manual
+      // file write: the window decides first, then the gateway
+      // executes the bound approval. Execute never approves.
+      if (current.approvalId) {
+        await agent.decideApproval(current.approvalId, "approve");
+        const updated = await tasks.execute(current.taskId);
+        setCurrent(updated);
+        setMessage(`已批准并写入 ${artifactPath}，任务完成。`);
+        await refreshTasks();
+        return;
+      }
       // Round 2: the file client requests a bound approval for
       // this exact draft, decides it from this click, and
       // executes under it; a separate tool-only request would
@@ -213,6 +336,15 @@ export function TasksView({
     setMessage("");
     setBusy(true);
     try {
+      // Gateway-run tasks reject through their own endpoint,
+      // which decides the stored approval rejected itself.
+      if (current.approvalId) {
+        const updated = await tasks.reject(current.taskId);
+        setCurrent(updated);
+        setMessage("已拒绝写入，任务标记为 rejected，未写任何文件。");
+        await refreshTasks();
+        return;
+      }
       // The rejection is recorded against the exact draft, so
       // the audit shows what was refused. With no draft there
       // is nothing to refuse; the task rejection alone stands.
@@ -263,6 +395,7 @@ export function TasksView({
   async function handleSelect(task: TaskRecord) {
     setError("");
     setMessage("");
+    setResuming(false);
     setBusy(true);
     try {
       const fresh = await tasks.get(task.taskId);
@@ -271,6 +404,24 @@ export function TasksView({
       setArtifactContent("");
       if (fresh.artifactPath) {
         setArtifactPath(fresh.artifactPath);
+      }
+      // Gateway-run drafts live on the server, not in page
+      // state: fetch them on selection, or the draft block
+      // would stay empty for a task that is ready to decide.
+      // Decided tasks keep their draft inspectable too; only
+      // running and interrupted have no draft yet.
+      const viewable = fresh.status === "draft_ready" || fresh.status === "rejected"
+        || fresh.status === "cancelled" || fresh.status === "failed"
+        || fresh.status === "completed";
+      if (viewable && fresh.approvalId) {
+        try {
+          const saved = await tasks.draft(fresh.taskId);
+          setDraft(saved.draft);
+        } catch (e) {
+          if (fresh.status === "draft_ready") {
+            setError(`网关草稿读取失败：${errText(e)}`);
+          }
+        }
       }
     } catch (e) {
       setError(`任务读取失败：${errText(e)}`);
@@ -285,6 +436,7 @@ export function TasksView({
       <p>
         确定性任务闭环：选目录 → 生成报告草稿 → 审批后写入 → 查看产物。
         无模型 key 时生成步骤返回回显（与聊天线一致），真实报告需要已配置的 key。
+        已创建的任务也可以点“自动运行到审批点”，由网关端运行，关窗不丢进度。
       </p>
       {!defaultDirValid && (
         <p className="error">
@@ -324,28 +476,57 @@ export function TasksView({
             状态 {current.status}
             {current.artifactPath ? ` · 产物 ${current.artifactPath}` : ""}
           </p>
+          {current.status === "failed" && current.error && (
+            <p>失败原因：{current.error}</p>
+          )}
           <div>
-            <button onClick={() => void handleGenerate()} disabled={busy}>
-              读取并生成
-            </button>
+            {!current.approvalId && (
+              <button onClick={() => void handleGenerate()} disabled={busy}>
+                读取并生成
+              </button>
+            )}
+            {current.status === "created" && (
+              <button onClick={() => void handleRun()} disabled={busy}>
+                自动运行到审批点
+              </button>
+            )}
+            {current.status === "interrupted" && (
+              <button onClick={() => void handleResume()} disabled={busy}>
+                恢复运行
+              </button>
+            )}
+            {(current.status === "running" ||
+              (current.status === "draft_ready" && current.approvalId)) && (
+              <button onClick={() => void handleCancel()} disabled={busy}>
+                取消
+              </button>
+            )}
           </div>
           {draft !== "" && (
             <div>
               <h3>草稿</h3>
               <pre>{draft}</pre>
-              <div>
-                <input
-                  value={artifactPath}
-                  onChange={(e) => setArtifactPath(e.target.value)}
-                  placeholder="产物路径，如 report.md"
-                />
-                <button onClick={() => void handleApproveWrite()} disabled={busy}>
-                  批准并写入
-                </button>
-                <button onClick={() => void handleReject()} disabled={busy}>
-                  拒绝
-                </button>
-              </div>
+              {current.status === "draft_ready" ? (
+                <div>
+                  {current.approvalId ? (
+                    <p>产物路径：{artifactPath}（审批绑定的路径，不可改）</p>
+                  ) : (
+                    <input
+                      value={artifactPath}
+                      onChange={(e) => setArtifactPath(e.target.value)}
+                      placeholder="产物路径，如 report.md"
+                    />
+                  )}
+                  <button onClick={() => void handleApproveWrite()} disabled={busy}>
+                    批准并写入
+                  </button>
+                  <button onClick={() => void handleReject()} disabled={busy}>
+                    拒绝
+                  </button>
+                </div>
+              ) : (
+                <p>只读草稿：查看原草稿，不产生新的写入或审批。</p>
+              )}
             </div>
           )}
           {current.artifactPath && (

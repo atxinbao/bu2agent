@@ -237,6 +237,10 @@ pub struct TaskOut {
     pub directory: String,
     pub artifact_path: Option<String>,
     pub status: String,
+    pub error: Option<String>,
+    pub approval_id: Option<String>,
+    pub draft_sha256: Option<String>,
+    pub draft_bytes: Option<u64>,
 }
 
 impl From<TaskRecord> for TaskOut {
@@ -246,8 +250,20 @@ impl From<TaskRecord> for TaskOut {
             directory: value.directory,
             artifact_path: value.artifact_path,
             status: value.status,
+            error: value.error,
+            approval_id: value.approval_id,
+            draft_sha256: value.draft_sha256,
+            draft_bytes: value.draft_bytes,
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct TaskDraftOut {
+    pub task_id: String,
+    pub draft: String,
+    pub draft_sha256: Option<String>,
+    pub draft_bytes: Option<u64>,
 }
 
 fn task_client() -> Result<TaskClient, String> {
@@ -280,6 +296,46 @@ pub fn task_update(
         .update(&task_id, &status, artifact_path.as_deref())
         .map_err(|e| err_string(&e))
         .map(TaskOut::from)
+}
+
+// --- Task runner (Round 3b): one command per gateway endpoint.
+// All take only the task id; execute never self-approves, the
+// window decides approved first, then calls task_execute.
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_run(task_id: String) -> Result<TaskOut, String> {
+    task_client()?.run(&task_id).map_err(|e| err_string(&e)).map(TaskOut::from)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_draft(task_id: String) -> Result<TaskDraftOut, String> {
+    let draft = task_client()?.draft(&task_id).map_err(|e| err_string(&e))?;
+    Ok(TaskDraftOut {
+        task_id: draft.task_id,
+        draft: draft.draft,
+        draft_sha256: draft.draft_sha256,
+        draft_bytes: draft.draft_bytes,
+    })
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_execute(task_id: String) -> Result<TaskOut, String> {
+    task_client()?.execute(&task_id).map_err(|e| err_string(&e)).map(TaskOut::from)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_reject(task_id: String) -> Result<TaskOut, String> {
+    task_client()?.reject(&task_id).map_err(|e| err_string(&e)).map(TaskOut::from)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_resume(task_id: String) -> Result<TaskOut, String> {
+    task_client()?.resume(&task_id).map_err(|e| err_string(&e)).map(TaskOut::from)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_cancel(task_id: String) -> Result<TaskOut, String> {
+    task_client()?.cancel(&task_id).map_err(|e| err_string(&e)).map(TaskOut::from)
 }
 
 // --- Devices (B-layer single-device validation) ---

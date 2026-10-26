@@ -134,7 +134,8 @@ impl Harness {
             None,
             timeouts,
         )
-        .unwrap();
+        .unwrap()
+        .with_auto_drive(false);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         self.url = format!("http://{}", listener.local_addr().unwrap());
         self.server = tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
@@ -152,7 +153,8 @@ impl Harness {
             None,
             Timeouts::default(),
         )
-        .unwrap();
+        .unwrap()
+        .with_auto_drive(false);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         self.url = format!("http://{}", listener.local_addr().unwrap());
         self.server = tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
@@ -180,7 +182,10 @@ impl Harness {
             Some(Arc::new(files.clone())),
             timeouts,
         )
-        .unwrap();
+        .unwrap()
+        // Step assertions stay deterministic: the driver is off
+        // here and covered by driver_smoke with the flag on.
+        .with_auto_drive(false);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
@@ -253,6 +258,10 @@ impl Harness {
             Timeouts::default(),
         )
         .unwrap()
+        // Single-step tests drive resume by hand: the rebuilt
+        // engine must not auto-drive, or its in-flight step
+        // turns the test's manual resume into a 409.
+        .with_auto_drive(false)
     }
 }
 

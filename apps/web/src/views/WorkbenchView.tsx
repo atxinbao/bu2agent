@@ -7,9 +7,9 @@ import type {
   SessionGateway,
   SessionRecord,
 } from "../domain/session_client";
-import type { TaskGateway, TaskRecord } from "../domain/task_client";
+import type { TaskDraft, TaskGateway, TaskRecord } from "../domain/task_client";
 
-// Workbench (Round 3, 3a): one list on the left, a timeline in
+// Workbench (Round 3, 3a+3b): one list on the left, a timeline in
 // the middle, an on-demand file preview on the right. Navigation
 // only: selecting an item never approves or resumes anything,
 // and each kind keeps its own state machine (sessions, the
@@ -17,8 +17,9 @@ import type { TaskGateway, TaskRecord } from "../domain/task_client";
 // this view is additive navigation, not a replacement.
 //
 // Depth, stated honestly: sessions are full here (history +
-// input + delete). Tasks show their record; drafts and approval
-// writes still happen on the Tasks tab. Loops show progress,
+// input + delete). Tasks show their record; gateway-run drafts
+// can be approved or rejected here, manual drafts stay on the
+// Tasks tab. Loops show progress,
 // calls, and their pending approval, which can be decided here.
 
 type ItemKind = "session" | "task" | "loop";
@@ -44,10 +45,13 @@ interface Preview {
 
 const taskLabels: Record<string, string> = {
   created: "已创建",
+  running: "运行中",
   draft_ready: "草稿就绪",
   completed: "已完成",
   rejected: "已拒绝",
   failed: "失败",
+  cancelled: "已取消",
+  interrupted: "已中断",
 };
 
 const loopLabels: Record<string, string> = {
@@ -83,6 +87,12 @@ export function WorkbenchView(props: WorkbenchViewProps) {
   const [selection, setSelection] = useState<WorkItem | null>(null);
   const [sessionDetail, setSessionDetail] = useState<SessionRecord | null>(null);
   const [taskDetail, setTaskDetail] = useState<TaskRecord | null>(null);
+  const [taskDraft, setTaskDraft] = useState<TaskDraft | null>(null);
+  const [taskBusy, setTaskBusy] = useState(false);
+  // Resume is accepted, not completed: the record it returns is
+  // still interrupted. While this holds the task's id, polling
+  // continues until the runner leaves interrupted.
+  const [resumingTaskId, setResumingTaskId] = useState<string | null>(null);
   const [loopDetail, setLoopDetail] = useState<LoopSnapshot | null>(null);
   const [detailError, setDetailError] = useState("");
   const [composer, setComposer] = useState("");
@@ -105,6 +115,61 @@ export function WorkbenchView(props: WorkbenchViewProps) {
             : snapshot.status === "needs_review" ? "待复核" : null,
         }
       : item));
+  }
+
+  // Task detail shares the same list-sync rule. A gateway-run
+  // task at draft_ready genuinely awaits a decision here, so it
+  // carries the pending badge; a manual draft_ready task has no
+  // gateway approval and can only be decided on the Tasks tab,
+  // so it never shows as pending here.
+  function updateTask(record: TaskRecord) {
+    setTaskDetail(record);
+    const pending = record.status === "draft_ready" && !!record.approvalId;
+    setItems((previous) => previous.map((item) => item.key === `task:${record.taskId}`
+      ? {
+          ...item,
+          status: taskLabels[record.status] ?? record.status,
+          pending,
+          pendingLabel: pending ? "待审批" : null,
+        }
+      : item));
+  }
+
+  // After any task action or poll, sync the detail and the list,
+  // and fetch the draft exactly when it is gateway-run and ready.
+  // A missing draft is not a state: the detail stays, the draft
+  // block explains itself.
+  async function syncTask(record: TaskRecord) {
+    updateTask(record);
+    if (record.status !== "interrupted") setResumingTaskId(null);
+    // A gateway-run task's draft stays inspectable after the
+    // decision: rejected, cancelled, failed and completed all
+    // keep the sidecar. Only running and interrupted have no
+    // draft yet, so no fetch there.
+    const viewable = record.status === "draft_ready" || record.status === "rejected"
+      || record.status === "cancelled" || record.status === "failed"
+      || record.status === "completed";
+    if (viewable && record.approvalId) {
+      try {
+        setTaskDraft(await tasks.draft(record.taskId));
+      } catch (e) {
+        // On draft_ready the draft must exist, so a fetch failure
+        // is an error. On a decided task it only means no draft
+        // block; the detail itself stays.
+        if (record.status === "draft_ready") setDetailError(errText(e));
+        else setTaskDraft(null);
+      }
+    } else {
+      setTaskDraft(null);
+    }
+  }
+
+  // A 409 on a loop resume means the driver is already running
+  // the step: show running, not failure.
+  function loopRunText(e: unknown): string {
+    const text = errText(e);
+    if (text.includes("409") || text.includes("loop_step_in_flight")) return "自动运行中，稍后查询即可。";
+    return text;
   }
 
   async function refreshList() {
@@ -135,8 +200,8 @@ export function WorkbenchView(props: WorkbenchViewProps) {
           id: t.taskId,
           title: t.artifactPath ?? (t.directory || t.taskId),
           status: taskLabels[t.status] ?? t.status,
-          pending: false,
-          pendingLabel: null,
+          pending: t.status === "draft_ready" && !!t.approvalId,
+          pendingLabel: t.status === "draft_ready" && !!t.approvalId ? "待审批" : null,
         });
       }
       for (const l of loopList) {
@@ -174,6 +239,8 @@ export function WorkbenchView(props: WorkbenchViewProps) {
     setSelection(item);
     setSessionDetail(null);
     setTaskDetail(null);
+    setTaskDraft(null);
+    setResumingTaskId(null);
     setLoopDetail(null);
     setDetailError("");
     setConfirmDelete(false);
@@ -181,7 +248,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
     setPreviewError("");
     try {
       if (item.kind === "session") setSessionDetail(await sessions.get(item.id));
-      else if (item.kind === "task") setTaskDetail(await tasks.get(item.id));
+      else if (item.kind === "task") await syncTask(await tasks.get(item.id));
       else updateLoop(await loops.get(item.id));
     } catch (e) {
       setDetailError(errText(e));
@@ -267,6 +334,77 @@ export function WorkbenchView(props: WorkbenchViewProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loopDetail?.loop_id, loopDetail?.status]);
 
+  // Task polling: status reads only, while the gateway runner
+  // is working. Landing on draft_ready also fetches the draft.
+  // A resumed task polls too: resume returns the pre-run
+  // interrupted snapshot, so polling must continue until the
+  // runner leaves interrupted, not just while running.
+  useEffect(() => {
+    if (!taskDetail) return;
+    const polling = taskDetail.status === "running"
+      || (taskDetail.status === "interrupted" && resumingTaskId === taskDetail.taskId);
+    if (!polling) return;
+    const token = selectionToken.current;
+    const timer = setInterval(async () => {
+      try {
+        const next = await tasks.get(taskDetail.taskId);
+        if (selectionToken.current === token) await syncTask(next);
+      } catch {
+        // A failed poll leaves the last snapshot; the user can
+        // refresh explicitly. Never invent a state.
+      }
+    }, 2000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [taskDetail?.taskId, taskDetail?.status, resumingTaskId]);
+
+  async function resumeTask() {
+    if (!taskDetail || taskBusy) return;
+    setTaskBusy(true);
+    setDetailError("");
+    try {
+      const record = await tasks.resume(taskDetail.taskId);
+      await syncTask(record);
+      // Resume is accepted, not completed: the record above is
+      // still interrupted. Poll until the runner leaves it.
+      if (record.status === "interrupted") setResumingTaskId(taskDetail.taskId);
+    } catch (e) {
+      setDetailError(errText(e));
+    } finally {
+      setTaskBusy(false);
+    }
+  }
+
+  async function runTaskAction(action: () => Promise<TaskRecord>) {
+    if (!taskDetail || taskBusy) return;
+    setTaskBusy(true);
+    setDetailError("");
+    try {
+      await syncTask(await action());
+    } catch (e) {
+      setDetailError(errText(e));
+    } finally {
+      setTaskBusy(false);
+    }
+  }
+
+  async function approveTask() {
+    const record = taskDetail;
+    if (!record?.approvalId) return;
+    setTaskBusy(true);
+    setDetailError("");
+    try {
+      // The gateway-run approval, decided here, then executed:
+      // execute never approves itself.
+      await agent.decideApproval(record.approvalId, "approve");
+      await syncTask(await tasks.execute(record.taskId));
+    } catch (e) {
+      setDetailError(errText(e));
+    } finally {
+      setTaskBusy(false);
+    }
+  }
+
   async function decideLoop(decision: "approve" | "reject") {
     const view = loopDetail;
     if (!view) return;
@@ -279,7 +417,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
       await agent.decideApproval(call.approval_id, decision);
       updateLoop(await loops.resume(view.loop_id, call.approval_id, call.binding));
     } catch (e) {
-      setDetailError(errText(e));
+      setDetailError(loopRunText(e));
     } finally {
       setLoopBusy(false);
     }
@@ -295,7 +433,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
     try {
       updateLoop(await loops.resume(view.loop_id, call.approval_id, call.binding));
     } catch (e) {
-      setDetailError(errText(e));
+      setDetailError(loopRunText(e));
     } finally {
       setLoopBusy(false);
     }
@@ -438,6 +576,66 @@ export function WorkbenchView(props: WorkbenchViewProps) {
                 状态：{taskLabels[taskDetail.status] ?? taskDetail.status} · 目录：
                 {taskDetail.directory || "文件根"}
               </p>
+              {taskDetail.status === "failed" && taskDetail.error && (
+                <p className="error">失败原因：{taskDetail.error}</p>
+              )}
+              {taskDetail.status === "created" && (
+                <div className="row">
+                  <button type="button" disabled={taskBusy} onClick={() => void runTaskAction(() => tasks.run(taskDetail.taskId))}>
+                    自动运行到审批点
+                  </button>
+                </div>
+              )}
+              {taskDetail.status === "running" && (
+                <>
+                  <p>网关正在运行，关窗不丢进度。</p>
+                  <div className="row">
+                    <button type="button" disabled={taskBusy} onClick={() => void runTaskAction(() => tasks.cancel(taskDetail.taskId))}>
+                      取消
+                    </button>
+                  </div>
+                </>
+              )}
+              {taskDetail.status === "interrupted" && (
+                <div className="row">
+                  <button type="button" disabled={taskBusy} onClick={() => void resumeTask()}>
+                    恢复运行
+                  </button>
+                </div>
+              )}
+              {taskDetail.status === "draft_ready" && taskDetail.approvalId && taskDraft && (
+                <div>
+                  <h3>草稿 · 产物：{taskDetail.artifactPath ?? "report.md"}</h3>
+                  <p className="note">
+                    草稿摘要：{taskDraft.draftSha256} · {taskDraft.draftBytes} 字节。批准即按此草稿写入，路径不可改。
+                  </p>
+                  <pre className="result">{taskDraft.draft}</pre>
+                  <div className="row">
+                    <button type="button" disabled={taskBusy} onClick={() => void approveTask()}>
+                      批准并写入
+                    </button>
+                    <button type="button" disabled={taskBusy} onClick={() => void runTaskAction(() => tasks.reject(taskDetail.taskId))}>
+                      拒绝
+                    </button>
+                    <button type="button" disabled={taskBusy} onClick={() => void runTaskAction(() => tasks.cancel(taskDetail.taskId))}>
+                      取消
+                    </button>
+                  </div>
+                </div>
+              )}
+              {taskDetail.status === "draft_ready" && taskDetail.approvalId && !taskDraft && (
+                <p>草稿加载中…若一直未出现，点刷新列表后重选任务。</p>
+              )}
+              {taskDetail.status === "draft_ready" && !taskDetail.approvalId && (
+                <p className="note">手动任务的草稿只在任务页，审批写入也在任务页进行。</p>
+              )}
+              {taskDraft && taskDetail.status !== "draft_ready" && (
+                <div>
+                  <h3>草稿（只读）</h3>
+                  <p className="note">只供查看原草稿，不产生新的写入或审批。</p>
+                  <pre className="result">{taskDraft.draft}</pre>
+                </div>
+              )}
               {taskDetail.artifactPath ? (
                 <p>
                   产物：{taskDetail.artifactPath}{" "}
@@ -451,7 +649,6 @@ export function WorkbenchView(props: WorkbenchViewProps) {
               ) : (
                 <p className="empty">暂无产物。</p>
               )}
-              <p className="note">草稿与审批写入仍在任务页进行；这里只展示任务记录。</p>
               <button type="button" onClick={() => onNavigate("tasks")}>
                 在任务页继续
               </button>
@@ -527,7 +724,7 @@ function LoopCenter(props: LoopCenterProps) {
       <div className="row">
         {waiting && decided && (
           <button type="button" disabled={busy || current.in_flight} onClick={onResumeDecided}>
-            继续已决定的步骤
+            运行到下一停止点
           </button>
         )}
         <button type="button" onClick={onRefresh}>

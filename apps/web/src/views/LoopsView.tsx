@@ -11,7 +11,7 @@ function savedId(): string { try { return localStorage.getItem(LAST_ID) ?? ""; }
 function errorText(e: unknown): string {
   const text = e instanceof Error ? e.message : String(e);
   if (text.includes("HTTP 503")) return "循环模型不可用：网关未配置模型凭据或使用了 --mock-chat。";
-  if (text.includes("HTTP 409")) return "步骤正在执行、审批状态已变化或循环已结束。请查询状态后再操作。";
+  if (text.includes("HTTP 409")) return "自动运行中，稍后查询即可；这不是失败。";
   if (text.includes("HTTP 403")) return "审批绑定未通过网关复核。请查询状态；不要另建审批绕过。";
   if (text.includes("HTTP 404")) return "没有找到该循环，请检查 ID 以及网关是否启用了持久化。";
   return `响应未确认：${text}。请先查询状态，不要重复发起或批准。`;
@@ -70,7 +70,7 @@ export function LoopsView({ loops, agent }: { loops: LoopGateway; agent: AgentGa
     };
     timer = setTimeout(() => void poll(), 1500);
     return () => { stopped = true; clearTimeout(timer); };
-    // 轮询只查状态，推进始终来自用户明确点击。
+    // 轮询只查状态；推进由网关驱动器自动进行，审批决定来自用户明确点击。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loops, current?.loop_id, current?.status, current?.in_flight]);
 
@@ -117,7 +117,7 @@ export function LoopsView({ loops, agent }: { loops: LoopGateway; agent: AgentGa
 
   return <section className="view loop-view">
     <h2>模型工具循环</h2>
-    <p>发起任务后，每次点击推进一个步骤。模型可以列目录、读文本；每次新写入都需你确认。最多 5 次工具提议，执行预算最多 120 秒。</p>
+    <p>发起后网关自动运行到审批点或终态；审批后继续自动运行，无需一步步点。模型可以列目录、读文本；每次新写入都需你确认。最多 5 次工具提议，执行预算最多 120 秒。</p>
     <label htmlFor="loop-prompt">任务要求</label>
     <textarea id="loop-prompt" value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="例如：读取 demo 下的材料，生成报告到 demo/report.md" disabled={busy || !terminal} />
     <div className="row loop-options">
@@ -138,8 +138,8 @@ export function LoopsView({ loops, agent }: { loops: LoopGateway; agent: AgentGa
       </p>
       {waiting && <p>等待审批不消耗执行预算。审批状态：{current.approval_status ?? "尚未同步，请查询"}。</p>}
       <div className="row">
-        {!terminal && !waiting && <button disabled={busy || current.in_flight || cancelling} onClick={() => void run(() => resume(current))}>推进一步</button>}
-        {waiting && decided && <button disabled={busy || current.in_flight || cancelling} onClick={() => void run(() => resume(current))}>继续已决定的步骤</button>}
+        {!terminal && !waiting && <button disabled={busy || current.in_flight || cancelling} onClick={() => void run(() => resume(current))}>运行到下一停止点</button>}
+        {waiting && decided && <button disabled={busy || current.in_flight || cancelling} onClick={() => void run(() => resume(current))}>运行到下一停止点</button>}
         <button onClick={() => { setError(""); void refresh(); }}>查询状态</button>
         {!terminal && <button disabled={cancelling} onClick={() => void cancel()}>取消循环</button>}
       </div>

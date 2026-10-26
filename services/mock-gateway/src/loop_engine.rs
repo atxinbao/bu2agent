@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -62,6 +63,11 @@ pub enum ErrorCode {
     UserRejected,
     Interrupted,
     AuditUnavailable,
+    /// The auto-run driver exceeded its step cap. A loop step always
+    /// advances state (a model attempt, a call transition, or a
+    /// terminal state), so reaching the cap means a logic bug, not
+    /// a long loop; failing loudly beats spinning silently.
+    DriverLimit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -415,6 +421,11 @@ pub struct LoopEngine {
     model: Option<Arc<dyn LoopModel>>,
     tools: Option<Arc<dyn LoopTools>>,
     timeouts: Timeouts,
+    /// True in production: start/resume spawn a driver that runs
+    /// steps until a stopping point. Tests that assert single-step
+    /// states turn it off and drive explicitly; the driver itself
+    /// is covered by driver_smoke with the flag on.
+    auto_drive: AtomicBool,
 }
 
 fn now() -> u64 {
@@ -545,6 +556,7 @@ impl LoopEngine {
             model,
             tools,
             timeouts,
+            auto_drive: AtomicBool::new(true),
         })
     }
 
@@ -646,6 +658,75 @@ impl LoopEngine {
             self.save(live)?;
         }
         Ok(live.view())
+    }
+
+    /// Test seam: disable the auto-run driver. Production never
+    /// calls this; loop_smoke turns it off so single-step states
+    /// stay deterministic, and driver_smoke leaves it on.
+    pub fn set_auto_drive(&self, enabled: bool) {
+        self.auto_drive.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn auto_drive(&self) -> bool {
+        self.auto_drive.load(Ordering::SeqCst)
+    }
+
+    /// Run steps until a stopping point: awaiting_approval or a
+    /// terminal state. This composes the same single-step resume
+    /// the manual flow used; it adds no step logic of its own.
+    /// A driver that loses a race exits quietly: the winning
+    /// step's owner continues the loop (a manual resume restarts
+    /// a driver after its step; a concurrent driver keeps going).
+    /// Budget, proposal-cap and model failures are terminal states
+    /// produced by resume itself, so the driver never interprets
+    /// them. Hard cap 50 steps: a step always advances state, so
+    /// the cap only trips on a logic bug, and then the loop fails
+    /// loudly instead of spinning.
+    pub(crate) async fn drive_until_stopped(self: &Arc<Self>, app: AppState, loop_id: String) {
+        if !self.auto_drive() {
+            return;
+        }
+        let mut steps = 0usize;
+        loop {
+            let view = match self.get(&loop_id) {
+                Ok(view) => view,
+                Err(_) => return,
+            };
+            if view.record.status.terminal() || view.record.status == LoopStatus::AwaitingApproval {
+                return;
+            }
+            if steps >= 50 {
+                let mut state = self.state.lock().unwrap();
+                if let Some(live) = state.loops.get_mut(&loop_id) {
+                    if !live.record.status.terminal() {
+                        live.finish(LoopStatus::Failed, Some(ErrorCode::DriverLimit));
+                        let _ = self.save(live);
+                    }
+                }
+                return;
+            }
+            steps += 1;
+            match self
+                .resume(
+                    app.clone(),
+                    ResumeLoop { loop_id: loop_id.clone(), approval_id: None, binding: None },
+                )
+                .await
+            {
+                Ok(view) => {
+                    if view.record.status.terminal() || view.record.status == LoopStatus::AwaitingApproval {
+                        return;
+                    }
+                }
+                // 409: another step is in flight; its owner
+                // continues. 403: an approval decision landed
+                // meanwhile; the user resumes with the approval.
+                // 404: loop gone. Any other error: resume already
+                // failed the loop or the loop is terminal; do not
+                // spin.
+                Err(_) => return,
+            }
+        }
     }
 
     pub async fn resume(

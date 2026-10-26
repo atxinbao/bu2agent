@@ -16,6 +16,23 @@ pub struct TaskFileRecord {
     pub directory: String,
     pub artifact_path: Option<String>,
     pub status: String,
+    /// Runner-only failure reason, shown in the workbench. Manual
+    /// tasks never set it; old JSONL lines load as None.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Bound file-write approval for a gateway-run task, set at
+    /// draft_ready. Manual tasks keep None and use the client-side
+    /// approve path; the approval itself is a file-write
+    /// authorization, not a task-state lock.
+    #[serde(default)]
+    pub approval_id: Option<String>,
+    /// Draft identity: SHA-256 of the draft bytes and its length.
+    /// The record never carries the draft body; the body lives in
+    /// the task_drafts sidecar (see task_runner), keyed by task id.
+    #[serde(default)]
+    pub draft_sha256: Option<String>,
+    #[serde(default)]
+    pub draft_bytes: Option<u64>,
 }
 
 pub fn load_tasks(path: &Path) -> Vec<TaskFileRecord> {
@@ -103,6 +120,10 @@ mod tests {
                 directory: "notes".to_string(),
                 artifact_path: None,
                 status: "created".to_string(),
+                error: None,
+                approval_id: None,
+                draft_sha256: None,
+                draft_bytes: None,
             },
         );
         append_task(
@@ -112,6 +133,10 @@ mod tests {
                 directory: "notes".to_string(),
                 artifact_path: Some("notes/report.md".to_string()),
                 status: "completed".to_string(),
+                error: None,
+                approval_id: None,
+                draft_sha256: None,
+                draft_bytes: None,
             },
         );
         let records = load_tasks(&path);
@@ -129,12 +154,20 @@ mod tests {
                 directory: "a".to_string(),
                 artifact_path: None,
                 status: "created".to_string(),
+                error: None,
+                approval_id: None,
+                draft_sha256: None,
+                draft_bytes: None,
             },
             TaskFileRecord {
                 task_id: "other".to_string(),
                 directory: "b".to_string(),
                 artifact_path: None,
                 status: "created".to_string(),
+                error: None,
+                approval_id: None,
+                draft_sha256: None,
+                draft_bytes: None,
             },
         ];
         assert_eq!(next_task_number(&records), 4);

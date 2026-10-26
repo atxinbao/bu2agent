@@ -64,7 +64,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::approval_store::{append_record, load_records, next_id_number, ApprovalFileRecord};
 use crate::loop_engine::{
-    ApprovalBinding, LoopEngine, LoopError, LoopModel, LoopTools, LoopView, Timeouts, ToolOutcome, ErrorCode,
+    ApprovalBinding, LoopEngine, LoopError, LoopModel, LoopStatus, LoopTools, LoopView, Timeouts,
+    ToolOutcome, ErrorCode,
 };
 use crate::device_backend::{
     execute_set, resolve_unknown, AuthorizationStatus, ExecuteOutcome, FakeReminderBackend,
@@ -176,12 +177,28 @@ struct StreamState {
 }
 
 #[derive(Clone)]
-struct ApprovalState {
+pub(crate) struct ApprovalState {
     tool: String,
     status: ApprovalStatus,
     binding: Option<ApprovalBinding>,
     consumed: bool,
     operation_digest: Option<String>,
+}
+
+impl ApprovalState {
+    /// Cross-module constructor: fields stay private to this
+    /// module, so other modules build records through here.
+    /// (A struct literal with any private field fails E0451
+    /// outside this module, even when every field is given.)
+    pub(crate) fn new(
+        tool: String,
+        status: ApprovalStatus,
+        binding: Option<ApprovalBinding>,
+        consumed: bool,
+        operation_digest: Option<String>,
+    ) -> Self {
+        ApprovalState { tool, status, binding, consumed, operation_digest }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -215,18 +232,25 @@ fn seed_messages() -> Vec<MockMessage> {
 }
 
 #[derive(Clone)]
+// The type stays pub (as before Round 3b): integration tests
+// and the pub constructors/serve functions expose it, and
+// narrowing it to pub(crate) produced private_interfaces
+// warnings on all of them. Fields stay pub(crate); other
+// modules reach them only through server-side helpers.
 pub struct AppState {
     pub(crate) loops: Arc<LoopEngine>,
     loop_fault: crate::loop_fault::LoopFault,
-    deepseek: DeepSeekClient,
+    pub(crate) deepseek: DeepSeekClient,
     streams: Arc<Mutex<HashMap<String, StreamState>>>,
-    files_root: PathBuf,
-    approvals: Arc<Mutex<HashMap<String, ApprovalState>>>,
-    next_approval_id: Arc<Mutex<u64>>,
+    pub(crate) files_root: PathBuf,
+    pub(crate) approvals: Arc<Mutex<HashMap<String, ApprovalState>>>,
+    pub(crate) next_approval_id: Arc<Mutex<u64>>,
     approvals_path: Option<PathBuf>,
-    tasks: Arc<Mutex<HashMap<String, TaskFileRecord>>>,
+    pub(crate) tasks: Arc<Mutex<HashMap<String, TaskFileRecord>>>,
     next_task_id: Arc<Mutex<u64>>,
     tasks_path: Option<PathBuf>,
+    pub(crate) task_drafts: Arc<Mutex<HashMap<String, String>>>,
+    pub(crate) task_drafts_dir: Option<PathBuf>,
     sessions: Arc<Mutex<HashMap<String, SessionRecord>>>,
     next_session_id: Arc<Mutex<u64>>,
     sessions_path: Option<PathBuf>,
@@ -260,6 +284,9 @@ impl AppState {
             .expect("invalid loop configuration or audit");
         if let Ok(tasks_path) = std::env::var("MOCK_TASKS_PATH") {
             state = state.with_tasks_path(PathBuf::from(tasks_path));
+        }
+        if let Ok(drafts_dir) = std::env::var("MOCK_TASK_DRAFTS_PATH") {
+            state = state.with_task_drafts_dir(PathBuf::from(drafts_dir));
         }
         if let Ok(sessions_path) = std::env::var("MOCK_SESSIONS_PATH") {
             state = state.with_sessions_path(PathBuf::from(sessions_path));
@@ -335,6 +362,8 @@ impl AppState {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             next_task_id: Arc::new(Mutex::new(1)),
             tasks_path: None,
+            task_drafts: Arc::new(Mutex::new(HashMap::new())),
+            task_drafts_dir: None,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_session_id: Arc::new(Mutex::new(1)),
             sessions_path: None,
@@ -541,16 +570,49 @@ impl AppState {
 
     /// Test seam: load task records from a JSONL file, so
     /// persistence tests can point at a temp path. Production
-    /// state reads MOCK_TASKS_PATH in Default.
+    /// state reads MOCK_TASKS_PATH in Default. A run that died
+    /// with the process comes back interrupted, never running;
+    /// its draft sidecar and approval survive, so resume can
+    /// return it to the approval point.
+    ///
+    /// Fold first, then convert: the file holds history, one
+    /// line per transition. Converting before folding would
+    /// append an interrupted line for a stale running snapshot
+    /// AFTER a later completed / rejected / cancelled line, and
+    /// the next load would read that appended line as the latest
+    /// state. Only the latest record per task may convert, and
+    /// only converted records are appended.
     pub fn with_tasks_path(mut self, path: PathBuf) -> Self {
         let records = load_tasks(&path);
         let mut tasks = HashMap::new();
         for record in &records {
             tasks.insert(record.task_id.clone(), record.clone());
         }
+        for record in tasks.values_mut() {
+            if record.status == "running" {
+                record.status = "interrupted".to_string();
+                append_task(&path, record);
+            }
+        }
         self.next_task_id = Arc::new(Mutex::new(next_task_number(&records)));
         self.tasks = Arc::new(Mutex::new(tasks));
         self.tasks_path = Some(path);
+        self
+    }
+
+    /// Test seam + production path for task drafts: load
+    /// `<task_id>.md` sidecars so an interrupted task's draft
+    /// survives a restart. Production reads MOCK_TASK_DRAFTS_PATH.
+    pub fn with_task_drafts_dir(mut self, dir: PathBuf) -> Self {
+        self.task_drafts =
+            Arc::new(Mutex::new(crate::task_runner::load_draft_dir(&dir)));
+        self.task_drafts_dir = Some(dir);
+        self
+    }
+
+    /// Test seam for the loop auto-run driver (see LoopEngine).
+    pub fn with_auto_drive(self, enabled: bool) -> Self {
+        self.loops.set_auto_drive(enabled);
         self
     }
 
@@ -657,7 +719,7 @@ struct DeleteRequestDto {
     approval_id: Option<String>,
 }
 
-fn resolve_file(root: &Path, rel: &str) -> Result<PathBuf, StatusCode> {
+pub(crate) fn resolve_file(root: &Path, rel: &str) -> Result<PathBuf, StatusCode> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
         return Err(StatusCode::BAD_REQUEST);
@@ -668,7 +730,7 @@ fn resolve_file(root: &Path, rel: &str) -> Result<PathBuf, StatusCode> {
     Ok(root.join(rel_path))
 }
 
-fn ensure_root(root: &Path) -> Result<(), StatusCode> {
+pub(crate) fn ensure_root(root: &Path) -> Result<(), StatusCode> {
     std::fs::create_dir_all(root).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -1044,7 +1106,7 @@ async fn approval_decide(
 /// Append one approval record to the persistence file, when
 /// configured. Best-effort: a failure is logged to stderr and
 /// the in-memory record (authoritative for this run) is kept.
-fn persist_approval(state: &AppState, tool_call_id: &str, approval: &ApprovalState) -> Result<(), String> {
+pub(crate) fn persist_approval(state: &AppState, tool_call_id: &str, approval: &ApprovalState) -> Result<(), String> {
     let Some(path) = &state.approvals_path else { return Ok(()) };
     let record = ApprovalFileRecord {
         tool_call_id: tool_call_id.to_string(),
@@ -1055,6 +1117,32 @@ fn persist_approval(state: &AppState, tool_call_id: &str, approval: &ApprovalSta
         operation_digest: approval.operation_digest.clone(),
     };
     append_record(path, &record)
+}
+
+/// Task-runner read of an approval's status. ApprovalState fields
+/// stay private to this module; the runner must not read them
+/// directly (a cross-module field access does not compile).
+pub(crate) fn approval_status(state: &AppState, approval_id: &str) -> Option<ApprovalStatus> {
+    state.approvals.lock().expect("approval lock").get(approval_id).map(|r| r.status)
+}
+
+/// Decide an approval rejected, failing closed like
+/// approval_decide: a persist failure restores Pending and the
+/// caller sees the error, never a silent rejection.
+pub(crate) fn decide_approval_rejected(state: &AppState, approval_id: &str) -> Result<(), String> {
+    let mut approvals = state.approvals.lock().expect("approval lock");
+    let Some(record) = approvals.get_mut(approval_id) else {
+        return Err("unknown approval".to_string());
+    };
+    if record.status != ApprovalStatus::Pending {
+        return Err("approval already decided".to_string());
+    }
+    record.status = ApprovalStatus::Rejected;
+    if let Err(detail) = persist_approval(state, approval_id, record) {
+        record.status = ApprovalStatus::Pending;
+        return Err(format!("approval_audit_failed: {detail}"));
+    }
+    Ok(())
 }
 
 /// Reverse of `parse_approval_status`: the string form stored in
@@ -1107,7 +1195,7 @@ fn check_approval(
 /// in-memory consumed flag stays set (fail closed, as in the loop
 /// path). Loop-bound records and legacy unbound records can never
 /// pass this gate.
-fn consume_bound_approval(
+pub(crate) fn consume_bound_approval(
     state: &AppState,
     tool: &str,
     tool_call_id: &Option<String>,
@@ -1387,12 +1475,17 @@ fn cors_layer() -> CorsLayer {
         .allow_headers([header::CONTENT_TYPE])
 }
 
-// --- Tasks (deterministic task loop, first cut) ---
+// --- Tasks (deterministic task loop) ---
 //
-// A task is a directory + a report artifact. The frontend drives the
-// fixed steps (read -> generate -> approve -> write); the gateway only
-// stores task records. Records persist as JSONL when MOCK_TASKS_PATH is
-// set, mirroring the approval store.
+// A task is a directory + a report artifact. The manual flow stays
+// frontend-driven (read -> generate -> approve -> write) through
+// tasks_update. Round 3b adds a gateway runner (task_runner):
+// run/resume spawn it, it generates to draft_ready, execute
+// consumes the bound approval and writes, reject decides the
+// approval rejected, cancel stops it between steps. Records
+// persist as JSONL when MOCK_TASKS_PATH is set, mirroring the
+// approval store; draft bodies live in the task_drafts sidecar,
+// never in the record.
 
 #[derive(Debug, Deserialize)]
 struct TaskCreateDto {
@@ -1417,7 +1510,7 @@ fn valid_task_status(status: &str) -> bool {
 
 /// Append one task record to the persistence file, when configured.
 /// Best-effort, mirroring persist_approval.
-fn persist_task(state: &AppState, record: &TaskFileRecord) {
+pub(crate) fn persist_task(state: &AppState, record: &TaskFileRecord) {
     let Some(path) = &state.tasks_path else { return };
     append_task(path, record);
 }
@@ -1448,6 +1541,10 @@ async fn tasks_create(
         directory: req.directory,
         artifact_path: None,
         status: "created".to_string(),
+        error: None,
+        approval_id: None,
+        draft_sha256: None,
+        draft_bytes: None,
     };
     state.tasks.lock().expect("task lock").insert(record.task_id.clone(), record.clone());
     persist_task(&state, &record);
@@ -1494,6 +1591,302 @@ async fn tasks_update(
     let updated = record.clone();
     persist_task(&state, &updated);
     Json(updated).into_response()
+}
+
+// --- Task runner endpoints (Round 3, 3b) ---
+//
+// run/resume only validate and spawn; the runner owns transitions.
+// Execute consumes the bound approval and never self-approves;
+// the window decides approved first, then calls execute. Reject
+// decides rejected itself (rejection only removes power). Cancel
+// stops a running task between steps, or rejects a draft_ready
+// one whose approval is still pending; an already-decided
+// approval cannot be cancelled or rejected, only executed or
+// left alone.
+
+#[derive(Debug, Serialize)]
+struct TaskDraftDto {
+    task_id: String,
+    draft: String,
+    draft_sha256: Option<String>,
+    draft_bytes: Option<u64>,
+}
+
+async fn tasks_run(
+    State(state): State<AppState>,
+    Json(req): Json<TaskGetQuery>,
+) -> impl IntoResponse {
+    // No model, no run: refused outright, never an echo draft.
+    if state.deepseek.config().api_key.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "model_not_configured"})),
+        )
+            .into_response();
+    }
+    let mut tasks = state.tasks.lock().expect("task lock");
+    let Some(record) = tasks.get_mut(&req.task_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
+            .into_response();
+    };
+    if record.status != "created" {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not runnable" })))
+            .into_response();
+    }
+    record.status = "running".to_string();
+    record.error = None;
+    let updated = record.clone();
+    persist_task(&state, &updated);
+    drop(tasks);
+    tokio::spawn(crate::task_runner::run_task(state.clone(), req.task_id));
+    Json(updated).into_response()
+}
+
+async fn tasks_draft(
+    State(state): State<AppState>,
+    Query(query): Query<TaskGetQuery>,
+) -> impl IntoResponse {
+    let Some(record) =
+        state.tasks.lock().expect("task lock").get(&query.task_id).cloned()
+    else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
+            .into_response();
+    };
+    let Some(draft) = crate::task_runner::load_draft(&state, &query.task_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "no draft" })))
+            .into_response();
+    };
+    Json(TaskDraftDto {
+        task_id: record.task_id,
+        draft_sha256: record
+            .draft_sha256
+            .or_else(|| Some(crate::operation_binding::sha256_hex(draft.as_bytes()))),
+        draft_bytes: record.draft_bytes.or(Some(draft.len() as u64)),
+        draft,
+    })
+    .into_response()
+}
+
+async fn tasks_execute(
+    State(state): State<AppState>,
+    Json(req): Json<TaskGetQuery>,
+) -> impl IntoResponse {
+    let Some(record) =
+        state.tasks.lock().expect("task lock").get(&req.task_id).cloned()
+    else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
+            .into_response();
+    };
+    if record.status != "draft_ready" {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not executable" })))
+            .into_response();
+    }
+    let Some(approval_id) = record.approval_id.clone() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "task approval missing" })),
+        )
+            .into_response();
+    };
+    let Some(artifact_path) = record.artifact_path.clone() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "task artifact missing" })),
+        )
+            .into_response();
+    };
+    let Some(draft) = crate::task_runner::load_draft(&state, &req.task_id) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "draft unavailable" })),
+        )
+            .into_response();
+    };
+    // The digest is recomputed server-side from the stored draft,
+    // never trusted from the caller; consume is atomic and
+    // single-use, exactly like files_write.
+    let Some(digest) =
+        crate::operation_binding::write_digest(&artifact_path, draft.as_bytes(), false)
+    else {
+        return bad_request("invalid path");
+    };
+    if let Err(response) =
+        consume_bound_approval(&state, "fs.write", &Some(approval_id), &digest)
+    {
+        return *response;
+    }
+    // Same tail as files_write (overwrite): normalized path,
+    // parent dirs, direct write. The approval is already consumed,
+    // so a write failure fails the task instead of leaving it
+    // executable; the draft is kept, and the manual Tasks flow
+    // can still write it with a fresh approval.
+    let Some(normalized) = crate::operation_binding::normalize_path(&artifact_path) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "invalid path" })),
+        )
+            .into_response();
+    };
+    let Ok(full) = resolve_file(&state.files_root, &normalized) else {
+        return bad_request("path escapes file root");
+    };
+    if let Some(parent) = full.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "cannot create parent directory" })),
+            )
+                .into_response();
+        }
+    }
+    if std::fs::write(&full, draft.as_bytes()).is_err() {
+        crate::task_runner::fail(&state, &req.task_id, "产物写入失败");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "cannot write file" })),
+        )
+            .into_response();
+    }
+    let mut tasks = state.tasks.lock().expect("task lock");
+    if let Some(current) = tasks.get_mut(&req.task_id) {
+        current.status = "completed".to_string();
+        current.error = None;
+        let updated = current.clone();
+        persist_task(&state, &updated);
+        return Json(updated).into_response();
+    }
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" }))).into_response()
+}
+
+async fn tasks_reject(
+    State(state): State<AppState>,
+    Json(req): Json<TaskGetQuery>,
+) -> impl IntoResponse {
+    let Some(record) =
+        state.tasks.lock().expect("task lock").get(&req.task_id).cloned()
+    else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
+            .into_response();
+    };
+    if record.status != "draft_ready" {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not rejectable" })))
+            .into_response();
+    }
+    let Some(approval_id) = record.approval_id.clone() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "task approval missing" })),
+        )
+            .into_response();
+    };
+    if let Err(error) = crate::task_runner::decide_rejected(&state, &approval_id) {
+        if error == "approval already decided" {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": error })))
+                .into_response();
+        }
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": error })))
+            .into_response();
+    }
+    let mut tasks = state.tasks.lock().expect("task lock");
+    if let Some(current) = tasks.get_mut(&req.task_id) {
+        if current.status != "draft_ready" {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not rejectable" })))
+                .into_response();
+        }
+        current.status = "rejected".to_string();
+        let updated = current.clone();
+        persist_task(&state, &updated);
+        return Json(updated).into_response();
+    }
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" }))).into_response()
+}
+
+async fn tasks_resume(
+    State(state): State<AppState>,
+    Json(req): Json<TaskGetQuery>,
+) -> impl IntoResponse {
+    let Some(record) =
+        state.tasks.lock().expect("task lock").get(&req.task_id).cloned()
+    else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
+            .into_response();
+    };
+    if record.status != "interrupted" {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not resumable" })))
+            .into_response();
+    }
+    // Contract: resume is accepted, not completed. The returned
+    // record is the pre-run snapshot (still interrupted); the
+    // runner flips it to running or draft_ready promptly, and
+    // callers poll until the status leaves interrupted. A
+    // fabricated running record would lie about the runner's
+    // state, and blocking here would stall on a model call.
+    tokio::spawn(crate::task_runner::run_task(state.clone(), req.task_id));
+    Json(record).into_response()
+}
+
+async fn tasks_cancel(
+    State(state): State<AppState>,
+    Json(req): Json<TaskGetQuery>,
+) -> impl IntoResponse {
+    let Some(record) =
+        state.tasks.lock().expect("task lock").get(&req.task_id).cloned()
+    else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
+            .into_response();
+    };
+    match record.status.as_str() {
+        "running" => {
+            // The runner observes the flip at its next checkpoint
+            // and discards the model result; no approval exists
+            // yet, so nothing is left behind.
+            let mut tasks = state.tasks.lock().expect("task lock");
+            if let Some(current) = tasks.get_mut(&req.task_id) {
+                if current.status != "running" {
+                    return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not cancellable" })))
+                        .into_response();
+                }
+                current.status = "cancelled".to_string();
+                let updated = current.clone();
+                persist_task(&state, &updated);
+                return Json(updated).into_response();
+            }
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
+                .into_response()
+        }
+        "draft_ready" => {
+            let Some(approval_id) = record.approval_id.clone() else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "task approval missing" })),
+                )
+                    .into_response();
+            };
+            if let Err(error) = crate::task_runner::decide_rejected(&state, &approval_id) {
+                if error == "approval already decided" {
+                    return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": error })))
+                        .into_response();
+                }
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": error })))
+                    .into_response();
+            }
+            let mut tasks = state.tasks.lock().expect("task lock");
+            if let Some(current) = tasks.get_mut(&req.task_id) {
+                if current.status != "draft_ready" {
+                    return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not cancellable" })))
+                        .into_response();
+                }
+                current.status = "cancelled".to_string();
+                let updated = current.clone();
+                persist_task(&state, &updated);
+                return Json(updated).into_response();
+            }
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
+                .into_response()
+        }
+        _ => (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not cancellable" })))
+            .into_response(),
+    }
 }
 
 // --- Chat sessions (Round 3, 3a) ---
@@ -2050,11 +2443,30 @@ fn loop_response(
     }
 }
 
+/// Start an auto-run driver unless auto-drive is off (loop_smoke)
+/// or the loop already stopped. The driver re-checks the flag and
+/// the loop state itself, so a redundant spawn exits at once.
+fn spawn_driver(state: &AppState, loop_id: &str) {
+    if !state.loops.auto_drive() {
+        return;
+    }
+    let engine = Arc::clone(&state.loops);
+    let app = state.clone();
+    let loop_id = loop_id.to_string();
+    tokio::spawn(async move {
+        engine.drive_until_stopped(app, loop_id).await;
+    });
+}
+
 async fn loop_start(
     State(state): State<AppState>,
     Json(req): Json<crate::loop_engine::StartLoop>,
 ) -> axum::response::Response {
-    loop_response(&state, state.loops.start(req))
+    let result = state.loops.start(req);
+    if let Ok(view) = &result {
+        spawn_driver(&state, &view.record.loop_id);
+    }
+    loop_response(&state, result)
 }
 async fn loop_get(
     State(state): State<AppState>,
@@ -2067,7 +2479,16 @@ async fn loop_resume(
     Json(req): Json<crate::loop_engine::ResumeLoop>,
 ) -> axum::response::Response {
     let engine = Arc::clone(&state.loops);
-    loop_response(&state, engine.resume(state.clone(), req).await)
+    let result = engine.resume(state.clone(), req).await;
+    // A manual resume runs one step, then hands over to the
+    // driver; a stopping view needs no driver. Frontend copy
+    // says "run to next stopping point", not "step once".
+    if let Ok(view) = &result {
+        if !view.record.status.terminal() && view.record.status != LoopStatus::AwaitingApproval {
+            spawn_driver(&state, &view.record.loop_id);
+        }
+    }
+    loop_response(&state, result)
 }
 async fn loop_cancel(
     State(state): State<AppState>,
@@ -2107,6 +2528,12 @@ pub fn app(state: AppState) -> Router {
         .route("/tasks/list", get(tasks_list))
         .route("/tasks/get", get(tasks_get))
         .route("/tasks/update", post(tasks_update))
+        .route("/tasks/run", post(tasks_run))
+        .route("/tasks/draft", get(tasks_draft))
+        .route("/tasks/execute", post(tasks_execute))
+        .route("/tasks/reject", post(tasks_reject))
+        .route("/tasks/resume", post(tasks_resume))
+        .route("/tasks/cancel", post(tasks_cancel))
         .route("/sessions/create", post(sessions_create))
         .route("/sessions/list", get(sessions_list))
         .route("/sessions/get", get(sessions_get))

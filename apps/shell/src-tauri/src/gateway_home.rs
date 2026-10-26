@@ -42,6 +42,7 @@ pub struct GatewayPaths {
     pub files_root: PathBuf,
     pub approvals_path: PathBuf,
     pub tasks_path: PathBuf,
+    pub task_drafts_dir: PathBuf,
     pub actions_path: PathBuf,
     pub loops_path: PathBuf,
     pub sessions_path: PathBuf,
@@ -53,6 +54,7 @@ pub fn gateway_paths(working_dir: &Path) -> GatewayPaths {
         files_root: working_dir.to_path_buf(),
         approvals_path: data.join("approvals.jsonl"),
         tasks_path: data.join("tasks.jsonl"),
+        task_drafts_dir: data.join("task_drafts"),
         actions_path: data.join("actions.jsonl"),
         loops_path: data.join("loops.jsonl"),
         sessions_path: data.join("sessions.jsonl"),
@@ -75,6 +77,7 @@ pub fn gateway_env(paths: &GatewayPaths, addr: &str) -> Vec<(String, String)> {
     push("MOCK_FILES_ROOT", &paths.files_root.to_string_lossy());
     push("MOCK_APPROVALS_PATH", &paths.approvals_path.to_string_lossy());
     push("MOCK_TASKS_PATH", &paths.tasks_path.to_string_lossy());
+    push("MOCK_TASK_DRAFTS_PATH", &paths.task_drafts_dir.to_string_lossy());
     push("MOCK_DEVICE_ACTIONS_PATH", &paths.actions_path.to_string_lossy());
     push("MOCK_LOOPS_PATH", &paths.loops_path.to_string_lossy());
     push("MOCK_SESSIONS_PATH", &paths.sessions_path.to_string_lossy());
