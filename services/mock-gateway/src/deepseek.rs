@@ -142,14 +142,26 @@ impl DeepSeekClient {
     }
 
     pub async fn reply(&self, user_text: &str) -> DeepseekOutcome {
+        self.reply_with_history(&[], user_text).await
+    }
+
+    /// Session send: prior complete turns first, then the current
+    /// user message. The caller owns trimming; this only sends
+    /// what it is given, in order.
+    pub async fn reply_with_history(
+        &self,
+        history: &[(String, String)],
+        user_text: &str,
+    ) -> DeepseekOutcome {
         let Some(key) = &self.config.api_key else {
             return DeepseekOutcome::Disabled;
         };
-        let request = ChatRequest {
-            model: self.config.model.clone(),
-            messages: vec![ChatMessage { role: "user".to_string(), content: user_text.to_string() }],
-            stream: false,
-        };
+        let mut messages: Vec<ChatMessage> = history
+            .iter()
+            .map(|(role, content)| ChatMessage { role: role.clone(), content: content.clone() })
+            .collect();
+        messages.push(ChatMessage { role: "user".to_string(), content: user_text.to_string() });
+        let request = ChatRequest { model: self.config.model.clone(), messages, stream: false };
         let sent =
             self.http.post(self.config.completions_url()).bearer_auth(key).json(&request).send().await;
         let response = match sent {

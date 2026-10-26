@@ -112,6 +112,9 @@ impl LoopClient {
         self.http
             .get_json(&format!("/agent/loop/get?loop_id={loop_id}"))
     }
+    pub fn list(&self) -> Result<Vec<LoopSnapshot>> {
+        self.http.get_json("/agent/loop/list")
+    }
     pub fn resume(
         &self,
         loop_id: &str,

@@ -40,6 +40,7 @@ fn loop_workflow_invoke_roundtrip() {
         ("POST", "/agent/loop/start", json!({"prompt":"你好","max_calls":3,"budget_ms":45000}), created.clone()),
         ("POST", "/agent/loop/resume", json!({"loop_id":"loop-8","approval_id":null,"binding":null}), waiting.clone()),
         ("GET", "/agent/loop/get?loop_id=loop-8", Value::Null, waiting.clone()),
+        ("GET", "/agent/loop/list", Value::Null, json!([waiting.clone()])),
         ("POST", "/agent/loop/resume", json!({"loop_id":"loop-8","approval_id":"approval-9","binding":binding}), completed.clone()),
         ("POST", "/agent/loop/cancel", json!({"loop_id":"loop-8"}), cancelled.clone()),
     ];
@@ -72,7 +73,7 @@ fn loop_workflow_invoke_roundtrip() {
     });
     crate::gateway_endpoint::set_base_url(&base_url);
     let app = tauri::test::mock_builder()
-        .invoke_handler(tauri::generate_handler![loop_start, loop_get, loop_resume, loop_cancel])
+        .invoke_handler(tauri::generate_handler![loop_start, loop_get, loop_list, loop_resume, loop_cancel])
         .build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
     let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
     let invoke = |cmd: &str, body: Value| {
@@ -85,6 +86,7 @@ fn loop_workflow_invoke_roundtrip() {
     assert_eq!(invoke("loop_start", json!({"prompt":"你好","max_calls":3,"budget_ms":45000})), created);
     assert_eq!(invoke("loop_resume", json!({"loop_id":"loop-8","approval_id":null,"binding":null})), waiting);
     assert_eq!(invoke("loop_get", json!({"loop_id":"loop-8"})), waiting);
+    assert_eq!(invoke("loop_list", json!({})), json!([waiting]));
     assert_eq!(invoke("loop_resume", json!({"loop_id":"loop-8","approval_id":"approval-9","binding":binding})), completed);
     assert_eq!(invoke("loop_cancel", json!({"loop_id":"loop-8"})), cancelled);
     server.join().unwrap();
@@ -665,4 +667,35 @@ fn device_authorization_roundtrip() {
         ["authorized", "denied", "not_determined"].contains(&status.as_str()),
         "unexpected status: {status}"
     );
+}
+
+/// 会话命令通过真实 IPC 验证字段命名、DTO、隔离与删除；使用回归服务的假模型。
+#[test]
+fn session_workflow_invoke_roundtrip() {
+    use crate::session_commands::*;
+    use serde_json::{json, Value};
+    crate::gateway_endpoint::reset_base_url();
+    let app = tauri::test::mock_builder()
+        .invoke_handler(tauri::generate_handler![session_create, session_list, session_get, session_send, session_delete])
+        .build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+    let invoke = |cmd: &str, body: Value| {
+        tauri::test::get_ipc_response(&webview, tauri::webview::InvokeRequest {
+            cmd: cmd.into(), callback: tauri::ipc::CallbackFn(0), error: tauri::ipc::CallbackFn(1),
+            url: "tauri://localhost".parse().unwrap(), body: tauri::ipc::InvokeBody::Json(body),
+            headers: Default::default(), invoke_key: tauri::test::INVOKE_KEY.into(),
+        }).unwrap_or_else(|e| panic!("{cmd}: {e:?}")).deserialize::<Value>().unwrap()
+    };
+    let a = invoke("session_create", json!({"title":"IPC A"}));
+    let b = invoke("session_create", json!({"title":"IPC B"}));
+    let id = &a["session_id"];
+    let sent = invoke("session_send", json!({"session_id":id,"text":"仅属于 A"}));
+    assert_eq!(sent["turns"].as_array().unwrap().len(), 2);
+    assert_eq!(sent["turns"][1]["text"], "仅属于 A");
+    assert_eq!(invoke("session_get", json!({"session_id":id})), sent);
+    assert_eq!(invoke("session_get", json!({"session_id":b["session_id"]}))["turns"], json!([]));
+    assert!(invoke("session_list", json!({})).as_array().unwrap().iter().any(|s| s["session_id"] == *id && s["turn_count"] == 2));
+    invoke("session_delete", json!({"session_id":id}));
+    assert!(!invoke("session_list", json!({})).as_array().unwrap().iter().any(|s| s["session_id"] == *id));
+    invoke("session_delete", json!({"session_id":b["session_id"]}));
 }

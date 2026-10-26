@@ -25,6 +25,7 @@ export interface LoopGateway {
   get(loopId: string): Promise<LoopSnapshot>;
   resume(loopId: string, approvalId?: string, binding?: ApprovalBinding): Promise<LoopSnapshot>;
   cancel(loopId: string): Promise<LoopSnapshot>;
+  list(): Promise<LoopSnapshot[]>;
 }
 export function isTerminal(status: LoopStatus): boolean {
   return !["created", "running", "awaiting_approval"].includes(status);
@@ -50,4 +51,11 @@ export class LoopClient implements LoopGateway {
     return this.request("/agent/loop/resume", { loop_id: loopId, approval_id: approvalId ?? null, binding: binding ?? null });
   }
   cancel(loopId: string) { return this.request("/agent/loop/cancel", { loop_id: loopId }); }
+  async list(): Promise<LoopSnapshot[]> {
+    const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}/agent/loop/list`, {
+      signal: AbortSignal.timeout(70_000),
+    });
+    if (!response.ok) throw new Error(`mock gateway returned HTTP ${response.status}`);
+    return await response.json() as LoopSnapshot[];
+  }
 }

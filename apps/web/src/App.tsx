@@ -43,6 +43,9 @@ import { DevicesView } from "./views/DevicesView";
 import { LoopClient, type LoopGateway } from "./domain/loop_client";
 import { InvokeLoopClient } from "./domain/invoke_loop_client";
 import { LoopsView } from "./views/LoopsView";
+import { SessionClient, type SessionGateway } from "./domain/session_client";
+import { InvokeSessionClient } from "./domain/invoke_session_client";
+import { WorkbenchView } from "./views/WorkbenchView";
 import {
   InvokeSettingsClient,
   type SettingsData,
@@ -85,11 +88,13 @@ interface Clients {
   tasks: TaskGateway;
   devices: DeviceGateway;
   loops: LoopGateway;
+  sessions: SessionGateway;
 }
 
-type Tab = "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "settings";
+type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
+  { id: "workbench", label: "工作台" },
   { id: "chat", label: "Chat" },
   { id: "files", label: "Files" },
   { id: "agent", label: "Agent" },
@@ -156,6 +161,7 @@ export function App() {
           tasks: new InvokeTaskClient(),
           devices: new InvokeDeviceClient(),
           loops: new InvokeLoopClient(),
+          sessions: new InvokeSessionClient(),
         };
         transportName = "invoke (Rust client)";
       } catch {
@@ -171,6 +177,7 @@ export function App() {
           tasks: new TaskClient(MOCK_BASE_URL),
           devices: new DeviceClient(MOCK_BASE_URL),
           loops: new LoopClient(MOCK_BASE_URL),
+          sessions: new SessionClient(MOCK_BASE_URL),
         };
         transportName = "http (browser preview)";
       }
@@ -426,6 +433,19 @@ export function App() {
           </p>
         </>
       )}
+      {tab === "workbench" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : (
+          <WorkbenchView
+            sessions={clients.sessions}
+            tasks={clients.tasks}
+            loops={clients.loops}
+            agent={clients.agent}
+            files={clients.files}
+            onNavigate={(target) => setTab(target)}
+          />
+        ))}
       {tab === "files" &&
         (clients === null ? (
           <p className="empty">Choosing transport…</p>

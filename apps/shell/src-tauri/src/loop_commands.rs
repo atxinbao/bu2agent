@@ -56,6 +56,15 @@ pub async fn loop_resume(
     .map_err(|_| "循环推进响应未确认，请查询状态".to_string())?
 }
 #[tauri::command(rename_all = "snake_case")]
+pub async fn loop_list() -> Result<Vec<LoopSnapshot>, String> {
+    let base = base();
+    tauri::async_runtime::spawn_blocking(move || {
+        LoopClient::new(&base).and_then(|c| c.list()).map_err(error)
+    })
+    .await
+    .map_err(|_| "循环列表查询失败".to_string())?
+}
+#[tauri::command(rename_all = "snake_case")]
 pub async fn loop_cancel(loop_id: String) -> Result<LoopSnapshot, String> {
     let base = base();
     tauri::async_runtime::spawn_blocking(move || {

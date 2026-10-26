@@ -264,3 +264,11 @@ body {
 .loop-approval pre { max-height: 320px; overflow: auto; }
 .loop-calls { padding-left: 24px; }
 .loop-calls li { margin: 10px 0; overflow-wrap: anywhere; }
+
+/* 工作台三栏：左列表、中时间线、右预览（默认收起，有内容才打开）。 */
+.workbench { display: flex; gap: 12px; flex: 1; min-height: 0; }
+.workbench-list { width: 220px; flex-shrink: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+.workbench-list .entries li button.selected { background: #e8f0fe; }
+.workbench-center { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.workbench-preview { width: 280px; flex-shrink: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+.pending-badge { color: #b3261e; font-weight: 600; }

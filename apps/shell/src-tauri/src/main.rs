@@ -11,6 +11,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod gateway_commands;
+mod session_commands;
 mod gateway_endpoint;
 mod gateway_home;
 mod gateway_lifecycle;
@@ -103,6 +104,12 @@ fn main() {
             loop_commands::loop_get,
             loop_commands::loop_resume,
             loop_commands::loop_cancel,
+            loop_commands::loop_list,
+            session_commands::session_create,
+            session_commands::session_list,
+            session_commands::session_get,
+            session_commands::session_send,
+            session_commands::session_delete,
             gateway_lifecycle::gateway_status,
             gateway_lifecycle::gateway_restart,
             settings_commands::settings_get,

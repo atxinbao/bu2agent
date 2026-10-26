@@ -624,6 +624,17 @@ impl LoopEngine {
             .ok_or(LoopError(404, "unknown_loop"))
     }
 
+    /// All loops, oldest first, for the workbench list. Snapshots
+    /// only: no execution is started, resumed, or cancelled here.
+    pub fn list(&self) -> Vec<LoopView> {
+        let state = self.state.lock().unwrap();
+        let mut views: Vec<LoopView> = state.loops.values().map(LiveLoop::view).collect();
+        views.sort_by_key(|view| {
+            view.record.loop_id.strip_prefix("loop-").and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)
+        });
+        views
+    }
+
     pub fn cancel(&self, id: &str) -> Result<LoopView, LoopError> {
         let mut state = self.state.lock().unwrap();
         let live = state

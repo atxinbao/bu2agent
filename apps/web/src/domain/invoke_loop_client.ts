@@ -10,4 +10,5 @@ export class InvokeLoopClient implements LoopGateway {
     return invoke<LoopSnapshot>("loop_resume", { loop_id: loopId, approval_id: approvalId ?? null, binding: binding ?? null });
   }
   cancel(loopId: string) { return invoke<LoopSnapshot>("loop_cancel", { loop_id: loopId }); }
+  list() { return invoke<LoopSnapshot[]>("loop_list"); }
 }

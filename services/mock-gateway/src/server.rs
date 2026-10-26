@@ -12,6 +12,11 @@
 //! - POST /chat/stream/start    -> stream records 1..=4 for a turn
 //! - POST /chat/stream/apply    -> deduped records + last applied
 //! - POST /chat/stream/cancel   -> cancel a stream
+//! - POST /sessions/create      -> new chat session
+//! - GET  /sessions/list        -> session summaries (deleted hidden)
+//! - GET  /sessions/get         -> full session record
+//! - POST /sessions/send        -> append turn + model reply
+//! - POST /sessions/delete      -> tombstone (hidden, not erased)
 //! - POST /approval/check       -> approval gate result
 //! - GET  /files/list            -> list a directory in the file root
 //! - GET  /files/read            -> chunked read (offset/len, base64, EOF)
@@ -58,7 +63,9 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::approval_store::{append_record, load_records, next_id_number, ApprovalFileRecord};
-use crate::loop_engine::{ApprovalBinding, LoopEngine, LoopError, LoopModel, LoopTools, Timeouts, ToolOutcome, ErrorCode};
+use crate::loop_engine::{
+    ApprovalBinding, LoopEngine, LoopError, LoopModel, LoopTools, LoopView, Timeouts, ToolOutcome, ErrorCode,
+};
 use crate::device_backend::{
     execute_set, resolve_unknown, AuthorizationStatus, ExecuteOutcome, FakeReminderBackend,
     Reminder, ReminderBackend, ResolveOutcome,
@@ -69,6 +76,10 @@ use crate::device_store::{
     append_action, load_actions, next_action_number, DeviceActionRecord,
 };
 use crate::task_store::{append_task, load_tasks, next_task_number, TaskFileRecord};
+use crate::session_store::{
+    append_session, load_sessions, next_session_number, select_context, session_number, title_from,
+    SessionRecord, SessionTurn, MAX_INPUT_BYTES,
+};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
 
@@ -216,6 +227,9 @@ pub struct AppState {
     tasks: Arc<Mutex<HashMap<String, TaskFileRecord>>>,
     next_task_id: Arc<Mutex<u64>>,
     tasks_path: Option<PathBuf>,
+    sessions: Arc<Mutex<HashMap<String, SessionRecord>>>,
+    next_session_id: Arc<Mutex<u64>>,
+    sessions_path: Option<PathBuf>,
     actions: Arc<Mutex<HashMap<String, DeviceActionRecord>>>,
     next_action_id: Arc<Mutex<u64>>,
     actions_path: Option<PathBuf>,
@@ -246,6 +260,9 @@ impl AppState {
             .expect("invalid loop configuration or audit");
         if let Ok(tasks_path) = std::env::var("MOCK_TASKS_PATH") {
             state = state.with_tasks_path(PathBuf::from(tasks_path));
+        }
+        if let Ok(sessions_path) = std::env::var("MOCK_SESSIONS_PATH") {
+            state = state.with_sessions_path(PathBuf::from(sessions_path));
         }
         if let Ok(actions_path) = std::env::var("MOCK_DEVICE_ACTIONS_PATH") {
             state = state.with_actions_path(PathBuf::from(actions_path));
@@ -318,6 +335,9 @@ impl AppState {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             next_task_id: Arc::new(Mutex::new(1)),
             tasks_path: None,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            next_session_id: Arc::new(Mutex::new(1)),
+            sessions_path: None,
             actions: Arc::new(Mutex::new(HashMap::new())),
             next_action_id: Arc::new(Mutex::new(1)),
             actions_path: None,
@@ -531,6 +551,20 @@ impl AppState {
         self.next_task_id = Arc::new(Mutex::new(next_task_number(&records)));
         self.tasks = Arc::new(Mutex::new(tasks));
         self.tasks_path = Some(path);
+        self
+    }
+
+    /// Test seam: load session records from a JSONL file, mirroring
+    /// with_tasks_path. Production state reads MOCK_SESSIONS_PATH.
+    pub fn with_sessions_path(mut self, path: PathBuf) -> Self {
+        let records = load_sessions(&path);
+        let mut sessions = HashMap::new();
+        for record in &records {
+            sessions.insert(record.session_id.clone(), record.clone());
+        }
+        self.next_session_id = Arc::new(Mutex::new(next_session_number(&records)));
+        self.sessions = Arc::new(Mutex::new(sessions));
+        self.sessions_path = Some(path);
         self
     }
 
@@ -1462,6 +1496,206 @@ async fn tasks_update(
     Json(updated).into_response()
 }
 
+// --- Chat sessions (Round 3, 3a) ---
+//
+// Session bodies live here, never in the audit JSONL files.
+// Deletion is a tombstone: hidden from list/get/send and never
+// entering model context, but earlier snapshot lines stay in
+// the file until it is removed. The UI delete confirmation must
+// say exactly that.
+
+#[derive(Debug, Deserialize)]
+struct SessionCreateDto {
+    title: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionGetQuery {
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionSendDto {
+    session_id: String,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionDeleteDto {
+    session_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionSummary {
+    session_id: String,
+    title: String,
+    created_ms: u64,
+    updated_ms: u64,
+    turn_count: usize,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Append one session snapshot to the persistence file, when
+/// configured. Best-effort, mirroring persist_task.
+fn persist_session(state: &AppState, record: &SessionRecord) {
+    let Some(path) = &state.sessions_path else { return };
+    append_session(path, record);
+}
+
+async fn sessions_create(
+    State(state): State<AppState>,
+    Json(req): Json<SessionCreateDto>,
+) -> impl IntoResponse {
+    let mut next = state.next_session_id.lock().expect("session id lock");
+    let id = format!("session-{}", *next);
+    *next += 1;
+    let now = now_ms();
+    let record = SessionRecord {
+        session_id: id,
+        title: req.title.unwrap_or_default(),
+        created_ms: now,
+        updated_ms: now,
+        deleted: false,
+        turns: Vec::new(),
+    };
+    state.sessions.lock().expect("session lock").insert(record.session_id.clone(), record.clone());
+    persist_session(&state, &record);
+    Json(record).into_response()
+}
+
+async fn sessions_list(State(state): State<AppState>) -> Json<Vec<SessionSummary>> {
+    let mut records: Vec<SessionSummary> = state
+        .sessions
+        .lock()
+        .expect("session lock")
+        .values()
+        .filter(|r| !r.deleted)
+        .map(|r| SessionSummary {
+            session_id: r.session_id.clone(),
+            title: r.title.clone(),
+            created_ms: r.created_ms,
+            updated_ms: r.updated_ms,
+            turn_count: r.turns.len(),
+        })
+        .collect();
+    records.sort_by_key(|r| session_number(&r.session_id));
+    Json(records)
+}
+
+async fn sessions_get(
+    State(state): State<AppState>,
+    Query(query): Query<SessionGetQuery>,
+) -> impl IntoResponse {
+    match state.sessions.lock().expect("session lock").get(&query.session_id) {
+        Some(record) if !record.deleted => Json(record.clone()).into_response(),
+        _ => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown session" }))).into_response(),
+    }
+}
+
+async fn sessions_send(
+    State(state): State<AppState>,
+    Json(req): Json<SessionSendDto>,
+) -> impl IntoResponse {
+    let text = req.text.trim().to_string();
+    if text.is_empty() {
+        return bad_request("empty message");
+    }
+    if text.len() > MAX_INPUT_BYTES {
+        return bad_request("message too large");
+    }
+    // Record the user turn first, then release the lock for the
+    // model call: holding a std mutex across a 30 s await would
+    // stall every other session request.
+    let context = {
+        let mut sessions = state.sessions.lock().expect("session lock");
+        let Some(record) = sessions.get_mut(&req.session_id) else {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown session" })))
+                .into_response();
+        };
+        if record.deleted {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown session" })))
+                .into_response();
+        }
+        let context = select_context(&record.turns);
+        let first_message = record.turns.is_empty();
+        let now = now_ms();
+        record.turns.push(SessionTurn {
+            role: "user".to_string(),
+            text: text.clone(),
+            created_ms: now,
+            model: None,
+            finish_reason: None,
+        });
+        if first_message && record.title.is_empty() {
+            record.title = title_from(&text);
+        }
+        record.updated_ms = now;
+        let snapshot = record.clone();
+        persist_session(&state, &snapshot);
+        context
+    };
+    let outcome = state.deepseek.reply_with_history(&context, &text).await;
+    let (reply, model, finish_reason) = match outcome {
+        DeepseekOutcome::Disabled => (text.clone(), None, None),
+        DeepseekOutcome::Replied(reply) => {
+            (reply, Some(state.deepseek.config().model.clone()), Some("stop".to_string()))
+        }
+        DeepseekOutcome::Failed(status) => {
+            // The user turn is already persisted; a failed model
+            // call adds no assistant turn and never echoes.
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "deepseek request failed", "status": status })),
+            )
+                .into_response();
+        }
+    };
+    let mut sessions = state.sessions.lock().expect("session lock");
+    let Some(record) = sessions.get_mut(&req.session_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown session" })))
+            .into_response();
+    };
+    if record.deleted {
+        // Deleted while the model was in flight: the delete wins,
+        // the late reply is dropped, never resurrecting the session.
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown session" })))
+            .into_response();
+    }
+    record.turns.push(SessionTurn {
+        role: "assistant".to_string(),
+        text: reply,
+        created_ms: now_ms(),
+        model,
+        finish_reason,
+    });
+    record.updated_ms = now_ms();
+    let updated = record.clone();
+    persist_session(&state, &updated);
+    Json(updated).into_response()
+}
+
+async fn sessions_delete(
+    State(state): State<AppState>,
+    Json(req): Json<SessionDeleteDto>,
+) -> impl IntoResponse {
+    let mut sessions = state.sessions.lock().expect("session lock");
+    let Some(record) = sessions.get_mut(&req.session_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown session" })))
+            .into_response();
+    };
+    record.deleted = true;
+    record.updated_ms = now_ms();
+    let updated = record.clone();
+    persist_session(&state, &updated);
+    Json(serde_json::json!({ "session_id": updated.session_id, "deleted": true })).into_response()
+}
+
 // --- Device loop (B-layer single-device validation) ---
 //
 // The gateway owns the device backend (Fake for now, EventKit later)
@@ -1841,6 +2075,9 @@ async fn loop_cancel(
 ) -> axum::response::Response {
     loop_response(&state, state.loops.cancel(&req.loop_id))
 }
+async fn loops_list(State(state): State<AppState>) -> Json<Vec<LoopView>> {
+    Json(state.loops.list())
+}
 
 pub fn app(state: AppState) -> Router {
     Router::new()
@@ -1861,6 +2098,7 @@ pub fn app(state: AppState) -> Router {
         .route("/agent/loop/get", get(loop_get))
         .route("/agent/loop/resume", post(loop_resume))
         .route("/agent/loop/cancel", post(loop_cancel))
+        .route("/agent/loop/list", get(loops_list))
         .route("/connectors/notes/list", get(notes_list))
         .route("/connectors/notes/create", post(notes_create))
         .route("/connectors/mail/list", get(mail_list))
@@ -1869,6 +2107,11 @@ pub fn app(state: AppState) -> Router {
         .route("/tasks/list", get(tasks_list))
         .route("/tasks/get", get(tasks_get))
         .route("/tasks/update", post(tasks_update))
+        .route("/sessions/create", post(sessions_create))
+        .route("/sessions/list", get(sessions_list))
+        .route("/sessions/get", get(sessions_get))
+        .route("/sessions/send", post(sessions_send))
+        .route("/sessions/delete", post(sessions_delete))
         .route("/devices/reminders/list", get(reminders_list))
         .route("/devices/actions/create", post(actions_create))
         .route("/devices/reminders/set", post(device_set))
