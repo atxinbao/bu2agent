@@ -70,7 +70,8 @@ fn loop_workflow_invoke_roundtrip() {
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
         }
     });
-    let app = tauri::test::mock_builder().manage(LoopTransport { base_url })
+    crate::gateway_endpoint::set_base_url(&base_url);
+    let app = tauri::test::mock_builder()
         .invoke_handler(tauri::generate_handler![loop_start, loop_get, loop_resume, loop_cancel])
         .build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
     let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
@@ -87,13 +88,15 @@ fn loop_workflow_invoke_roundtrip() {
     assert_eq!(invoke("loop_resume", json!({"loop_id":"loop-8","approval_id":"approval-9","binding":binding})), completed);
     assert_eq!(invoke("loop_cancel", json!({"loop_id":"loop-8"})), cancelled);
     server.join().unwrap();
+    crate::gateway_endpoint::reset_base_url();
 }
 
 /// 真实 Mock 网关未配置循环模型时，错误经异步 IPC 返回，不能变成回显成功。
 #[test]
 fn loop_unconfigured_invoke_errors() {
     use crate::loop_commands::*;
-    let app = tauri::test::mock_builder().manage(LoopTransport::default())
+    crate::gateway_endpoint::reset_base_url();
+    let app = tauri::test::mock_builder()
         .invoke_handler(tauri::generate_handler![loop_start, loop_get])
         .build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
     let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();

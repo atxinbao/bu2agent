@@ -57,6 +57,17 @@ interface ShellInfo {
   version: string;
 }
 
+// 壳内网关状态（gateway_status 命令的返回形状）。HTTP 预览没有
+// 这个命令，状态只在 invoke 传输下存在。
+interface GatewayStatus {
+  endpoint: string;
+  port: number;
+  ownership: "owned" | "attached";
+  state: "ready" | "down";
+  foreign_port: boolean;
+  error: string | null;
+}
+
 // One client per mainline, chosen together with the transport:
 // either all invoke (Tauri window) or all HTTP (browser
 // preview). Views take these interfaces, never a concrete
@@ -87,6 +98,10 @@ export function App() {
   const [tab, setTab] = useState<Tab>("chat");
   const [chat, setChat] = useState<ChatState>(initialChatState);
   const [gatewayOk, setGatewayOk] = useState<boolean | null>(null);
+  const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus | null>(null);
+  const [isInvoke, setIsInvoke] = useState(false);
+  const [restarting, setRestarting] = useState(false);
+  const [restartError, setRestartError] = useState<string | null>(null);
   const [shell, setShell] = useState<string>("checking shell bridge…");
   const [transport, setTransport] = useState<string | null>(null);
   const [clients, setClients] = useState<Clients | null>(null);
@@ -113,6 +128,7 @@ export function App() {
         const info = await invoke<ShellInfo>("app_info");
         if (!cancelled) {
           setShell(`shell bridge ok: ping=${pong}, ${info.name} ${info.version}`);
+          setIsInvoke(true);
         }
         selected = {
           chat: new InvokeGatewayClient(),
@@ -127,6 +143,7 @@ export function App() {
       } catch {
         if (!cancelled) {
           setShell("shell bridge unavailable (browser preview, not a Tauri window)");
+          setIsInvoke(false);
         }
         selected = {
           chat: httpClient,
@@ -164,10 +181,12 @@ export function App() {
     };
   }, []);
 
-  // 启动检查失败可能只是网关尚未就绪，不能让 unreachable 一直保留。
-  // 仅失败时每两秒复查；成功或卸载后停止，网关未启动时仍显示不可达。
+  // HTTP 预览没有 status 命令，沿用 health 复查：启动检查失败
+  // 可能只是网关尚未就绪，不能让 unreachable 一直保留。仅失败
+  // 时每两秒复查；成功或卸载后停止，网关未启动时仍显示不可达。
+  // invoke 传输走下面那条 status 轮询，不并存两套定时器。
   useEffect(() => {
-    if (gatewayOk !== false) {
+    if (gatewayOk !== false || isInvoke) {
       return;
     }
     let cancelled = false;
@@ -194,7 +213,55 @@ export function App() {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [gatewayOk]);
+  }, [gatewayOk, isInvoke]);
+
+  // invoke 传输下持续轮询壳内网关状态：启动未就绪与运行中崩溃
+  // 都要翻转显示。状态来自壳命令的新鲜 health 检查，不是缓存。
+  useEffect(() => {
+    if (!isInvoke) {
+      return;
+    }
+    let cancelled = false;
+    let inFlight = false;
+    const poll = async () => {
+      if (inFlight) {
+        return;
+      }
+      inFlight = true;
+      try {
+        const status = await invoke<GatewayStatus>("gateway_status");
+        if (!cancelled) {
+          setGatewayStatus(status);
+          setGatewayOk(status.state === "ready");
+        }
+      } catch {
+        // 壳命令失败时不改写状态，下一轮再试。
+      } finally {
+        inFlight = false;
+      }
+    };
+    void poll();
+    const timer = setInterval(() => void poll(), 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [isInvoke]);
+
+  // 仅自有网关可重启：附着网关会被后端拒绝，故不给按钮。
+  async function restartGateway() {
+    setRestarting(true);
+    setRestartError(null);
+    try {
+      const status = await invoke<GatewayStatus>("gateway_restart");
+      setGatewayStatus(status);
+      setGatewayOk(status.state === "ready");
+    } catch (err) {
+      setRestartError(err instanceof Error ? err.message : typeof err === "string" ? err : "restart failed");
+    } finally {
+      setRestarting(false);
+    }
+  }
 
   async function send() {
     const input = inputRef.current;
@@ -238,8 +305,25 @@ export function App() {
         <div className="status-line">
           <span>
             gateway:{" "}
-            {gatewayOk === null ? "…" : gatewayOk ? "ok" : "unreachable (is mock-gateway running?)"}
+            {isInvoke && gatewayStatus !== null
+              ? gatewayStatus.state === "ready"
+                ? `ok (端口 ${gatewayStatus.port}${gatewayStatus.foreign_port ? "，外来占用" : ""})`
+                : `down${gatewayStatus.error ? `（${gatewayStatus.error}）` : ""}`
+              : gatewayOk === null
+                ? "…"
+                : gatewayOk
+                  ? "ok"
+                  : "unreachable (is mock-gateway running?)"}
           </span>
+          {isInvoke && gatewayStatus !== null && gatewayStatus.state === "down" && gatewayStatus.ownership === "owned" && (
+            <button type="button" onClick={() => void restartGateway()} disabled={restarting}>
+              {restarting ? "重启中…" : "重启网关"}
+            </button>
+          )}
+          {isInvoke && gatewayStatus !== null && gatewayStatus.state === "down" && gatewayStatus.ownership === "attached" && (
+            <span>附着的网关未响应（本应用不管理它）</span>
+          )}
+          {restartError !== null && <span className="error">{restartError}</span>}
           <span>{shell}</span>
           <span>transport: {transport ?? "…"}</span>
         </div>

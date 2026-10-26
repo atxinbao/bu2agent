@@ -11,6 +11,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod gateway_commands;
+mod gateway_endpoint;
+mod gateway_home;
+mod gateway_lifecycle;
 mod tool_commands;
 mod loop_commands;
 
@@ -18,6 +21,7 @@ mod loop_commands;
 mod shell_tests;
 
 use serde::Serialize;
+use tauri::Manager;
 
 #[derive(Serialize)]
 struct AppInfo {
@@ -39,8 +43,27 @@ fn app_info() -> AppInfo {
 }
 
 fn main() {
-    tauri::Builder::default()
-        .manage(loop_commands::LoopTransport::default())
+    // Plugin registration is skipped in test builds: mock_builder
+    // builds several apps in one test process, and plugins do OS-level
+    // registration. The lifecycle setup is skipped there for the same
+    // reason; shell tests use the script-started gateway instead.
+    #[cfg(not(test))]
+    let builder = tauri::Builder::default()
+        // 单实例插件必须先注册，避免第二实例初始化其它插件。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // A second launch hands off to this instance and exits
+            // without reaching setup, so it can never spawn a second
+            // gateway. Just bring the existing window forward.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_shell::init());
+    #[cfg(test)]
+    let builder = tauri::Builder::default();
+    let app = builder
+        .manage(gateway_lifecycle::GatewayLifecycle::default())
         .invoke_handler(tauri::generate_handler![
             ping,
             app_info,
@@ -76,8 +99,22 @@ fn main() {
             loop_commands::loop_start,
             loop_commands::loop_get,
             loop_commands::loop_resume,
-            loop_commands::loop_cancel
+            loop_commands::loop_cancel,
+            gateway_lifecycle::gateway_status,
+            gateway_lifecycle::gateway_restart
         ])
-        .run(tauri::generate_context!())
+        .setup(|_app| {
+            #[cfg(not(test))]
+            gateway_lifecycle::setup(_app.handle());
+            Ok(())
+        })
+        .build(tauri::generate_context!())
         .expect("error while running tauri application");
+    app.run(|handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(lifecycle) = handle.try_state::<gateway_lifecycle::GatewayLifecycle>() {
+                lifecycle.stop_owned();
+            }
+        }
+    });
 }

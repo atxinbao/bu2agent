@@ -1,12 +1,12 @@
 # 打包现状与权限归属验证
 
-日期：2026-10-25；更新：Codex。
+日期：2026-10-25；日用包更新：2026-10-26（正式包自管理网关，见“当前交付”；历史段落保留原结论不追改）。
 
 ## 当前交付
 
 - Tauri 2 窗口与七个视图已实现。run-build.command 先构建 apps/web，再生成 Tauri release 包；本机开发包可用 cargo tauri build --debug --bundles app 构建。
 - run-package.command 仅构建 workspace 的 CLI 与 mock-gateway，不等于完整桌面安装方案。
-- 窗口与网关仍分开启动；run-shell.command 启动本地网关、Vite 与开发窗口。现有 .app 本身不负责安装或管理独立网关。
+- 自第一轮日用包起，正式 .app 自带 sidecar 网关：从 Applications 打开即自动启动包内网关并等待就绪，页头显示状态与端口，崩溃可窗口重启，退出时停止自有网关并清理锁文件（2026-10-26 窗口验收通过，见 .codex/lifecycle-window-validation/report.md）。run-shell.command 仍为开发模式（本地网关、Vite 与开发窗口），与正式包的自管理网关是两条路径。2026-10-25 前为分开启动，属历史记录。
 - OS Keychain、EventKit 提醒事项已有本机验证。签名发行、公证、自动更新、跨机器 Swift 运行库交付未据此宣告完成；独立网关权限归属已由独立实验包端到端验证闭合（见下节），但正式发行包自身验证仍待完成。
 
 ## 已有验证与限制

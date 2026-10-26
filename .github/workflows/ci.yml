@@ -65,6 +65,14 @@ jobs:
       # SERVER_PID the server itself, not cargo).
       - name: Build mock-gateway
         run: cargo build -q -p mock-gateway
+      # The shell build script checks externalBin even for cargo
+      # test, so the sidecar must exist before the tests compile.
+      - name: Place gateway sidecar for shell build
+        run: |
+          cargo build --release -q -p mock-gateway
+          mkdir -p apps/shell/src-tauri/binaries
+          TRIPLE="$(rustc --print host-tuple)"
+          cp target/release/mock-gateway "apps/shell/src-tauri/binaries/mock-gateway-$TRIPLE"
       - name: Start throwaway mock-gateway
         run: |
           FILES_ROOT=$(mktemp -d)

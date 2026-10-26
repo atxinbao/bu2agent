@@ -20,13 +20,11 @@ use agent_desktop::gateway::SubscriptionRecord;
 use agent_desktop::UnifiedError;
 use serde::{Deserialize, Serialize};
 
-/// Mock Gateway only, localhost only. Matches the address the
-/// HTTP client used, so the migration changes the transport,
-/// not the destination.
-const MOCK_BASE_URL: &str = "http://127.0.0.1:3001";
-
+/// Mock Gateway only, localhost only. The address is the shell-wide
+/// endpoint (default 127.0.0.1:3001); the lifecycle step may move it
+/// after port selection, and every command follows.
 fn client() -> Result<ChatClient, String> {
-    ChatClient::new(MOCK_BASE_URL).map_err(err_string)
+    ChatClient::new(&crate::gateway_endpoint::base_url()).map_err(err_string)
 }
 
 fn err_string(error: UnifiedError) -> String {

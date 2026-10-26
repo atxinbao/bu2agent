@@ -27,8 +27,6 @@ use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry};
 use agent_desktop::{ErrorCode, UnifiedError, UserAction};
 
-const MOCK_BASE_URL: &str = "http://127.0.0.1:3001";
-
 fn err_string(error: &UnifiedError) -> String {
     format!("{:?}: {}", error.code, error.redacted_detail)
 }
@@ -81,15 +79,15 @@ impl From<ToolResult> for ToolResultOut {
 }
 
 fn file_client() -> Result<FileGatewayClient, String> {
-    FileGatewayClient::new(MOCK_BASE_URL).map_err(|e| err_string(&e))
+    FileGatewayClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
 }
 
 fn agent_client() -> Result<AgentClient, String> {
-    AgentClient::new(MOCK_BASE_URL).map_err(|e| err_string(&e))
+    AgentClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
 }
 
 fn connector_client() -> Result<ConnectorClient, String> {
-    ConnectorClient::new(MOCK_BASE_URL).map_err(|e| err_string(&e))
+    ConnectorClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
 }
 
 // --- Files (Phase 2 file gateway) ---
@@ -246,7 +244,7 @@ impl From<TaskRecord> for TaskOut {
 }
 
 fn task_client() -> Result<TaskClient, String> {
-    TaskClient::new(MOCK_BASE_URL).map_err(|e| err_string(&e))
+    TaskClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
 }
 
 #[tauri::command]
@@ -318,7 +316,7 @@ impl From<DeviceActionRecord> for DeviceActionOut {
 }
 
 fn device_client() -> Result<DeviceClient, String> {
-    DeviceClient::new(MOCK_BASE_URL).map_err(|e| err_string(&e))
+    DeviceClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
 }
 
 #[tauri::command]

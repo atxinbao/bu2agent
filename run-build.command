@@ -19,6 +19,13 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
+echo "--- 构建网关并放入 sidecar 位置 ---"
+cargo build --release -p mock-gateway
+mkdir -p apps/shell/src-tauri/binaries
+TRIPLE="$(rustc --print host-tuple)"
+cp target/release/mock-gateway "apps/shell/src-tauri/binaries/mock-gateway-$TRIPLE"
+echo "sidecar: apps/shell/src-tauri/binaries/mock-gateway-$TRIPLE"
+
 echo "--- 构建前端 ---"
 cd apps/web
 if [ ! -d node_modules ]; then

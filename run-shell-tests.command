@@ -39,6 +39,14 @@ if ! curl -s -f http://127.0.0.1:3001/health > /dev/null 2>&1; then
   echo "See /tmp/mock-gateway-shell-tests.log."
   exit 1
 fi
+# The shell build script checks externalBin even for cargo test,
+# so the sidecar must exist before the tests compile. Build the
+# release gateway and place it where run-build puts it.
+echo "Building gateway sidecar for the shell build script..."
+cargo build --release -p mock-gateway
+mkdir -p apps/shell/src-tauri/binaries
+TRIPLE="$(rustc --print host-tuple)"
+cp target/release/mock-gateway "apps/shell/src-tauri/binaries/mock-gateway-$TRIPLE"
 echo "Running: cargo test in apps/shell/src-tauri (single-threaded: the tests share one server)"
 (cd apps/shell/src-tauri && cargo test -- --test-threads=1)
 TEST_STATUS=$?
