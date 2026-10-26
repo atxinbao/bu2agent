@@ -170,6 +170,7 @@ struct ApprovalState {
     status: ApprovalStatus,
     binding: Option<ApprovalBinding>,
     consumed: bool,
+    operation_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -291,7 +292,7 @@ impl AppState {
                     Some(status) => {
                         approvals.insert(
                             record.tool_call_id.clone(),
-                            ApprovalState { tool: record.tool.clone(), status, binding: record.binding.clone(), consumed: record.consumed },
+                            ApprovalState { tool: record.tool.clone(), status, binding: record.binding.clone(), consumed: record.consumed, operation_digest: record.operation_digest.clone() },
                         );
                     }
                     None => {
@@ -380,6 +381,7 @@ impl AppState {
             status: ApprovalStatus::Pending,
             binding: Some(binding),
             consumed: false,
+            operation_digest: None,
         };
         let mut approvals = self.approvals.lock().unwrap();
         persist_approval(self, &id, &record)
@@ -612,11 +614,13 @@ struct WriteRequestDto {
     path: String,
     content_base64: String,
     append: Option<bool>,
+    approval_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct DeleteRequestDto {
     path: String,
+    approval_id: Option<String>,
 }
 
 fn resolve_file(root: &Path, rel: &str) -> Result<PathBuf, StatusCode> {
@@ -695,11 +699,23 @@ async fn files_write(
     State(state): State<AppState>,
     Json(req): Json<WriteRequestDto>,
 ) -> impl IntoResponse {
-    let Ok(full) = resolve_file(&state.files_root, &req.path) else {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
-    };
+    // The digest is computed from the normalized path and the decoded
+    // bytes, then the bound approval is consumed before any write.
+    // A bare call without an approval id is a 403, not a write.
     let Ok(data) = base64::engine::general_purpose::STANDARD.decode(&req.content_base64) else {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "invalid base64 content" }))).into_response();
+    };
+    let Some(digest) = crate::operation_binding::write_digest(&req.path, &data, req.append.unwrap_or(false)) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
+    };
+    if let Err(response) = consume_bound_approval(&state, "fs.write", &req.approval_id, &digest) {
+        return *response;
+    }
+    let Some(normalized) = crate::operation_binding::normalize_path(&req.path) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
+    };
+    let Ok(full) = resolve_file(&state.files_root, &normalized) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
     };
     if let Some(parent) = full.parent() {
         if std::fs::create_dir_all(parent).is_err() {
@@ -730,7 +746,17 @@ async fn files_delete(
     State(state): State<AppState>,
     Json(req): Json<DeleteRequestDto>,
 ) -> impl IntoResponse {
-    let Ok(full) = resolve_file(&state.files_root, &req.path) else {
+    // Same bound gate as files_write: no approval id, no delete.
+    let Some(digest) = crate::operation_binding::delete_digest(&req.path) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
+    };
+    if let Err(response) = consume_bound_approval(&state, "fs.delete", &req.approval_id, &digest) {
+        return *response;
+    }
+    let Some(normalized) = crate::operation_binding::normalize_path(&req.path) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
+    };
+    let Ok(full) = resolve_file(&state.files_root, &normalized) else {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
     };
     if full.is_dir() {
@@ -858,6 +884,9 @@ async fn approval_check(Json(req): Json<ApprovalRequest>) -> impl IntoResponse {
 #[derive(Debug, Deserialize)]
 struct ApprovalRequestDto {
     tool: String,
+    path: Option<String>,
+    content_base64: Option<String>,
+    append: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -899,12 +928,47 @@ async fn approval_request(
         })
         .into_response();
     }
+    // File tools must present their full operation so the server can
+    // bind the approval to it; the digest is computed here from the
+    // parameters the client presented, never from a client hash.
+    // Connector tools keep tool-only requests and stay unbound.
+    let operation_digest = match req.tool.as_str() {
+        "fs.write" => {
+            let (Some(path), Some(content_base64)) = (req.path.as_deref(), req.content_base64.as_deref()) else {
+                return bad_request("fs.write approval requires path and content_base64");
+            };
+            let Ok(data) = base64::engine::general_purpose::STANDARD.decode(content_base64) else {
+                return bad_request("invalid base64 content");
+            };
+            match crate::operation_binding::write_digest(path, &data, req.append.unwrap_or(false)) {
+                Some(digest) => Some(digest),
+                None => return bad_request("invalid path"),
+            }
+        }
+        "fs.delete" => {
+            let Some(path) = req.path.as_deref() else {
+                return bad_request("fs.delete approval requires path");
+            };
+            match crate::operation_binding::delete_digest(path) {
+                Some(digest) => Some(digest),
+                None => return bad_request("invalid path"),
+            }
+        }
+        _ => None,
+    };
     let mut next = state.next_approval_id.lock().expect("approval id lock");
     let id = format!("approval-{}", *next);
     *next += 1;
-    let record = ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending, binding: None, consumed: false };
+    let record = ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending, binding: None, consumed: false, operation_digest: operation_digest.clone() };
     let mut approvals = state.approvals.lock().expect("approval lock");
-    if let Err(detail) = persist_approval(&state, &id, &record) { eprintln!("warning: approval persistence failed: {detail}"); }
+    if let Err(detail) = persist_approval(&state, &id, &record) {
+        // Bound records fail closed like loop approvals: an id whose
+        // pending line is not durable must not be issued.
+        if operation_digest.is_some() {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"approval_audit_failed"}))).into_response();
+        }
+        eprintln!("warning: approval persistence failed: {detail}");
+    }
     approvals.insert(id.clone(), record);
     Json(ApprovalRequestResponse {
         tool_call_id: Some(id),
@@ -928,12 +992,16 @@ async fn approval_decide(
     let Some(record) = approvals.get_mut(&req.tool_call_id) else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown tool_call_id" }))).into_response();
     };
-    if record.binding.is_some() && (record.consumed || record.status != ApprovalStatus::Pending || status == ApprovalStatus::Edited) {
+    // Bound records (loop binding or operation digest) fail closed on
+    // decide persistence, exactly like loop approvals already did:
+    // a decision that cannot be audited must not take effect.
+    let bound = record.binding.is_some() || record.operation_digest.is_some();
+    if bound && (record.consumed || record.status != ApprovalStatus::Pending || status == ApprovalStatus::Edited) {
         return (StatusCode::CONFLICT, Json(serde_json::json!({"error":"loop_approval_already_decided_or_invalid"}))).into_response();
     }
     record.status = status;
     if let Err(detail) = persist_approval(&state, &req.tool_call_id, record) {
-        if record.binding.is_some() { record.status = ApprovalStatus::Pending; return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"approval_audit_failed"}))).into_response(); }
+        if bound { record.status = ApprovalStatus::Pending; return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"approval_audit_failed"}))).into_response(); }
         eprintln!("warning: approval persistence failed: {detail}");
     }
     Json(serde_json::json!({ "tool_call_id": req.tool_call_id, "status": req.status })).into_response()
@@ -950,6 +1018,7 @@ fn persist_approval(state: &AppState, tool_call_id: &str, approval: &ApprovalSta
         status: approval_status_name(approval.status).to_string(),
         binding: approval.binding.clone(),
         consumed: approval.consumed,
+        operation_digest: approval.operation_digest.clone(),
     };
     append_record(path, &record)
 }
@@ -995,6 +1064,58 @@ fn check_approval(
     Ok(())
 }
 
+/// Unified execution gate for file writes and deletes: the caller
+/// presents the server-computed digest of the exact operation it is
+/// about to run. Lookup, tool match, status, digest match and
+/// consumption happen under a single lock acquisition, so concurrent
+/// executions of one approval serialize and only the first consumes
+/// it. A persistence failure returns 500 without executing, and the
+/// in-memory consumed flag stays set (fail closed, as in the loop
+/// path). Loop-bound records and legacy unbound records can never
+/// pass this gate.
+fn consume_bound_approval(
+    state: &AppState,
+    tool: &str,
+    tool_call_id: &Option<String>,
+    digest: &str,
+) -> Result<(), Box<axum::response::Response>> {
+    let forbidden = |error: &str| {
+        Box::new(
+            (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": error }))).into_response(),
+        )
+    };
+    let Some(id) = tool_call_id else {
+        return Err(forbidden("approval_required"));
+    };
+    let mut approvals = state.approvals.lock().expect("approval lock");
+    let Some(record) = approvals.get_mut(id) else {
+        return Err(forbidden("approval_required"));
+    };
+    if record.binding.is_some() || record.operation_digest.is_none() {
+        return Err(forbidden("approval_binding_mismatch"));
+    }
+    if record.tool != tool {
+        return Err(forbidden("approval_required"));
+    }
+    if record.status == ApprovalStatus::Rejected {
+        return Err(forbidden("approval_rejected"));
+    }
+    if record.status != ApprovalStatus::Approved {
+        return Err(forbidden("approval_required"));
+    }
+    if record.consumed || record.operation_digest.as_deref() != Some(digest) {
+        return Err(forbidden("approval_binding_mismatch"));
+    }
+    record.consumed = true;
+    if let Err(detail) = persist_approval(state, id, record) {
+        eprintln!("warning: bound approval consumption persistence failed: {detail}");
+        return Err(Box::new(
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "approval_audit_failed" }))).into_response(),
+        ));
+    }
+    Ok(())
+}
+
 async fn agent_tool_call(
     State(state): State<AppState>,
     Json(req): Json<ToolCallDto>,
@@ -1003,6 +1124,40 @@ async fn agent_tool_call(
         return bad_request("unknown tool");
     };
     if requires {
+        // File tools go through the bound gate: the digest is computed
+        // from the very args about to be dispatched, so an approval
+        // for one write can never authorize a different write. Other
+        // approval tools keep the status-only gate (their endpoints
+        // are not file execution paths).
+        let bound = match req.tool.as_str() {
+            "fs.write" => {
+                let (Some(path), Some(text)) = (req.args.get("path"), req.args.get("text")) else {
+                    return bad_request("fs.write requires path and text args");
+                };
+                crate::operation_binding::write_digest(path, text.as_bytes(), false)
+            }
+            "fs.delete" => {
+                let Some(path) = req.args.get("path") else {
+                    return bad_request("fs.delete requires a path arg");
+                };
+                crate::operation_binding::delete_digest(path)
+            }
+            _ => None,
+        };
+        if let Some(digest) = bound {
+            if let Err(response) = consume_bound_approval(&state, &req.tool, &req.tool_call_id, &digest) {
+                return *response;
+            }
+            // Dispatch the normalized path so the executed path is
+            // exactly the path the digest bound.
+            let mut req = req;
+            if let Some(path) = req.args.get("path").cloned() {
+                if let Some(normalized) = crate::operation_binding::normalize_path(&path) {
+                    req.args.insert("path".to_string(), normalized);
+                }
+            }
+            return dispatch_agent_tool(&state, req);
+        }
         if let Err(response) = check_approval(&state, &req.tool, &req.tool_call_id) {
             return *response;
         }

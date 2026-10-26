@@ -413,13 +413,23 @@ async fn fault_is_scoped_to_loop_dispatch_not_public_files_agent_or_chat() {
         "rejected"
     );
     assert!(!h.root.join("out").exists());
+    let raw_approval = h.ok(
+        "/approval/request",
+        json!({"tool":"fs.write","path":"raw","content_base64":"cmF3","append":false}),
+    )
+    .await;
+    h.ok(
+        "/approval/decide",
+        json!({"tool_call_id":raw_approval["tool_call_id"],"status":"approved"}),
+    )
+    .await;
     h.ok(
         "/files/write",
-        json!({"path":"raw","content_base64":"cmF3","append":false}),
+        json!({"path":"raw","content_base64":"cmF3","append":false,"approval_id":raw_approval["tool_call_id"]}),
     )
     .await;
     assert_eq!(std::fs::read_to_string(h.root.join("raw")).unwrap(), "raw");
-    let approval = h.ok("/approval/request", json!({"tool":"fs.write"})).await;
+    let approval = h.ok("/approval/request", json!({"tool":"fs.write","path":"public","content_base64":"cHVibGljIHdyaXRl"})).await;
     h.ok(
         "/approval/decide",
         json!({"tool_call_id":approval["tool_call_id"],"status":"approved"}),

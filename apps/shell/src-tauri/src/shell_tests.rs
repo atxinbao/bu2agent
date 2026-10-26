@@ -218,7 +218,11 @@ fn agent_commands_roundtrip() {
     )
     .expect("read back");
     assert_eq!(read.result, serde_json::json!("from shell"));
-    let request = agent_request_approval("fs.delete".to_string()).expect("request delete");
+    let request = agent_request_approval(
+        "fs.delete".to_string(),
+        Some(args(&[("path", "shell-agent.txt")])),
+    )
+    .expect("request delete");
     assert!(request.requires_approval);
     let id = request.tool_call_id.expect("delete approval id");
     agent_decide_approval(id.clone(), "approve".to_string()).expect("decide approved");
@@ -229,7 +233,7 @@ fn agent_commands_roundtrip() {
     )
     .expect("call delete");
     assert_eq!(deleted.result["deleted"], serde_json::json!(true));
-    let echo_request = agent_request_approval("echo".to_string()).expect("request echo");
+    let echo_request = agent_request_approval("echo".to_string(), None).expect("request echo");
     assert!(!echo_request.requires_approval);
     assert_eq!(echo_request.tool_call_id, None);
 }
@@ -346,7 +350,7 @@ fn task_workflow_invoke_roundtrip() {
         "task_id": id, "status": "draft_ready", "artifact_path": null
     }));
     assert_eq!(draft["status"], "draft_ready");
-    let approval = invoke("agent_request_approval", serde_json::json!({"tool":"fs.write"}));
+    let approval = invoke("agent_request_approval", serde_json::json!({"tool":"fs.write","args":{"path": path, "text": "生成的报告"}}));
     let approval_id = &approval["tool_call_id"];
     invoke("agent_decide_approval", serde_json::json!({
         "tool_call_id": approval_id, "decision": "approve"
@@ -379,7 +383,7 @@ fn device_commands_roundtrip() {
     assert_eq!(action.reminder_id, "reminder-demo");
     assert_eq!(action.target_completed, target);
     let request =
-        agent_request_approval("reminders.set_completed".to_string()).expect("request approval");
+        agent_request_approval("reminders.set_completed".to_string(), None).expect("request approval");
     assert!(request.requires_approval);
     let id = request.tool_call_id.expect("approval id");
     agent_decide_approval(id.clone(), "approve".to_string()).expect("decide approved");
@@ -396,7 +400,7 @@ fn device_commands_roundtrip() {
     let second =
         device_actions_create("reminder-demo".to_string(), !target).expect("create second action");
     let request2 =
-        agent_request_approval("reminders.set_completed".to_string()).expect("request second approval");
+        agent_request_approval("reminders.set_completed".to_string(), None).expect("request second approval");
     let id2 = request2.tool_call_id.expect("second approval id");
     agent_decide_approval(id2.clone(), "reject".to_string()).expect("decide rejected");
     let rejected =
@@ -465,4 +469,200 @@ fn device_workflow_invoke_roundtrip() {
     assert_eq!(rejected["status"], "rejected");
     let list = invoke("device_actions_list", serde_json::json!({}));
     assert!(list.as_array().unwrap().iter().any(|a| a["action_id"] == action_id));
+}
+
+/// Settings working directory through real invoke decoding:
+/// save/load roundtrip, root reset, out-of-root and missing
+/// refusals, and invalid stored values loading as invalid
+/// (never silently reinterpreted). Runs against isolated temp
+/// dirs: BU2AGENT_APP_DATA_DIR and MOCK_FILES_ROOT are swapped
+/// for this test only and restored after (single-threaded run).
+/// Key commands are NOT tested here: they touch the real
+/// Keychain handle, which no test may mutate. The picker
+/// command is NOT tested either: it needs a real dialog and
+/// the dialog plugin is not registered in test builds.
+#[test]
+fn settings_working_dir_invoke_roundtrip() {
+    use crate::gateway_lifecycle::GatewayLifecycle;
+    use crate::settings_commands::*;
+    use serde_json::json;
+    let prev_data = std::env::var("BU2AGENT_APP_DATA_DIR").ok();
+    let prev_root = std::env::var("MOCK_FILES_ROOT").ok();
+    let base = std::env::temp_dir().join(format!("bu2agent-settings-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("files");
+    let data = base.join("data");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    std::env::set_var("BU2AGENT_APP_DATA_DIR", &data);
+    std::env::set_var("MOCK_FILES_ROOT", &root);
+    let app = tauri::test::mock_builder()
+        .manage(GatewayLifecycle::default())
+        .invoke_handler(tauri::generate_handler![
+            settings_get,
+            settings_save_working_dir,
+            settings_clear_working_dir
+        ])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let webview =
+        tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+    let invoke = |cmd: &str, body: serde_json::Value| {
+        tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: cmd.to_string(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "tauri://localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::Json(body),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        )
+        .unwrap_or_else(|e| panic!("{cmd}: {e:?}"))
+        .deserialize::<serde_json::Value>()
+        .unwrap()
+    };
+    let invoke_err = |cmd: &str, body: serde_json::Value| {
+        tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: cmd.to_string(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "tauri://localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::Json(body),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        )
+        .unwrap_err()
+        .to_string()
+    };
+    let got = invoke("settings_get", json!({}));
+    assert_eq!(got["default_working_dir"], serde_json::Value::Null);
+    assert_eq!(got["working_dir_valid"], true);
+    assert_eq!(got["working_dir_editable"], true);
+    let projects = root.join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let saved = invoke(
+        "settings_save_working_dir",
+        json!({"path": projects.to_string_lossy()}),
+    );
+    assert_eq!(saved["default_working_dir"], "projects");
+    assert_eq!(saved["working_dir_valid"], true);
+    assert_eq!(invoke("settings_get", json!({}))["default_working_dir"], "projects");
+    let saved = invoke(
+        "settings_save_working_dir",
+        json!({"path": root.to_string_lossy()}),
+    );
+    assert_eq!(saved["default_working_dir"], serde_json::Value::Null);
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    assert!(invoke_err(
+        "settings_save_working_dir",
+        json!({"path": outside.to_string_lossy()}),
+    )
+    .contains("outside the file root"));
+    assert!(invoke_err(
+        "settings_save_working_dir",
+        json!({"path": base.join("gone").to_string_lossy()}),
+    )
+    .contains("does not exist"));
+    let cleared = invoke("settings_clear_working_dir", json!({}));
+    assert_eq!(cleared["default_working_dir"], serde_json::Value::Null);
+    // Hand-corrupted settings must load as invalid, not as a
+    // silent fallback: missing dir, absolute path, escape.
+    for bad in ["gone", "/absolute", "../escape"] {
+        std::fs::write(
+            data.join("settings.json"),
+            format!("{{\"default_working_dir\":\"{bad}\"}}"),
+        )
+        .unwrap();
+        let got = invoke("settings_get", json!({}));
+        assert_eq!(got["working_dir_valid"], false, "stored: {bad}");
+    }
+    match prev_data {
+        Some(v) => std::env::set_var("BU2AGENT_APP_DATA_DIR", v),
+        None => std::env::remove_var("BU2AGENT_APP_DATA_DIR"),
+    }
+    match prev_root {
+        Some(v) => std::env::set_var("MOCK_FILES_ROOT", v),
+        None => std::env::remove_var("MOCK_FILES_ROOT"),
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A symlink inside the root pointing outside it must be
+/// refused: canonicalization on both sides defeats the escape.
+#[cfg(unix)]
+#[test]
+fn settings_working_dir_symlink_escape_refused() {
+    use crate::gateway_lifecycle::GatewayLifecycle;
+    use crate::settings_commands::*;
+    use serde_json::json;
+    let prev_data = std::env::var("BU2AGENT_APP_DATA_DIR").ok();
+    let prev_root = std::env::var("MOCK_FILES_ROOT").ok();
+    let base = std::env::temp_dir().join(format!("bu2agent-settings-link-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("files");
+    let data = base.join("data");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    std::env::set_var("BU2AGENT_APP_DATA_DIR", &data);
+    std::env::set_var("MOCK_FILES_ROOT", &root);
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+    let app = tauri::test::mock_builder()
+        .manage(GatewayLifecycle::default())
+        .invoke_handler(tauri::generate_handler![settings_save_working_dir])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let webview =
+        tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+    let err = tauri::test::get_ipc_response(
+        &webview,
+        tauri::webview::InvokeRequest {
+            cmd: "settings_save_working_dir".to_string(),
+            callback: tauri::ipc::CallbackFn(0),
+            error: tauri::ipc::CallbackFn(1),
+            url: "tauri://localhost".parse().unwrap(),
+            body: tauri::ipc::InvokeBody::Json(json!({"path": root.join("link").to_string_lossy()})),
+            headers: Default::default(),
+            invoke_key: tauri::test::INVOKE_KEY.to_string(),
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("outside the file root"), "{err}");
+    match prev_data {
+        Some(v) => std::env::set_var("BU2AGENT_APP_DATA_DIR", v),
+        None => std::env::remove_var("BU2AGENT_APP_DATA_DIR"),
+    }
+    match prev_root {
+        Some(v) => std::env::set_var("MOCK_FILES_ROOT", v),
+        None => std::env::remove_var("MOCK_FILES_ROOT"),
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Reminders authorization status through the settings
+/// command, against the script-started gateway. Only the
+/// enum membership is asserted: the value depends on the
+/// backend (Fake here, EventKit in the daily app).
+#[test]
+fn device_authorization_roundtrip() {
+    use crate::settings_commands::device_authorization;
+    crate::gateway_endpoint::reset_base_url();
+    let status = device_authorization().expect("authorization");
+    assert!(
+        ["authorized", "denied", "not_determined"].contains(&status.as_str()),
+        "unexpected status: {status}"
+    );
 }

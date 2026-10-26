@@ -14,6 +14,8 @@ mod gateway_commands;
 mod gateway_endpoint;
 mod gateway_home;
 mod gateway_lifecycle;
+mod settings_commands;
+mod settings_store;
 mod tool_commands;
 mod loop_commands;
 
@@ -59,7 +61,8 @@ fn main() {
                 let _ = window.set_focus();
             }
         }))
-        .plugin(tauri_plugin_shell::init());
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init());
     #[cfg(test)]
     let builder = tauri::Builder::default();
     let app = builder
@@ -101,7 +104,15 @@ fn main() {
             loop_commands::loop_resume,
             loop_commands::loop_cancel,
             gateway_lifecycle::gateway_status,
-            gateway_lifecycle::gateway_restart
+            gateway_lifecycle::gateway_restart,
+            settings_commands::settings_get,
+            settings_commands::settings_pick_directory,
+            settings_commands::settings_save_working_dir,
+            settings_commands::settings_clear_working_dir,
+            settings_commands::settings_key_status,
+            settings_commands::settings_key_save,
+            settings_commands::settings_key_remove,
+            settings_commands::device_authorization
         ])
         .setup(|_app| {
             #[cfg(not(test))]

@@ -52,6 +52,11 @@ struct ActionRefreshRequest {
     action_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AuthorizationStatusDto {
+    status: String,
+}
+
 /// `base_url` must look like `http://127.0.0.1:3001`.
 #[derive(Debug, Clone)]
 pub struct DeviceClient {
@@ -65,6 +70,13 @@ impl DeviceClient {
 
     pub fn list_reminders(&self) -> Result<Vec<DeviceReminder>> {
         self.http.get_json("/devices/reminders/list")
+    }
+
+    /// Current Reminders authorization status, as the gateway
+    /// reports it: "authorized" | "denied" | "not_determined".
+    pub fn authorization(&self) -> Result<String> {
+        let dto: AuthorizationStatusDto = self.http.get_json("/devices/authorization")?;
+        Ok(dto.status)
     }
 
     pub fn create_action(

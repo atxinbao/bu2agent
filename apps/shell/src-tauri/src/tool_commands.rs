@@ -134,10 +134,17 @@ pub fn file_delete(path: String, approved: bool) -> Result<(), String> {
 
 // --- Agent tools (Phase 3 approval loop) ---
 
-#[tauri::command]
-pub fn agent_request_approval(tool: String) -> Result<ApprovalRequestOut, String> {
+/// `args` carries the exact operation for file tools (fs.write:
+/// path + text, fs.delete: path) so the Rust client can request
+/// a bound approval; other tools ignore it. Absent args for a
+/// file tool is a client-side error, not a tool-only request.
+#[tauri::command(rename_all = "snake_case")]
+pub fn agent_request_approval(
+    tool: String,
+    args: Option<HashMap<String, String>>,
+) -> Result<ApprovalRequestOut, String> {
     let request = agent_client()?
-        .request_approval(&tool)
+        .request_approval_for(&tool, args.as_ref())
         .map_err(agent_err_string)?;
     Ok(ApprovalRequestOut {
         tool_call_id: request.tool_call_id,

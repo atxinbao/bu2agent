@@ -125,6 +125,14 @@ impl GatewayLifecycle {
         self.ownership.lock().expect("lifecycle lock poisoned").clone()
     }
 
+    /// Whether this shell is attached to a foreign gateway.
+    /// Settings working-dir edits are refused while attached:
+    /// the foreign gateway's file root is unknown to the shell,
+    /// so no directory can be validated against it.
+    pub(crate) fn is_attached(&self) -> bool {
+        self.ownership() != GatewayOwnership::Ours
+    }
+
     fn port(&self) -> u16 {
         *self.port.lock().expect("lifecycle lock poisoned")
     }

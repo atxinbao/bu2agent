@@ -7,6 +7,8 @@
 //!    executed without a decided approval record.
 //! 2. `POST /approval/request` opens a pending record for
 //!    approval tools (non-approval tools need no record).
+//!    Round 2: file tools present the exact operation in the
+//!    request, so the server binds the record to it.
 //! 3. `POST /approval/decide` records the user's decision.
 //! 4. `POST /agent/tool/call` executes, and the server re-checks
 //!    its own record: a call with no record, a pending record,
@@ -22,6 +24,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::file_client::to_base64;
 use crate::http_client::{gateway_error, transport_error, HttpClient};
 use crate::tools::ToolRegistry;
 use crate::{ErrorCode, Result, UnifiedError, UserAction};
@@ -86,6 +89,12 @@ fn invalid(detail: &str) -> UnifiedError {
 #[derive(Debug, Serialize)]
 struct ApprovalRequestDto {
     tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    append: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,11 +142,12 @@ impl AgentClient {
         self.registry.get(tool).map(|spec| spec.requires_approval)
     }
 
-    pub fn request_approval(&self, tool: &str) -> std::result::Result<ApprovalRequest, AgentError> {
-        let Some(requires) = self.requires_approval(tool) else {
-            return Err(invalid("unknown tool").into());
-        };
-        let body = serde_json::to_string(&ApprovalRequestDto { tool: tool.to_string() })
+    fn post_approval(
+        &self,
+        dto: &ApprovalRequestDto,
+        requires: bool,
+    ) -> std::result::Result<ApprovalRequest, AgentError> {
+        let body = serde_json::to_string(dto)
             .map_err(|_| transport_error("cannot encode approval request"))?;
         let (status, resp_body) = self.http.request("POST", "/approval/request", Some(&body))?;
         if !(200..300).contains(&status) {
@@ -153,6 +163,59 @@ impl AgentClient {
             requires_approval: dto.requires_approval,
             status: dto.status,
         })
+    }
+
+    pub fn request_approval(&self, tool: &str) -> std::result::Result<ApprovalRequest, AgentError> {
+        let Some(requires) = self.requires_approval(tool) else {
+            return Err(invalid("unknown tool").into());
+        };
+        self.post_approval(
+            &ApprovalRequestDto { tool: tool.to_string(), path: None, content_base64: None, append: None },
+            requires,
+        )
+    }
+
+    /// Bound approval request (round 2 unified execution): file
+    /// tools must present the exact operation, so the server can
+    /// bind the record to it. Agent writes are always overwrite
+    /// (the tool call has no append mode), so the request binds
+    /// `append: false`. Other tools fall back to the tool-only
+    /// request; unknown tools are rejected before any request.
+    pub fn request_approval_for(
+        &self,
+        tool: &str,
+        args: Option<&HashMap<String, String>>,
+    ) -> std::result::Result<ApprovalRequest, AgentError> {
+        let Some(requires) = self.requires_approval(tool) else {
+            return Err(invalid("unknown tool").into());
+        };
+        let dto = match tool {
+            "fs.write" => {
+                let args = args.ok_or_else(|| invalid("fs.write approval requires path and text"))?;
+                let path = args.get("path").ok_or_else(|| invalid("fs.write approval requires path"))?;
+                let text = args.get("text").ok_or_else(|| invalid("fs.write approval requires text"))?;
+                ApprovalRequestDto {
+                    tool: tool.to_string(),
+                    path: Some(path.clone()),
+                    content_base64: Some(to_base64(text.as_bytes())),
+                    append: Some(false),
+                }
+            }
+            "fs.delete" => {
+                let args = args.ok_or_else(|| invalid("fs.delete approval requires path"))?;
+                let path = args.get("path").ok_or_else(|| invalid("fs.delete approval requires path"))?;
+                ApprovalRequestDto {
+                    tool: tool.to_string(),
+                    path: Some(path.clone()),
+                    content_base64: None,
+                    append: None,
+                }
+            }
+            _ => {
+                return self.request_approval(tool);
+            }
+        };
+        self.post_approval(&dto, requires)
     }
 
     pub fn decide_approval(
@@ -194,7 +257,10 @@ impl AgentClient {
         .map_err(|_| transport_error("cannot encode tool call"))?;
         let (status, resp_body) = self.http.request("POST", "/agent/tool/call", Some(&body))?;
         if status == 403 {
-            return Err(denied("tool call refused: approval required or rejected").into());
+            // Neutral here: a direct call carries no decision
+            // context, so it must not claim a user rejection.
+            // `run_tool` rewords this by the decision it made.
+            return Err(denied("tool call refused by the server approval gate").into());
         }
         if !(200..300).contains(&status) {
             return Err(gateway_error(status).into());
@@ -222,7 +288,7 @@ impl AgentClient {
         if !requires {
             return self.call_tool(tool, args, None);
         }
-        let request = self.request_approval(tool)?;
+        let request = self.request_approval_for(tool, Some(args))?;
         let Some(tool_call_id) = request.tool_call_id else {
             return Err(transport_error("approval tool returned no tool_call_id").into());
         };
@@ -230,7 +296,24 @@ impl AgentClient {
             ToolDecision::Ask => Err(AgentError::ApprovalPending { tool_call_id }),
             ToolDecision::Approve | ToolDecision::Reject => {
                 self.decide_approval(&tool_call_id, decision)?;
-                self.call_tool(tool, args, Some(&tool_call_id))
+                match self.call_tool(tool, args, Some(&tool_call_id)) {
+                    // The decision is known here, so the 403
+                    // wording can be exact: an approved call
+                    // refused after approval is a mismatch (the
+                    // operation changed, was already used, or
+                    // expired), never a user rejection.
+                    Err(AgentError::Unified(e))
+                        if e.code == ErrorCode::PermissionDenied =>
+                    {
+                        Err(match decision {
+                            ToolDecision::Approve => denied("approved operation does not match this execution (changed, already used, or expired); nothing was executed"),
+                            ToolDecision::Reject => denied("tool call refused: approval was rejected"),
+                            ToolDecision::Ask => unreachable!(),
+                        }
+                        .into())
+                    }
+                    other => other,
+                }
             }
         }
     }

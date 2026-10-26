@@ -1,7 +1,8 @@
 //! Agent invocation smoke tests for the Mock Gateway Axum transport.
 //!
 //! Covers the Phase 3 approval loop on the server side: echo
-//! needs no record, approval tools need an approved record,
+//! needs no record, approval tools need an approved record bound
+//! to the exact operation (round 2 unified execution),
 //! pending/rejected/no-record calls are refused with 403,
 //! unknown tools are refused with 400, and an approved write
 //! actually lands in the file root and reads back.
@@ -57,7 +58,7 @@ async fn agent_approval_loop_over_http() {
     )
     .await;
     assert!(status.contains("403"), "no-record write status: {status}");
-    let (status, body) = post(addr, "/approval/request", "{\"tool\":\"fs.write\"}").await;
+    let (status, body) = post(addr, "/approval/request", "{\"tool\":\"fs.write\",\"path\":\"agent.txt\",\"content_base64\":\"ZnJvbSBhZ2VudA==\"}").await;
     assert!(status.contains("200"), "request status: {status}");
     let request: serde_json::Value = serde_json::from_str(&body).expect("request json");
     let id = request["tool_call_id"].as_str().expect("tool_call_id").to_string();
@@ -71,7 +72,7 @@ async fn agent_approval_loop_over_http() {
     let (status, body) = post(addr, "/agent/tool/call", &call).await;
     assert!(status.contains("403"), "rejected write status: {status}");
     assert!(body.contains("approval_rejected"), "rejected body: {body}");
-    let (status, body) = post(addr, "/approval/request", "{\"tool\":\"fs.write\"}").await;
+    let (status, body) = post(addr, "/approval/request", "{\"tool\":\"fs.write\",\"path\":\"agent.txt\",\"content_base64\":\"ZnJvbSBhZ2VudA==\"}").await;
     assert!(status.contains("200"), "request2 status: {status}");
     let request: serde_json::Value = serde_json::from_str(&body).expect("request2 json");
     let id2 = request["tool_call_id"].as_str().expect("tool_call_id2").to_string();

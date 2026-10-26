@@ -105,7 +105,11 @@ fn scoped_files_scope_approval_chunks_and_max() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// Fake gateway: read returns 401 once then 200; write always 401.
+// Fake gateway: read returns 401 once then 200; the bound
+// approval request and decision succeed, write always 401.
+// (Round 2: an approved write first requests and decides a
+// bound approval, then executes; only the execute is counted
+// as a write, and it is sent exactly once.)
 fn start_fake_gateway() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake gateway");
     let addr = listener.local_addr().expect("fake gateway addr");
@@ -135,6 +139,10 @@ fn start_fake_gateway() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
                 } else {
                     (200, r#"{"path":"demo.txt","offset":0,"content_base64":"aGVsbG8=","eof":true,"total_size":5,"bytes_read":5}"#.to_string())
                 }
+            } else if path.starts_with("/approval/request") {
+                (200, r#"{"tool_call_id":"approval-1","requires_approval":true,"status":"pending"}"#.to_string())
+            } else if path.starts_with("/approval/decide") {
+                (200, r#"{"decided":true}"#.to_string())
             } else if path.starts_with("/files/write") {
                 writes_clone.fetch_add(1, Ordering::SeqCst);
                 (401, r#"{"error":"unauthorized"}"#.to_string())

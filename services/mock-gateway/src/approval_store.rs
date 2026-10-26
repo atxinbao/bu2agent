@@ -31,6 +31,8 @@ pub struct ApprovalFileRecord {
     pub binding: Option<crate::loop_engine::ApprovalBinding>,
     #[serde(default)]
     pub consumed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_digest: Option<String>,
 }
 
 /// Read every well-formed record from `path`, in file order.
@@ -109,6 +111,7 @@ mod tests {
             status: status.to_string(),
             binding: None,
             consumed: false,
+            operation_digest: None,
         }
     }
 

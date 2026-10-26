@@ -21,8 +21,14 @@ function pendingId(err: unknown): string | null {
 // Invoke argument keys are snake_case to match the Rust
 // command parameters exactly.
 export class InvokeAgentClient implements AgentGateway {
-  async requestApproval(tool: string): Promise<ApprovalRequestResponse> {
-    return invoke<ApprovalRequestResponse>("agent_request_approval", { tool });
+  async requestApproval(
+    tool: string,
+    args?: Record<string, string>,
+  ): Promise<ApprovalRequestResponse> {
+    return invoke<ApprovalRequestResponse>("agent_request_approval", {
+      tool,
+      args: args ?? null,
+    });
   }
 
   async decideApproval(toolCallId: string, decision: ToolDecision): Promise<void> {

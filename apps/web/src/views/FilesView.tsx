@@ -4,12 +4,31 @@ import type { FileGateway, GatewayFileEntry } from "../domain/file_client";
 // Files view over the FileGateway interface: the view never
 // knows whether it runs on invoke or on HTTP. Writes and
 // deletes first pass the client-side approval gate (the
-// Phase 2 with_writes_allowed rule); the Mock file endpoints
-// themselves do not re-check approval records, unlike the
-// agent and connector lines. Deletes additionally ask once
-// more, because they are destructive.
-export function FilesView({ client }: { client: FileGateway }) {
-  const [dir, setDir] = useState("");
+// Phase 2 with_writes_allowed rule); since round 2 they also
+// execute under a server-side bound approval, same as the
+// agent line: the client requests an approval for the exact
+// operation, decides it from the window confirmation, and the
+// server consumes it once on execute. Deletes additionally
+// ask once more, because they are destructive.
+// defaultDir is the settings page's default working directory
+// (root-relative, "" = file root). It only sets the initial
+// listing directory; write paths stay root-relative and an
+// explicitly typed path always wins. When defaultDirValid is
+// false the stored default is ignored entirely -- no fallback
+// location is substituted for it -- and the banner below asks
+// for a re-selection. Listing starts at the root either way;
+// listing is a read, and writes here always need an explicit
+// path, so no write can land in a fallback location.
+export function FilesView({
+  client,
+  defaultDir = "",
+  defaultDirValid = true,
+}: {
+  client: FileGateway;
+  defaultDir?: string;
+  defaultDirValid?: boolean;
+}) {
+  const [dir, setDir] = useState(defaultDirValid ? defaultDir : "");
   const [entries, setEntries] = useState<GatewayFileEntry[]>([]);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [selectedText, setSelectedText] = useState("");
@@ -34,7 +53,7 @@ export function FilesView({ client }: { client: FileGateway }) {
   }
 
   useEffect(() => {
-    void refresh("");
+    void refresh(dir);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -113,6 +132,11 @@ export function FilesView({ client }: { client: FileGateway }) {
         refused client-side. Writes and deletes need the switch below, and deletes ask
         once more before they run.
       </p>
+      {!defaultDirValid && (
+        <p className="error">
+          默认工作目录已失效，请到设置页重新选择；失效的默认目录不会用于任何写入。
+        </p>
+      )}
       <div className="row">
         <input
           type="text"

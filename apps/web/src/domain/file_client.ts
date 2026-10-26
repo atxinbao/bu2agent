@@ -187,6 +187,58 @@ export class FileGatewayClient implements FileGateway {
     return new TextDecoder().decode(bytes);
   }
 
+  // Plain POST that reports the status instead of throwing a
+  // generic error, so the approval flow can word a 403 exactly.
+  // Never retried: like the old write path, these are writes.
+  private async postJson(
+    path: string,
+    body: unknown,
+  ): Promise<{ status: number; json: Record<string, unknown> }> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const json = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    return { status: response.status, json };
+  }
+
+  // Request a bound approval for one file operation, then
+  // decide it approved. `approved` means the window already
+  // confirmed; a 403 on execute after approval can only mean
+  // the operation no longer matches the record (changed,
+  // already used, or expired) -- never a user rejection.
+  private async boundApprovalId(
+    tool: string,
+    path: string,
+    contentBase64?: string,
+    append?: boolean,
+  ): Promise<string> {
+    const requestBody: Record<string, unknown> = { tool, path };
+    if (contentBase64 !== undefined) {
+      requestBody.content_base64 = contentBase64;
+    }
+    if (append !== undefined) {
+      requestBody.append = append;
+    }
+    const request = await this.postJson("/approval/request", requestBody);
+    if (request.status !== 200) {
+      throw new Error(`mock gateway returned HTTP ${request.status}`);
+    }
+    const toolCallId = request.json.tool_call_id;
+    if (typeof toolCallId !== "string" || toolCallId === "") {
+      throw new Error("approval tool returned no tool_call_id");
+    }
+    const decision = await this.postJson("/approval/decide", {
+      tool_call_id: toolCallId,
+      status: "approved",
+    });
+    if (decision.status !== 200) {
+      throw new Error(`mock gateway returned HTTP ${decision.status}`);
+    }
+    return toolCallId;
+  }
+
   async write(
     path: string,
     text: string,
@@ -198,21 +250,24 @@ export class FileGatewayClient implements FileGateway {
     }
     checkRelative(path);
     const data = new TextEncoder().encode(text);
-    const result = await this.requestWithRetry<{ size_bytes: number }>(
-      "/files/write",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          path,
-          content_base64: encodeBase64(data),
-          append,
-        }),
-      },
-      undefined,
-      false,
-    );
-    return result.size_bytes;
+    const contentBase64 = encodeBase64(data);
+    const approvalId = await this.boundApprovalId("fs.write", path, contentBase64, append);
+    const result = await this.postJson("/files/write", {
+      path,
+      content_base64: contentBase64,
+      append,
+      approval_id: approvalId,
+    });
+    if (result.status === 403) {
+      throw new Error(
+        "approved file operation does not match this execution (changed, already used, or expired); nothing was written",
+      );
+    }
+    if (result.status !== 200) {
+      throw new Error(`mock gateway returned HTTP ${result.status}`);
+    }
+    const size = result.json.size_bytes;
+    return typeof size === "number" ? size : data.length;
   }
 
   async delete(path: string, approved: boolean): Promise<void> {
@@ -220,15 +275,18 @@ export class FileGatewayClient implements FileGateway {
       throw new Error("file delete requires approval");
     }
     checkRelative(path);
-    await this.requestWithRetry<{ deleted: boolean }>(
-      "/files/delete",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path }),
-      },
-      undefined,
-      false,
-    );
+    const approvalId = await this.boundApprovalId("fs.delete", path);
+    const result = await this.postJson("/files/delete", {
+      path,
+      approval_id: approvalId,
+    });
+    if (result.status === 403) {
+      throw new Error(
+        "approved file operation does not match this execution (changed, already used, or expired); nothing was deleted",
+      );
+    }
+    if (result.status !== 200) {
+      throw new Error(`mock gateway returned HTTP ${result.status}`);
+    }
   }
 }

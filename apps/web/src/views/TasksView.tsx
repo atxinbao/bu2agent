@@ -27,6 +27,16 @@ interface TasksViewProps {
   files: FileGateway;
   agent: AgentGateway;
   tasks: TaskGateway;
+  // Settings page's default working directory (root-relative,
+  // "" = file root). Only the initial directory for a new
+  // task and its default artifact path; an explicitly typed
+  // directory always wins, and existing tasks are untouched.
+  // When defaultDirValid is false the stored default is
+  // ignored entirely: creating a task with no typed directory
+  // is refused instead of falling back to the root, so no
+  // write can land in a location the user never chose.
+  defaultDir?: string;
+  defaultDirValid?: boolean;
 }
 
 function errText(e: unknown): string {
@@ -37,8 +47,15 @@ const CHUNK_LEN = 4096;
 const MAX_FILE_BYTES = 262144;
 const MAX_ARTIFACT_BYTES = 1048576;
 
-export function TasksView({ chat, files, agent, tasks }: TasksViewProps) {
-  const [directory, setDirectory] = useState("");
+export function TasksView({
+  chat,
+  files,
+  agent,
+  tasks,
+  defaultDir = "",
+  defaultDirValid = true,
+}: TasksViewProps) {
+  const [directory, setDirectory] = useState(defaultDirValid ? defaultDir : "");
   const [entries, setEntries] = useState<GatewayFileEntry[]>([]);
   const [taskList, setTaskList] = useState<TaskRecord[]>([]);
   const [current, setCurrent] = useState<TaskRecord | null>(null);
@@ -90,6 +107,14 @@ export function TasksView({ chat, files, agent, tasks }: TasksViewProps) {
   async function handleCreate() {
     setError("");
     setMessage("");
+    if (!defaultDirValid && directory === "") {
+      // No usable default and no explicit directory: refuse
+      // instead of creating the task at the root. The user
+      // either re-selects a default in settings or types a
+      // directory here; either is an explicit choice.
+      setError("默认工作目录已失效，请先到设置页重新选择，或在此填写一个目录。");
+      return;
+    }
     setBusy(true);
     try {
       const task = await tasks.create(directory);
@@ -163,15 +188,14 @@ export function TasksView({ chat, files, agent, tasks }: TasksViewProps) {
     setMessage("");
     setBusy(true);
     try {
-      const request = await agent.requestApproval("fs.write");
-      if (!request.requires_approval || !request.tool_call_id) {
-        throw new Error("fs.write 审批记录未建立，与预期不符");
-      }
-      await agent.decideApproval(request.tool_call_id, "approve");
+      // Round 2: the file client requests a bound approval for
+      // this exact draft, decides it from this click, and
+      // executes under it; a separate tool-only request would
+      // leave an orphan record and no longer passes the server.
       await files.write(artifactPath, draft, true);
       const updated = await tasks.update(current.taskId, "completed", artifactPath);
       setCurrent(updated);
-      setMessage(`已批准（${request.tool_call_id}）并写入 ${artifactPath}，任务完成。`);
+      setMessage(`已批准并写入 ${artifactPath}，任务完成。`);
       await refreshTasks();
     } catch (e) {
       setError(`写入失败：${errText(e)}`);
@@ -189,9 +213,17 @@ export function TasksView({ chat, files, agent, tasks }: TasksViewProps) {
     setMessage("");
     setBusy(true);
     try {
-      const request = await agent.requestApproval("fs.write");
-      if (request.requires_approval && request.tool_call_id) {
-        await agent.decideApproval(request.tool_call_id, "reject");
+      // The rejection is recorded against the exact draft, so
+      // the audit shows what was refused. With no draft there
+      // is nothing to refuse; the task rejection alone stands.
+      if (draft !== "") {
+        const request = await agent.requestApproval("fs.write", {
+          path: artifactPath,
+          text: draft,
+        });
+        if (request.requires_approval && request.tool_call_id) {
+          await agent.decideApproval(request.tool_call_id, "reject");
+        }
       }
       const updated = await tasks.update(current.taskId, "rejected");
       setCurrent(updated);
@@ -254,6 +286,12 @@ export function TasksView({ chat, files, agent, tasks }: TasksViewProps) {
         确定性任务闭环：选目录 → 生成报告草稿 → 审批后写入 → 查看产物。
         无模型 key 时生成步骤返回回显（与聊天线一致），真实报告需要已配置的 key。
       </p>
+      {!defaultDirValid && (
+        <p className="error">
+          默认工作目录已失效，请到设置页重新选择；失效的默认目录不会用于任何写入，
+          新建任务需先重新选择或在此填写目录。
+        </p>
+      )}
       <div>
         <input
           value={directory}

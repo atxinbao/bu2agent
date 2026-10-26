@@ -11,6 +11,12 @@
 //! - Writes and deletes are NEVER retried after a 401: a retry
 //!   could duplicate a write. They return the 401 error at once.
 //!
+//! Round 2 unified execution: writes and deletes execute under
+//! a server-side bound approval. The client requests an approval
+//! carrying the exact operation, decides it from the window's
+//! confirmation, and executes with its id; the server consumes
+//! the record exactly once and refuses any changed replay.
+//!
 //! The Mock Gateway itself never returns 401, so the retry path
 //! is covered by a fake-server test, not by the live Mock --
 //! that limitation is stated, not hidden.
@@ -50,11 +56,38 @@ struct WriteRequest {
     path: String,
     content_base64: String,
     append: bool,
+    approval_id: String,
 }
 
 #[derive(Debug, Serialize)]
 struct DeleteRequest {
     path: String,
+    approval_id: String,
+}
+
+/// Bound approval request (round 2 unified execution): file
+/// tools must present the exact operation so the server can
+/// bind the record to it; `None` fields are omitted.
+#[derive(Debug, Serialize)]
+struct ApprovalRequestDto {
+    tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    append: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApprovalRequestResponse {
+    tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApprovalDecideDto {
+    tool_call_id: String,
+    status: String,
 }
 
 fn denied(detail: &str) -> UnifiedError {
@@ -184,8 +217,58 @@ impl FileGatewayClient {
         Ok(out)
     }
 
+    /// Request a bound approval for one file operation, then
+    /// decide it approved. `approved` means the window already
+    /// confirmed: the record is requested and decided here so
+    /// the server can bind and consume it on execute. A 403 on
+    /// execute after approval can only mean the operation no
+    /// longer matches the record (changed, already used, or
+    /// expired) -- never a user rejection, which would have
+    /// stopped before this point.
+    fn request_bound_approval(
+        &self,
+        tool: &str,
+        path: &str,
+        content: Option<(&[u8], bool)>,
+    ) -> Result<String> {
+        let (content_base64, append) = match content {
+            Some((data, append)) => (Some(to_base64(data)), Some(append)),
+            None => (None, None),
+        };
+        let body = serde_json::to_string(&ApprovalRequestDto {
+            tool: tool.to_string(),
+            path: Some(path.to_string()),
+            content_base64,
+            append,
+        })
+        .map_err(|_| transport_error("cannot encode approval request"))?;
+        let (status, resp_body) = self.http.request("POST", "/approval/request", Some(&body))?;
+        if !(200..300).contains(&status) {
+            return Err(gateway_error(status));
+        }
+        let dto: ApprovalRequestResponse = serde_json::from_str(&resp_body)
+            .map_err(|_| transport_error("mock gateway returned invalid JSON"))?;
+        dto.tool_call_id
+            .ok_or_else(|| transport_error("approval tool returned no tool_call_id"))
+    }
+
+    fn decide_bound_approval(&self, tool_call_id: &str) -> Result<()> {
+        let body = serde_json::to_string(&ApprovalDecideDto {
+            tool_call_id: tool_call_id.to_string(),
+            status: "approved".to_string(),
+        })
+        .map_err(|_| transport_error("cannot encode approval decision"))?;
+        let (status, _) = self.http.request("POST", "/approval/decide", Some(&body))?;
+        if !(200..300).contains(&status) {
+            return Err(gateway_error(status));
+        }
+        Ok(())
+    }
+
     /// Write (overwrite, or append when `append` is true).
-    /// Requires approval and is NEVER retried on 401.
+    /// Requires approval and is NEVER retried on 401. The
+    /// write executes under the bound approval requested and
+    /// decided above; the server consumes it exactly once.
     pub fn write(
         &self,
         path: &str,
@@ -197,13 +280,19 @@ impl FileGatewayClient {
             return Err(denied("file write requires approval"));
         }
         check_relative(path)?;
+        let approval_id = self.request_bound_approval("fs.write", path, Some((data, append)))?;
+        self.decide_bound_approval(&approval_id)?;
         let body = serde_json::to_string(&WriteRequest {
             path: path.to_string(),
             content_base64: to_base64(data),
             append,
+            approval_id,
         })
         .map_err(|_| transport_error("cannot encode file write request"))?;
         let (status, resp_body) = self.http.request("POST", "/files/write", Some(&body))?;
+        if status == 403 {
+            return Err(denied("approved file operation does not match this execution (changed, already used, or expired); nothing was written"));
+        }
         if !(200..300).contains(&status) {
             return Err(gateway_error(status));
         }
@@ -215,15 +304,24 @@ impl FileGatewayClient {
             .unwrap_or(data.len() as u64))
     }
 
-    /// Delete a file. Requires approval and is NEVER retried on 401.
+    /// Delete a file. Requires approval and is NEVER retried on
+    /// 401. Executes under a bound approval, as `write` does.
     pub fn delete(&self, path: &str, approved: bool) -> Result<()> {
         if !approved {
             return Err(denied("file delete requires approval"));
         }
         check_relative(path)?;
-        let body = serde_json::to_string(&DeleteRequest { path: path.to_string() })
-            .map_err(|_| transport_error("cannot encode file delete request"))?;
+        let approval_id = self.request_bound_approval("fs.delete", path, None)?;
+        self.decide_bound_approval(&approval_id)?;
+        let body = serde_json::to_string(&DeleteRequest {
+            path: path.to_string(),
+            approval_id,
+        })
+        .map_err(|_| transport_error("cannot encode file delete request"))?;
         let (status, _) = self.http.request("POST", "/files/delete", Some(&body))?;
+        if status == 403 {
+            return Err(denied("approved file operation does not match this execution (changed, already used, or expired); nothing was deleted"));
+        }
         if !(200..300).contains(&status) {
             return Err(gateway_error(status));
         }

@@ -6,6 +6,8 @@
 //    without a decided approval record.
 // 2. POST /approval/request opens a pending record for
 //    approval tools (non-approval tools need no record).
+//    Round 2: file tools present the exact operation in the
+//    request, so the server binds the record to it.
 // 3. POST /approval/decide records the user's decision.
 // 4. POST /agent/tool/call executes, and the server re-checks
 //    its own record: no record, pending, or rejected records
@@ -39,9 +41,28 @@ export interface ApprovalRequestResponse {
   status: string;
 }
 
+// A 403 from the server approval gate. Deliberately neutral:
+// a direct call carries no decision context, so it must not
+// claim a user rejection. `runTool` rewords it by the
+// decision it made (approved -> mismatch, rejected -> rejected).
+export class ApprovalGateError extends Error {
+  constructor() {
+    super("tool call refused by the server approval gate");
+  }
+}
+
 interface ToolCallResponse {
   tool: string;
   result: unknown;
+}
+
+function encodeBase64(text: string): string {
+  const data = new TextEncoder().encode(text);
+  let binary = "";
+  for (const byte of data) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
 }
 
 function requiresApproval(tool: string): boolean | undefined {
@@ -62,7 +83,7 @@ function requiresApproval(tool: string): boolean | undefined {
 // client below and the invoke client both implement it, so the
 // view never knows which transport it runs on.
 export interface AgentGateway {
-  requestApproval(tool: string): Promise<ApprovalRequestResponse>;
+  requestApproval(tool: string, args?: Record<string, string>): Promise<ApprovalRequestResponse>;
   decideApproval(toolCallId: string, decision: ToolDecision): Promise<void>;
   callTool(tool: string, args: Record<string, string>, toolCallId?: string): Promise<ToolResult>;
   runTool(tool: string, args: Record<string, string>, decision: ToolDecision): Promise<ToolResult>;
@@ -89,7 +110,7 @@ export class AgentClient implements AgentGateway {
       body: JSON.stringify(body),
     });
     if (response.status === 403) {
-      throw new Error("tool call refused: approval required or rejected");
+      throw new ApprovalGateError();
     }
     if (!response.ok) {
       throw new Error(`mock gateway returned HTTP ${response.status}`);
@@ -97,15 +118,32 @@ export class AgentClient implements AgentGateway {
     return (await response.json()) as T;
   }
 
-  async requestApproval(tool: string): Promise<ApprovalRequestResponse> {
+  async requestApproval(
+    tool: string,
+    args?: Record<string, string>,
+  ): Promise<ApprovalRequestResponse> {
     const requires = requiresApproval(tool);
     if (requires === undefined) {
       throw new Error("unknown tool");
     }
-    const response = await this.post<ApprovalRequestResponse>(
-      "/approval/request",
-      { tool },
-    );
+    // Round 2: file tools present the exact operation, so the
+    // server binds the record to it. Agent writes are always
+    // overwrite (the tool call has no append mode).
+    const body: Record<string, unknown> = { tool };
+    if (tool === "fs.write") {
+      if (args?.path === undefined || args?.text === undefined) {
+        throw new Error("fs.write approval requires path and text");
+      }
+      body.path = args.path;
+      body.content_base64 = encodeBase64(args.text);
+      body.append = false;
+    } else if (tool === "fs.delete") {
+      if (args?.path === undefined) {
+        throw new Error("fs.delete approval requires path");
+      }
+      body.path = args.path;
+    }
+    const response = await this.post<ApprovalRequestResponse>("/approval/request", body);
     if (response.requires_approval !== requires) {
       throw new Error("mock gateway disagrees on tool approval flag");
     }
@@ -148,7 +186,7 @@ export class AgentClient implements AgentGateway {
     if (!requires) {
       return this.callTool(tool, args);
     }
-    const request = await this.requestApproval(tool);
+    const request = await this.requestApproval(tool, args);
     if (!request.tool_call_id) {
       throw new Error("approval tool returned no tool_call_id");
     }
@@ -156,6 +194,22 @@ export class AgentClient implements AgentGateway {
       throw new ApprovalPendingError(request.tool_call_id);
     }
     await this.decideApproval(request.tool_call_id, decision);
-    return this.callTool(tool, args, request.tool_call_id);
+    try {
+      return await this.callTool(tool, args, request.tool_call_id);
+    } catch (err) {
+      // The decision is known here, so the 403 wording can be
+      // exact: an approved call refused after approval is a
+      // mismatch (changed, already used, or expired), never a
+      // user rejection.
+      if (err instanceof ApprovalGateError) {
+        if (decision === "approve") {
+          throw new Error(
+            "approved operation does not match this execution (changed, already used, or expired); nothing was executed",
+          );
+        }
+        throw new Error("tool call refused: approval was rejected");
+      }
+      throw err;
+    }
   }
 }

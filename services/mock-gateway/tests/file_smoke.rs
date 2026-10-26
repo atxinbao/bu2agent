@@ -2,9 +2,10 @@
 //!
 //! Covers the Phase 2 file rules on the server side: scoped root,
 //! chunked read with offset/len/base64/EOF, write/append, delete,
-//! and rejection of paths that escape the root. The client-side
-//! rules (approval, 401 retry for reads only) are covered by the
-//! desktop phase2 tests, not here.
+//! and rejection of paths that escape the root. Writes and deletes
+//! require a bound approval (round 2 unified execution): the
+//! approval request carries the exact operation, and execution
+//! consumes it once.
 
 use mock_gateway::server::{app, new_state_with_files_root};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -58,16 +59,30 @@ fn temp_root(name: &str) -> std::path::PathBuf {
     root
 }
 
+/// Request a bound approval for one file operation and approve it.
+async fn approve(addr: std::net::SocketAddr, tool: &str, params: &str) -> String {
+    let (status, body) = post(addr, "/approval/request", &format!("{{\"tool\":\"{tool}\",{params}}}")).await;
+    assert!(status.contains("200"), "request status: {status} body: {body}");
+    let id = serde_json::from_str::<serde_json::Value>(&body).expect("request json")["tool_call_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+    let (status, body) = post(addr, "/approval/decide", &format!("{{\"tool_call_id\":\"{id}\",\"status\":\"approved\"}}")).await;
+    assert!(status.contains("200"), "decide status: {status} body: {body}");
+    id
+}
+
 #[tokio::test]
 async fn file_write_read_list_delete_and_escape() {
     let root = temp_root("smoke");
     let addr = start_server(root.clone()).await;
 
     // Write "hello world" (base64: aGVsbG8gd29ybGQ=).
+    let id = approve(addr, "fs.write", r#""path":"demo.txt","content_base64":"aGVsbG8gd29ybGQ=","append":false"#).await;
     let (status, body) = post(
         addr,
         "/files/write",
-        r#"{"path":"demo.txt","content_base64":"aGVsbG8gd29ybGQ=","append":false}"#,
+        &format!("{{\"path\":\"demo.txt\",\"content_base64\":\"aGVsbG8gd29ybGQ=\",\"append\":false,\"approval_id\":\"{id}\"}}"),
     )
     .await;
     assert!(status.contains("200"), "write status: {status} body: {body}");
@@ -87,10 +102,11 @@ async fn file_write_read_list_delete_and_escape() {
     assert_eq!(chunk["eof"].as_bool(), Some(true));
 
     // Append "!" and list.
+    let id = approve(addr, "fs.write", r#""path":"demo.txt","content_base64":"IQ==","append":true"#).await;
     let (status, _) = post(
         addr,
         "/files/write",
-        r#"{"path":"demo.txt","content_base64":"IQ==","append":true}"#,
+        &format!("{{\"path\":\"demo.txt\",\"content_base64\":\"IQ==\",\"append\":true,\"approval_id\":\"{id}\"}}"),
     )
     .await;
     assert!(status.contains("200"), "append status: {status}");
@@ -113,7 +129,8 @@ async fn file_write_read_list_delete_and_escape() {
     assert!(status.contains("400"), "escape write status: {status}");
 
     // Delete, then list is empty and read is 404.
-    let (status, body) = post(addr, "/files/delete", r#"{"path":"demo.txt"}"#).await;
+    let id = approve(addr, "fs.delete", r#""path":"demo.txt""#).await;
+    let (status, body) = post(addr, "/files/delete", &format!("{{\"path\":\"demo.txt\",\"approval_id\":\"{id}\"}}")).await;
     assert!(status.contains("200"), "delete status: {status} body: {body}");
     let (status, body) = get(addr, "/files/list").await;
     assert!(status.contains("200"), "list2 status: {status}");

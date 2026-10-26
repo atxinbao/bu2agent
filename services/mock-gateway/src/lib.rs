@@ -13,6 +13,7 @@
 //! - unapproved sensitive calls are refused, even if the UI is bypassed
 
 pub mod approval_store;
+pub mod operation_binding;
 pub mod loop_engine;
 pub mod loop_fault;
 pub mod loop_store;

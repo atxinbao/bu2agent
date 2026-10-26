@@ -43,6 +43,11 @@ import { DevicesView } from "./views/DevicesView";
 import { LoopClient, type LoopGateway } from "./domain/loop_client";
 import { InvokeLoopClient } from "./domain/invoke_loop_client";
 import { LoopsView } from "./views/LoopsView";
+import {
+  InvokeSettingsClient,
+  type SettingsData,
+} from "./domain/settings_client";
+import { SettingsView } from "./views/SettingsView";
 
 // Browser-preview fallback: plain HTTP to the Mock Gateway.
 // In a Tauri window the invoke clients below replace them, so
@@ -82,7 +87,7 @@ interface Clients {
   loops: LoopGateway;
 }
 
-type Tab = "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops";
+type Tab = "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "chat", label: "Chat" },
@@ -92,6 +97,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "tasks", label: "Tasks" },
   { id: "devices", label: "Devices" },
   { id: "loops", label: "Loops" },
+  { id: "settings", label: "设置" },
 ];
 
 export function App() {
@@ -104,6 +110,16 @@ export function App() {
   const [restartError, setRestartError] = useState<string | null>(null);
   const [shell, setShell] = useState<string>("checking shell bridge…");
   const [transport, setTransport] = useState<string | null>(null);
+  // Default working directory (root-relative, "" = file root) from
+  // the settings page. Files/Tasks tabs mount fresh on every
+  // switch, so they pick up the latest value as their initial
+  // directory; existing tasks and artifacts are untouched.
+  // When the stored default is invalid, the views get valid=false
+  // and must NOT fall back to the root for writes: an invalid
+  // default is never a usable default, it only asks for a
+  // re-selection (or an explicitly typed path).
+  const [defaultDir, setDefaultDir] = useState<string | null>(null);
+  const [defaultDirValid, setDefaultDirValid] = useState(true);
   const [clients, setClients] = useState<Clients | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -123,9 +139,11 @@ export function App() {
       // shown in the status line, never silent.
       let selected: Clients;
       let transportName: string;
+      let invokeTransport = false;
       try {
         const pong = await invoke<string>("ping");
         const info = await invoke<ShellInfo>("app_info");
+        invokeTransport = true;
         if (!cancelled) {
           setShell(`shell bridge ok: ping=${pong}, ${info.name} ${info.version}`);
           setIsInvoke(true);
@@ -162,6 +180,18 @@ export function App() {
       clientsRef.current = selected;
       setClients(selected);
       setTransport(transportName);
+      if (invokeTransport) {
+        try {
+          const s = await invoke<SettingsData>("settings_get");
+          if (!cancelled) {
+            setDefaultDir(s.default_working_dir);
+            setDefaultDirValid(s.working_dir_valid);
+          }
+        } catch {
+          // Settings stay at the root default; the settings
+          // page itself reports the failure when opened.
+        }
+      }
       const ok = await selected.chat.health();
       if (!cancelled) {
         setGatewayOk(ok);
@@ -263,6 +293,21 @@ export function App() {
     }
   }
 
+  // 保存设置或进入文件/任务页前重新校验，捕获 Finder 改名等外部变化。
+  async function refreshSettings() {
+    if (!isInvoke) {
+      return;
+    }
+    try {
+      const s = await invoke<SettingsData>("settings_get");
+      setDefaultDir(s.default_working_dir);
+      setDefaultDirValid(s.working_dir_valid);
+    } catch {
+      // 无法校验时不把缓存目录当作有效默认值，显式路径仍可使用。
+      setDefaultDirValid(false);
+    }
+  }
+
   async function send() {
     const input = inputRef.current;
     const gateway = clientsRef.current?.chat ?? null;
@@ -334,7 +379,12 @@ export function App() {
             key={entry.id}
             type="button"
             className={tab === entry.id ? "active" : ""}
-            onClick={() => setTab(entry.id)}
+            onClick={async () => {
+              if (entry.id === "files" || entry.id === "tasks") {
+                await refreshSettings();
+              }
+              setTab(entry.id);
+            }}
           >
             {entry.label}
           </button>
@@ -380,7 +430,11 @@ export function App() {
         (clients === null ? (
           <p className="empty">Choosing transport…</p>
         ) : (
-          <FilesView client={clients.files} />
+          <FilesView
+            client={clients.files}
+            defaultDir={defaultDir ?? ""}
+            defaultDirValid={defaultDirValid}
+          />
         ))}
       {tab === "agent" &&
         (clients === null ? (
@@ -403,6 +457,8 @@ export function App() {
             files={clients.files}
             agent={clients.agent}
             tasks={clients.tasks}
+            defaultDir={defaultDir ?? ""}
+            defaultDirValid={defaultDirValid}
           />
         ))}
       {tab === "devices" &&
@@ -412,6 +468,14 @@ export function App() {
           <DevicesView agent={clients.agent} devices={clients.devices} />
         ))}
       {tab === "loops" && clients && <LoopsView loops={clients.loops} agent={clients.agent} />}
+      {tab === "settings" && (
+        <SettingsView
+          settings={new InvokeSettingsClient()}
+          isInvoke={isInvoke}
+          gatewayStatus={gatewayStatus}
+          onSettingsChanged={() => void refreshSettings()}
+        />
+      )}
     </div>
   );
 }
