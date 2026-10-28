@@ -83,6 +83,29 @@ pub fn delete_digest(path_raw: &str) -> Option<String> {
     ))
 }
 
+/// Digest for an idempotent directory creation bound to one path.
+pub fn mkdir_digest(path_raw: &str) -> Option<String> {
+    let path = normalize_path(path_raw)?;
+    let params = BTreeMap::from([("path".to_string(), path)]);
+    Some(sha256_hex(
+        serde_json::to_string(&("fs.mkdir", params))
+            .expect("string map")
+            .as_bytes(),
+    ))
+}
+
+/// Digest for moving an entry between two normalized paths.
+pub fn rename_digest(from_raw: &str, to_raw: &str) -> Option<String> {
+    let from = normalize_path(from_raw)?;
+    let to = normalize_path(to_raw)?;
+    let params = BTreeMap::from([("from".to_string(), from), ("to".to_string(), to)]);
+    Some(sha256_hex(
+        serde_json::to_string(&("fs.rename", params))
+            .expect("string map")
+            .as_bytes(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +144,19 @@ mod tests {
     fn digests_reject_bad_paths() {
         assert_eq!(write_digest("../x", b"hi", false), None);
         assert_eq!(delete_digest("/x"), None);
+        assert_eq!(mkdir_digest("../x"), None);
+        assert_eq!(rename_digest("a", "/x"), None);
+    }
+
+    #[test]
+    fn rename_and_mkdir_digests_are_stable_and_sensitive() {
+        let rename = rename_digest("a/./from.txt", "b/to.txt").expect("digest");
+        assert_eq!(rename_digest("a/from.txt", "b/to.txt").expect("digest"), rename);
+        assert_ne!(rename_digest("a/other.txt", "b/to.txt").expect("digest"), rename);
+        assert_ne!(rename_digest("a/from.txt", "b/other.txt").expect("digest"), rename);
+        let mkdir = mkdir_digest("a/./new").expect("digest");
+        assert_eq!(mkdir_digest("a/new").expect("digest"), mkdir);
+        assert_ne!(mkdir_digest("a/other").expect("digest"), mkdir);
+        assert_ne!(mkdir, delete_digest("a/new").expect("digest"));
     }
 }

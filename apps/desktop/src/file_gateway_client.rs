@@ -35,6 +35,13 @@ pub struct GatewayFileEntry {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayFileStat {
+    pub path: String,
+    pub is_dir: bool,
+    pub size_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileChunk {
     pub data: Vec<u8>,
@@ -65,6 +72,19 @@ struct DeleteRequest {
     approval_id: String,
 }
 
+#[derive(Debug, Serialize)]
+struct RenameRequest {
+    from: String,
+    to: String,
+    approval_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MkdirRequest {
+    path: String,
+    approval_id: String,
+}
+
 /// Bound approval request (round 2 unified execution): file
 /// tools must present the exact operation so the server can
 /// bind the record to it; `None` fields are omitted.
@@ -73,6 +93,8 @@ struct ApprovalRequestDto {
     tool: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content_base64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -165,6 +187,14 @@ impl FileGatewayClient {
         self.get_with_retry(&query, refresh)
     }
 
+    pub fn stat(&self, path: &str) -> Result<GatewayFileStat> {
+        if !path.is_empty() {
+            check_relative(path)?;
+        }
+        let mut refresh = || Ok(());
+        self.get_with_retry(&format!("/files/stat?path={path}"), &mut refresh)
+    }
+
     pub fn read_chunk(
         &self,
         path: &str,
@@ -229,6 +259,7 @@ impl FileGatewayClient {
         &self,
         tool: &str,
         path: &str,
+        to_path: Option<&str>,
         content: Option<(&[u8], bool)>,
     ) -> Result<String> {
         let (content_base64, append) = match content {
@@ -238,6 +269,7 @@ impl FileGatewayClient {
         let body = serde_json::to_string(&ApprovalRequestDto {
             tool: tool.to_string(),
             path: Some(path.to_string()),
+            to_path: to_path.map(str::to_string),
             content_base64,
             append,
         })
@@ -280,7 +312,7 @@ impl FileGatewayClient {
             return Err(denied("file write requires approval"));
         }
         check_relative(path)?;
-        let approval_id = self.request_bound_approval("fs.write", path, Some((data, append)))?;
+        let approval_id = self.request_bound_approval("fs.write", path, None, Some((data, append)))?;
         self.decide_bound_approval(&approval_id)?;
         let body = serde_json::to_string(&WriteRequest {
             path: path.to_string(),
@@ -311,7 +343,7 @@ impl FileGatewayClient {
             return Err(denied("file delete requires approval"));
         }
         check_relative(path)?;
-        let approval_id = self.request_bound_approval("fs.delete", path, None)?;
+        let approval_id = self.request_bound_approval("fs.delete", path, None, None)?;
         self.decide_bound_approval(&approval_id)?;
         let body = serde_json::to_string(&DeleteRequest {
             path: path.to_string(),
@@ -326,5 +358,57 @@ impl FileGatewayClient {
             return Err(gateway_error(status));
         }
         Ok(())
+    }
+
+    pub fn rename(&self, from: &str, to: &str, approved: bool) -> Result<()> {
+        if !approved {
+            return Err(denied("file rename requires approval"));
+        }
+        check_relative(from)?;
+        check_relative(to)?;
+        let approval_id = self.request_bound_approval("fs.rename", from, Some(to), None)?;
+        self.decide_bound_approval(&approval_id)?;
+        let body = serde_json::to_string(&RenameRequest { from: from.to_string(), to: to.to_string(), approval_id })
+            .map_err(|_| transport_error("cannot encode file rename request"))?;
+        let (status, _) = self.http.request("POST", "/files/rename", Some(&body))?;
+        if status == 403 {
+            return Err(denied("approved file operation does not match this execution (changed, already used, or expired); nothing was renamed"));
+        }
+        if status == 409 {
+            return Err(gateway_error_with_detail("rename target already exists; nothing was renamed"));
+        }
+        if !(200..300).contains(&status) {
+            return Err(gateway_error(status));
+        }
+        Ok(())
+    }
+
+    pub fn mkdir(&self, path: &str, approved: bool) -> Result<()> {
+        if !approved {
+            return Err(denied("file mkdir requires approval"));
+        }
+        check_relative(path)?;
+        let approval_id = self.request_bound_approval("fs.mkdir", path, None, None)?;
+        self.decide_bound_approval(&approval_id)?;
+        let body = serde_json::to_string(&MkdirRequest { path: path.to_string(), approval_id })
+            .map_err(|_| transport_error("cannot encode file mkdir request"))?;
+        let (status, _) = self.http.request("POST", "/files/mkdir", Some(&body))?;
+        if status == 403 {
+            return Err(denied("approved file operation does not match this execution (changed, already used, or expired); directory was not created"));
+        }
+        if !(200..300).contains(&status) {
+            return Err(gateway_error(status));
+        }
+        Ok(())
+    }
+}
+
+fn gateway_error_with_detail(detail: &str) -> UnifiedError {
+    UnifiedError {
+        code: ErrorCode::Gateway,
+        capability: Some("gateway".to_string()),
+        retryable: false,
+        user_action: UserAction::Retry,
+        redacted_detail: detail.to_string(),
     }
 }

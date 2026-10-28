@@ -22,6 +22,9 @@
 //! - GET  /files/read            -> chunked read (offset/len, base64, EOF)
 //! - POST /files/write           -> write/append a file in the root
 //! - POST /files/delete          -> delete a file in the root
+//! - GET  /files/stat            -> stat a file or directory
+//! - POST /files/rename          -> move a file or directory
+//! - POST /files/mkdir           -> create a directory
 //! - POST /approval/request      -> open a pending approval record (approval tools)
 //! - POST /approval/decide       -> decide an approval record (approved/rejected/edited)
 //! - POST /agent/tool/call       -> execute a tool, server re-checks its own approval record
@@ -790,6 +793,26 @@ struct DeleteRequestDto {
     approval_id: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct FileStatDto {
+    path: String,
+    is_dir: bool,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RenameRequestDto {
+    from: String,
+    to: String,
+    approval_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MkdirRequestDto {
+    path: String,
+    approval_id: Option<String>,
+}
+
 pub(crate) fn resolve_file(root: &Path, rel: &str) -> Result<PathBuf, StatusCode> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
@@ -860,6 +883,24 @@ async fn files_read(
         bytes_read: chunk.len() as u64,
     })
     .into_response()
+}
+
+async fn files_stat(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> impl IntoResponse {
+    let rel = query.path.unwrap_or_default();
+    let Ok(full) = resolve_file(&state.files_root, &rel) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
+    };
+    let Ok(metadata) = std::fs::metadata(&full) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "file not found" }))).into_response();
+    };
+    Json(FileStatDto {
+        path: rel,
+        is_dir: metadata.is_dir(),
+        size_bytes: if metadata.is_dir() { 0 } else { metadata.len() },
+    }).into_response()
 }
 
 async fn files_write(
@@ -935,6 +976,64 @@ async fn files_delete(
             (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "file not found" }))).into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot delete file" }))).into_response(),
+    }
+}
+
+async fn files_rename(
+    State(state): State<AppState>,
+    Json(req): Json<RenameRequestDto>,
+) -> impl IntoResponse {
+    let Some(digest) = crate::operation_binding::rename_digest(&req.from, &req.to) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
+    };
+    let Ok(from) = resolve_file(&state.files_root, &req.from) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
+    };
+    let Ok(to) = resolve_file(&state.files_root, &req.to) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
+    };
+    if req.approval_id.is_none() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "bound approval required" }))).into_response();
+    }
+    if to.exists() {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "rename target already exists" }))).into_response();
+    }
+    if let Err(response) = consume_bound_approval(&state, "fs.rename", &req.approval_id, &digest) {
+        return *response;
+    }
+    if !from.exists() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "source file not found" }))).into_response();
+    }
+    if let Some(parent) = to.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot create parent directory" }))).into_response();
+        }
+    }
+    match std::fs::rename(&from, &to) {
+        Ok(()) => Json(serde_json::json!({ "from": req.from, "to": req.to })).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot rename file" }))).into_response(),
+    }
+}
+
+async fn files_mkdir(
+    State(state): State<AppState>,
+    Json(req): Json<MkdirRequestDto>,
+) -> impl IntoResponse {
+    let Some(digest) = crate::operation_binding::mkdir_digest(&req.path) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
+    };
+    if let Err(response) = consume_bound_approval(&state, "fs.mkdir", &req.approval_id, &digest) {
+        return *response;
+    }
+    let Some(normalized) = crate::operation_binding::normalize_path(&req.path) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
+    };
+    let Ok(full) = resolve_file(&state.files_root, &normalized) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
+    };
+    match std::fs::create_dir_all(&full) {
+        Ok(()) => Json(serde_json::json!({ "path": normalized })).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot create directory" }))).into_response(),
     }
 }
 
@@ -1052,6 +1151,7 @@ async fn approval_check(Json(req): Json<ApprovalRequest>) -> impl IntoResponse {
 struct ApprovalRequestDto {
     tool: String,
     path: Option<String>,
+    to_path: Option<String>,
     content_base64: Option<String>,
     append: Option<bool>,
 }
@@ -1117,6 +1217,24 @@ async fn approval_request(
                 return bad_request("fs.delete approval requires path");
             };
             match crate::operation_binding::delete_digest(path) {
+                Some(digest) => Some(digest),
+                None => return bad_request("invalid path"),
+            }
+        }
+        "fs.rename" => {
+            let (Some(from), Some(to)) = (req.path.as_deref(), req.to_path.as_deref()) else {
+                return bad_request("fs.rename approval requires path and to_path");
+            };
+            match crate::operation_binding::rename_digest(from, to) {
+                Some(digest) => Some(digest),
+                None => return bad_request("invalid path"),
+            }
+        }
+        "fs.mkdir" => {
+            let Some(path) = req.path.as_deref() else {
+                return bad_request("fs.mkdir approval requires path");
+            };
+            match crate::operation_binding::mkdir_digest(path) {
                 Some(digest) => Some(digest),
                 None => return bad_request("invalid path"),
             }
@@ -2594,8 +2712,11 @@ pub fn app(state: AppState) -> Router {
         .route("/approval/check", post(approval_check))
         .route("/files/list", get(files_list))
         .route("/files/read", get(files_read))
+        .route("/files/stat", get(files_stat))
         .route("/files/write", post(files_write))
         .route("/files/delete", post(files_delete))
+        .route("/files/rename", post(files_rename))
+        .route("/files/mkdir", post(files_mkdir))
         .route("/approval/request", post(approval_request))
         .route("/approval/decide", post(approval_decide))
         .route("/agent/tool/call", post(agent_tool_call))

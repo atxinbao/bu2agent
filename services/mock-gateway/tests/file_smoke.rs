@@ -140,3 +140,43 @@ async fn file_write_read_list_delete_and_escape() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[tokio::test]
+async fn file_stat_mkdir_and_rename_use_bound_approvals() {
+    let root = temp_root("stat-rename-mkdir");
+    let addr = start_server(root.clone()).await;
+    let (status, body) = get(addr, "/files/stat?path=").await;
+    assert!(status.contains("200"), "root stat: {status} {body}");
+    let stat: serde_json::Value = serde_json::from_str(&body).expect("root stat json");
+    assert_eq!(stat["is_dir"].as_bool(), Some(true));
+    let (status, _) = post(addr, "/files/mkdir", r#"{"path":"docs"}"#).await;
+    assert!(status.contains("403"), "bare mkdir: {status}");
+    let id = approve(addr, "fs.mkdir", r#""path":"docs""#).await;
+    let (status, _) = post(addr, "/files/mkdir", &format!(r#"{{"path":"docs","approval_id":"{id}"}}"#)).await;
+    assert!(status.contains("200"), "mkdir: {status}");
+    let id = approve(addr, "fs.mkdir", r#""path":"docs""#).await;
+    let (status, _) = post(addr, "/files/mkdir", &format!(r#"{{"path":"docs","approval_id":"{id}"}}"#)).await;
+    assert!(status.contains("200"), "idempotent mkdir: {status}");
+    let id = approve(addr, "fs.write", r#""path":"docs/old.txt","content_base64":"aGVsbG8=","append":false"#).await;
+    let (status, _) = post(addr, "/files/write", &format!(r#"{{"path":"docs/old.txt","content_base64":"aGVsbG8=","append":false,"approval_id":"{id}"}}"#)).await;
+    assert!(status.contains("200"), "seed write: {status}");
+    let (status, body) = get(addr, "/files/stat?path=docs/old.txt").await;
+    assert!(status.contains("200"), "file stat: {status} {body}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["size_bytes"].as_u64(), Some(5));
+    let (status, _) = post(addr, "/files/rename", r#"{"from":"docs/old.txt","to":"docs/new.txt"}"#).await;
+    assert!(status.contains("403"), "bare rename: {status}");
+    let id = approve(addr, "fs.rename", r#""path":"docs/old.txt","to_path":"docs/new.txt""#).await;
+    let (status, _) = post(addr, "/files/rename", &format!(r#"{{"from":"docs/old.txt","to":"docs/new.txt","approval_id":"{id}"}}"#)).await;
+    assert!(status.contains("200"), "rename: {status}");
+    let (status, _) = get(addr, "/files/stat?path=docs/old.txt").await;
+    assert!(status.contains("404"), "old path: {status}");
+    let (status, body) = get(addr, "/files/read?path=docs/new.txt").await;
+    assert!(status.contains("200"), "new path: {status} {body}");
+    let id = approve(addr, "fs.write", r#""path":"docs/existing.txt","content_base64":"eA==","append":false"#).await;
+    let (status, _) = post(addr, "/files/write", &format!(r#"{{"path":"docs/existing.txt","content_base64":"eA==","append":false,"approval_id":"{id}"}}"#)).await;
+    assert!(status.contains("200"), "existing seed: {status}");
+    let id = approve(addr, "fs.rename", r#""path":"docs/new.txt","to_path":"docs/existing.txt""#).await;
+    let (status, _) = post(addr, "/files/rename", &format!(r#"{{"from":"docs/new.txt","to":"docs/existing.txt","approval_id":"{id}"}}"#)).await;
+    assert!(status.contains("409"), "existing target must reject: {status}");
+    let _ = std::fs::remove_dir_all(&root);
+}

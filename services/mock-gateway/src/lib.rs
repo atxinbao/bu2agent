@@ -85,7 +85,7 @@ pub fn start_stream(stream_id: &str, turn_id: &str, text: &str) -> Vec<Subscript
 pub fn tool_requires_approval(name: &str) -> Option<bool> {
     match name {
         "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" => Some(false),
-        "fs.write" | "fs.delete" | "notes.create" | "mail.send" | "reminders.set_completed" => Some(true),
+        "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "notes.create" | "mail.send" | "reminders.set_completed" => Some(true),
         _ => None,
     }
 }
@@ -199,6 +199,8 @@ mod tests {
         assert_eq!(tool_requires_approval("fs.read"), Some(false));
         assert_eq!(tool_requires_approval("fs.write"), Some(true));
         assert_eq!(tool_requires_approval("fs.delete"), Some(true));
+        assert_eq!(tool_requires_approval("fs.rename"), Some(true));
+        assert_eq!(tool_requires_approval("fs.mkdir"), Some(true));
         assert_eq!(tool_requires_approval("echo"), Some(false));
         assert_eq!(tool_requires_approval("notes.list"), Some(false));
         assert_eq!(tool_requires_approval("mail.list"), Some(false));
