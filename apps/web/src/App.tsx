@@ -93,9 +93,12 @@ interface Clients {
 
 type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "settings";
 
+// Visible navigation: the workbench (sessions) is the only
+// chat entry and the default view (R1, 2026-10-28). The legacy
+// Chat tab is not listed here; its code and the /chat/* gateway
+// interface stay as a compatibility layer only.
 const TABS: { id: Tab; label: string }[] = [
   { id: "workbench", label: "工作台" },
-  { id: "chat", label: "Chat" },
   { id: "files", label: "Files" },
   { id: "agent", label: "Agent" },
   { id: "connectors", label: "Connectors" },
@@ -106,7 +109,7 @@ const TABS: { id: Tab; label: string }[] = [
 ];
 
 export function App() {
-  const [tab, setTab] = useState<Tab>("chat");
+  const [tab, setTab] = useState<Tab>("workbench");
   const [chat, setChat] = useState<ChatState>(initialChatState);
   const [gatewayOk, setGatewayOk] = useState<boolean | null>(null);
   const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus | null>(null);

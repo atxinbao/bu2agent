@@ -13,8 +13,14 @@ import type { TaskDraft, TaskGateway, TaskRecord } from "../domain/task_client";
 // the middle, an on-demand file preview on the right. Navigation
 // only: selecting an item never approves or resumes anything,
 // and each kind keeps its own state machine (sessions, the
-// deterministic task flow, the model loop). The old tabs stay;
-// this view is additive navigation, not a replacement.
+// deterministic task flow, the model loop).
+//
+// Since the R1 decision (2026-10-28) this view is the product's
+// only chat entry and the default landing view: sessions here
+// are the main chat (multi-turn context, local JSONL
+// persistence, recovery after restart). The legacy Chat tab
+// was removed from the visible navigation; its code and the
+// /chat/* interface remain as a compatibility layer only.
 //
 // Depth, stated honestly: sessions are full here (history +
 // input + delete). Tasks show their record; gateway-run drafts
@@ -487,7 +493,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
     <section className="view workbench-view">
       <h2>工作台</h2>
       <p className="note">
-        左侧是会话与任务列表，中间是交流与执行时间线，右侧按需预览文件或产物。切换项目不批准、不续跑任何内容。
+        这里是主聊天入口：会话支持多轮上下文，记录保存在本地、重启后恢复。左侧是会话与任务列表，中间是交流与执行时间线，右侧按需预览文件或产物。切换项目不批准、不续跑任何内容。
       </p>
       <div className="workbench">
         <div className="workbench-list">
