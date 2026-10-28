@@ -38,11 +38,13 @@ pub fn set_base_url(url: &str) {
 }
 
 /// Restore the default gateway base URL.
+#[cfg(test)]
 pub fn reset_base_url() {
     set_base_url(DEFAULT_BASE_URL);
 }
 
 /// The default gateway base URL, for tests and status text.
+#[cfg(test)]
 pub fn default_base_url() -> &'static str {
     DEFAULT_BASE_URL
 }

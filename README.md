@@ -2,15 +2,16 @@
 
 [![CI](https://github.com/atxinbao/bu2agent/actions/workflows/ci.yml/badge.svg)](https://github.com/atxinbao/bu2agent/actions/workflows/ci.yml)
 
-## 当前能力与边界（2026-10-25，Codex 更新）
+## 当前能力与边界（2026-10-28，Codex 更新）
 
 下文编号章节保留阶段推进历史；其中“未实现”“待跑”等描述是当时状态，当前以本节及所链接的专项文档为准。
 
 - 本地单机、单用户：Tauri 2 窗口与网关运行在同一台 Mac，默认网关地址为 `127.0.0.1:3001`。尚未交付局域网访问、外部鉴权、OAuth、多用户或 Noise。回环监听限制网络入口，不意味着本机其它进程不能访问。
-- 已有 Chat / Files / Agent / Connectors / Tasks / Devices / Loops 七个视图。窗口使用 Rust invoke；浏览器开发预览使用 HTTP。连接器演示不能等同于真实邮件或 OAuth 接入。
+- 已有 Workbench / Files / Agent / Connectors / Tasks / Devices / Loops 七个可见入口；Workbench 是唯一聊天入口，旧 Chat 代码仅保留兼容层。窗口使用 Rust invoke；浏览器开发预览使用 HTTP。连接器演示不能等同于真实邮件或 OAuth 接入。
 - 任务闭环已验收：读取材料、生成草稿、审批写入、查看产物，普通停服重启后任务和产物恢复。
 - B 层已验收 Fake 与 EventKit 提醒事项闭环；只验证过专用提醒的显式完成状态修改，不代表任意设备均已接通。见 [设备契约与验收](services/mock-gateway/DEVICES.md)。
-- 模型循环已验收真实 DeepSeek 成功/拒绝/取消/重启，以及假模型驱动的 unknown、重复未知写、工具在途取消；只开放文件列目录、读取、写入。见 [循环协议](services/mock-gateway/LOOP.md)。
+- 模型循环已验收真实 DeepSeek 成功/拒绝/取消/重启，以及假模型驱动的 unknown、重复未知写、工具在途取消；文件工具支持列目录、读取、写入，提醒事项支持列出与经审批设定完成状态。见 [循环协议](services/mock-gateway/LOOP.md)。
+- Files 工作台已接通 `stat`、`rename`、`mkdir`；rename 目标已存在会返回冲突并保留源、目标文件，mkdir 对已有目录保持幂等。三项暂不暴露给 Loops 或 Agent。
 - 凭据支持 OS Keychain，审批、任务、设备动作、循环审计使用各自 JSONL。循环审计不存提示、读写正文或最终回答；不承诺断电耐久。
 - 有本地 Tauri `.app`/安装包构建入口，但独立网关未作为完整日常安装方案交付；TCC 权限归属已由独立实验包端到端验证闭合（见设备契约），Swift 运行库分发、签名与公证、升级授权延续、安装与生命周期仍需独立核验。见 [打包现状与验证](packaging/README.md)。
 
@@ -86,7 +87,7 @@ bu2agent/
     cross-platform/         # 三系统构建与冒烟
 ```
 
-当前状态：`apps/desktop/` 与 `apps/web/` 尚未开工；`packages/contract/schemas/` 与示例 fixture 已落骨架。不要把骨架当作已实现。
+当前状态：`apps/desktop/`、`apps/shell/`、`apps/web/` 与 `services/mock-gateway/` 已承载首期主线；`packages/contract/schemas/` 与部分早期模块仍保留骨架，不能把未接线骨架当作已实现。
 
 ## 6. 开发阶段
 
@@ -104,11 +105,11 @@ bu2agent/
 - 桥就绪、连接状态、致命错误上报可用；桥版本不匹配时启动即明确报错。
 - 聊天、文件、审批三条主线在 macOS / Linux / Windows 上都跑通，只在某一系统上通过不算完成。
 - 失败矩阵全覆盖：断线、取消、超时、401、权限拒绝、审批拒绝、旧 generation、目标切换。
-- 反验收：只有前端动画、Mock 永远成功、取消只关 spinner、旧会话结果混入新会话、权限拒绝显示成功、日志或 fixture 含 secret、把 337 条静态路由当作已对接接口数，一律不算通过。
+- 反验收：只有前端动画、Mock 永远成功、取消只关 spinner、旧会话结果混入新会话、权限拒绝显示成功、日志或 fixture 含 secret、把 Muse 静态路由数（规格旧基线 337；2026-10-28 当前安装包实测 350）当作已对接接口数，一律不算通过。
 
 ## 8. 证据边界与未知项
 
-基线文档的结论分观察、推断、未知三档。337 条路由来自静态 route spec，请求体、响应模型、鉴权细节、服务端状态机、Noise 握手、真实 Tool 参数 schema 等仍属未知。没有受控运行时证据时，保持“未知”，不在代码注释或文档里写成已确认；有证据时，更新本文件与契约测试。
+基线文档的结论分观察、推断、未知三档。337 条是规格旧基线，当前安装包按同一提取方法得到 350 条（2026-10-28）；请求体、响应模型、鉴权细节、服务端状态机、Noise 握手、真实 Tool 参数 schema 等仍属未知。没有受控运行时证据时，保持“未知”，不在代码注释或文档里写成已确认；有证据时，更新本文件与契约测试。
 
 ## 9. 待确认（不阻塞 Phase 0–1）
 
