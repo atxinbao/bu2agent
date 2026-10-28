@@ -42,6 +42,21 @@ pub struct GatewayFileStat {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayBatchReadItem { pub path: String, pub offset: Option<u64>, pub len: Option<u64> }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayBatchReadResult { pub path: String, pub ok: bool, pub result: Option<ReadResponseDto>, pub error: Option<String> }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayBatchStatResult { pub path: String, pub ok: bool, pub stat: Option<GatewayFileStat>, pub error: Option<String> }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewaySearchResult { pub entries: Vec<GatewayFileEntry>, pub truncated: bool }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayThumbnail { pub path: String, pub content_type: String, pub content_base64: String }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayLibraryItem { pub path: String, pub kind: String, pub is_dir: bool, pub size_bytes: u64, pub modified_ms: u128 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayLibraryResult { pub items: Vec<GatewayLibraryItem>, pub truncated: bool }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileChunk {
     pub data: Vec<u8>,
@@ -50,8 +65,8 @@ pub struct FileChunk {
     pub bytes_read: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct ReadResponseDto {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadResponseDto {
     content_base64: String,
     eof: bool,
     total_size: u64,
@@ -400,6 +415,55 @@ impl FileGatewayClient {
             return Err(gateway_error(status));
         }
         Ok(())
+    }
+
+    fn post_json<T: serde::de::DeserializeOwned>(&self, path: &str, body: &str) -> Result<T> {
+        let (status, response) = self.http.request("POST", path, Some(body))?;
+        if !(200..300).contains(&status) { return Err(gateway_error(status)); }
+        serde_json::from_str(&response).map_err(|_| transport_error("mock gateway returned invalid JSON"))
+    }
+
+    pub fn reads(&self, items: &[GatewayBatchReadItem]) -> Result<Vec<GatewayBatchReadResult>> {
+        if items.len() > 128 { return Err(transport_error("too many read items")); }
+        let body = serde_json::to_string(&serde_json::json!({"items": items})).map_err(|_| transport_error("cannot encode batch read"))?;
+        #[derive(Deserialize)] struct Response { items: Vec<GatewayBatchReadResult> }
+        Ok(self.post_json::<Response>("/files/reads", &body)?.items)
+    }
+    pub fn stats(&self, paths: &[String]) -> Result<Vec<GatewayBatchStatResult>> {
+        let body = serde_json::to_string(&serde_json::json!({"paths": paths})).map_err(|_| transport_error("cannot encode batch stat"))?;
+        #[derive(Deserialize)] struct Response { items: Vec<GatewayBatchStatResult> }
+        Ok(self.post_json::<Response>("/files/stats", &body)?.items)
+    }
+    pub fn search(&self, query: &str, start_path: &str) -> Result<GatewaySearchResult> {
+        if !start_path.is_empty() { check_relative(start_path)?; }
+        let body = serde_json::to_string(&serde_json::json!({"query": query, "start_path": start_path})).map_err(|_| transport_error("cannot encode search"))?;
+        self.post_json("/files/search", &body)
+    }
+    pub fn subscribe(&self, path: &str, cursor: Option<&str>, wait_ms: u64) -> Result<serde_json::Value> {
+        if !path.is_empty() { check_relative(path)?; }
+        let body = serde_json::to_string(&serde_json::json!({"path": path, "cursor": cursor, "wait_ms": wait_ms})).map_err(|_| transport_error("cannot encode subscribe"))?;
+        self.post_json("/files/subscribe", &body)
+    }
+    pub fn thumbnail(&self, path: &str, width: u32) -> Result<GatewayThumbnail> {
+        check_relative(path)?;
+        self.get_with_retry(&format!("/files/thumbnail?path={path}&w={width}&format=json"), &mut || Ok(()))
+    }
+    pub fn library(&self, kinds: &[String], limit: usize) -> Result<GatewayLibraryResult> {
+        let body = serde_json::to_string(&serde_json::json!({"kinds": kinds, "limit": limit})).map_err(|_| transport_error("cannot encode library"))?;
+        self.post_json("/files/library", &body)
+    }
+    pub fn export(&self, from: &str, to: &str, approved: bool) -> Result<u64> {
+        if !approved { return Err(denied("file export requires approval")); }
+        check_relative(from)?;
+        if !to.starts_with('/') { return Err(transport_error("export target must be an absolute path outside the file root")); }
+        let approval_id = self.request_bound_approval("fs.export", from, Some(to), None)?;
+        self.decide_bound_approval(&approval_id)?;
+        let body = serde_json::to_string(&serde_json::json!({"from": from, "to": to, "approval_id": approval_id})).map_err(|_| transport_error("cannot encode export"))?;
+        let (status, response) = self.http.request("POST", "/files/export", Some(&body))?;
+        if status == 403 { return Err(denied("approved file operation does not match this execution (changed, already used, or expired); nothing was exported")); }
+        if status == 409 { return Err(gateway_error_with_detail("export target already exists; nothing was exported")); }
+        if !(200..300).contains(&status) { return Err(gateway_error(status)); }
+        Ok(serde_json::from_str::<serde_json::Value>(&response).ok().and_then(|v| v.get("size_bytes").and_then(|n| n.as_u64())).unwrap_or(0))
     }
 }
 

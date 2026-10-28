@@ -106,6 +106,22 @@ pub fn rename_digest(from_raw: &str, to_raw: &str) -> Option<String> {
     ))
 }
 
+/// Digest for exporting a root file to one explicit absolute destination.
+pub fn export_digest(from_raw: &str, to_raw: &str) -> Option<String> {
+    let from = normalize_path(from_raw)?;
+    let to = Path::new(to_raw);
+    if !to.is_absolute() || to.to_string_lossy().len() > 4096 {
+        return None;
+    }
+    let params = BTreeMap::from([
+        ("from".to_string(), from),
+        ("to".to_string(), to.to_string_lossy().into_owned()),
+    ]);
+    Some(sha256_hex(
+        serde_json::to_string(&("fs.export", params)).expect("string map").as_bytes(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +174,10 @@ mod tests {
         assert_eq!(mkdir_digest("a/new").expect("digest"), mkdir);
         assert_ne!(mkdir_digest("a/other").expect("digest"), mkdir);
         assert_ne!(mkdir, delete_digest("a/new").expect("digest"));
+        let export = export_digest("a/file.txt", "/tmp/out.txt").expect("digest");
+        assert_eq!(export_digest("a/./file.txt", "/tmp/out.txt"), Some(export.clone()));
+        assert_ne!(export_digest("b/file.txt", "/tmp/out.txt").unwrap(), export);
+        assert_ne!(export_digest("a/file.txt", "/tmp/other.txt").unwrap(), export);
+        assert_eq!(export_digest("a/file.txt", "relative.txt"), None);
     }
 }

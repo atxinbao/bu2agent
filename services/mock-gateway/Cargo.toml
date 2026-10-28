@@ -18,6 +18,7 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 # EventKit backend: macOS only. Other platforms (including CI's
 # ubuntu/windows jobs) compile without it; the gateway keeps the

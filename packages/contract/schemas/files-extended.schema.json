@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "bu2agent://contract/files-extended",
+  "title": "bu2agent local fs extension responses",
+  "description": "Task 6 local interpretations of batch reads, stats, search, subscribe, thumbnail, export and library.",
+  "type": "object",
+  "properties": {
+    "cursor": { "type": "string" },
+    "changed": { "type": "boolean" },
+    "truncated": { "type": "boolean" },
+    "entries": { "type": "array", "items": { "$ref": "#/$defs/fileEntry" } },
+    "items": { "type": "array" },
+    "content_base64": { "type": "string" },
+    "content_type": { "type": "string" }
+  },
+  "$defs": {
+    "fileEntry": {
+      "type": "object",
+      "required": ["name", "path", "is_dir", "size_bytes"],
+      "properties": {
+        "name": { "type": "string" },
+        "path": { "type": "string" },
+        "is_dir": { "type": "boolean" },
+        "size_bytes": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    }
+  }
+}

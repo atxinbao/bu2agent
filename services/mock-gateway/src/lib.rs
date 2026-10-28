@@ -85,7 +85,7 @@ pub fn start_stream(stream_id: &str, turn_id: &str, text: &str) -> Vec<Subscript
 pub fn tool_requires_approval(name: &str) -> Option<bool> {
     match name {
         "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" => Some(false),
-        "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "notes.create" | "mail.send" | "reminders.set_completed" => Some(true),
+        "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "fs.export" | "notes.create" | "mail.send" | "reminders.set_completed" => Some(true),
         _ => None,
     }
 }

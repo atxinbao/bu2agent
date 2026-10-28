@@ -25,6 +25,12 @@
 //! - GET  /files/stat            -> stat a file or directory
 //! - POST /files/rename          -> move a file or directory
 //! - POST /files/mkdir           -> create a directory
+//! - POST /files/reads|stats     -> bounded batch read/stat
+//! - POST /files/search          -> bounded name/path search
+//! - GET  /files/raw             -> HTTP raw bytes (JSON variant for invoke)
+//! - POST /files/subscribe       -> long-poll directory cursor
+//! - GET  /files/thumbnail       -> bounded image thumbnail
+//! - POST /files/export|library  -> bound external export and local media index
 //! - POST /approval/request      -> open a pending approval record (approval tools)
 //! - POST /approval/decide       -> decide an approval record (approved/rejected/edited)
 //! - POST /agent/tool/call       -> execute a tool, server re-checks its own approval record
@@ -48,6 +54,7 @@
 //! fatal; the in-memory map stays authoritative for the run.
 
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -55,10 +62,11 @@ use std::time::Duration;
 use agent_desktop::approval::ApprovalStatus;
 use agent_desktop::gateway::SubscriptionRecord;
 use axum::{
+    body::Body,
     Json, Router,
     extract::{Query, State},
     http::{header, HeaderValue, Method, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -813,6 +821,41 @@ struct MkdirRequestDto {
     approval_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BatchReadItemDto { path: String, offset: Option<u64>, len: Option<u64> }
+#[derive(Debug, Deserialize)]
+struct BatchReadRequestDto { items: Vec<BatchReadItemDto> }
+#[derive(Debug, Serialize)]
+struct BatchReadItemResponseDto { path: String, ok: bool, #[serde(skip_serializing_if = "Option::is_none")] result: Option<ReadResponseDto>, #[serde(skip_serializing_if = "Option::is_none")] error: Option<String> }
+#[derive(Debug, Serialize)]
+struct BatchReadResponseDto { items: Vec<BatchReadItemResponseDto> }
+#[derive(Debug, Deserialize)]
+struct BatchStatsRequestDto { paths: Vec<String> }
+#[derive(Debug, Serialize)]
+struct BatchStatItemResponseDto { path: String, ok: bool, #[serde(skip_serializing_if = "Option::is_none")] stat: Option<FileStatDto>, #[serde(skip_serializing_if = "Option::is_none")] error: Option<String> }
+#[derive(Debug, Serialize)]
+struct BatchStatsResponseDto { items: Vec<BatchStatItemResponseDto> }
+#[derive(Debug, Deserialize)]
+struct SearchRequestDto { query: String, start_path: Option<String>, limit: Option<usize>, max_depth: Option<usize> }
+#[derive(Debug, Serialize)]
+struct SearchResponseDto { entries: Vec<FileEntryDto>, truncated: bool }
+#[derive(Debug, Deserialize)]
+struct RawQuery { path: String, format: Option<String> }
+#[derive(Debug, Deserialize)]
+struct SubscribeRequestDto { path: Option<String>, cursor: Option<String>, wait_ms: Option<u64> }
+#[derive(Debug, Serialize)]
+struct SubscribeResponseDto { changed: bool, cursor: String, #[serde(skip_serializing_if = "Option::is_none")] entries: Option<Vec<FileEntryDto>> }
+#[derive(Debug, Deserialize)]
+struct ThumbnailQuery { path: String, w: Option<u32>, format: Option<String> }
+#[derive(Debug, Deserialize)]
+struct ExportRequestDto { from: String, to: String, approval_id: Option<String> }
+#[derive(Debug, Deserialize)]
+struct LibraryRequestDto { kinds: Option<Vec<String>>, limit: Option<usize> }
+#[derive(Debug, Serialize)]
+struct LibraryItemDto { path: String, kind: String, is_dir: bool, size_bytes: u64, modified_ms: u128 }
+#[derive(Debug, Serialize)]
+struct LibraryResponseDto { items: Vec<LibraryItemDto>, truncated: bool }
+
 pub(crate) fn resolve_file(root: &Path, rel: &str) -> Result<PathBuf, StatusCode> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
@@ -901,6 +944,177 @@ async fn files_stat(
         is_dir: metadata.is_dir(),
         size_bytes: if metadata.is_dir() { 0 } else { metadata.len() },
     }).into_response()
+}
+
+fn collect_tree(root: &Path, rel: &str, max_depth: usize) -> Result<Vec<FileEntryDto>, StatusCode> {
+    let start = resolve_file(root, rel)?;
+    let mut out = Vec::new();
+    fn visit(dir: &Path, prefix: &str, depth: usize, max_depth: usize, out: &mut Vec<FileEntryDto>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+            out.push(FileEntryDto { name, path: path.clone(), is_dir: meta.is_dir(), size_bytes: if meta.is_dir() { 0 } else { meta.len() } });
+            if meta.is_dir() && depth < max_depth { visit(&entry.path(), &path, depth + 1, max_depth, out); }
+        }
+    }
+    let _ = root;
+    visit(&start, rel.trim_matches('/'), 0, max_depth, &mut out);
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+fn read_chunk_value(root: &Path, item: &BatchReadItemDto) -> Result<ReadResponseDto, String> {
+    let full = resolve_file(root, &item.path).map_err(|_| "path escapes file root".to_string())?;
+    let data = std::fs::read(&full).map_err(|_| "file not found".to_string())?;
+    if full.is_dir() { return Err("cannot read directory".to_string()); }
+    let offset = item.offset.unwrap_or(0);
+    let len = item.len.unwrap_or(4096).min(1_048_576);
+    let total = data.len() as u64;
+    let start = (offset as usize).min(data.len());
+    let end = start.saturating_add(len as usize).min(data.len());
+    let chunk = &data[start..end];
+    Ok(ReadResponseDto { path: item.path.clone(), offset, content_base64: base64::engine::general_purpose::STANDARD.encode(chunk), eof: end as u64 >= total, total_size: total, bytes_read: chunk.len() as u64 })
+}
+
+/// 对绝对目标做不依赖文件系统的词法折叠，避免 export
+/// 用未经折叠的 `..` 绕过文件根前缀判断。
+fn normalize_absolute_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() { return None; }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(value) => normalized.push(value),
+            Component::ParentDir => {
+                let Some(last) = normalized.file_name() else { continue };
+                if last == std::ffi::OsStr::new("/") { return None; }
+                normalized.pop();
+            }
+        }
+    }
+    Some(normalized)
+}
+
+async fn files_reads(State(state): State<AppState>, Json(req): Json<BatchReadRequestDto>) -> impl IntoResponse {
+    const MAX_ITEMS: usize = 128;
+    const MAX_TOTAL: u64 = 8 * 1_048_576;
+    if req.items.len() > MAX_ITEMS { return bad_request("too many read items"); }
+    let requested: u64 = req.items.iter().map(|i| i.len.unwrap_or(4096).min(1_048_576)).sum();
+    if requested > MAX_TOTAL { return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({"error":"batch read exceeds byte limit"}))).into_response(); }
+    let items = req.items.iter().map(|item| match read_chunk_value(&state.files_root, item) {
+        Ok(result) => BatchReadItemResponseDto { path: item.path.clone(), ok: true, result: Some(result), error: None },
+        Err(error) => BatchReadItemResponseDto { path: item.path.clone(), ok: false, result: None, error: Some(error) },
+    }).collect();
+    Json(BatchReadResponseDto { items }).into_response()
+}
+
+async fn files_stats(State(state): State<AppState>, Json(req): Json<BatchStatsRequestDto>) -> impl IntoResponse {
+    if req.paths.len() > 256 { return bad_request("too many stat paths"); }
+    let items = req.paths.iter().map(|path| {
+        let result = resolve_file(&state.files_root, path).ok().and_then(|full| std::fs::metadata(full).ok().map(|m| FileStatDto { path: path.clone(), is_dir: m.is_dir(), size_bytes: if m.is_dir() { 0 } else { m.len() } }));
+        match result { Some(stat) => BatchStatItemResponseDto { path: path.clone(), ok: true, stat: Some(stat), error: None }, None => BatchStatItemResponseDto { path: path.clone(), ok: false, stat: None, error: Some("file not found or invalid path".to_string()) } }
+    }).collect();
+    Json(BatchStatsResponseDto { items }).into_response()
+}
+
+async fn files_search(State(state): State<AppState>, Json(req): Json<SearchRequestDto>) -> impl IntoResponse {
+    let Ok(start) = resolve_file(&state.files_root, req.start_path.as_deref().unwrap_or("")) else { return bad_request("path escapes file root"); };
+    let limit = req.limit.unwrap_or(200).clamp(1, 200);
+    let depth = req.max_depth.unwrap_or(16).min(16);
+    let query = req.query.to_lowercase();
+    let mut all = collect_tree(&state.files_root, req.start_path.as_deref().unwrap_or(""), depth).unwrap_or_default();
+    all.retain(|e| e.path.to_lowercase().contains(&query));
+    let truncated = all.len() > limit;
+    all.truncate(limit);
+    let _ = start;
+    Json(SearchResponseDto { entries: all, truncated }).into_response()
+}
+
+async fn files_raw(State(state): State<AppState>, Query(query): Query<RawQuery>) -> Response {
+    let Ok(full) = resolve_file(&state.files_root, &query.path) else { return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"path escapes file root"}))).into_response(); };
+    let Ok(meta) = std::fs::metadata(&full) else { return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"file not found"}))).into_response(); };
+    if meta.is_dir() { return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"cannot read directory"}))).into_response(); }
+    if meta.len() > 1_048_576 { return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({"error":"file exceeds read limit"}))).into_response(); }
+    let Ok(bytes) = std::fs::read(&full) else { return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot read file"}))).into_response(); };
+    let content_type = match full.extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase().as_str() { "png" => "image/png", "jpg" | "jpeg" => "image/jpeg", "gif" => "image/gif", "webp" => "image/webp", "json" => "application/json", "txt" | "md" => "text/plain; charset=utf-8", _ => "application/octet-stream" };
+    if query.format.as_deref() == Some("json") { return Json(serde_json::json!({"path":query.path,"content_type":content_type,"content_base64":base64::engine::general_purpose::STANDARD.encode(bytes)})).into_response(); }
+    Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, content_type).header(header::CONTENT_DISPOSITION, "inline").body(Body::from(bytes)).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn tree_cursor(entries: &[FileEntryDto]) -> String { crate::operation_binding::sha256_hex(serde_json::to_string(entries).unwrap_or_default().as_bytes()) }
+async fn files_subscribe(State(state): State<AppState>, Json(req): Json<SubscribeRequestDto>) -> impl IntoResponse {
+    let path = req.path.as_deref().unwrap_or("");
+    let wait = req.wait_ms.unwrap_or(0).min(25_000);
+    let mut entries = collect_tree(&state.files_root, path, 32).unwrap_or_default();
+    let mut cursor = tree_cursor(&entries);
+    if req.cursor.as_deref() != Some(cursor.as_str()) || wait == 0 { return Json(SubscribeResponseDto { changed: req.cursor.as_deref() != Some(cursor.as_str()), cursor, entries: Some(entries) }).into_response(); }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(wait);
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        entries = collect_tree(&state.files_root, path, 32).unwrap_or_default();
+        cursor = tree_cursor(&entries);
+        if req.cursor.as_deref() != Some(cursor.as_str()) || tokio::time::Instant::now() >= deadline { break; }
+    }
+    let changed = req.cursor.as_deref() != Some(cursor.as_str());
+    Json(SubscribeResponseDto { changed, cursor, entries: if changed { Some(entries) } else { None } }).into_response()
+}
+
+async fn files_thumbnail(State(state): State<AppState>, Query(query): Query<ThumbnailQuery>) -> Response {
+    let Ok(full) = resolve_file(&state.files_root, &query.path) else { return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"path escapes file root"}))).into_response(); };
+    let Ok(meta) = std::fs::metadata(&full) else { return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"file not found"}))).into_response(); };
+    if meta.is_dir() { return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(serde_json::json!({"error":"thumbnail supports images only"}))).into_response(); }
+    let ext = full.extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
+    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") { return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(serde_json::json!({"error":"thumbnail supports png, jpeg, gif and webp"}))).into_response(); }
+    let Ok(bytes) = std::fs::read(&full) else { return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"error":"cannot read image"}))).into_response(); };
+    let Ok(image) = image::load_from_memory(&bytes) else { return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"error":"cannot decode image"}))).into_response(); };
+    let width = query.w.unwrap_or(256).clamp(1, 512);
+    let thumb = image.thumbnail(width, width);
+    let mut output = Cursor::new(Vec::new());
+    if thumb.write_to(&mut output, image::ImageFormat::Jpeg).is_err() { return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot encode thumbnail"}))).into_response(); }
+    let data = output.into_inner();
+    if query.format.as_deref() == Some("json") { return Json(serde_json::json!({"path":query.path,"content_type":"image/jpeg","content_base64":base64::engine::general_purpose::STANDARD.encode(data)})).into_response(); }
+    Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, "image/jpeg").header(header::CONTENT_DISPOSITION, "inline").body(Body::from(data)).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn files_export(State(state): State<AppState>, Json(req): Json<ExportRequestDto>) -> impl IntoResponse {
+    let Some(digest) = crate::operation_binding::export_digest(&req.from, &req.to) else { return bad_request("invalid export path"); };
+    let Ok(source) = resolve_file(&state.files_root, &req.from) else { return bad_request("path escapes file root"); };
+    let Some(target) = normalize_absolute_path(Path::new(&req.to)) else { return bad_request("export target must be an absolute path outside file root"); };
+    let Ok(root) = std::fs::canonicalize(&state.files_root) else { return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot resolve file root"}))).into_response(); };
+    let target_abs = if target.exists() {
+        std::fs::canonicalize(&target).unwrap_or(target.clone())
+    } else if let (Some(parent), Some(name)) = (target.parent(), target.file_name()) {
+        std::fs::canonicalize(parent).map(|p| p.join(name)).unwrap_or(target.clone())
+    } else {
+        target.clone()
+    };
+    if !target_abs.is_absolute() || target_abs.starts_with(&root) { return bad_request("export target must be outside file root"); }
+    if target.exists() { return (StatusCode::CONFLICT, Json(serde_json::json!({"error":"export target already exists"}))).into_response(); }
+    if let Err(response) = consume_bound_approval(&state, "fs.export", &req.approval_id, &digest) { return *response; }
+    if !source.is_file() { return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"export source must be a file"}))).into_response(); }
+    if let Some(parent) = target.parent() { if std::fs::create_dir_all(parent).is_err() { return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot create export parent"}))).into_response(); } }
+    match std::fs::copy(&source, &target) { Ok(bytes) => Json(serde_json::json!({"from":req.from,"to":req.to,"size_bytes":bytes})).into_response(), Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot export file"}))).into_response() }
+}
+
+async fn files_library(State(state): State<AppState>, Json(req): Json<LibraryRequestDto>) -> impl IntoResponse {
+    let limit = req.limit.unwrap_or(200).clamp(1, 1000);
+    let allowed = req.kinds.unwrap_or_default();
+    let all = collect_tree(&state.files_root, "", 32).unwrap_or_default();
+    let mut items = Vec::new();
+    for entry in all.into_iter().filter(|e| !e.is_dir) {
+        let ext = Path::new(&entry.path).extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
+        let kind = if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp") { "image" } else if matches!(ext.as_str(), "mp4" | "mov" | "mkv" | "avi") { "video" } else if matches!(ext.as_str(), "mp3" | "wav" | "m4a" | "flac") { "audio" } else { "document" }.to_string();
+        if !allowed.is_empty() && !allowed.iter().any(|k| k == &kind) { continue; }
+        let modified_ms = std::fs::metadata(state.files_root.join(&entry.path)).ok().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis()).unwrap_or(0);
+        items.push(LibraryItemDto { path: entry.path, kind, is_dir: false, size_bytes: entry.size_bytes, modified_ms });
+    }
+    items.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms).then_with(|| a.path.cmp(&b.path)));
+    let truncated = items.len() > limit;
+    items.truncate(limit);
+    Json(LibraryResponseDto { items, truncated }).into_response()
 }
 
 async fn files_write(
@@ -1237,6 +1451,15 @@ async fn approval_request(
             match crate::operation_binding::mkdir_digest(path) {
                 Some(digest) => Some(digest),
                 None => return bad_request("invalid path"),
+            }
+        }
+        "fs.export" => {
+            let (Some(from), Some(to)) = (req.path.as_deref(), req.to_path.as_deref()) else {
+                return bad_request("fs.export approval requires path and to_path");
+            };
+            match crate::operation_binding::export_digest(from, to) {
+                Some(digest) => Some(digest),
+                None => return bad_request("invalid export path"),
             }
         }
         _ => None,
@@ -2717,6 +2940,14 @@ pub fn app(state: AppState) -> Router {
         .route("/files/delete", post(files_delete))
         .route("/files/rename", post(files_rename))
         .route("/files/mkdir", post(files_mkdir))
+        .route("/files/reads", post(files_reads))
+        .route("/files/stats", post(files_stats))
+        .route("/files/search", post(files_search))
+        .route("/files/raw", get(files_raw))
+        .route("/files/subscribe", post(files_subscribe))
+        .route("/files/thumbnail", get(files_thumbnail))
+        .route("/files/export", post(files_export))
+        .route("/files/library", post(files_library))
         .route("/approval/request", post(approval_request))
         .route("/approval/decide", post(approval_decide))
         .route("/agent/tool/call", post(agent_tool_call))
