@@ -24,7 +24,7 @@ use agent_desktop::agent_client::{AgentClient, AgentError, ToolDecision, ToolRes
 use agent_desktop::connector_client::{ConnectorClient, MockMessage, MockNote};
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
-use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry};
+use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat};
 use agent_desktop::{ErrorCode, UnifiedError, UserAction};
 
 fn err_string(error: &UnifiedError) -> String {
@@ -97,6 +97,11 @@ pub fn file_list(path: String) -> Result<Vec<GatewayFileEntry>, String> {
     file_client()?.list(&path).map_err(|e| err_string(&e))
 }
 
+#[tauri::command]
+pub fn file_stat(path: String) -> Result<GatewayFileStat, String> {
+    file_client()?.stat(&path).map_err(|e| err_string(&e))
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub fn file_read_text(
     path: String,
@@ -130,6 +135,22 @@ pub fn file_delete(path: String, approved: bool) -> Result<(), String> {
         return Err(err_string(&denied("file delete requires approval")));
     }
     file_client()?.delete(&path, true).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn file_rename(from_path: String, to_path: String, approved: bool) -> Result<(), String> {
+    if !approved {
+        return Err(err_string(&denied("file rename requires approval")));
+    }
+    file_client()?.rename(&from_path, &to_path, true).map_err(|e| err_string(&e))
+}
+
+#[tauri::command]
+pub fn file_mkdir(path: String, approved: bool) -> Result<(), String> {
+    if !approved {
+        return Err(err_string(&denied("file mkdir requires approval")));
+    }
+    file_client()?.mkdir(&path, true).map_err(|e| err_string(&e))
 }
 
 // --- Agent tools (Phase 3 approval loop) ---

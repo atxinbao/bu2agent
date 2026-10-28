@@ -26,6 +26,12 @@ export interface FileChunk {
   bytesRead: number;
 }
 
+export interface GatewayFileStat {
+  path: string;
+  isDir: boolean;
+  sizeBytes: number;
+}
+
 interface ServerFileEntry {
   name: string;
   path: string;
@@ -40,6 +46,12 @@ interface ServerReadResponse {
   eof: boolean;
   total_size: number;
   bytes_read: number;
+}
+
+interface ServerFileStat {
+  path: string;
+  is_dir: boolean;
+  size_bytes: number;
 }
 
 function checkRelative(path: string): void {
@@ -70,9 +82,12 @@ function encodeBase64(data: Uint8Array): string {
 // view never knows which transport it runs on.
 export interface FileGateway {
   list(path?: string): Promise<GatewayFileEntry[]>;
+  stat(path: string): Promise<GatewayFileStat>;
   readText(path: string, chunkLen: number, maxTotal: number): Promise<string>;
   write(path: string, text: string, approved: boolean, append?: boolean): Promise<number>;
   delete(path: string, approved: boolean): Promise<void>;
+  rename(from: string, to: string, approved: boolean): Promise<void>;
+  mkdir(path: string, approved: boolean): Promise<void>;
 }
 
 export class FileGatewayClient implements FileGateway {
@@ -123,6 +138,19 @@ export class FileGatewayClient implements FileGateway {
       isDir: e.is_dir,
       sizeBytes: e.size_bytes,
     }));
+  }
+
+  async stat(path: string): Promise<GatewayFileStat> {
+    if (path !== "") {
+      checkRelative(path);
+    }
+    const result = await this.requestWithRetry<ServerFileStat>(
+      `/files/stat?path=${path}`,
+      undefined,
+      undefined,
+      true,
+    );
+    return { path: result.path, isDir: result.is_dir, sizeBytes: result.size_bytes };
   }
 
   async readChunk(
@@ -211,10 +239,14 @@ export class FileGatewayClient implements FileGateway {
   private async boundApprovalId(
     tool: string,
     path: string,
+    toPath?: string,
     contentBase64?: string,
     append?: boolean,
   ): Promise<string> {
     const requestBody: Record<string, unknown> = { tool, path };
+    if (toPath !== undefined) {
+      requestBody.to_path = toPath;
+    }
     if (contentBase64 !== undefined) {
       requestBody.content_base64 = contentBase64;
     }
@@ -251,7 +283,7 @@ export class FileGatewayClient implements FileGateway {
     checkRelative(path);
     const data = new TextEncoder().encode(text);
     const contentBase64 = encodeBase64(data);
-    const approvalId = await this.boundApprovalId("fs.write", path, contentBase64, append);
+    const approvalId = await this.boundApprovalId("fs.write", path, undefined, contentBase64, append);
     const result = await this.postJson("/files/write", {
       path,
       content_base64: contentBase64,
@@ -284,6 +316,40 @@ export class FileGatewayClient implements FileGateway {
       throw new Error(
         "approved file operation does not match this execution (changed, already used, or expired); nothing was deleted",
       );
+    }
+    if (result.status !== 200) {
+      throw new Error(`mock gateway returned HTTP ${result.status}`);
+    }
+  }
+
+  async rename(from: string, to: string, approved: boolean): Promise<void> {
+    if (!approved) {
+      throw new Error("file rename requires approval");
+    }
+    checkRelative(from);
+    checkRelative(to);
+    const approvalId = await this.boundApprovalId("fs.rename", from, to);
+    const result = await this.postJson("/files/rename", { from, to, approval_id: approvalId });
+    if (result.status === 403) {
+      throw new Error("approved file operation does not match this execution (changed, already used, or expired); nothing was renamed");
+    }
+    if (result.status === 409) {
+      throw new Error("rename target already exists; nothing was renamed");
+    }
+    if (result.status !== 200) {
+      throw new Error(`mock gateway returned HTTP ${result.status}`);
+    }
+  }
+
+  async mkdir(path: string, approved: boolean): Promise<void> {
+    if (!approved) {
+      throw new Error("file mkdir requires approval");
+    }
+    checkRelative(path);
+    const approvalId = await this.boundApprovalId("fs.mkdir", path);
+    const result = await this.postJson("/files/mkdir", { path, approval_id: approvalId });
+    if (result.status === 403) {
+      throw new Error("approved file operation does not match this execution (changed, already used, or expired); directory was not created");
     }
     if (result.status !== 200) {
       throw new Error(`mock gateway returned HTTP ${result.status}`);

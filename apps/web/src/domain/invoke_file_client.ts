@@ -1,10 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { FileGateway, GatewayFileEntry } from "./file_client";
+import type { FileGateway, GatewayFileEntry, GatewayFileStat } from "./file_client";
 
 // The Rust file entry serializes snake_case; the domain shape
 // is camelCase, so the mapping lives here, not in the view.
 interface ServerFileEntry {
   name: string;
+  path: string;
+  is_dir: boolean;
+  size_bytes: number;
+}
+
+interface ServerFileStat {
   path: string;
   is_dir: boolean;
   size_bytes: number;
@@ -36,6 +42,11 @@ export class InvokeFileClient implements FileGateway {
     });
   }
 
+  async stat(path: string): Promise<GatewayFileStat> {
+    const result = await invoke<ServerFileStat>("file_stat", { path });
+    return { path: result.path, isDir: result.is_dir, sizeBytes: result.size_bytes };
+  }
+
   async write(
     path: string,
     text: string,
@@ -47,5 +58,13 @@ export class InvokeFileClient implements FileGateway {
 
   async delete(path: string, approved: boolean): Promise<void> {
     await invoke("file_delete", { path, approved });
+  }
+
+  async rename(from: string, to: string, approved: boolean): Promise<void> {
+    await invoke("file_rename", { from_path: from, to_path: to, approved });
+  }
+
+  async mkdir(path: string, approved: boolean): Promise<void> {
+    await invoke("file_mkdir", { path, approved });
   }
 }

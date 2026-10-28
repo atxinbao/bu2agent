@@ -175,18 +175,62 @@ fn file_commands_roundtrip() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "shell-test.txt");
     assert!(!entries[0].is_dir);
+    let stat = file_stat("shell-test.txt".to_string()).expect("stat file");
+    assert_eq!(stat.size_bytes, 11);
+    assert!(file_mkdir("shell-dir".to_string(), false).is_err());
+    file_mkdir("shell-dir".to_string(), true).expect("approved mkdir");
+    assert!(file_stat("shell-dir".to_string()).expect("stat directory").is_dir);
+    assert!(file_rename("shell-test.txt".to_string(), "shell-dir/renamed.txt".to_string(), false).is_err());
+    file_rename("shell-test.txt".to_string(), "shell-dir/renamed.txt".to_string(), true)
+        .expect("approved rename");
     let text =
-        file_read_text("shell-test.txt".to_string(), 4096, 1048576).expect("read back");
+        file_read_text("shell-dir/renamed.txt".to_string(), 4096, 1048576).expect("read back");
     assert_eq!(text, "hello shell");
     assert!(
         file_delete("shell-test.txt".to_string(), false).is_err(),
         "unapproved delete must be refused client-side"
     );
-    file_delete("shell-test.txt".to_string(), true).expect("approved delete");
-    assert!(
-        file_list("".to_string()).expect("list after delete").is_empty(),
-        "file root should be empty again"
-    );
+    file_delete("shell-dir/renamed.txt".to_string(), true).expect("approved delete");
+    assert!(file_list("shell-dir".to_string()).expect("list after delete").is_empty());
+}
+
+/// Files stat/rename/mkdir 通过真实 IPC，特别覆盖多词参数的 snake_case 解码。
+#[test]
+fn file_extended_invoke_roundtrip() {
+    let app = tauri::test::mock_builder()
+        .invoke_handler(tauri::generate_handler![file_stat, file_rename, file_mkdir])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("build mock shell");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let invoke = |cmd: &str, body: serde_json::Value| {
+        tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: cmd.to_string(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "tauri://localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::Json(body),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        )
+        .unwrap_or_else(|err| panic!("{cmd}: {err:?}"))
+        .deserialize::<serde_json::Value>()
+        .unwrap()
+    };
+    let source = "invoke-source.txt";
+    file_write(source.to_string(), "invoke".to_string(), true, false).expect("seed invoke source");
+    invoke("file_mkdir", serde_json::json!({"path":"invoke-dir","approved":true}));
+    invoke("file_rename", serde_json::json!({
+        "from_path": source, "to_path": "invoke-dir/renamed.txt", "approved": true
+    }));
+    let stat = invoke("file_stat", serde_json::json!({"path":"invoke-dir/renamed.txt"}));
+    assert_eq!(stat["is_dir"], false);
+    assert_eq!(stat["size_bytes"], 6);
+    file_delete("invoke-dir/renamed.txt".to_string(), true).expect("cleanup file");
 }
 
 #[test]

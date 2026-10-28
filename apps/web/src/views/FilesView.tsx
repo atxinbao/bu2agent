@@ -32,10 +32,15 @@ export function FilesView({
   const [entries, setEntries] = useState<GatewayFileEntry[]>([]);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [selectedText, setSelectedText] = useState("");
+  const [selectedStat, setSelectedStat] = useState<Awaited<ReturnType<FileGateway["stat"]>> | null>(null);
   const [writePath, setWritePath] = useState("");
   const [writeText, setWriteText] = useState("");
   const [writesAllowed, setWritesAllowed] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const [renameFrom, setRenameFrom] = useState<string | null>(null);
+  const [renameTo, setRenameTo] = useState("");
+  const [pendingRename, setPendingRename] = useState<{ from: string; to: string } | null>(null);
+  const [mkdirPath, setMkdirPath] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -46,7 +51,7 @@ export function FilesView({
     try {
       setEntries(await client.list(path));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "list failed");
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
@@ -60,6 +65,12 @@ export function FilesView({
   async function openEntry(entry: GatewayFileEntry) {
     setError(null);
     setNotice(null);
+    try {
+      setSelectedStat(await client.stat(entry.path));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      return;
+    }
     if (entry.isDir) {
       setDir(entry.path);
       setSelectedPath(null);
@@ -72,7 +83,7 @@ export function FilesView({
       setSelectedPath(entry.path);
       setSelectedText(text);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "read failed");
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
@@ -95,7 +106,7 @@ export function FilesView({
       setNotice(`wrote ${size} bytes to ${writePath}`);
       await refresh(dir);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "write failed");
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
@@ -114,11 +125,73 @@ export function FilesView({
       if (selectedPath === pendingDelete) {
         setSelectedPath(null);
         setSelectedText("");
+        setSelectedStat(null);
       }
       setPendingDelete(null);
       await refresh(dir);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "delete failed");
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function requestRename(from: string) {
+    setRenameFrom(from);
+    setRenameTo(from);
+    setError(null);
+    setNotice(null);
+  }
+
+  function confirmRenameRequest() {
+    if (renameFrom === null || renameTo.trim() === "") {
+      setError("rename needs a target path");
+      return;
+    }
+    if (!writesAllowed) {
+      setError("turn on the write switch first: renames need explicit approval");
+      return;
+    }
+    setPendingRename({ from: renameFrom, to: renameTo.trim() });
+    setRenameFrom(null);
+  }
+
+  async function confirmRename() {
+    if (pendingRename === null) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await client.rename(pendingRename.from, pendingRename.to, true);
+      setNotice(`renamed ${pendingRename.from} to ${pendingRename.to}`);
+      setPendingRename(null);
+      await refresh(dir);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function mkdir() {
+    if (mkdirPath.trim() === "") {
+      setError("mkdir needs a path");
+      return;
+    }
+    if (!writesAllowed) {
+      setError("turn on the write switch first: directories need explicit approval");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await client.mkdir(mkdirPath.trim(), true);
+      setNotice(`created directory ${mkdirPath.trim()}`);
+      setMkdirPath("");
+      await refresh(dir);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
@@ -161,6 +234,15 @@ export function FilesView({
                 Delete
               </button>
             )}
+            {renameFrom === entry.path ? (
+              <span className="row">
+                <input value={renameTo} onChange={(event) => setRenameTo(event.target.value)} />
+                <button type="button" onClick={confirmRenameRequest} disabled={busy}>Rename</button>
+                <button type="button" onClick={() => setRenameFrom(null)} disabled={busy}>Cancel</button>
+              </span>
+            ) : (
+              <button type="button" onClick={() => requestRename(entry.path)} disabled={busy}>Rename</button>
+            )}
           </li>
         ))}
       </ul>
@@ -175,12 +257,31 @@ export function FilesView({
           </button>
         </div>
       )}
+      {pendingRename !== null && (
+        <div className="confirm">
+          <span>Rename {pendingRename.from} to {pendingRename.to}?</span>
+          <button type="button" onClick={() => void confirmRename()} disabled={busy}>Confirm rename</button>
+          <button type="button" onClick={() => setPendingRename(null)} disabled={busy}>Cancel</button>
+        </div>
+      )}
       {selectedPath !== null && (
         <div>
           <h3>{selectedPath}</h3>
           <pre className="result">{selectedText}</pre>
         </div>
       )}
+      {selectedStat !== null && (
+        <div className="note">
+          <div>Path: {selectedStat.path}</div>
+          <div>Type: {selectedStat.isDir ? "directory" : "file"}</div>
+          <div>Size: {selectedStat.sizeBytes} bytes</div>
+        </div>
+      )}
+      <h3>Create directory</h3>
+      <div className="row">
+        <input type="text" value={mkdirPath} placeholder="Directory path" onChange={(event) => setMkdirPath(event.target.value)} />
+        <button type="button" onClick={() => void mkdir()} disabled={busy}>Create directory</button>
+      </div>
       <h3>Write a file</h3>
       <div className="row">
         <input
