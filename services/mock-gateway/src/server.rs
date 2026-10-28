@@ -64,8 +64,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::approval_store::{append_record, load_records, next_id_number, ApprovalFileRecord};
 use crate::loop_engine::{
-    ApprovalBinding, LoopEngine, LoopError, LoopModel, LoopStatus, LoopTools, LoopView, Timeouts,
-    ToolOutcome, ErrorCode,
+    loop_tool_requires_approval, ApprovalBinding, LoopEngine, LoopError, LoopModel, LoopStatus,
+    LoopTools, LoopView, Timeouts, ToolOutcome, ErrorCode,
 };
 use crate::device_backend::{
     execute_set, resolve_unknown, AuthorizationStatus, ExecuteOutcome, FakeReminderBackend,
@@ -485,7 +485,7 @@ impl AppState {
         binding: Option<ApprovalBinding>,
         backend: Option<Arc<dyn LoopTools>>,
     ) -> ToolOutcome {
-        if tool == "fs.write" {
+        if loop_tool_requires_approval(&tool) {
             let valid = {
                 let approvals = self.approvals.lock().unwrap();
                 approval_id
@@ -505,6 +505,77 @@ impl AppState {
             if !valid {
                 return ToolOutcome::failed(ErrorCode::InvalidArguments);
             }
+        }
+        if tool == "reminders.list" {
+            let device_backend = Arc::clone(&self.device_backend);
+            return match tokio::task::spawn_blocking(move || device_backend.list()).await {
+                Ok(Ok(reminders)) => ToolOutcome::success(
+                    serde_json::to_string(
+                        &reminders
+                            .iter()
+                            .map(|reminder| {
+                                serde_json::json!({
+                                    "id": reminder.id.clone(),
+                                    "title": reminder.title.clone(),
+                                    "completed": reminder.completed,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_else(|_| "[]".to_string()),
+                ),
+                _ => ToolOutcome {
+                    status: crate::loop_engine::CallStatus::Failed,
+                    error: Some(ErrorCode::ToolFailed),
+                    body: "reminders list failed".to_string(),
+                },
+            };
+        }
+        if tool == "reminders.set_completed" {
+            let Some(id) = args.get("id").cloned() else {
+                return ToolOutcome::failed(ErrorCode::InvalidArguments);
+            };
+            let Some(completed) = args.get("completed").and_then(|value| value.parse::<bool>().ok()) else {
+                return ToolOutcome::failed(ErrorCode::InvalidArguments);
+            };
+            if self.device_reminder_pin.as_ref().is_some_and(|pin| pin != &id) {
+                return ToolOutcome {
+                    status: crate::loop_engine::CallStatus::Failed,
+                    error: Some(ErrorCode::ToolFailed),
+                    body: "reminder is outside the configured allowlist".to_string(),
+                };
+            }
+            let device_backend = Arc::clone(&self.device_backend);
+            return match tokio::task::spawn_blocking(move || {
+                execute_set(&device_backend, &id, completed, Duration::from_secs(8))
+            })
+            .await
+            {
+                Ok(ExecuteOutcome::Completed(reminder)) => ToolOutcome::success(
+                    serde_json::to_string(&serde_json::json!({
+                        "id": reminder.id,
+                        "title": reminder.title,
+                        "completed": reminder.completed,
+                    }))
+                    .unwrap_or_else(|_| "{}".to_string()),
+                ),
+                Ok(ExecuteOutcome::Unknown) => ToolOutcome {
+                    status: crate::loop_engine::CallStatus::Unknown,
+                    error: Some(ErrorCode::Unconfirmed),
+                    body: "reminder set result unknown; query the reminder to observe its state".to_string(),
+                },
+                Ok(ExecuteOutcome::AwaitingAuthorization) => ToolOutcome {
+                    status: crate::loop_engine::CallStatus::Failed,
+                    error: Some(ErrorCode::ToolFailed),
+                    body: "reminders authorization is not granted; authorize it in Devices first".to_string(),
+                },
+                Ok(ExecuteOutcome::Failed(error)) => ToolOutcome {
+                    status: crate::loop_engine::CallStatus::Failed,
+                    error: Some(ErrorCode::ToolFailed),
+                    body: format!("reminder operation failed: {}", error.kind.as_str()),
+                },
+                Err(_) => ToolOutcome::unknown(),
+            };
         }
         if let Some(backend) = backend {
             return backend.execute(tool, args).await;
@@ -2425,7 +2496,7 @@ fn loop_response(
 ) -> axum::response::Response {
     match result {
         Ok(mut view) => {
-            if view.pending_write.is_some() {
+            if view.pending_write.is_some() || view.pending_reminder.is_some() {
                 if let Some(call) = view.record.calls.get(view.record.queue_position) {
                     if let (Some(id), Some(binding)) = (&call.approval_id, &call.binding) {
                         view.approval_status = state.loop_approval_status(id, binding).ok()
@@ -2433,6 +2504,7 @@ fn loop_response(
                     }
                 }
             }
+            fill_pending_reminder_title(state, &mut view);
             Json(view).into_response()
         },
         Err(LoopError(status, code)) => (
@@ -2440,6 +2512,14 @@ fn loop_response(
             Json(serde_json::json!({"error":code})),
         )
             .into_response(),
+    }
+}
+
+fn fill_pending_reminder_title(state: &AppState, view: &mut LoopView) {
+    if let Some(pending) = view.pending_reminder.as_mut() {
+        if let Ok(Some(reminder)) = state.device_backend.get(&pending.reminder_id) {
+            pending.title = reminder.title;
+        }
     }
 }
 
@@ -2497,7 +2577,11 @@ async fn loop_cancel(
     loop_response(&state, state.loops.cancel(&req.loop_id))
 }
 async fn loops_list(State(state): State<AppState>) -> Json<Vec<LoopView>> {
-    Json(state.loops.list())
+    let mut views = state.loops.list();
+    for view in &mut views {
+        fill_pending_reminder_title(&state, view);
+    }
+    Json(views)
 }
 
 pub fn app(state: AppState) -> Router {

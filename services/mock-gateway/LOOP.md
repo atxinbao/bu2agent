@@ -2,22 +2,22 @@
 
 日期：2026-10-25；执行者：Codex。基线：`ec42561`。
 
-提供状态机、审计存储、四个 HTTP 端点、绑定审批及 DeepSeek 非流式工具协议。
+提供状态机、审计存储、循环 HTTP 端点、绑定审批及 DeepSeek 非流式工具协议。
 正常启动从现有 env/Keychain 路径解析一次配置，聊天与循环共用配置。
 有 key 时接入 DeepSeek 循环模型；无 key 或使用 `--mock-chat` 时，循环
 `start` 返回 503 `loop_model_not_configured`，普通聊天仍回显。
 普通聊天的请求、失败 502 和 stream 协议不变；不会把回显当作循环模型。
 测试通过 `AppState::with_loop_backends` 注入模型与内存工具。桌面/壳/Loops
-视图通过同一份快照接线；不开放删除或真实提醒。
+ 视图通过同一份快照接线；循环不开放删除或创建提醒。
 
 ## DeepSeek 适配
 
 - 仍用 `POST {base_url}/chat/completions`，默认 `deepseek-flash`；复用
   `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` 配置，不新增凭据来源。
-- 固定系统指令只约束工具使用；不能由用户请求编辑。请求含三工具 JSON
+- 固定系统指令只约束工具使用；不能由用户请求编辑。请求含五工具 JSON
   Schema、`tool_choice=auto`、`stream=false`、`thinking.type=disabled`。
-  提供方函数名不允许点号，因此对外用 `fs_list` / `fs_read` / `fs_write`，
-  只映射这三个名字到内部 `fs.list` / `fs.read` / `fs.write`。
+  提供方函数名不允许点号，因此对外用 `fs_list` / `fs_read` / `fs_write`、
+  `reminders_list` / `reminders_set_completed`，分别映射到内部工具名。
 - assistant 的调用 ID、原始 arguments 字符串和伴随文本只保存在内存历史。
   按提议顺序为每个结果生成 `role=tool`，原样使用该次调用的 `tool_call_id`，
   包括非法、超额、重复、拒绝结果。相同写入的不同提议仍有各自的提供方 ID。
@@ -47,6 +47,8 @@
 - `GET /agent/loop/get?loop_id=loop-1`：返回审计字段、在途标志、剩余预算，
   以及当前进程内可用的最终回答。待审批时额外返回 `pending_write`
   （call_id、规范化 path、text 全文、args_sha256）与 `approval_status`，
+  或返回仅内存的 `pending_reminder`（call_id、reminder_id、标题、目标完成状态、
+  args_sha256）；提醒标题来自执行侧即时查询，不进入 LoopRecord/JSONL，
   用于用户核对写入和恢复已决定但尚未推进的审批。其它工具参数与消息
   历史不返回；该全文预览只留内存，不属于审计记录。
 - `POST /agent/loop/resume`：普通推进传 `{"loop_id":"loop-1"}`。
@@ -100,6 +102,15 @@
 写操作前的审计失败会阻止该步骤执行；损坏的循环审计文件拒绝加载，
 避免按旧行恢复出错误状态。普通人工审批仍保持原 best-effort 行为。
 本轮不承诺断电耐久性。取消不代表在途写被撤回。
+
+## 提醒事项工具
+
+循环只开放 `reminders.list`（只读）和 `reminders.set_completed`（需逐次绑定审批）。
+前者返回内存中的 `id`、标题和完成状态，结果会作为工具正文发送给模型；标题不写审计
+或 JSONL。后者只接受查询得到的 `id` 与明确的 `completed` 布尔值，参数摘要使用
+`set_completed` 独立语义标签，不能复用文件写授权；执行复用 `ReminderBackend::execute_set`
+的授权检查、超时、保存后重查和 Unknown 规则，并遵守单提醒 pin。未授权只返回失败说明，
+不会在循环里弹系统授权；创建提醒不属于本任务。
 
 ## 验证
 

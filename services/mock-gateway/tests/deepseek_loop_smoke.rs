@@ -392,8 +392,17 @@ async fn multi_call_ids_history_schema_and_bound_write_roundtrip() {
     assert_eq!(first["thinking"]["type"], "disabled");
     assert_eq!(first["messages"][0]["role"], "system");
     assert_eq!(first["messages"][1]["role"], "user");
-    assert_eq!(first["tools"].as_array().unwrap().len(), 3);
-    for (i, name) in ["fs_list", "fs_read", "fs_write"].iter().enumerate() {
+    assert_eq!(first["tools"].as_array().unwrap().len(), 5);
+    for (i, name) in [
+        "fs_list",
+        "fs_read",
+        "fs_write",
+        "reminders_list",
+        "reminders_set_completed",
+    ]
+    .iter()
+    .enumerate()
+    {
         assert_eq!(first["tools"][i]["function"]["name"], *name);
         assert_eq!(
             first["tools"][i]["function"]["parameters"]["additionalProperties"],

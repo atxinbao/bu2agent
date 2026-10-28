@@ -154,6 +154,8 @@ pub struct LoopView {
     pub final_text: Option<String>,
     /// 仅待审批时展示内存中的拟写全文；不进入 LoopRecord 或 JSONL。
     pub pending_write: Option<PendingWrite>,
+    /// 仅提醒事项审批时由服务端填充的内存视图，不进入 LoopRecord 或 JSONL。
+    pub pending_reminder: Option<PendingReminder>,
     pub approval_status: Option<String>,
 }
 
@@ -162,6 +164,15 @@ pub struct PendingWrite {
     pub call_id: usize,
     pub path: String,
     pub text: String,
+    pub args_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingReminder {
+    pub call_id: usize,
+    pub reminder_id: String,
+    pub title: String,
+    pub target_completed: bool,
     pub args_sha256: String,
 }
 
@@ -327,7 +338,7 @@ impl LiveLoop {
             .calls
             .iter()
             .filter(|c| {
-                c.tool == "fs.write"
+                loop_tool_requires_approval(&c.tool)
                     && c.submitted
                     && matches!(c.status, CallStatus::Unknown | CallStatus::Running)
             })
@@ -364,6 +375,26 @@ impl LiveLoop {
                             call_id: self.record.calls.get(i)?.call_id,
                             path: args.get("path")?.clone(),
                             text: args.get("text")?.clone(),
+                            args_sha256: self.record.calls.get(i)?.args_sha256.clone(),
+                        })
+                    })
+            } else {
+                None
+            },
+            pending_reminder: if self.record.status == LoopStatus::AwaitingApproval {
+                let i = self.record.queue_position;
+                self.arguments
+                    .get(i)
+                    .and_then(Option::as_ref)
+                    .and_then(|args| {
+                        if self.record.calls.get(i)?.tool != "reminders.set_completed" {
+                            return None;
+                        }
+                        Some(PendingReminder {
+                            call_id: self.record.calls.get(i)?.call_id,
+                            reminder_id: args.get("id")?.clone(),
+                            title: String::new(),
+                            target_completed: args.get("completed")?.parse().ok()?,
                             args_sha256: self.record.calls.get(i)?.args_sha256.clone(),
                         })
                     })
@@ -440,11 +471,39 @@ fn millis(d: Duration) -> u64 {
 }
 
 /// 参数只接受现有文件工具模式；写入仅覆盖，不默默接受额外字段。
+pub fn loop_tool_requires_approval(tool: &str) -> bool {
+    matches!(tool, "fs.write" | "reminders.set_completed")
+}
+
 pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, ErrorCode> {
-    if !matches!(tool, "fs.list" | "fs.read" | "fs.write") {
+    if !matches!(tool, "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed") {
         return Err(ErrorCode::InvalidTool);
     }
     let object = args.as_object().ok_or(ErrorCode::InvalidArguments)?;
+    if tool == "reminders.list" {
+        if !object.is_empty() {
+            return Err(ErrorCode::InvalidArguments);
+        }
+        return Ok(BTreeMap::new());
+    }
+    if tool == "reminders.set_completed" {
+        if object.keys().any(|k| !matches!(k.as_str(), "id" | "completed")) {
+            return Err(ErrorCode::InvalidArguments);
+        }
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty() && id.len() <= 4096)
+            .ok_or(ErrorCode::InvalidArguments)?;
+        let completed = object
+            .get("completed")
+            .and_then(Value::as_bool)
+            .ok_or(ErrorCode::InvalidArguments)?;
+        return Ok(BTreeMap::from([
+            ("id".into(), id.to_string()),
+            ("completed".into(), completed.to_string()),
+        ]));
+    }
     let allowed = if tool == "fs.write" {
         vec!["path", "text"]
     } else {
@@ -494,8 +553,9 @@ pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, E
 }
 
 pub fn args_digest(tool: &str, args: &BTreeMap<String, String>) -> String {
-    // 固定覆盖语义也纳入摘要，未来若加入写入模式，不会复用旧授权。
-    digest(&serde_json::to_string(&(tool, "overwrite", args)).expect("string map")).sha256
+    // 每种写入语义使用独立标签，提醒事项授权不能复用文件写授权。
+    let mode = if tool == "reminders.set_completed" { "set_completed" } else { "overwrite" };
+    digest(&serde_json::to_string(&(tool, mode, args)).expect("string map")).sha256
 }
 
 impl LoopEngine {
@@ -792,7 +852,7 @@ impl LoopEngine {
                         self.save(live)?;
                         return Ok(live.view());
                     }
-                    if live.record.calls[index].tool == "fs.write" {
+                    if loop_tool_requires_approval(&live.record.calls[index].tool) {
                         let duplicate = (0..index).find(|&i| {
                             let old = &live.record.calls[i];
                             old.args_sha256 == live.record.calls[index].args_sha256
@@ -990,7 +1050,7 @@ impl LoopEngine {
                                 // 非法工具名不原样写盘，避免把模型任意文本带入审计。
                                 let tool = if matches!(
                                     proposal.tool.as_str(),
-                                    "fs.list" | "fs.read" | "fs.write"
+                                    "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed"
                                 ) {
                                     proposal.tool.clone()
                                 } else {
