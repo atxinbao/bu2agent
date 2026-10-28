@@ -18,6 +18,13 @@ export interface LoopSnapshot {
   late_model_arrivals_ms: number[]; final_digest: ContentDigest | null;
   in_flight: boolean; final_text: string | null;
   pending_write: { call_id: number; path: string; text: string; args_sha256: string } | null;
+  pending_reminder: {
+    call_id: number;
+    reminder_id: string;
+    title: string;
+    target_completed: boolean;
+    args_sha256: string;
+  } | null;
   approval_status: string | null;
 }
 export interface LoopGateway {

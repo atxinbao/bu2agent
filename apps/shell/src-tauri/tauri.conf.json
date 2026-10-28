@@ -23,6 +23,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "macOS": {
+      "infoPlist": "Info.plist"
+    },
     "externalBin": [
       "binaries/mock-gateway"
     ],

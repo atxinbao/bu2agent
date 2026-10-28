@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { AgentGateway } from "../domain/agent_client";
 import { isTerminal, type LoopGateway, type LoopSnapshot, type LoopStatus } from "../domain/loop_client";
+import { LoopReminderApproval } from "./LoopReminderApproval";
 
 const LAST_ID = "bu2agent.lastLoopId";
 const labels: Record<LoopStatus, string> = {
@@ -155,6 +156,14 @@ export function LoopsView({ loops, agent }: { loops: LoopGateway; agent: AgentGa
           <button disabled={busy || cancelling} onClick={() => void decide("reject")}>拒绝本次写入</button>
         </div>}
       </div>}
+      {waiting && current.pending_reminder && (
+        <LoopReminderApproval
+          snapshot={current}
+          call={call}
+          busy={busy || cancelling}
+          onDecide={(decision) => void decide(decision)}
+        />
+      )}
       {!!current.unknown_writes.length && <p className="error">未确认写入：{current.unknown_writes.map(i => `#${i}`).join("、")}。不要重试相同写入；读取只提供观测，不消除未知状态。</p>}
       {!!current.unknown_reads.length && <p>未确认读取：{current.unknown_reads.map(i => `#${i}`).join("、")}。</p>}
       {current.status === "interrupted" && <p>网关重启已中断该循环。只能查看记录，请新建任务；旧审批不能复用。</p>}

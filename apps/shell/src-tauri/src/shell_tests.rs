@@ -18,7 +18,7 @@ fn loop_workflow_invoke_roundtrip() {
         "status":"created","error":null,"max_calls":3,"proposal_count":0,"model_attempts":0,
         "budget_ms":45000,"used_ms":0,"created_at_ms":1,"updated_at_ms":1,"queue_position":0,
         "calls":[],"unknown_writes":[],"unknown_reads":[],"late_model_arrivals_ms":[],"final_digest":null,
-        "in_flight":false,"remaining_ms":45000,"final_text":null,"pending_write":null,"approval_status":null
+        "in_flight":false,"remaining_ms":45000,"final_text":null,"pending_write":null,"pending_reminder":null,"approval_status":null
     });
     let created = view.clone();
     view["status"] = json!("awaiting_approval");

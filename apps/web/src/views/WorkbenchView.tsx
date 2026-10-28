@@ -8,6 +8,7 @@ import type {
   SessionRecord,
 } from "../domain/session_client";
 import type { TaskDraft, TaskGateway, TaskRecord } from "../domain/task_client";
+import { LoopReminderApproval } from "./LoopReminderApproval";
 
 // Workbench (Round 3, 3a+3b): one list on the left, a timeline in
 // the middle, an on-demand file preview on the right. Navigation
@@ -767,6 +768,14 @@ function LoopCenter(props: LoopCenterProps) {
             </div>
           )}
         </div>
+      )}
+      {waiting && current.pending_reminder && (
+        <LoopReminderApproval
+          snapshot={current}
+          call={call}
+          busy={busy}
+          onDecide={onDecide}
+        />
       )}
       {!!current.unknown_writes.length && (
         <p className="error">

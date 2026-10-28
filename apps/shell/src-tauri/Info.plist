@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>bu2agent 需要访问提醒事项，以便在你批准后更新指定提醒的完成状态。</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>bu2agent 需要访问提醒事项，以便在你批准后更新指定提醒的完成状态。</string>
+</dict>
+</plist>

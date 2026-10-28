@@ -52,6 +52,14 @@ pub struct PendingWrite {
     pub args_sha256: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingReminder {
+    pub call_id: usize,
+    pub reminder_id: String,
+    pub title: String,
+    pub target_completed: bool,
+    pub args_sha256: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopSnapshot {
     pub loop_id: String,
     pub prompt_digest: ContentDigest,
@@ -75,6 +83,8 @@ pub struct LoopSnapshot {
     pub remaining_ms: u64,
     pub final_text: Option<String>,
     pub pending_write: Option<PendingWrite>,
+    #[serde(default)]
+    pub pending_reminder: Option<PendingReminder>,
     pub approval_status: Option<String>,
 }
 
