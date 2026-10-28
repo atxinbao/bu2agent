@@ -32,6 +32,14 @@ export interface GatewayFileStat {
   sizeBytes: number;
 }
 
+export interface GatewayBatchReadItem { path: string; offset?: number; len?: number }
+export interface GatewayBatchReadResult { path: string; ok: boolean; result?: { content_base64: string; eof: boolean; total_size: number; bytes_read: number }; error?: string }
+export interface GatewayBatchStatResult { path: string; ok: boolean; stat?: GatewayFileStat; error?: string }
+export interface GatewaySearchResult { entries: GatewayFileEntry[]; truncated: boolean }
+export interface GatewayThumbnail { path: string; contentType: string; contentBase64: string }
+export interface GatewayLibraryItem { path: string; kind: string; isDir: boolean; sizeBytes: number; modifiedMs: number }
+export interface GatewayLibraryResult { items: GatewayLibraryItem[]; truncated: boolean }
+
 interface ServerFileEntry {
   name: string;
   path: string;
@@ -88,6 +96,13 @@ export interface FileGateway {
   delete(path: string, approved: boolean): Promise<void>;
   rename(from: string, to: string, approved: boolean): Promise<void>;
   mkdir(path: string, approved: boolean): Promise<void>;
+  reads(items: GatewayBatchReadItem[]): Promise<GatewayBatchReadResult[]>;
+  stats(paths: string[]): Promise<GatewayBatchStatResult[]>;
+  search(query: string, startPath?: string): Promise<GatewaySearchResult>;
+  subscribe(path: string, cursor?: string, waitMs?: number): Promise<{ changed: boolean; cursor: string; entries?: GatewayFileEntry[] }>;
+  thumbnail(path: string, width?: number): Promise<GatewayThumbnail>;
+  export(from: string, to: string, approved: boolean): Promise<number>;
+  library(kinds?: string[], limit?: number): Promise<GatewayLibraryResult>;
 }
 
 export class FileGatewayClient implements FileGateway {
@@ -354,5 +369,40 @@ export class FileGatewayClient implements FileGateway {
     if (result.status !== 200) {
       throw new Error(`mock gateway returned HTTP ${result.status}`);
     }
+  }
+
+  async reads(items: GatewayBatchReadItem[]): Promise<GatewayBatchReadResult[]> {
+    const result = await this.requestWithRetry<{ items: GatewayBatchReadResult[] }>("/files/reads", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items }) }, undefined, false);
+    return result.items;
+  }
+  async stats(paths: string[]): Promise<GatewayBatchStatResult[]> {
+    const result = await this.requestWithRetry<{ items: GatewayBatchStatResult[] }>("/files/stats", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ paths }) }, undefined, false);
+    return result.items;
+  }
+  async search(query: string, startPath = ""): Promise<GatewaySearchResult> {
+    return this.requestWithRetry<GatewaySearchResult>("/files/search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query, start_path: startPath }) }, undefined, false);
+  }
+  async subscribe(path: string, cursor?: string, waitMs = 25000): Promise<{ changed: boolean; cursor: string; entries?: GatewayFileEntry[] }> {
+    const result = await this.requestWithRetry<{ changed: boolean; cursor: string; entries?: ServerFileEntry[] }>("/files/subscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, cursor, wait_ms: waitMs }) }, undefined, false);
+    return { changed: result.changed, cursor: result.cursor, entries: result.entries?.map((e) => ({ name: e.name, path: e.path, isDir: e.is_dir, sizeBytes: e.size_bytes })) };
+  }
+  async thumbnail(path: string, width = 256): Promise<GatewayThumbnail> {
+    const result = await this.requestWithRetry<{ path: string; content_type: string; content_base64: string }>(`/files/thumbnail?path=${encodeURIComponent(path)}&w=${width}&format=json`, undefined, undefined, false);
+    return { path: result.path, contentType: result.content_type, contentBase64: result.content_base64 };
+  }
+  async export(from: string, to: string, approved: boolean): Promise<number> {
+    if (!approved) throw new Error("file export requires approval");
+    checkRelative(from);
+    if (!to.startsWith("/")) throw new Error("export target must be an absolute path outside the file root");
+    const approvalId = await this.boundApprovalId("fs.export", from, to);
+    const result = await this.postJson("/files/export", { from, to, approval_id: approvalId });
+    if (result.status === 403) throw new Error("approved file operation does not match this execution (changed, already used, or expired); nothing was exported");
+    if (result.status === 409) throw new Error("export target already exists; nothing was exported");
+    if (result.status !== 200) throw new Error(`mock gateway returned HTTP ${result.status}`);
+    return typeof result.json.size_bytes === "number" ? result.json.size_bytes : 0;
+  }
+  async library(kinds?: string[], limit?: number): Promise<GatewayLibraryResult> {
+    const result = await this.requestWithRetry<{ items: Array<{ path: string; kind: string; is_dir: boolean; size_bytes: number; modified_ms: number }>; truncated: boolean }>("/files/library", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kinds, limit }) }, undefined, false);
+    return { truncated: result.truncated, items: result.items.map((e) => ({ path: e.path, kind: e.kind, isDir: e.is_dir, sizeBytes: e.size_bytes, modifiedMs: e.modified_ms })) };
   }
 }

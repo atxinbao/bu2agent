@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { FileGateway, GatewayFileEntry } from "../domain/file_client";
+import type { FileGateway, GatewayFileEntry, GatewayLibraryItem } from "../domain/file_client";
 
 // Files view over the FileGateway interface: the view never
 // knows whether it runs on invoke or on HTTP. Writes and
@@ -44,6 +44,12 @@ export function FilesView({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<GatewayFileEntry[]>([]);
+  const [libraryItems, setLibraryItems] = useState<GatewayLibraryItem[]>([]);
+  const [showLibrary, setShowLibrary] = useState(false);
+  const [exportTarget, setExportTarget] = useState("");
+  const [thumbnail, setThumbnail] = useState<string | null>(null);
 
   async function refresh(path: string) {
     setBusy(true);
@@ -61,6 +67,24 @@ export function FilesView({
     void refresh(dir);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    let cursor: string | undefined;
+    async function watch() {
+      try {
+        const result = await client.subscribe(dir, cursor, 25000);
+        if (stopped) return;
+        cursor = result.cursor;
+        if (result.changed) await refresh(dir);
+      } catch {
+        // 订阅是辅助刷新；目录列表本身仍可手动刷新。
+      }
+      if (!stopped) void watch();
+    }
+    void watch();
+    return () => { stopped = true; };
+  }, [client, dir]);
 
   async function openEntry(entry: GatewayFileEntry) {
     setError(null);
@@ -82,11 +106,42 @@ export function FilesView({
       const text = await client.readText(entry.path, 4096, 1048576);
       setSelectedPath(entry.path);
       setSelectedText(text);
+      const ext = entry.path.toLowerCase().split(".").pop() ?? "";
+      if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) {
+        try {
+          const image = await client.thumbnail(entry.path, 256);
+          setThumbnail(`data:${image.contentType};base64,${image.contentBase64}`);
+        } catch { setThumbnail(null); }
+      } else {
+        setThumbnail(null);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
+  }
+
+  async function search() {
+    setBusy(true); setError(null);
+    try { const result = await client.search(searchQuery, dir); setSearchResults(result.entries); setNotice(result.truncated ? "search results truncated" : `found ${result.entries.length} entries`); }
+    catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setBusy(false); }
+  }
+
+  async function loadLibrary() {
+    setBusy(true); setError(null);
+    try { const result = await client.library(); setLibraryItems(result.items); setShowLibrary(true); }
+    catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setBusy(false); }
+  }
+
+  async function exportSelected() {
+    if (!selectedPath || !writesAllowed || exportTarget.trim() === "") { setError("export needs a selected file, an absolute target, and approval"); return; }
+    setBusy(true); setError(null);
+    try { const size = await client.export(selectedPath, exportTarget.trim(), true); setNotice(`exported ${size} bytes to ${exportTarget.trim()}`); }
+    catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setBusy(false); }
   }
 
   async function write() {
@@ -221,6 +276,13 @@ export function FilesView({
           List
         </button>
       </div>
+      <div className="row">
+        <input value={searchQuery} placeholder="Search file name or path" onChange={(event) => setSearchQuery(event.target.value)} />
+        <button type="button" onClick={() => void search()} disabled={busy || searchQuery.trim() === ""}>Search</button>
+        <button type="button" onClick={() => void loadLibrary()} disabled={busy}>Library</button>
+      </div>
+      {searchResults.length > 0 && <div className="note"><strong>Search results</strong><ul>{searchResults.map((entry) => <li key={`search-${entry.path}`}>{entry.path}</li>)}</ul></div>}
+      {showLibrary && <div className="note"><strong>Library (single-root local interpretation)</strong><ul>{libraryItems.map((item) => <li key={`library-${item.path}`}>{item.kind}: {item.path} ({item.sizeBytes} bytes)</li>)}</ul></div>}
       {entries.length === 0 && <p className="empty">No entries in this directory.</p>}
       <ul className="entries">
         {entries.map((entry) => (
@@ -268,6 +330,11 @@ export function FilesView({
         <div>
           <h3>{selectedPath}</h3>
           <pre className="result">{selectedText}</pre>
+          {thumbnail !== null && <img src={thumbnail} alt={`Thumbnail for ${selectedPath}`} style={{ maxWidth: 256, maxHeight: 256 }} />}
+          <div className="row">
+            <input value={exportTarget} placeholder="Absolute export path" onChange={(event) => setExportTarget(event.target.value)} />
+            <button type="button" onClick={() => void exportSelected()} disabled={busy || !writesAllowed}>Export</button>
+          </div>
         </div>
       )}
       {selectedStat !== null && (

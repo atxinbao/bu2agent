@@ -24,7 +24,7 @@ use agent_desktop::agent_client::{AgentClient, AgentError, ToolDecision, ToolRes
 use agent_desktop::connector_client::{ConnectorClient, MockMessage, MockNote};
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
-use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat};
+use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
 use agent_desktop::{ErrorCode, UnifiedError, UserAction};
 
 fn err_string(error: &UnifiedError) -> String {
@@ -152,6 +152,27 @@ pub fn file_mkdir(path: String, approved: bool) -> Result<(), String> {
     }
     file_client()?.mkdir(&path, true).map_err(|e| err_string(&e))
 }
+
+#[tauri::command]
+pub fn file_reads(items: Vec<GatewayBatchReadItem>) -> Result<Vec<GatewayBatchReadResult>, String> { file_client()?.reads(&items).map_err(|e| err_string(&e)) }
+
+#[tauri::command]
+pub fn file_stats(paths: Vec<String>) -> Result<Vec<GatewayBatchStatResult>, String> { file_client()?.stats(&paths).map_err(|e| err_string(&e)) }
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn file_search(query: String, start_path: String) -> Result<GatewaySearchResult, String> { file_client()?.search(&query, &start_path).map_err(|e| err_string(&e)) }
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn file_subscribe(path: String, cursor: Option<String>, wait_ms: u64) -> Result<serde_json::Value, String> { file_client()?.subscribe(&path, cursor.as_deref(), wait_ms).map_err(|e| err_string(&e)) }
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn file_thumbnail(path: String, width: u32) -> Result<GatewayThumbnail, String> { file_client()?.thumbnail(&path, width).map_err(|e| err_string(&e)) }
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn file_export(from_path: String, to_path: String, approved: bool) -> Result<u64, String> { file_client()?.export(&from_path, &to_path, approved).map_err(|e| err_string(&e)) }
+
+#[tauri::command]
+pub fn file_library(kinds: Option<Vec<String>>, limit: Option<usize>) -> Result<GatewayLibraryResult, String> { file_client()?.library(&kinds.unwrap_or_default(), limit.unwrap_or(200)).map_err(|e| err_string(&e)) }
 
 // --- Agent tools (Phase 3 approval loop) ---
 
