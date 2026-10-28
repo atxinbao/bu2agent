@@ -23,8 +23,10 @@ async fn request(addr: std::net::SocketAddr, method: &str, path: &str, body: Opt
 fn root(name: &str) -> std::path::PathBuf { let p = std::env::temp_dir().join(format!("task6-{name}-{}", std::process::id())); let _ = std::fs::remove_dir_all(&p); std::fs::create_dir_all(&p).unwrap(); p }
 async fn post(addr: std::net::SocketAddr, path: &str, body: &str) -> (String, String) { request(addr, "POST", path, Some(body)).await }
 async fn get(addr: std::net::SocketAddr, path: &str) -> (String, String) { request(addr, "GET", path, None).await }
-async fn approve(addr: std::net::SocketAddr, tool: &str, params: &str) -> String {
-    let (_, body) = post(addr, "/approval/request", &format!(r#"{{"tool":"{tool}",{params}}}"#)).await;
+async fn approve(addr: std::net::SocketAddr, tool: &str, params: serde_json::Value) -> String {
+    let mut request = serde_json::json!({ "tool": tool });
+    request.as_object_mut().unwrap().extend(params.as_object().unwrap().clone());
+    let (_, body) = post(addr, "/approval/request", &request.to_string()).await;
     let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["tool_call_id"].as_str().unwrap().to_string();
     let (status, _) = post(addr, "/approval/decide", &format!(r#"{{"tool_call_id":"{id}","status":"approved"}}"#)).await;
     assert!(status.contains("200")); id
@@ -47,12 +49,12 @@ async fn extended_file_endpoints_keep_partial_results_and_jail() {
     let (status, body) = post(addr, "/files/subscribe", r#"{"path":"","wait_ms":0}"#).await; assert!(status.contains("200")); let cursor = serde_json::from_str::<serde_json::Value>(&body).unwrap()["cursor"].as_str().unwrap().to_string();
     let (status, _) = post(addr, "/files/subscribe", &format!(r#"{{"path":"","cursor":"{cursor}","wait_ms":1}}"#)).await; assert!(status.contains("200"));
     let export = std::env::temp_dir().join(format!("task6-export-{}.txt", std::process::id())); let _ = std::fs::remove_file(&export);
-    let id = approve(addr, "fs.export", &format!(r#""path":"a.txt","to_path":"{}""#, export.display())).await;
-    let (status, _) = post(addr, "/files/export", &format!(r#"{{"from":"a.txt","to":"{}","approval_id":"{id}"}}"#, export.display())).await; assert!(status.contains("200")); assert_eq!(std::fs::read(&export).unwrap(), b"alpha");
+    let id = approve(addr, "fs.export", serde_json::json!({ "path": "a.txt", "to_path": export.display().to_string() })).await;
+    let (status, _) = post(addr, "/files/export", &serde_json::json!({ "from": "a.txt", "to": export.display().to_string(), "approval_id": id }).to_string()).await; assert!(status.contains("200")); assert_eq!(std::fs::read(&export).unwrap(), b"alpha");
     let inside = root.join("inside.txt");
     let dotted_inside = root.join("..").join(root.file_name().unwrap()).join("inside.txt");
-    let id = approve(addr, "fs.export", &format!(r#""path":"a.txt","to_path":"{}""#, dotted_inside.display())).await;
-    let (status, _) = post(addr, "/files/export", &format!(r#"{{"from":"a.txt","to":"{}","approval_id":"{id}"}}"#, dotted_inside.display())).await;
+    let id = approve(addr, "fs.export", serde_json::json!({ "path": "a.txt", "to_path": dotted_inside.display().to_string() })).await;
+    let (status, _) = post(addr, "/files/export", &serde_json::json!({ "from": "a.txt", "to": dotted_inside.display().to_string(), "approval_id": id }).to_string()).await;
     assert!(status.contains("400"), "dotted root-internal export must be rejected: {status}");
     assert!(!inside.exists());
     let (status, body) = post(addr, "/files/library", r#"{"limit":10}"#).await; assert!(status.contains("200")); assert!(body.contains("a.txt"));
