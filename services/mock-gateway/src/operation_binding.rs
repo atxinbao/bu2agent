@@ -174,10 +174,12 @@ mod tests {
         assert_eq!(mkdir_digest("a/new").expect("digest"), mkdir);
         assert_ne!(mkdir_digest("a/other").expect("digest"), mkdir);
         assert_ne!(mkdir, delete_digest("a/new").expect("digest"));
-        let export = export_digest("a/file.txt", "/tmp/out.txt").expect("digest");
-        assert_eq!(export_digest("a/./file.txt", "/tmp/out.txt"), Some(export.clone()));
-        assert_ne!(export_digest("b/file.txt", "/tmp/out.txt").unwrap(), export);
-        assert_ne!(export_digest("a/file.txt", "/tmp/other.txt").unwrap(), export);
+        let out = if cfg!(windows) { "C:\\tmp\\out.txt" } else { "/tmp/out.txt" };
+        let other = if cfg!(windows) { "C:\\tmp\\other.txt" } else { "/tmp/other.txt" };
+        let export = export_digest("a/file.txt", out).expect("digest");
+        assert_eq!(export_digest("a/./file.txt", out), Some(export.clone()));
+        assert_ne!(export_digest("b/file.txt", out).unwrap(), export);
+        assert_ne!(export_digest("a/file.txt", other).unwrap(), export);
         assert_eq!(export_digest("a/file.txt", "relative.txt"), None);
     }
 }
