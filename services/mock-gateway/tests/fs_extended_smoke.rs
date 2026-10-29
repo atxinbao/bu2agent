@@ -61,6 +61,21 @@ async fn extended_file_endpoints_keep_partial_results_and_jail() {
     let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=").unwrap();
     std::fs::write(root.join("pixel.png"), png).unwrap();
     let (status, body) = get(addr, "/files/thumbnail?path=pixel.png&w=32&format=json").await; assert!(status.contains("200")); assert!(body.contains("image/jpeg"));
+    // Thumbnails never upscale: the 1x1 source stays 1x1 even with w=32.
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value["content_base64"].as_str().unwrap()).unwrap();
+    let thumb = image::load_from_memory(&data).unwrap();
+    assert_eq!((thumb.width(), thumb.height()), (1, 1));
+    // Downscaling still applies: a 120x90 source at w=60 comes back 60x45.
+    let big = image::DynamicImage::new_rgb8(120, 90);
+    let mut png_bytes = std::io::Cursor::new(Vec::new());
+    big.write_to(&mut png_bytes, image::ImageFormat::Png).unwrap();
+    std::fs::write(root.join("big.png"), png_bytes.into_inner()).unwrap();
+    let (status, body) = get(addr, "/files/thumbnail?path=big.png&w=60&format=json").await; assert!(status.contains("200"));
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value["content_base64"].as_str().unwrap()).unwrap();
+    let thumb = image::load_from_memory(&data).unwrap();
+    assert_eq!((thumb.width(), thumb.height()), (60, 45));
     std::fs::write(root.join("large.bin"), vec![0u8; 1_048_577]).unwrap();
     let (status, _) = get(addr, "/files/raw?path=large.bin").await; assert!(status.contains("413"));
     let _ = std::fs::remove_file(export); let _ = std::fs::remove_dir_all(root);

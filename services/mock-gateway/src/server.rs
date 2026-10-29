@@ -1082,7 +1082,8 @@ async fn files_thumbnail(State(state): State<AppState>, Query(query): Query<Thum
     let Ok(bytes) = std::fs::read(&full) else { return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"error":"cannot read image"}))).into_response(); };
     let Ok(image) = image::load_from_memory(&bytes) else { return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"error":"cannot decode image"}))).into_response(); };
     let width = query.w.unwrap_or(256).clamp(1, 512);
-    let thumb = image.thumbnail(width, width);
+    // Downscale only: a source that already fits the box keeps its size.
+    let thumb = if image.width() > width || image.height() > width { image.thumbnail(width, width) } else { image };
     let mut output = Cursor::new(Vec::new());
     if thumb.write_to(&mut output, image::ImageFormat::Jpeg).is_err() { return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot encode thumbnail"}))).into_response(); }
     let data = output.into_inner();
