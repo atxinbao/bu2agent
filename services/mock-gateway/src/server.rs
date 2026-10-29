@@ -33,6 +33,11 @@
 //! - POST /files/export|library  -> bound external export and local media index
 //! - POST /approval/request      -> open a pending approval record (approval tools)
 //! - POST /approval/decide       -> decide an approval record (approved/rejected/edited)
+//! - GET  /approvals             -> current approval records, one per id
+//! - GET  /approvals/history     -> approval event history (JSONL order)
+//! - GET  /approvals/{id}        -> one approval record
+//! - GET  /approvals/{id}/editable-message -> message + whether it may be edited
+//! - POST /approvals/{id}/edit-message     -> edit an unbound pending approval's message
 //! - POST /agent/tool/call       -> execute a tool, server re-checks its own approval record
 //!
 //! File scope: every file path is relative to one root (default
@@ -194,6 +199,7 @@ pub(crate) struct ApprovalState {
     binding: Option<ApprovalBinding>,
     consumed: bool,
     operation_digest: Option<String>,
+    message: Option<String>,
 }
 
 impl ApprovalState {
@@ -208,7 +214,11 @@ impl ApprovalState {
         consumed: bool,
         operation_digest: Option<String>,
     ) -> Self {
-        ApprovalState { tool, status, binding, consumed, operation_digest }
+        ApprovalState { tool, status, binding, consumed, operation_digest, message: None }
+    }
+
+    fn is_bound(&self) -> bool {
+        self.binding.is_some() || self.operation_digest.is_some()
     }
 }
 
@@ -347,7 +357,7 @@ impl AppState {
                     Some(status) => {
                         approvals.insert(
                             record.tool_call_id.clone(),
-                            ApprovalState { tool: record.tool.clone(), status, binding: record.binding.clone(), consumed: record.consumed, operation_digest: record.operation_digest.clone() },
+                            ApprovalState { tool: record.tool.clone(), status, binding: record.binding.clone(), consumed: record.consumed, operation_digest: record.operation_digest.clone(), message: record.message.clone() },
                         );
                     }
                     None => {
@@ -442,6 +452,7 @@ impl AppState {
             binding: Some(binding),
             consumed: false,
             operation_digest: None,
+            message: None,
         };
         let mut approvals = self.approvals.lock().unwrap();
         persist_approval(self, &id, &record)
@@ -1368,6 +1379,7 @@ struct ApprovalRequestDto {
     to_path: Option<String>,
     content_base64: Option<String>,
     append: Option<bool>,
+    message: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1467,7 +1479,7 @@ async fn approval_request(
     let mut next = state.next_approval_id.lock().expect("approval id lock");
     let id = format!("approval-{}", *next);
     *next += 1;
-    let record = ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending, binding: None, consumed: false, operation_digest: operation_digest.clone() };
+    let record = ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending, binding: None, consumed: false, operation_digest: operation_digest.clone(), message: req.message.clone() };
     let mut approvals = state.approvals.lock().expect("approval lock");
     if let Err(detail) = persist_approval(&state, &id, &record) {
         // Bound records fail closed like loop approvals: an id whose
@@ -1515,6 +1527,149 @@ async fn approval_decide(
     Json(serde_json::json!({ "tool_call_id": req.tool_call_id, "status": req.status })).into_response()
 }
 
+// --- Egress approval query surface (Task 7) ---
+//
+// Local semantics only (route schemas are unknown; see the Task 7
+// plan): views follow the local JSONL record shape, history is the
+// persisted event lines in file order, and edit-message mirrors
+// decide-edited: only a pending, unconsumed, unbound record may be
+// edited, and a successful edit moves it to `edited`.
+
+#[derive(Debug, Serialize)]
+struct ApprovalView {
+    approval_id: String,
+    /// Local alias: existing clients name approval ids tool_call_id.
+    tool_call_id: String,
+    tool: String,
+    status: String,
+    consumed: bool,
+    bound: bool,
+    binding: Option<ApprovalBinding>,
+    operation_digest: Option<String>,
+    message: Option<String>,
+}
+
+fn approval_number(approval_id: &str) -> u64 {
+    approval_id.strip_prefix("approval-").and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)
+}
+
+fn approval_view(approval_id: &str, record: &ApprovalState) -> ApprovalView {
+    ApprovalView {
+        approval_id: approval_id.to_string(),
+        tool_call_id: approval_id.to_string(),
+        tool: record.tool.clone(),
+        status: approval_status_name(record.status).to_string(),
+        consumed: record.consumed,
+        bound: record.is_bound(),
+        binding: record.binding.clone(),
+        operation_digest: record.operation_digest.clone(),
+        message: record.message.clone(),
+    }
+}
+
+fn approval_view_from_file(record: &ApprovalFileRecord) -> ApprovalView {
+    ApprovalView {
+        approval_id: record.tool_call_id.clone(),
+        tool_call_id: record.tool_call_id.clone(),
+        tool: record.tool.clone(),
+        status: record.status.clone(),
+        consumed: record.consumed,
+        bound: record.binding.is_some() || record.operation_digest.is_some(),
+        binding: record.binding.clone(),
+        operation_digest: record.operation_digest.clone(),
+        message: record.message.clone(),
+    }
+}
+
+fn unknown_approval() -> axum::response::Response {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown approval_id" }))).into_response()
+}
+
+fn approval_editable(record: &ApprovalState) -> bool {
+    record.status == ApprovalStatus::Pending && !record.consumed && !record.is_bound()
+}
+
+async fn approvals_list(State(state): State<AppState>) -> Json<Vec<ApprovalView>> {
+    let approvals = state.approvals.lock().expect("approval lock");
+    let mut views: Vec<ApprovalView> =
+        approvals.iter().map(|(id, record)| approval_view(id, record)).collect();
+    views.sort_by_key(|view| approval_number(&view.approval_id));
+    Json(views)
+}
+
+async fn approvals_history(State(state): State<AppState>) -> Json<Vec<ApprovalView>> {
+    if let Some(path) = &state.approvals_path {
+        let views: Vec<ApprovalView> =
+            load_records(path).iter().map(approval_view_from_file).collect();
+        return Json(views);
+    }
+    // No persistence configured: history degrades to the current
+    // state, one entry per approval.
+    approvals_list(State(state)).await
+}
+
+async fn approvals_get(
+    State(state): State<AppState>,
+    axum::extract::Path(approval_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let approvals = state.approvals.lock().expect("approval lock");
+    match approvals.get(&approval_id) {
+        Some(record) => Json(approval_view(&approval_id, record)).into_response(),
+        None => unknown_approval(),
+    }
+}
+
+async fn approval_editable_message(
+    State(state): State<AppState>,
+    axum::extract::Path(approval_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let approvals = state.approvals.lock().expect("approval lock");
+    match approvals.get(&approval_id) {
+        Some(record) => Json(serde_json::json!({
+            "approval_id": approval_id,
+            "message": record.message,
+            "editable": approval_editable(record),
+        }))
+        .into_response(),
+        None => unknown_approval(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EditMessageDto {
+    message: Option<String>,
+}
+
+async fn approval_edit_message(
+    State(state): State<AppState>,
+    axum::extract::Path(approval_id): axum::extract::Path<String>,
+    Json(req): Json<EditMessageDto>,
+) -> impl IntoResponse {
+    let Some(message) = req.message.filter(|m| !m.trim().is_empty()) else {
+        return bad_request("message must not be empty");
+    };
+    let mut approvals = state.approvals.lock().expect("approval lock");
+    let Some(record) = approvals.get_mut(&approval_id) else {
+        return unknown_approval();
+    };
+    if !approval_editable(record) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "approval_not_editable" }))).into_response();
+    }
+    let old_message = record.message.clone();
+    let old_status = record.status;
+    record.message = Some(message);
+    record.status = ApprovalStatus::Edited;
+    let view = approval_view(&approval_id, record);
+    if persist_approval(&state, &approval_id, record).is_err() {
+        // Fail closed like approval_decide: an edit that cannot be
+        // audited must not take effect.
+        record.message = old_message;
+        record.status = old_status;
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "approval_audit_failed" }))).into_response();
+    }
+    Json(view).into_response()
+}
+
 /// Append one approval record to the persistence file, when
 /// configured. Best-effort: a failure is logged to stderr and
 /// the in-memory record (authoritative for this run) is kept.
@@ -1527,6 +1682,7 @@ pub(crate) fn persist_approval(state: &AppState, tool_call_id: &str, approval: &
         binding: approval.binding.clone(),
         consumed: approval.consumed,
         operation_digest: approval.operation_digest.clone(),
+        message: approval.message.clone(),
     };
     append_record(path, &record)
 }
@@ -2950,6 +3106,11 @@ pub fn app(state: AppState) -> Router {
         .route("/files/library", post(files_library))
         .route("/approval/request", post(approval_request))
         .route("/approval/decide", post(approval_decide))
+        .route("/approvals", get(approvals_list))
+        .route("/approvals/history", get(approvals_history))
+        .route("/approvals/{approval_id}", get(approvals_get))
+        .route("/approvals/{approval_id}/editable-message", get(approval_editable_message))
+        .route("/approvals/{approval_id}/edit-message", post(approval_edit_message))
         .route("/agent/tool/call", post(agent_tool_call))
         .route("/agent/loop/start", post(loop_start))
         .route("/agent/loop/get", get(loop_get))

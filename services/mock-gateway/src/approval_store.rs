@@ -33,6 +33,8 @@ pub struct ApprovalFileRecord {
     pub consumed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Read every well-formed record from `path`, in file order.
@@ -112,6 +114,7 @@ mod tests {
             binding: None,
             consumed: false,
             operation_digest: None,
+            message: None,
         }
     }
 
@@ -126,12 +129,16 @@ mod tests {
     fn append_then_load_roundtrips_in_order() {
         let path = temp_path("roundtrip");
         append_record(&path, &record("approval-1", "fs.write", "pending")).expect("append 1");
-        append_record(&path, &record("approval-1", "fs.write", "approved")).expect("append 2");
+        let mut edited = record("approval-1", "fs.write", "edited");
+        edited.message = Some("revised draft".to_string());
+        append_record(&path, &edited).expect("append 2");
         append_record(&path, &record("approval-2", "mail.send", "pending")).expect("append 3");
         let loaded = load_records(&path);
         assert_eq!(loaded.len(), 3);
         assert_eq!(loaded[0].status, "pending");
-        assert_eq!(loaded[1].status, "approved");
+        assert_eq!(loaded[0].message, None);
+        assert_eq!(loaded[1].status, "edited");
+        assert_eq!(loaded[1].message.as_deref(), Some("revised draft"));
         assert_eq!(loaded[2].tool_call_id, "approval-2");
         let _ = std::fs::remove_file(&path);
     }
