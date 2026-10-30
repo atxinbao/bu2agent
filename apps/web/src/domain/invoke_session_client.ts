@@ -22,6 +22,8 @@ interface ServerSessionRecord {
   created_ms: number;
   updated_ms: number;
   deleted: boolean;
+  pinned: boolean;
+  archived: boolean;
   turns: ServerSessionTurn[];
 }
 
@@ -31,6 +33,8 @@ interface ServerSessionSummary {
   created_ms: number;
   updated_ms: number;
   turn_count: number;
+  pinned: boolean;
+  archived: boolean;
 }
 
 function toTurn(server: ServerSessionTurn): SessionTurn {
@@ -50,6 +54,8 @@ function toRecord(server: ServerSessionRecord): SessionRecord {
     createdMs: server.created_ms,
     updatedMs: server.updated_ms,
     deleted: server.deleted,
+    pinned: server.pinned ?? false,
+    archived: server.archived ?? false,
     turns: server.turns.map(toTurn),
   };
 }
@@ -61,6 +67,8 @@ function toSummary(server: ServerSessionSummary): SessionSummary {
     createdMs: server.created_ms,
     updatedMs: server.updated_ms,
     turnCount: server.turn_count,
+    pinned: server.pinned ?? false,
+    archived: server.archived ?? false,
   };
 }
 
@@ -75,8 +83,9 @@ export class InvokeSessionClient implements SessionGateway {
     return toRecord(record);
   }
 
-  async list(): Promise<SessionSummary[]> {
-    const records = await invoke<ServerSessionSummary[]>("session_list");
+  async list(includeArchived?: boolean): Promise<SessionSummary[]> {
+    const command = includeArchived ? "session_list_including_archived" : "session_list";
+    const records = await invoke<ServerSessionSummary[]>(command);
     return records.map(toSummary);
   }
 
@@ -97,5 +106,34 @@ export class InvokeSessionClient implements SessionGateway {
 
   async delete(sessionId: string): Promise<void> {
     await invoke("session_delete", { session_id: sessionId });
+  }
+
+  private async flag(command: string, sessionId: string): Promise<SessionSummary> {
+    const summary = await invoke<ServerSessionSummary>(command, { session_id: sessionId });
+    return toSummary(summary);
+  }
+
+  async pin(sessionId: string): Promise<SessionSummary> {
+    return this.flag("session_pin", sessionId);
+  }
+
+  async unpin(sessionId: string): Promise<SessionSummary> {
+    return this.flag("session_unpin", sessionId);
+  }
+
+  async archive(sessionId: string): Promise<SessionSummary> {
+    return this.flag("session_archive", sessionId);
+  }
+
+  async unarchive(sessionId: string): Promise<SessionSummary> {
+    return this.flag("session_unarchive", sessionId);
+  }
+
+  async rename(sessionId: string, title: string): Promise<SessionSummary> {
+    const summary = await invoke<ServerSessionSummary>("session_rename", {
+      session_id: sessionId,
+      title,
+    });
+    return toSummary(summary);
   }
 }

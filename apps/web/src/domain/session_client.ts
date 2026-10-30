@@ -25,6 +25,8 @@ export interface SessionRecord {
   createdMs: number;
   updatedMs: number;
   deleted: boolean;
+  pinned: boolean;
+  archived: boolean;
   turns: SessionTurn[];
 }
 
@@ -34,6 +36,8 @@ export interface SessionSummary {
   createdMs: number;
   updatedMs: number;
   turnCount: number;
+  pinned: boolean;
+  archived: boolean;
 }
 
 interface ServerSessionTurn {
@@ -50,6 +54,8 @@ interface ServerSessionRecord {
   created_ms: number;
   updated_ms: number;
   deleted: boolean;
+  pinned: boolean;
+  archived: boolean;
   turns: ServerSessionTurn[];
 }
 
@@ -59,6 +65,8 @@ interface ServerSessionSummary {
   created_ms: number;
   updated_ms: number;
   turn_count: number;
+  pinned: boolean;
+  archived: boolean;
 }
 
 function toTurn(server: ServerSessionTurn): SessionTurn {
@@ -78,6 +86,8 @@ function toRecord(server: ServerSessionRecord): SessionRecord {
     createdMs: server.created_ms,
     updatedMs: server.updated_ms,
     deleted: server.deleted,
+    pinned: server.pinned ?? false,
+    archived: server.archived ?? false,
     turns: server.turns.map(toTurn),
   };
 }
@@ -89,6 +99,8 @@ function toSummary(server: ServerSessionSummary): SessionSummary {
     createdMs: server.created_ms,
     updatedMs: server.updated_ms,
     turnCount: server.turn_count,
+    pinned: server.pinned ?? false,
+    archived: server.archived ?? false,
   };
 }
 
@@ -97,10 +109,15 @@ function toSummary(server: ServerSessionSummary): SessionSummary {
 // view never knows which transport it runs on.
 export interface SessionGateway {
   create(title?: string | null): Promise<SessionRecord>;
-  list(): Promise<SessionSummary[]>;
+  list(includeArchived?: boolean): Promise<SessionSummary[]>;
   get(sessionId: string): Promise<SessionRecord>;
   send(sessionId: string, text: string): Promise<SessionRecord>;
   delete(sessionId: string): Promise<void>;
+  pin(sessionId: string): Promise<SessionSummary>;
+  unpin(sessionId: string): Promise<SessionSummary>;
+  archive(sessionId: string): Promise<SessionSummary>;
+  unarchive(sessionId: string): Promise<SessionSummary>;
+  rename(sessionId: string, title: string): Promise<SessionSummary>;
 }
 
 export class SessionClient implements SessionGateway {
@@ -127,8 +144,9 @@ export class SessionClient implements SessionGateway {
     return toRecord(record);
   }
 
-  async list(): Promise<SessionSummary[]> {
-    const records = await this.request<ServerSessionSummary[]>("/sessions/list");
+  async list(includeArchived?: boolean): Promise<SessionSummary[]> {
+    const path = includeArchived ? "/sessions/list?include_archived=true" : "/sessions/list";
+    const records = await this.request<ServerSessionSummary[]>(path);
     return records.map(toSummary);
   }
 
@@ -154,5 +172,39 @@ export class SessionClient implements SessionGateway {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: sessionId }),
     });
+  }
+
+  private async flag(path: string, sessionId: string): Promise<SessionSummary> {
+    const summary = await this.request<ServerSessionSummary>(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    return toSummary(summary);
+  }
+
+  async pin(sessionId: string): Promise<SessionSummary> {
+    return this.flag("/session/pin", sessionId);
+  }
+
+  async unpin(sessionId: string): Promise<SessionSummary> {
+    return this.flag("/session/unpin", sessionId);
+  }
+
+  async archive(sessionId: string): Promise<SessionSummary> {
+    return this.flag("/session/archive", sessionId);
+  }
+
+  async unarchive(sessionId: string): Promise<SessionSummary> {
+    return this.flag("/session/unarchive", sessionId);
+  }
+
+  async rename(sessionId: string, title: string): Promise<SessionSummary> {
+    const summary = await this.request<ServerSessionSummary>("/session/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, title }),
+    });
+    return toSummary(summary);
   }
 }

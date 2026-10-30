@@ -57,6 +57,10 @@ pub struct SessionRecord {
     #[serde(default)]
     pub deleted: bool,
     #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
     pub turns: Vec<SessionTurn>,
 }
 

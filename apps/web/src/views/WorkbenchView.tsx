@@ -43,6 +43,9 @@ interface WorkItem {
   // the pending filter.
   pending: boolean;
   pendingLabel: string | null;
+  // Session-only flags; tasks and loops always carry false.
+  pinned: boolean;
+  archived: boolean;
 }
 
 interface Preview {
@@ -91,6 +94,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [pendingOnly, setPendingOnly] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
   const [selection, setSelection] = useState<WorkItem | null>(null);
   const [sessionDetail, setSessionDetail] = useState<SessionRecord | null>(null);
   const [taskDetail, setTaskDetail] = useState<TaskRecord | null>(null);
@@ -105,6 +109,8 @@ export function WorkbenchView(props: WorkbenchViewProps) {
   const [composer, setComposer] = useState("");
   const [sending, setSending] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [renameTitle, setRenameTitle] = useState("");
   const [preview, setPreview] = useState<Preview | null>(null);
   const [previewError, setPreviewError] = useState("");
   const [loopBusy, setLoopBusy] = useState(false);
@@ -179,12 +185,12 @@ export function WorkbenchView(props: WorkbenchViewProps) {
     return text;
   }
 
-  async function refreshList() {
+  async function refreshList(includeArchived = showArchived) {
     setLoading(true);
     setError("");
     try {
       const [sessionList, taskList, loopList] = await Promise.all([
-        sessions.list(),
+        sessions.list(includeArchived),
         tasks.list(),
         loops.list(),
       ]);
@@ -195,9 +201,15 @@ export function WorkbenchView(props: WorkbenchViewProps) {
           kind: "session",
           id: s.sessionId,
           title: s.title || "新会话",
-          status: `${s.turnCount} 条消息`,
+          status: s.pinned
+            ? `置顶 · ${s.turnCount} 条消息`
+            : s.archived
+              ? `归档 · ${s.turnCount} 条消息`
+              : `${s.turnCount} 条消息`,
           pending: false,
           pendingLabel: null,
+          pinned: s.pinned,
+          archived: s.archived,
         });
       }
       for (const t of taskList) {
@@ -209,6 +221,8 @@ export function WorkbenchView(props: WorkbenchViewProps) {
           status: taskLabels[t.status] ?? t.status,
           pending: t.status === "draft_ready" && !!t.approvalId,
           pendingLabel: t.status === "draft_ready" && !!t.approvalId ? "待审批" : null,
+          pinned: false,
+          archived: false,
         });
       }
       for (const l of loopList) {
@@ -225,6 +239,8 @@ export function WorkbenchView(props: WorkbenchViewProps) {
               : l.status === "needs_review"
                 ? "待复核"
                 : null,
+          pinned: false,
+          archived: false,
         });
       }
       setItems(next);
@@ -251,6 +267,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
     setLoopDetail(null);
     setDetailError("");
     setConfirmDelete(false);
+    setRenaming(false);
     setPreview(null);
     setPreviewError("");
     try {
@@ -275,6 +292,8 @@ export function WorkbenchView(props: WorkbenchViewProps) {
         status: "0 条消息",
         pending: false,
         pendingLabel: null,
+        pinned: false,
+        archived: false,
       });
     } catch (e) {
       setError(errText(e));
@@ -305,6 +324,47 @@ export function WorkbenchView(props: WorkbenchViewProps) {
       setSelection(null);
       setSessionDetail(null);
       setConfirmDelete(false);
+      await refreshList();
+    } catch (e) {
+      setDetailError(errText(e));
+    }
+  }
+
+  async function togglePin() {
+    if (!sessionDetail) return;
+    setDetailError("");
+    try {
+      const summary = sessionDetail.pinned
+        ? await sessions.unpin(sessionDetail.sessionId)
+        : await sessions.pin(sessionDetail.sessionId);
+      setSessionDetail({ ...sessionDetail, pinned: summary.pinned });
+      await refreshList();
+    } catch (e) {
+      setDetailError(errText(e));
+    }
+  }
+
+  async function toggleArchive() {
+    if (!sessionDetail) return;
+    setDetailError("");
+    try {
+      const summary = sessionDetail.archived
+        ? await sessions.unarchive(sessionDetail.sessionId)
+        : await sessions.archive(sessionDetail.sessionId);
+      setSessionDetail({ ...sessionDetail, archived: summary.archived });
+      await refreshList();
+    } catch (e) {
+      setDetailError(errText(e));
+    }
+  }
+
+  async function confirmRename() {
+    if (!sessionDetail || !renameTitle.trim()) return;
+    setDetailError("");
+    try {
+      const summary = await sessions.rename(sessionDetail.sessionId, renameTitle.trim());
+      setSessionDetail({ ...sessionDetail, title: summary.title });
+      setRenaming(false);
       await refreshList();
     } catch (e) {
       setDetailError(errText(e));
@@ -514,6 +574,17 @@ export function WorkbenchView(props: WorkbenchViewProps) {
             />
             仅看待处理
           </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={(e) => {
+                setShowArchived(e.target.checked);
+                void refreshList(e.target.checked);
+              }}
+            />
+            显示归档
+          </label>
           {loading && <p className="empty">加载中…</p>}
           {error && <p className="error" role="alert">{error}</p>}
           {!loading && items.length === 0 && <p className="empty">暂无会话或任务。</p>}
@@ -556,6 +627,44 @@ export function WorkbenchView(props: WorkbenchViewProps) {
                   {sending ? "发送中…" : "发送"}
                 </button>
               </div>
+              <div className="row">
+                <button type="button" onClick={() => void togglePin()}>
+                  {sessionDetail.pinned ? "取消置顶" : "置顶"}
+                </button>
+                <button type="button" onClick={() => void toggleArchive()}>
+                  {sessionDetail.archived ? "恢复归档" : "归档"}
+                </button>
+                {!renaming && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRenameTitle(sessionDetail.title);
+                      setRenaming(true);
+                    }}
+                  >
+                    重命名
+                  </button>
+                )}
+              </div>
+              {renaming && (
+                <div className="row">
+                  <input
+                    aria-label="会话新标题"
+                    type="text"
+                    value={renameTitle}
+                    onChange={(e) => setRenameTitle(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") void confirmRename();
+                    }}
+                  />
+                  <button type="button" onClick={() => void confirmRename()} disabled={!renameTitle.trim()}>
+                    确认
+                  </button>
+                  <button type="button" onClick={() => setRenaming(false)}>
+                    取消
+                  </button>
+                </div>
+              )}
               {!confirmDelete && (
                 <button type="button" onClick={() => setConfirmDelete(true)}>
                   删除会话

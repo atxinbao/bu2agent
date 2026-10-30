@@ -28,6 +28,10 @@ pub struct SessionRecord {
     pub created_ms: u64,
     pub updated_ms: u64,
     pub deleted: bool,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub archived: bool,
     pub turns: Vec<SessionTurn>,
 }
 
@@ -38,6 +42,10 @@ pub struct SessionSummary {
     pub created_ms: u64,
     pub updated_ms: u64,
     pub turn_count: usize,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -54,6 +62,17 @@ struct SessionSendRequest {
 #[derive(Debug, Serialize)]
 struct SessionDeleteRequest {
     session_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionIdRequest {
+    session_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionRenameRequest {
+    session_id: String,
+    title: String,
 }
 
 /// `base_url` must look like `http://127.0.0.1:3001`.
@@ -79,6 +98,10 @@ impl SessionClient {
         self.http.get_json("/sessions/list")
     }
 
+    pub fn list_including_archived(&self) -> Result<Vec<SessionSummary>> {
+        self.http.get_json("/sessions/list?include_archived=true")
+    }
+
     pub fn get(&self, session_id: &str) -> Result<SessionRecord> {
         self.http.get_json(&format!("/sessions/get?session_id={session_id}"))
     }
@@ -97,5 +120,36 @@ impl SessionClient {
             .map_err(|_| transport_error("cannot encode session delete request"))?;
         let _: serde_json::Value = self.http.post_json("/sessions/delete", &body)?;
         Ok(())
+    }
+
+    fn flag(&self, path: &str, session_id: &str) -> Result<SessionSummary> {
+        let body = serde_json::to_string(&SessionIdRequest { session_id: session_id.to_string() })
+            .map_err(|_| transport_error("cannot encode session flag request"))?;
+        self.http.post_json(path, &body)
+    }
+
+    pub fn pin(&self, session_id: &str) -> Result<SessionSummary> {
+        self.flag("/session/pin", session_id)
+    }
+
+    pub fn unpin(&self, session_id: &str) -> Result<SessionSummary> {
+        self.flag("/session/unpin", session_id)
+    }
+
+    pub fn archive(&self, session_id: &str) -> Result<SessionSummary> {
+        self.flag("/session/archive", session_id)
+    }
+
+    pub fn unarchive(&self, session_id: &str) -> Result<SessionSummary> {
+        self.flag("/session/unarchive", session_id)
+    }
+
+    pub fn rename(&self, session_id: &str, title: &str) -> Result<SessionSummary> {
+        let body = serde_json::to_string(&SessionRenameRequest {
+            session_id: session_id.to_string(),
+            title: title.to_string(),
+        })
+        .map_err(|_| transport_error("cannot encode session rename request"))?;
+        self.http.post_json("/session/rename", &body)
     }
 }

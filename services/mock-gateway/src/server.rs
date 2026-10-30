@@ -2494,6 +2494,8 @@ struct SessionSummary {
     created_ms: u64,
     updated_ms: u64,
     turn_count: usize,
+    pinned: bool,
+    archived: bool,
 }
 
 fn now_ms() -> u64 {
@@ -2524,6 +2526,8 @@ async fn sessions_create(
         created_ms: now,
         updated_ms: now,
         deleted: false,
+        pinned: false,
+        archived: false,
         turns: Vec::new(),
     };
     state.sessions.lock().expect("session lock").insert(record.session_id.clone(), record.clone());
@@ -2531,22 +2535,37 @@ async fn sessions_create(
     Json(record).into_response()
 }
 
-async fn sessions_list(State(state): State<AppState>) -> Json<Vec<SessionSummary>> {
+#[derive(Debug, Deserialize)]
+struct SessionsListQuery {
+    include_archived: Option<bool>,
+}
+
+fn session_summary(record: &SessionRecord) -> SessionSummary {
+    SessionSummary {
+        session_id: record.session_id.clone(),
+        title: record.title.clone(),
+        created_ms: record.created_ms,
+        updated_ms: record.updated_ms,
+        turn_count: record.turns.len(),
+        pinned: record.pinned,
+        archived: record.archived,
+    }
+}
+
+async fn sessions_list(
+    State(state): State<AppState>,
+    Query(query): Query<SessionsListQuery>,
+) -> Json<Vec<SessionSummary>> {
+    let include_archived = query.include_archived.unwrap_or(false);
     let mut records: Vec<SessionSummary> = state
         .sessions
         .lock()
         .expect("session lock")
         .values()
-        .filter(|r| !r.deleted)
-        .map(|r| SessionSummary {
-            session_id: r.session_id.clone(),
-            title: r.title.clone(),
-            created_ms: r.created_ms,
-            updated_ms: r.updated_ms,
-            turn_count: r.turns.len(),
-        })
+        .filter(|r| !r.deleted && (include_archived || !r.archived))
+        .map(session_summary)
         .collect();
-    records.sort_by_key(|r| session_number(&r.session_id));
+    records.sort_by_key(|r| (!r.pinned, session_number(&r.session_id)));
     Json(records)
 }
 
@@ -2656,6 +2675,66 @@ async fn sessions_delete(
     let updated = record.clone();
     persist_session(&state, &updated);
     Json(serde_json::json!({ "session_id": updated.session_id, "deleted": true })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionIdDto {
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionRenameDto {
+    session_id: String,
+    title: String,
+}
+
+/// Shared mutation path for pin/unpin/archive/unarchive/rename:
+/// unknown ids and tombstoned sessions both read as 404, matching
+/// `sessions_get`/`sessions_delete`; the mutation bumps `updated_ms`
+/// and appends a fresh snapshot, like deletion does.
+fn mutate_session_flag(
+    state: &AppState,
+    session_id: &str,
+    mutate: impl FnOnce(&mut SessionRecord),
+) -> Response {
+    let mut sessions = state.sessions.lock().expect("session lock");
+    let Some(record) = sessions.get_mut(session_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown session" })))
+            .into_response();
+    };
+    if record.deleted {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown session" })))
+            .into_response();
+    }
+    mutate(record);
+    record.updated_ms = now_ms();
+    let updated = record.clone();
+    persist_session(state, &updated);
+    Json(session_summary(&updated)).into_response()
+}
+
+async fn session_pin(State(state): State<AppState>, Json(req): Json<SessionIdDto>) -> impl IntoResponse {
+    mutate_session_flag(&state, &req.session_id, |r| r.pinned = true)
+}
+
+async fn session_unpin(State(state): State<AppState>, Json(req): Json<SessionIdDto>) -> impl IntoResponse {
+    mutate_session_flag(&state, &req.session_id, |r| r.pinned = false)
+}
+
+async fn session_archive(State(state): State<AppState>, Json(req): Json<SessionIdDto>) -> impl IntoResponse {
+    mutate_session_flag(&state, &req.session_id, |r| r.archived = true)
+}
+
+async fn session_unarchive(State(state): State<AppState>, Json(req): Json<SessionIdDto>) -> impl IntoResponse {
+    mutate_session_flag(&state, &req.session_id, |r| r.archived = false)
+}
+
+async fn session_rename(State(state): State<AppState>, Json(req): Json<SessionRenameDto>) -> impl IntoResponse {
+    if req.title.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "title must not be empty" })))
+            .into_response();
+    }
+    mutate_session_flag(&state, &req.session_id, |r| r.title = req.title.clone())
 }
 
 // --- Device loop (B-layer single-device validation) ---
@@ -3137,6 +3216,11 @@ pub fn app(state: AppState) -> Router {
         .route("/sessions/get", get(sessions_get))
         .route("/sessions/send", post(sessions_send))
         .route("/sessions/delete", post(sessions_delete))
+        .route("/session/pin", post(session_pin))
+        .route("/session/unpin", post(session_unpin))
+        .route("/session/archive", post(session_archive))
+        .route("/session/unarchive", post(session_unarchive))
+        .route("/session/rename", post(session_rename))
         .route("/devices/reminders/list", get(reminders_list))
         .route("/devices/actions/create", post(actions_create))
         .route("/devices/reminders/set", post(device_set))

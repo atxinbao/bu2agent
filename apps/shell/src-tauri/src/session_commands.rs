@@ -42,3 +42,33 @@ pub fn session_send(session_id: String, text: String) -> Result<SessionRecord, S
 pub fn session_delete(session_id: String) -> Result<(), String> {
     client()?.delete(&session_id).map_err(|e| err_string(&e))
 }
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn session_list_including_archived() -> Result<Vec<SessionSummary>, String> {
+    client()?.list_including_archived().map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn session_pin(session_id: String) -> Result<SessionSummary, String> {
+    client()?.pin(&session_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn session_unpin(session_id: String) -> Result<SessionSummary, String> {
+    client()?.unpin(&session_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn session_archive(session_id: String) -> Result<SessionSummary, String> {
+    client()?.archive(&session_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn session_unarchive(session_id: String) -> Result<SessionSummary, String> {
+    client()?.unarchive(&session_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn session_rename(session_id: String, title: String) -> Result<SessionSummary, String> {
+    client()?.rename(&session_id, &title).map_err(|e| err_string(&e))
+}
