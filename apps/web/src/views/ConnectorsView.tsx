@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import type {
+  ConnectorAccount,
+  ConnectorConnectInfo,
   ConnectorGateway,
+  ConnectorInfo,
   MockMessage,
   MockNote,
 } from "../domain/connector_client";
@@ -24,19 +27,108 @@ export function ConnectorsView({ client }: { client: ConnectorGateway }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [registry, setRegistry] = useState<ConnectorInfo[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [accounts, setAccounts] = useState<ConnectorAccount[]>([]);
+  const [connectInfo, setConnectInfo] = useState<ConnectorConnectInfo | null>(null);
+  const [linkName, setLinkName] = useState("");
 
   async function refresh() {
     setBusy(true);
     setError(null);
     try {
-      const [listedNotes, listedMail] = await Promise.all([
+      const [listedNotes, listedMail, listedRegistry] = await Promise.all([
         client.notesList(),
         client.mailList(),
+        client.registryList(),
       ]);
       setNotes(listedNotes);
       setMessages(listedMail);
+      setRegistry(listedRegistry);
     } catch (err) {
       setError(err instanceof Error ? err.message : "list failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshRegistry() {
+    setError(null);
+    try {
+      setRegistry(await client.registryList());
+      if (selectedId !== null) {
+        setAccounts(await client.accounts(selectedId));
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "registry refresh failed");
+    }
+  }
+
+  async function selectConnector(id: string) {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const [listedAccounts, info] = await Promise.all([
+        client.accounts(id),
+        client.connectInfo(id),
+      ]);
+      setSelectedId(id);
+      setAccounts(listedAccounts);
+      setConnectInfo(info);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "connector load failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function linkSelectedAccount() {
+    if (selectedId === null) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const account = await client.linkAccount(selectedId, linkName.trim() || null);
+      setNotice(`linked account ${account.accountId} (${account.displayName})`);
+      setLinkName("");
+      await refreshRegistry();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "link failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function unlinkSelectedAccount(accountId: string) {
+    if (selectedId === null) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await client.unlinkAccount(selectedId, accountId);
+      setNotice(`unlinked account ${accountId}`);
+      await refreshRegistry();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "unlink failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleSelectedConnection(connected: boolean) {
+    if (selectedId === null) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const info = connected
+        ? await client.disconnect(selectedId)
+        : await client.connect(selectedId);
+      setNotice(info.connected ? `connected ${info.id}` : `disconnected ${info.id}`);
+      await refreshRegistry();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "connection change failed");
     } finally {
       setBusy(false);
     }
@@ -82,6 +174,70 @@ export function ConnectorsView({ client }: { client: ConnectorGateway }) {
       <button type="button" onClick={() => void refresh()} disabled={busy}>
         Refresh lists
       </button>
+      <h3>Registry</h3>
+      <p className="note">
+        The registry lists only the Mock connectors this gateway implements. Accounts
+        are local Mock records: no OAuth, no real account, no external redirect.
+      </p>
+      {registry.length === 0 && <p className="empty">No connectors.</p>}
+      <ul className="entries">
+        {registry.map((info) => (
+          <li key={info.id}>
+            <button type="button" onClick={() => void selectConnector(info.id)} disabled={busy}>
+              <strong>{info.name}</strong> — {info.capabilities.join(", ")} ·{" "}
+              {info.connected ? "connected" : "not connected"}
+            </button>
+          </li>
+        ))}
+      </ul>
+      {selectedId !== null && (
+        <>
+          <h3>Connector: {selectedId}</h3>
+          {connectInfo !== null && <p className="note">{connectInfo.description}</p>}
+          <div className="row">
+            <button
+              type="button"
+              onClick={() =>
+                void toggleSelectedConnection(
+                  registry.find((info) => info.id === selectedId)?.connected ?? false,
+                )
+              }
+              disabled={busy}
+            >
+              {registry.find((info) => info.id === selectedId)?.connected
+                ? "Disconnect"
+                : "Connect"}
+            </button>
+          </div>
+          <h4>Accounts</h4>
+          {accounts.length === 0 && <p className="empty">No linked accounts.</p>}
+          <ul className="entries">
+            {accounts.map((account) => (
+              <li key={account.accountId}>
+                <strong>{account.displayName}</strong> — {account.accountId} · {account.status}
+                <button
+                  type="button"
+                  onClick={() => void unlinkSelectedAccount(account.accountId)}
+                  disabled={busy}
+                >
+                  Unlink
+                </button>
+              </li>
+            ))}
+          </ul>
+          <div className="row">
+            <input
+              type="text"
+              value={linkName}
+              placeholder="Display name (optional)"
+              onChange={(event) => setLinkName(event.target.value)}
+            />
+            <button type="button" onClick={() => void linkSelectedAccount()} disabled={busy}>
+              Link account
+            </button>
+          </div>
+        </>
+      )}
       <h3>Notes</h3>
       {notes.length === 0 && <p className="empty">No notes.</p>}
       <ul className="entries">

@@ -31,6 +31,81 @@ export interface MockMessage {
 
 export type ConnectorDecision = "ask" | "approve" | "reject";
 
+// Registry + account lifecycle (Task 9). The gateway returns
+// snake_case; the domain shape is camelCase, so the mapping
+// lives here, not in the view.
+export interface ConnectorInfo {
+  id: string;
+  name: string;
+  capabilities: string[];
+  connected: boolean;
+}
+
+export interface ConnectorAccount {
+  accountId: string;
+  connectorId: string;
+  displayName: string;
+  status: string;
+  linkedMs: number;
+}
+
+export interface ConnectorConnectInfo {
+  connectorId: string;
+  flow: string;
+  requiresAccount: boolean;
+  description: string;
+}
+
+interface ServerConnectorInfo {
+  id: string;
+  name: string;
+  capabilities: string[];
+  connected: boolean;
+}
+
+interface ServerConnectorAccount {
+  account_id: string;
+  connector_id: string;
+  display_name: string;
+  status: string;
+  linked_ms: number;
+}
+
+interface ServerConnectorConnectInfo {
+  connector_id: string;
+  flow: string;
+  requires_account: boolean;
+  description: string;
+}
+
+function toConnectorInfo(server: ServerConnectorInfo): ConnectorInfo {
+  return {
+    id: server.id,
+    name: server.name,
+    capabilities: server.capabilities,
+    connected: server.connected,
+  };
+}
+
+function toConnectorAccount(server: ServerConnectorAccount): ConnectorAccount {
+  return {
+    accountId: server.account_id,
+    connectorId: server.connector_id,
+    displayName: server.display_name,
+    status: server.status,
+    linkedMs: server.linked_ms,
+  };
+}
+
+function toConnectorConnectInfo(server: ServerConnectorConnectInfo): ConnectorConnectInfo {
+  return {
+    connectorId: server.connector_id,
+    flow: server.flow,
+    requiresAccount: server.requires_account,
+    description: server.description,
+  };
+}
+
 export class ApprovalPendingError extends Error {
   readonly toolCallId: string;
 
@@ -81,6 +156,14 @@ export interface ConnectorGateway {
   mailList(): Promise<MockMessage[]>;
   notesCreate(title: string, body: string, decision: ConnectorDecision): Promise<MockNote>;
   mailSend(to: string, subject: string, body: string, decision: ConnectorDecision): Promise<MockMessage>;
+  registryList(): Promise<ConnectorInfo[]>;
+  registryGet(id: string): Promise<ConnectorInfo>;
+  accounts(id: string): Promise<ConnectorAccount[]>;
+  linkAccount(id: string, displayName?: string | null): Promise<ConnectorAccount>;
+  unlinkAccount(id: string, accountId: string): Promise<ConnectorAccount>;
+  connectInfo(id: string): Promise<ConnectorConnectInfo>;
+  connect(id: string): Promise<ConnectorInfo>;
+  disconnect(id: string): Promise<ConnectorInfo>;
 }
 
 export class ConnectorClient implements ConnectorGateway {
@@ -156,5 +239,46 @@ export class ConnectorClient implements ConnectorGateway {
       ? await this.approve("mail.send", decision)
       : undefined;
     return this.post<MockMessage>("/connectors/mail/send", { tool_call_id: toolCallId ?? null, to, subject, body });
+  }
+
+  async registryList(): Promise<ConnectorInfo[]> {
+    const infos = await this.get<ServerConnectorInfo[]>("/connectors");
+    return infos.map(toConnectorInfo);
+  }
+
+  async registryGet(id: string): Promise<ConnectorInfo> {
+    return toConnectorInfo(await this.get<ServerConnectorInfo>(`/connectors/${id}`));
+  }
+
+  async accounts(id: string): Promise<ConnectorAccount[]> {
+    const accounts = await this.get<ServerConnectorAccount[]>(`/connectors/${id}/accounts`);
+    return accounts.map(toConnectorAccount);
+  }
+
+  async linkAccount(id: string, displayName?: string | null): Promise<ConnectorAccount> {
+    const account = await this.post<ServerConnectorAccount>(`/connectors/${id}/accounts/link`, {
+      display_name: displayName ?? null,
+    });
+    return toConnectorAccount(account);
+  }
+
+  async unlinkAccount(id: string, accountId: string): Promise<ConnectorAccount> {
+    const account = await this.post<ServerConnectorAccount>(
+      `/connectors/${id}/accounts/${accountId}/unlink`,
+      {},
+    );
+    return toConnectorAccount(account);
+  }
+
+  async connectInfo(id: string): Promise<ConnectorConnectInfo> {
+    return toConnectorConnectInfo(await this.get<ServerConnectorConnectInfo>(`/connectors/${id}/connect/info`));
+  }
+
+  async connect(id: string): Promise<ConnectorInfo> {
+    return toConnectorInfo(await this.post<ServerConnectorInfo>(`/connectors/${id}/connect`, {}));
+  }
+
+  async disconnect(id: string): Promise<ConnectorInfo> {
+    return toConnectorInfo(await this.post<ServerConnectorInfo>(`/connectors/${id}/disconnect`, {}));
   }
 }

@@ -97,6 +97,10 @@ use crate::session_store::{
     append_session, load_sessions, next_session_number, select_context, session_number, title_from,
     SessionRecord, SessionTurn, MAX_INPUT_BYTES,
 };
+use crate::connector_store::{
+    account_number, append_connector_state, load_connector_state, next_account_number,
+    ConnectorAccount, ConnectorConnection, ConnectorStateLine,
+};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
 
@@ -284,6 +288,10 @@ pub struct AppState {
     messages: Arc<Mutex<Vec<MockMessage>>>,
     next_note_id: Arc<Mutex<u64>>,
     next_message_id: Arc<Mutex<u64>>,
+    connector_accounts: Arc<Mutex<HashMap<String, ConnectorAccount>>>,
+    next_account_id: Arc<Mutex<u64>>,
+    connector_connections: Arc<Mutex<HashMap<String, bool>>>,
+    connector_state_path: Option<PathBuf>,
 }
 
 impl Default for AppState {
@@ -314,6 +322,9 @@ impl AppState {
         }
         if let Ok(actions_path) = std::env::var("MOCK_DEVICE_ACTIONS_PATH") {
             state = state.with_actions_path(PathBuf::from(actions_path));
+        }
+        if let Ok(connector_state_path) = std::env::var("MOCK_CONNECTOR_STATE_PATH") {
+            state = state.with_connector_state_path(PathBuf::from(connector_state_path));
         }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
@@ -397,6 +408,10 @@ impl AppState {
             messages: Arc::new(Mutex::new(seed_messages())),
             next_note_id: Arc::new(Mutex::new(3)),
             next_message_id: Arc::new(Mutex::new(3)),
+            connector_accounts: Arc::new(Mutex::new(HashMap::new())),
+            next_account_id: Arc::new(Mutex::new(1)),
+            connector_connections: Arc::new(Mutex::new(HashMap::new())),
+            connector_state_path: None,
         }
     }
 
@@ -720,6 +735,26 @@ impl AppState {
         self.next_session_id = Arc::new(Mutex::new(next_session_number(&records)));
         self.sessions = Arc::new(Mutex::new(sessions));
         self.sessions_path = Some(path);
+        self
+    }
+
+    /// Test seam: load connector accounts and connection flags
+    /// from a tagged JSONL file, mirroring with_sessions_path.
+    /// Production state reads MOCK_CONNECTOR_STATE_PATH.
+    pub fn with_connector_state_path(mut self, path: PathBuf) -> Self {
+        let (accounts, connections) = load_connector_state(&path);
+        let mut account_map = HashMap::new();
+        for record in &accounts {
+            account_map.insert(record.account_id.clone(), record.clone());
+        }
+        let mut connection_map = HashMap::new();
+        for record in &connections {
+            connection_map.insert(record.connector_id.clone(), record.connected);
+        }
+        self.next_account_id = Arc::new(Mutex::new(next_account_number(&accounts)));
+        self.connector_accounts = Arc::new(Mutex::new(account_map));
+        self.connector_connections = Arc::new(Mutex::new(connection_map));
+        self.connector_state_path = Some(path);
         self
     }
 
@@ -2026,6 +2061,246 @@ async fn mail_send(
     Json(message).into_response()
 }
 
+// --- Connector registry (Task 9) ---
+//
+// The registry is static on purpose: it lists exactly the two
+// Mock connectors this gateway implements, nothing invented.
+// Accounts and connection flags are local state (see
+// connector_store.rs); there is no OAuth, no real account,
+// and no external redirect anywhere in this surface. The
+// notes/mail data routes above are untouched by it.
+
+struct ConnectorEntry {
+    id: &'static str,
+    name: &'static str,
+    capabilities: &'static [&'static str],
+}
+
+const CONNECTOR_REGISTRY: &[ConnectorEntry] = &[
+    ConnectorEntry { id: "notes", name: "Mock Notes", capabilities: &["notes.list", "notes.create"] },
+    ConnectorEntry { id: "mail", name: "Mock Mail", capabilities: &["mail.list", "mail.send"] },
+];
+
+fn registry_entry(id: &str) -> Option<&'static ConnectorEntry> {
+    CONNECTOR_REGISTRY.iter().find(|e| e.id == id)
+}
+
+#[derive(Debug, Serialize)]
+struct ConnectorView {
+    id: String,
+    name: String,
+    capabilities: Vec<String>,
+    connected: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ConnectorAccountView {
+    account_id: String,
+    connector_id: String,
+    display_name: String,
+    status: String,
+    linked_ms: u64,
+}
+
+fn connector_view(state: &AppState, entry: &'static ConnectorEntry) -> ConnectorView {
+    let connected = state
+        .connector_connections
+        .lock()
+        .expect("connector connections lock")
+        .get(entry.id)
+        .copied()
+        .unwrap_or(false);
+    ConnectorView {
+        id: entry.id.to_string(),
+        name: entry.name.to_string(),
+        capabilities: entry.capabilities.iter().map(|c| c.to_string()).collect(),
+        connected,
+    }
+}
+
+fn account_view(account: &ConnectorAccount) -> ConnectorAccountView {
+    ConnectorAccountView {
+        account_id: account.account_id.clone(),
+        connector_id: account.connector_id.clone(),
+        display_name: account.display_name.clone(),
+        status: if account.unlinked { "unlinked".to_string() } else { "linked".to_string() },
+        linked_ms: account.linked_ms,
+    }
+}
+
+fn persist_connector_line(state: &AppState, line: &ConnectorStateLine) {
+    let Some(path) = &state.connector_state_path else { return };
+    append_connector_state(path, line);
+}
+
+fn unknown_connector() -> Response {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown connector" }))).into_response()
+}
+
+async fn connectors_list(State(state): State<AppState>) -> Json<Vec<ConnectorView>> {
+    Json(CONNECTOR_REGISTRY.iter().map(|e| connector_view(&state, e)).collect())
+}
+
+async fn connectors_get(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match registry_entry(&id) {
+        Some(entry) => Json(connector_view(&state, entry)).into_response(),
+        None => unknown_connector(),
+    }
+}
+
+async fn connectors_accounts(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let Some(_) = registry_entry(&id) else {
+        return unknown_connector();
+    };
+    let mut accounts: Vec<ConnectorAccountView> = state
+        .connector_accounts
+        .lock()
+        .expect("connector accounts lock")
+        .values()
+        .filter(|a| a.connector_id == id && !a.unlinked)
+        .map(account_view)
+        .collect();
+    accounts.sort_by_key(|a| account_number(&a.account_id));
+    Json(accounts).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountLinkDto {
+    display_name: Option<String>,
+}
+
+async fn connectors_accounts_link(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<AccountLinkDto>,
+) -> impl IntoResponse {
+    let Some(_) = registry_entry(&id) else {
+        return unknown_connector();
+    };
+    let display_name = req
+        .display_name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Mock account".to_string());
+    let mut next = state.next_account_id.lock().expect("account id lock");
+    let account = ConnectorAccount {
+        account_id: format!("account-{}", *next),
+        connector_id: id,
+        display_name,
+        linked_ms: now_ms(),
+        unlinked: false,
+    };
+    *next += 1;
+    state
+        .connector_accounts
+        .lock()
+        .expect("connector accounts lock")
+        .insert(account.account_id.clone(), account.clone());
+    persist_connector_line(&state, &ConnectorStateLine::Account(account.clone()));
+    Json(account_view(&account)).into_response()
+}
+
+async fn connectors_accounts_unlink(
+    State(state): State<AppState>,
+    axum::extract::Path((id, account_id)): axum::extract::Path<(String, String)>,
+) -> impl IntoResponse {
+    let Some(_) = registry_entry(&id) else {
+        return unknown_connector();
+    };
+    let mut accounts = state.connector_accounts.lock().expect("connector accounts lock");
+    let Some(account) = accounts.get_mut(&account_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown account" }))).into_response();
+    };
+    if account.connector_id != id {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown account" }))).into_response();
+    }
+    // Idempotent: unlinking an already-unlinked account succeeds
+    // with its current state, mirroring session unpin/unarchive.
+    account.unlinked = true;
+    let updated = account.clone();
+    persist_connector_line(&state, &ConnectorStateLine::Account(updated.clone()));
+    Json(account_view(&updated)).into_response()
+}
+
+async fn connectors_connect_info(
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let Some(entry) = registry_entry(&id) else {
+        return unknown_connector();
+    };
+    Json(serde_json::json!({
+        "connector_id": entry.id,
+        "flow": "mock",
+        "requires_account": true,
+        "description": "Local Mock flow: link a Mock account, then connect. No OAuth, no real account, no external redirect.",
+    }))
+    .into_response()
+}
+
+async fn connectors_connect(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let Some(entry) = registry_entry(&id) else {
+        return unknown_connector();
+    };
+    let has_linked = state
+        .connector_accounts
+        .lock()
+        .expect("connector accounts lock")
+        .values()
+        .any(|a| a.connector_id == id && !a.unlinked);
+    if !has_linked {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "connector has no linked account" })))
+            .into_response();
+    }
+    state
+        .connector_connections
+        .lock()
+        .expect("connector connections lock")
+        .insert(id.to_string(), true);
+    persist_connector_line(
+        &state,
+        &ConnectorStateLine::Connection(ConnectorConnection {
+            connector_id: id.to_string(),
+            connected: true,
+            updated_ms: now_ms(),
+        }),
+    );
+    Json(connector_view(&state, entry)).into_response()
+}
+
+async fn connectors_disconnect(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let Some(entry) = registry_entry(&id) else {
+        return unknown_connector();
+    };
+    // Disconnect flips only the connection flag; linked accounts
+    // stay linked, so reconnecting needs no fresh link.
+    state
+        .connector_connections
+        .lock()
+        .expect("connector connections lock")
+        .insert(id.to_string(), false);
+    persist_connector_line(
+        &state,
+        &ConnectorStateLine::Connection(ConnectorConnection {
+            connector_id: id.to_string(),
+            connected: false,
+            updated_ms: now_ms(),
+        }),
+    );
+    Json(connector_view(&state, entry)).into_response()
+}
+
 /// CORS for browser/WebView clients. The Rust CLIs and curl
 /// are not subject to CORS, which is why every CLI and smoke
 /// test passed while the Tauri window (page origin
@@ -3201,6 +3476,14 @@ pub fn app(state: AppState) -> Router {
         .route("/connectors/notes/create", post(notes_create))
         .route("/connectors/mail/list", get(mail_list))
         .route("/connectors/mail/send", post(mail_send))
+        .route("/connectors", get(connectors_list))
+        .route("/connectors/{id}", get(connectors_get))
+        .route("/connectors/{id}/accounts", get(connectors_accounts))
+        .route("/connectors/{id}/accounts/link", post(connectors_accounts_link))
+        .route("/connectors/{id}/accounts/{account_id}/unlink", post(connectors_accounts_unlink))
+        .route("/connectors/{id}/connect/info", get(connectors_connect_info))
+        .route("/connectors/{id}/connect", post(connectors_connect))
+        .route("/connectors/{id}/disconnect", post(connectors_disconnect))
         .route("/tasks/create", post(tasks_create))
         .route("/tasks/list", get(tasks_list))
         .route("/tasks/get", get(tasks_get))

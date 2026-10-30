@@ -21,7 +21,9 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use agent_desktop::agent_client::{AgentClient, AgentError, ToolDecision, ToolResult};
-use agent_desktop::connector_client::{ConnectorClient, MockMessage, MockNote};
+use agent_desktop::connector_client::{
+    ConnectorAccount, ConnectorClient, ConnectorConnectInfo, ConnectorInfo, MockMessage, MockNote,
+};
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
@@ -274,6 +276,48 @@ pub fn connector_mail_send(
     connector_client()?
         .mail_send(&to, &subject, &body, decision)
         .map_err(agent_err_string)
+}
+
+// --- Connector registry (Task 9) ---
+
+#[tauri::command]
+pub fn connector_list() -> Result<Vec<ConnectorInfo>, String> {
+    connector_client()?.registry_list().map_err(agent_err_string)
+}
+
+#[tauri::command]
+pub fn connector_get(id: String) -> Result<ConnectorInfo, String> {
+    connector_client()?.registry_get(&id).map_err(agent_err_string)
+}
+
+#[tauri::command]
+pub fn connector_accounts(id: String) -> Result<Vec<ConnectorAccount>, String> {
+    connector_client()?.accounts(&id).map_err(agent_err_string)
+}
+
+#[tauri::command]
+pub fn connector_account_link(id: String, display_name: Option<String>) -> Result<ConnectorAccount, String> {
+    connector_client()?.link_account(&id, display_name.as_deref()).map_err(agent_err_string)
+}
+
+#[tauri::command]
+pub fn connector_account_unlink(id: String, account_id: String) -> Result<ConnectorAccount, String> {
+    connector_client()?.unlink_account(&id, &account_id).map_err(agent_err_string)
+}
+
+#[tauri::command]
+pub fn connector_connect_info(id: String) -> Result<ConnectorConnectInfo, String> {
+    connector_client()?.connect_info(&id).map_err(agent_err_string)
+}
+
+#[tauri::command]
+pub fn connector_connect(id: String) -> Result<ConnectorInfo, String> {
+    connector_client()?.connect(&id).map_err(agent_err_string)
+}
+
+#[tauri::command]
+pub fn connector_disconnect(id: String) -> Result<ConnectorInfo, String> {
+    connector_client()?.disconnect(&id).map_err(agent_err_string)
 }
 
 // --- Tasks (deterministic task loop) ---
