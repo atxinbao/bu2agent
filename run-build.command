@@ -35,6 +35,8 @@ npm run build
 cd ../shell/src-tauri
 
 echo "--- 打包 Tauri release（首次构建较久，请耐心等）---"
+# Tauri 将前端资源嵌入壳二进制；触发 build.rs 重跑，避免 Cargo 增量构建复用旧 dist。
+touch build.rs
 cargo tauri build
 
 echo "--- 打包产物 ---"

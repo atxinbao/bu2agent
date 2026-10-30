@@ -163,7 +163,12 @@ pub fn file_stats(paths: Vec<String>) -> Result<Vec<GatewayBatchStatResult>, Str
 pub fn file_search(query: String, start_path: String) -> Result<GatewaySearchResult, String> { file_client()?.search(&query, &start_path).map_err(|e| err_string(&e)) }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn file_subscribe(path: String, cursor: Option<String>, wait_ms: u64) -> Result<serde_json::Value, String> { file_client()?.subscribe(&path, cursor.as_deref(), wait_ms).map_err(|e| err_string(&e)) }
+pub async fn file_subscribe(path: String, cursor: Option<String>, wait_ms: u64) -> Result<serde_json::Value, String> {
+    // 长轮询必须放到阻塞线程，不能占住 Tauri 异步运行时；否则切换 Files/工作台时其它 invoke 会排队。
+    tauri::async_runtime::spawn_blocking(move || {
+        file_client()?.subscribe(&path, cursor.as_deref(), wait_ms).map_err(|e| err_string(&e))
+    }).await.map_err(|e| format!("file subscribe task failed: {e}"))?
+}
 
 #[tauri::command(rename_all = "snake_case")]
 pub fn file_thumbnail(path: String, width: u32) -> Result<GatewayThumbnail, String> { file_client()?.thumbnail(&path, width).map_err(|e| err_string(&e)) }

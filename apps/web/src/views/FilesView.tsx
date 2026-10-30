@@ -70,20 +70,22 @@ export function FilesView({
 
   useEffect(() => {
     let stopped = false;
+    const controller = new AbortController();
     let cursor: string | undefined;
     async function watch() {
       try {
-        const result = await client.subscribe(dir, cursor, 25000);
+        const result = await client.subscribe(dir, cursor, 25000, controller.signal);
         if (stopped) return;
         cursor = result.cursor;
         if (result.changed) await refresh(dir);
       } catch {
+        if (controller.signal.aborted) return;
         // 订阅是辅助刷新；目录列表本身仍可手动刷新。
       }
       if (!stopped) void watch();
     }
     void watch();
-    return () => { stopped = true; };
+    return () => { stopped = true; controller.abort(); };
   }, [client, dir]);
 
   async function openEntry(entry: GatewayFileEntry) {

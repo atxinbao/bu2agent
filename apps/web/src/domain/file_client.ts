@@ -99,7 +99,7 @@ export interface FileGateway {
   reads(items: GatewayBatchReadItem[]): Promise<GatewayBatchReadResult[]>;
   stats(paths: string[]): Promise<GatewayBatchStatResult[]>;
   search(query: string, startPath?: string): Promise<GatewaySearchResult>;
-  subscribe(path: string, cursor?: string, waitMs?: number): Promise<{ changed: boolean; cursor: string; entries?: GatewayFileEntry[] }>;
+  subscribe(path: string, cursor?: string, waitMs?: number, signal?: AbortSignal): Promise<{ changed: boolean; cursor: string; entries?: GatewayFileEntry[] }>;
   thumbnail(path: string, width?: number): Promise<GatewayThumbnail>;
   export(from: string, to: string, approved: boolean): Promise<number>;
   library(kinds?: string[], limit?: number): Promise<GatewayLibraryResult>;
@@ -382,8 +382,8 @@ export class FileGatewayClient implements FileGateway {
   async search(query: string, startPath = ""): Promise<GatewaySearchResult> {
     return this.requestWithRetry<GatewaySearchResult>("/files/search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query, start_path: startPath }) }, undefined, false);
   }
-  async subscribe(path: string, cursor?: string, waitMs = 25000): Promise<{ changed: boolean; cursor: string; entries?: GatewayFileEntry[] }> {
-    const result = await this.requestWithRetry<{ changed: boolean; cursor: string; entries?: ServerFileEntry[] }>("/files/subscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, cursor, wait_ms: waitMs }) }, undefined, false);
+  async subscribe(path: string, cursor?: string, waitMs = 25000, signal?: AbortSignal): Promise<{ changed: boolean; cursor: string; entries?: GatewayFileEntry[] }> {
+    const result = await this.requestWithRetry<{ changed: boolean; cursor: string; entries?: ServerFileEntry[] }>("/files/subscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, cursor, wait_ms: waitMs }), signal }, undefined, false);
     return { changed: result.changed, cursor: result.cursor, entries: result.entries?.map((e) => ({ name: e.name, path: e.path, isDir: e.is_dir, sizeBytes: e.size_bytes })) };
   }
   async thumbnail(path: string, width = 256): Promise<GatewayThumbnail> {

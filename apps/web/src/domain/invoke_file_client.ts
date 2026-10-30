@@ -79,7 +79,7 @@ export class InvokeFileClient implements FileGateway {
     const result = await invoke<{ entries: ServerFileEntry[]; truncated: boolean }>("file_search", { query, start_path: startPath });
     return { truncated: result.truncated, entries: result.entries.map(toEntry) };
   }
-  async subscribe(path: string, cursor?: string, waitMs = 25000): Promise<{ changed: boolean; cursor: string; entries?: GatewayFileEntry[] }> {
+  async subscribe(path: string, cursor?: string, waitMs = 25000, _signal?: AbortSignal): Promise<{ changed: boolean; cursor: string; entries?: GatewayFileEntry[] }> {
     const result = await invoke<{ changed: boolean; cursor: string; entries?: ServerFileEntry[] }>("file_subscribe", { path, cursor, wait_ms: waitMs });
     return { changed: result.changed, cursor: result.cursor, entries: result.entries?.map(toEntry) };
   }
@@ -88,7 +88,7 @@ export class InvokeFileClient implements FileGateway {
     return { path: result.path, contentType: result.content_type, contentBase64: result.content_base64 };
   }
   async export(from: string, to: string, approved: boolean): Promise<number> {
-    return invoke<number>("file_export", { fromPath: from, toPath: to, approved });
+    return invoke<number>("file_export", { from_path: from, to_path: to, approved });
   }
   async library(kinds?: string[], limit?: number): Promise<GatewayLibraryResult> {
     const result = await invoke<{ items: Array<{ path: string; kind: string; is_dir: boolean; size_bytes: number; modified_ms: number }>; truncated: boolean }>("file_library", { kinds, limit });
