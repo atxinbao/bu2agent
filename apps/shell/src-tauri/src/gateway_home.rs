@@ -1,7 +1,7 @@
 //! Daily-app home: fixed record directory, gateway lockfile, port choice.
 //!
 //! The packaged app must work with zero environment variables:
-//! records (approvals, tasks, device actions, loops, sessions, connectors) live under a fixed
+//! records (approvals, tasks, device actions, loops, sessions, connectors, vault) live under a fixed
 //! app-data directory, and the working file root is user-chosen
 //! (full settings page in Round 2; until then a default under the
 //! record directory). Environment overrides stay for development and
@@ -47,6 +47,7 @@ pub struct GatewayPaths {
     pub loops_path: PathBuf,
     pub sessions_path: PathBuf,
     pub connector_state_path: PathBuf,
+    pub vault_state_path: PathBuf,
 }
 
 pub fn gateway_paths(working_dir: &Path) -> GatewayPaths {
@@ -60,6 +61,7 @@ pub fn gateway_paths(working_dir: &Path) -> GatewayPaths {
         loops_path: data.join("loops.jsonl"),
         sessions_path: data.join("sessions.jsonl"),
         connector_state_path: data.join("connectors.jsonl"),
+        vault_state_path: data.join("vault.jsonl"),
     }
 }
 
@@ -84,6 +86,7 @@ pub fn gateway_env(paths: &GatewayPaths, addr: &str) -> Vec<(String, String)> {
     push("MOCK_LOOPS_PATH", &paths.loops_path.to_string_lossy());
     push("MOCK_SESSIONS_PATH", &paths.sessions_path.to_string_lossy());
     push("MOCK_CONNECTOR_STATE_PATH", &paths.connector_state_path.to_string_lossy());
+    push("MOCK_VAULT_STATE_PATH", &paths.vault_state_path.to_string_lossy());
     // The daily app uses the real EventKit backend on macOS; a developer
     // override (already set) still wins via the gap-fill rule above.
     #[cfg(target_os = "macos")]

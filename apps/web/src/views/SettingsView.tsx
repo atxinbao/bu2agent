@@ -5,6 +5,12 @@ import type {
   KeyStatus,
   SettingsData,
 } from "../domain/settings_client";
+import type {
+  CatalogEntry,
+  CredentialSlot,
+  CustomConnector,
+} from "../domain/credential_vault_client";
+import type { InvokeCredentialVaultClient } from "../domain/invoke_credential_vault_client";
 
 // Settings page (invoke-only). Save and effective state are
 // separate on purpose: a credential or directory save lands
@@ -25,6 +31,7 @@ interface GatewayStatusView {
 
 interface SettingsViewProps {
   settings: InvokeSettingsClient;
+  vault: InvokeCredentialVaultClient;
   isInvoke: boolean;
   gatewayStatus: GatewayStatusView | null;
   onSettingsChanged: () => void;
@@ -55,6 +62,7 @@ function remindersText(status: string | null): string {
 
 export function SettingsView({
   settings,
+  vault,
   isInvoke,
   gatewayStatus,
   onSettingsChanged,
@@ -69,6 +77,43 @@ export function SettingsView({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Vault section (Task 10). Secrets are never kept after save:
+  // inputs clear on success, lists carry only redacted displays.
+  const [slots, setSlots] = useState<CredentialSlot[] | null>(null);
+  const [catalog, setCatalog] = useState<CatalogEntry[] | null>(null);
+  const [custom, setCustom] = useState<CustomConnector[] | null>(null);
+  const [vaultHandle, setVaultHandle] = useState("");
+  const [vaultSecret, setVaultSecret] = useState("");
+  const [vaultProvider, setVaultProvider] = useState("");
+  const [captureHandle, setCaptureHandle] = useState("");
+  const [captureSecret, setCaptureSecret] = useState("");
+  const [ticketProvider, setTicketProvider] = useState("");
+  const [ticketHandle, setTicketHandle] = useState("");
+  const [ticketId, setTicketId] = useState("");
+  const [ticketSecret, setTicketSecret] = useState("");
+  const [ticketNote, setTicketNote] = useState<string | null>(null);
+  const [customId, setCustomId] = useState("");
+  const [customName, setCustomName] = useState("");
+  const [renameValues, setRenameValues] = useState<Record<string, string>>({});
+  const [pendingSlotDelete, setPendingSlotDelete] = useState<string | null>(null);
+
+  async function refreshVault() {
+    try {
+      setSlots(await vault.listCredentials());
+    } catch {
+      setSlots(null);
+    }
+    try {
+      setCatalog(await vault.catalogList());
+    } catch {
+      setCatalog(null);
+    }
+    try {
+      setCustom(await vault.customList());
+    } catch {
+      setCustom(null);
+    }
+  }
 
   async function refresh() {
     setBusy(true);
@@ -85,6 +130,7 @@ export function SettingsView({
       } catch {
         setReminders(null);
       }
+      await refreshVault();
     } catch (err) {
       setError(errText(err));
     } finally {
@@ -214,6 +260,185 @@ export function SettingsView({
     }
   }
 
+  async function registerSlot() {
+    if (vaultHandle.trim() === "" || vaultSecret.trim() === "") {
+      setError("凭据名与密钥不能为空");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await vault.registerCredential(
+        vaultHandle.trim(),
+        vaultSecret,
+        vaultProvider.trim() === "" ? null : vaultProvider.trim(),
+      );
+      setVaultHandle("");
+      setVaultSecret("");
+      setVaultProvider("");
+      await refreshVault();
+      setNotice("凭据已保存到 Keychain（仅显示尾号）。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function captureSlot() {
+    if (captureHandle.trim() === "" || captureSecret.trim() === "") {
+      setError("凭据名与密钥不能为空");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await vault.captureCredential(captureHandle.trim(), captureSecret);
+      setCaptureHandle("");
+      setCaptureSecret("");
+      await refreshVault();
+      setNotice("凭据密钥已更新。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteSlot() {
+    if (pendingSlotDelete === null) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await vault.deleteCredential(pendingSlotDelete);
+      setPendingSlotDelete(null);
+      await refreshVault();
+      setNotice("凭据已从 Keychain 删除。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function requestTicket() {
+    if (ticketProvider.trim() === "" || ticketHandle.trim() === "") {
+      setError("票据的 provider 与凭据名不能为空");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const ticket = await vault.requestCapture(ticketProvider.trim(), ticketHandle.trim());
+      setTicketId(ticket.ticketId);
+      setTicketNote(`票据 ${ticket.ticketId} 已创建，15 分钟内有效。`);
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function fulfillTicket() {
+    if (ticketId.trim() === "" || ticketSecret.trim() === "") {
+      setError("票据号与密钥不能为空");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await vault.fulfillCapture(ticketId.trim(), ticketSecret);
+      setTicketId("");
+      setTicketSecret("");
+      setTicketNote(null);
+      await refreshVault();
+      setNotice("票据已完成，凭据密钥已更新。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function registerCustom() {
+    if (customId.trim() === "" || customName.trim() === "") {
+      setError("自定义连接器 id 与名称不能为空");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await vault.customRegister(customId.trim(), customName.trim(), null);
+      setCustomId("");
+      setCustomName("");
+      await refreshVault();
+      setNotice("自定义连接器已注册。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteCustom(id: string) {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await vault.customDelete(id);
+      await refreshVault();
+      setNotice("自定义连接器已删除。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function renameCatalog(id: string) {
+    const displayName = (renameValues[id] ?? "").trim();
+    if (displayName === "") {
+      setError("新名称不能为空");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await vault.catalogUpdate(id, displayName, null);
+      setRenameValues((prev) => ({ ...prev, [id]: "" }));
+      await refreshVault();
+      setNotice("目录条目已改名。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteCatalog(id: string) {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await vault.catalogDelete(id);
+      await refreshVault();
+      setNotice("目录条目已删除（已存凭据不受影响）。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const owned = gatewayStatus?.ownership === "owned";
   const attached = gatewayStatus?.ownership === "attached";
 
@@ -332,6 +557,182 @@ export function SettingsView({
           )}
         </div>
       )}
+
+      <h3>凭据库（Vault）</h3>
+      <p className="note">
+        凭据密钥只进系统 Keychain，页面不回读密钥，只显示尾号；模型凭据（deepseek）仍在上方单独管理，不在此列出。
+        目录条目由凭据注册时的 provider 自动创建；删除目录条目不删除已存凭据。
+      </p>
+      <p>
+        已存凭据：
+        {slots === null
+          ? "未知（状态查询失败）"
+          : slots.length === 0
+            ? "无"
+            : slots.map((s) => `${s.handle}${s.redacted ? ` ${s.redacted}` : ""}`).join(" · ")}
+      </p>
+      <div className="row">
+        <input
+          type="text"
+          value={vaultHandle}
+          placeholder="凭据名（如验收-凭据A）"
+          onChange={(event) => setVaultHandle(event.target.value)}
+        />
+        <input
+          type="password"
+          value={vaultSecret}
+          placeholder="密钥（测试请用 mock-token-…）"
+          onChange={(event) => setVaultSecret(event.target.value)}
+        />
+        <input
+          type="text"
+          value={vaultProvider}
+          placeholder="provider（可选）"
+          onChange={(event) => setVaultProvider(event.target.value)}
+        />
+        <button type="button" onClick={() => void registerSlot()} disabled={busy}>
+          注册凭据
+        </button>
+      </div>
+      <div className="row">
+        <input
+          type="text"
+          value={captureHandle}
+          placeholder="已注册凭据名"
+          onChange={(event) => setCaptureHandle(event.target.value)}
+        />
+        <input
+          type="password"
+          value={captureSecret}
+          placeholder="新密钥"
+          onChange={(event) => setCaptureSecret(event.target.value)}
+        />
+        <button type="button" onClick={() => void captureSlot()} disabled={busy}>
+          填入密钥（capture）
+        </button>
+      </div>
+      {slots !== null &&
+        slots.map((slot) => (
+          <div className="row" key={slot.handle}>
+            <span>
+              {slot.handle}
+              {slot.provider ? ` · ${slot.provider}` : ""}
+              {slot.redacted ? ` · ${slot.redacted}` : ""}
+            </span>
+            {pendingSlotDelete !== slot.handle && (
+              <button type="button" onClick={() => setPendingSlotDelete(slot.handle)} disabled={busy}>
+                删除凭据
+              </button>
+            )}
+          </div>
+        ))}
+      {pendingSlotDelete !== null && (
+        <div className="confirm">
+          <span>删除 Keychain 中的凭据 {pendingSlotDelete}？此操作不可撤销。</span>
+          <button type="button" onClick={() => void deleteSlot()} disabled={busy}>
+            确认删除
+          </button>
+          <button type="button" onClick={() => setPendingSlotDelete(null)} disabled={busy}>
+            取消
+          </button>
+        </div>
+      )}
+
+      <h3>外部票据（capture ticket）</h3>
+      <p className="note">本地票据流程：先为已注册凭据申请票据，再凭票据号填入密钥；票据 15 分钟过期，不调用任何真实外部 provider。</p>
+      <div className="row">
+        <input
+          type="text"
+          value={ticketProvider}
+          placeholder="provider"
+          onChange={(event) => setTicketProvider(event.target.value)}
+        />
+        <input
+          type="text"
+          value={ticketHandle}
+          placeholder="已注册凭据名"
+          onChange={(event) => setTicketHandle(event.target.value)}
+        />
+        <button type="button" onClick={() => void requestTicket()} disabled={busy}>
+          申请票据
+        </button>
+      </div>
+      {ticketNote !== null && <p className="notice">{ticketNote}</p>}
+      <div className="row">
+        <input
+          type="text"
+          value={ticketId}
+          placeholder="票据号"
+          onChange={(event) => setTicketId(event.target.value)}
+        />
+        <input
+          type="password"
+          value={ticketSecret}
+          placeholder="密钥（测试请用 mock-token-…）"
+          onChange={(event) => setTicketSecret(event.target.value)}
+        />
+        <button type="button" onClick={() => void fulfillTicket()} disabled={busy}>
+          凭票据填入
+        </button>
+      </div>
+
+      <h3>目录（catalog）与自定义连接器</h3>
+      {catalog === null ? (
+        <p className="empty">目录读取失败。</p>
+      ) : catalog.length === 0 ? (
+        <p className="empty">暂无目录条目（注册带 provider 的凭据后自动创建）。</p>
+      ) : (
+        catalog.map((entry) => (
+          <div className="row" key={entry.id}>
+            <span>
+              {entry.id} · {entry.displayName}
+              {entry.description ? ` · ${entry.description}` : ""}
+            </span>
+            <input
+              type="text"
+              value={renameValues[entry.id] ?? ""}
+              placeholder="新名称"
+              onChange={(event) =>
+                setRenameValues((prev) => ({ ...prev, [entry.id]: event.target.value }))
+              }
+            />
+            <button type="button" onClick={() => void renameCatalog(entry.id)} disabled={busy}>
+              改名
+            </button>
+            <button type="button" onClick={() => void deleteCatalog(entry.id)} disabled={busy}>
+              删除条目
+            </button>
+          </div>
+        ))
+      )}
+      <div className="row">
+        <input
+          type="text"
+          value={customId}
+          placeholder="自定义连接器 id"
+          onChange={(event) => setCustomId(event.target.value)}
+        />
+        <input
+          type="text"
+          value={customName}
+          placeholder="显示名称"
+          onChange={(event) => setCustomName(event.target.value)}
+        />
+        <button type="button" onClick={() => void registerCustom()} disabled={busy}>
+          注册自定义连接器
+        </button>
+      </div>
+      {custom !== null &&
+        custom.map((def) => (
+          <div className="row" key={def.id}>
+            <span>
+              {def.id} · {def.displayName}
+            </span>
+            <button type="button" onClick={() => void deleteCustom(def.id)} disabled={busy}>
+              删除
+            </button>
+          </div>
+        ))}
 
       <h3>状态检查</h3>
       <p className="note">三项分开展示：网关状态、模型凭据配置、提醒事项授权。此行只反映凭据配置与网关可达，不做真实模型调用。</p>

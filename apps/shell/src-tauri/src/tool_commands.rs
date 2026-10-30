@@ -24,6 +24,9 @@ use agent_desktop::agent_client::{AgentClient, AgentError, ToolDecision, ToolRes
 use agent_desktop::connector_client::{
     ConnectorAccount, ConnectorClient, ConnectorConnectInfo, ConnectorInfo, MockMessage, MockNote,
 };
+use agent_desktop::credential_vault_client::{
+    CaptureTicketView, CatalogEntryView, CredentialSlotView, CredentialVaultClient, CustomConnectorView,
+};
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
@@ -90,6 +93,10 @@ fn agent_client() -> Result<AgentClient, String> {
 
 fn connector_client() -> Result<ConnectorClient, String> {
     ConnectorClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+fn vault_client() -> Result<CredentialVaultClient, String> {
+    CredentialVaultClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
 }
 
 // --- Files (Phase 2 file gateway) ---
@@ -318,6 +325,89 @@ pub fn connector_connect(id: String) -> Result<ConnectorInfo, String> {
 #[tauri::command]
 pub fn connector_disconnect(id: String) -> Result<ConnectorInfo, String> {
     connector_client()?.disconnect(&id).map_err(agent_err_string)
+}
+
+// --- Vault: credentials, catalog, custom connectors (Task 10) ---
+//
+// Every command carries rename_all = "snake_case": the Task 9
+// link/unlink failure was exactly these two attributes missing
+// while the frontend sent snake_case keys.
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn vault_credentials_list() -> Result<Vec<CredentialSlotView>, String> {
+    vault_client()?.list_credentials().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn vault_credential_register(
+    handle: String,
+    secret: String,
+    provider: Option<String>,
+) -> Result<CredentialSlotView, String> {
+    vault_client()?.register_credential(&handle, &secret, provider.as_deref()).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn vault_credential_delete(handle: String) -> Result<CredentialSlotView, String> {
+    vault_client()?.delete_credential(&handle).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn vault_credential_capture(handle: String, secret: String) -> Result<CredentialSlotView, String> {
+    vault_client()?.capture(&handle, &secret).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn vault_capture_request(provider: String, handle: String) -> Result<CaptureTicketView, String> {
+    vault_client()?.capture_request(&provider, &handle).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn vault_capture_fulfill(ticket_id: String, secret: String) -> Result<CredentialSlotView, String> {
+    vault_client()?.capture_fulfill(&ticket_id, &secret).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn vault_catalog_list() -> Result<Vec<CatalogEntryView>, String> {
+    vault_client()?.catalog_list().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn vault_catalog_details(id: String) -> Result<CatalogEntryView, String> {
+    vault_client()?.catalog_details(&id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn vault_catalog_update(
+    id: String,
+    display_name: Option<String>,
+    description: Option<String>,
+) -> Result<CatalogEntryView, String> {
+    vault_client()?.catalog_update(&id, display_name.as_deref(), description.as_deref()).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn vault_catalog_delete(id: String) -> Result<CatalogEntryView, String> {
+    vault_client()?.catalog_delete(&id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn vault_custom_register(
+    id: String,
+    display_name: String,
+    description: Option<String>,
+) -> Result<CustomConnectorView, String> {
+    vault_client()?.custom_register(&id, &display_name, description.as_deref()).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn vault_custom_list() -> Result<Vec<CustomConnectorView>, String> {
+    vault_client()?.custom_list().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn vault_custom_delete(id: String) -> Result<CustomConnectorView, String> {
+    vault_client()?.custom_delete(&id).map_err(agent_err_string)
 }
 
 // --- Tasks (deterministic task loop) ---

@@ -24,6 +24,7 @@ pub mod task_store;
 pub mod task_runner;
 pub mod session_store;
 pub mod connector_store;
+pub mod vault_store;
 pub mod device_store;
 pub mod device_backend;
 

@@ -101,6 +101,11 @@ use crate::connector_store::{
     account_number, append_connector_state, load_connector_state, next_account_number,
     ConnectorAccount, ConnectorConnection, ConnectorStateLine,
 };
+use crate::vault_store::{
+    append_vault_state, load_vault_state, next_ticket_number, ticket_expired, CatalogEntry,
+    CaptureTicket, CredentialSlot, CustomConnectorDef, TicketStatus, VaultStateLine, TICKET_TTL_MS,
+};
+use agent_desktop::credential_store::{CredentialStore, KeychainCredentialStore};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
 
@@ -292,6 +297,13 @@ pub struct AppState {
     next_account_id: Arc<Mutex<u64>>,
     connector_connections: Arc<Mutex<HashMap<String, bool>>>,
     connector_state_path: Option<PathBuf>,
+    vault_slots: Arc<Mutex<HashMap<String, CredentialSlot>>>,
+    vault_catalog: Arc<Mutex<HashMap<String, CatalogEntry>>>,
+    vault_custom: Arc<Mutex<HashMap<String, CustomConnectorDef>>>,
+    vault_tickets: Arc<Mutex<HashMap<String, CaptureTicket>>>,
+    next_ticket_id: Arc<Mutex<u64>>,
+    vault_state_path: Option<PathBuf>,
+    vault_secrets: Arc<dyn CredentialStore + Send + Sync>,
 }
 
 impl Default for AppState {
@@ -325,6 +337,9 @@ impl AppState {
         }
         if let Ok(connector_state_path) = std::env::var("MOCK_CONNECTOR_STATE_PATH") {
             state = state.with_connector_state_path(PathBuf::from(connector_state_path));
+        }
+        if let Ok(vault_state_path) = std::env::var("MOCK_VAULT_STATE_PATH") {
+            state = state.with_vault_state_path(PathBuf::from(vault_state_path));
         }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
@@ -412,6 +427,13 @@ impl AppState {
             next_account_id: Arc::new(Mutex::new(1)),
             connector_connections: Arc::new(Mutex::new(HashMap::new())),
             connector_state_path: None,
+            vault_slots: Arc::new(Mutex::new(HashMap::new())),
+            vault_catalog: Arc::new(Mutex::new(HashMap::new())),
+            vault_custom: Arc::new(Mutex::new(HashMap::new())),
+            vault_tickets: Arc::new(Mutex::new(HashMap::new())),
+            next_ticket_id: Arc::new(Mutex::new(1)),
+            vault_state_path: None,
+            vault_secrets: Arc::new(KeychainCredentialStore::new()),
         }
     }
 
@@ -755,6 +777,43 @@ impl AppState {
         self.connector_accounts = Arc::new(Mutex::new(account_map));
         self.connector_connections = Arc::new(Mutex::new(connection_map));
         self.connector_state_path = Some(path);
+        self
+    }
+
+    /// Test seam: load vault metadata from a tagged JSONL file,
+    /// mirroring with_connector_state_path. Production state reads
+    /// MOCK_VAULT_STATE_PATH. The secret backend is untouched: tests
+    /// swap it with with_vault_secrets, production keeps Keychain.
+    pub fn with_vault_state_path(mut self, path: PathBuf) -> Self {
+        let (slots, catalog, custom, tickets) = load_vault_state(&path);
+        let mut slot_map = HashMap::new();
+        for record in &slots {
+            slot_map.insert(record.handle.clone(), record.clone());
+        }
+        let mut catalog_map = HashMap::new();
+        for record in &catalog {
+            catalog_map.insert(record.id.clone(), record.clone());
+        }
+        let mut custom_map = HashMap::new();
+        for record in &custom {
+            custom_map.insert(record.id.clone(), record.clone());
+        }
+        let mut ticket_map = HashMap::new();
+        for record in &tickets {
+            ticket_map.insert(record.ticket_id.clone(), record.clone());
+        }
+        self.next_ticket_id = Arc::new(Mutex::new(next_ticket_number(&tickets)));
+        self.vault_slots = Arc::new(Mutex::new(slot_map));
+        self.vault_catalog = Arc::new(Mutex::new(catalog_map));
+        self.vault_custom = Arc::new(Mutex::new(custom_map));
+        self.vault_tickets = Arc::new(Mutex::new(ticket_map));
+        self.vault_state_path = Some(path);
+        self
+    }
+
+    /// Test seam: swap the secret backend (memory store in tests).
+    pub fn with_vault_secrets(mut self, backend: Arc<dyn CredentialStore + Send + Sync>) -> Self {
+        self.vault_secrets = backend;
         self
     }
 
@@ -2301,6 +2360,507 @@ async fn connectors_disconnect(
     Json(connector_view(&state, entry)).into_response()
 }
 
+// --- Vault: credentials, catalog, custom connectors (Task 10) ---
+//
+// Metadata lives in vault_store.rs (tagged JSONL); secrets live
+// only in the secret backend (OS keychain in production, memory
+// in tests). No handler ever returns, logs, or echoes a secret:
+// responses carry the handle, provider, timestamps, and the
+// backend's redacted last-4 display only. Slot deletes remove
+// the secret from the backend for real; catalog and
+// custom-connector deletes are metadata tombstones only.
+
+fn persist_vault_line(state: &AppState, line: &VaultStateLine) {
+    let Some(path) = &state.vault_state_path else { return };
+    append_vault_state(path, line);
+}
+
+fn unknown_credential() -> Response {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown credential" }))).into_response()
+}
+
+fn unknown_catalog_entry() -> Response {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown catalog entry" }))).into_response()
+}
+
+fn unknown_custom_connector() -> Response {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown custom connector" }))).into_response()
+}
+
+fn unknown_ticket() -> Response {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown capture ticket" }))).into_response()
+}
+
+fn store_failed() -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "credential store failed" }))).into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct CredentialSlotView {
+    handle: String,
+    provider: Option<String>,
+    redacted: Option<String>,
+    created_ms: u64,
+    updated_ms: u64,
+}
+
+fn credential_view(state: &AppState, slot: &CredentialSlot) -> CredentialSlotView {
+    CredentialSlotView {
+        handle: slot.handle.clone(),
+        provider: slot.provider.clone(),
+        redacted: state.vault_secrets.redacted(&slot.handle).ok(),
+        created_ms: slot.created_ms,
+        updated_ms: slot.updated_ms,
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogView {
+    id: String,
+    display_name: String,
+    description: Option<String>,
+    created_ms: u64,
+    updated_ms: u64,
+}
+
+fn catalog_view(entry: &CatalogEntry) -> CatalogView {
+    CatalogView {
+        id: entry.id.clone(),
+        display_name: entry.display_name.clone(),
+        description: entry.description.clone(),
+        created_ms: entry.created_ms,
+        updated_ms: entry.updated_ms,
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CustomConnectorView {
+    id: String,
+    display_name: String,
+    description: Option<String>,
+    created_ms: u64,
+    updated_ms: u64,
+}
+
+fn custom_connector_view(def: &CustomConnectorDef) -> CustomConnectorView {
+    CustomConnectorView {
+        id: def.id.clone(),
+        display_name: def.display_name.clone(),
+        description: def.description.clone(),
+        created_ms: def.created_ms,
+        updated_ms: def.updated_ms,
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TicketView {
+    ticket_id: String,
+    provider: String,
+    handle: String,
+    status: TicketStatus,
+    created_ms: u64,
+    expires_ms: u64,
+}
+
+fn ticket_view(ticket: &CaptureTicket) -> TicketView {
+    TicketView {
+        ticket_id: ticket.ticket_id.clone(),
+        provider: ticket.provider.clone(),
+        handle: ticket.handle.clone(),
+        status: ticket.status,
+        created_ms: ticket.created_ms,
+        expires_ms: ticket.expires_ms,
+    }
+}
+
+/// A provider id appearing on a credential implies a catalog
+/// entry; create it (display name defaults to the id) when absent.
+/// There is no catalog create route in the spec, so this is how
+/// entries come to exist for catalog/update/delete to manage.
+fn ensure_catalog_entry(state: &AppState, provider: &str, now: u64) {
+    let mut catalog = state.vault_catalog.lock().expect("vault catalog lock");
+    if catalog.get(provider).is_some_and(|e| !e.deleted) {
+        return;
+    }
+    let entry = CatalogEntry {
+        id: provider.to_string(),
+        display_name: provider.to_string(),
+        description: None,
+        created_ms: now,
+        updated_ms: now,
+        deleted: false,
+    };
+    catalog.insert(provider.to_string(), entry.clone());
+    persist_vault_line(state, &VaultStateLine::Catalog(entry));
+}
+
+fn live_slot(slots: &HashMap<String, CredentialSlot>, handle: &str) -> Option<CredentialSlot> {
+    slots.get(handle).filter(|s| !s.deleted).cloned()
+}
+
+#[derive(Debug, Deserialize)]
+struct CustomRegisterDto {
+    id: String,
+    display_name: String,
+    description: Option<String>,
+}
+
+async fn vault_custom_register(
+    State(state): State<AppState>,
+    Json(req): Json<CustomRegisterDto>,
+) -> impl IntoResponse {
+    let id = req.id.trim().to_string();
+    let display_name = req.display_name.trim().to_string();
+    if id.is_empty() || display_name.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "id and display_name must not be empty" }))).into_response();
+    }
+    let mut custom = state.vault_custom.lock().expect("vault custom lock");
+    if custom.get(&id).is_some_and(|d| !d.deleted) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "custom connector already exists" }))).into_response();
+    }
+    let now = now_ms();
+    let def = CustomConnectorDef {
+        id: id.clone(),
+        display_name,
+        description: req.description.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        created_ms: now,
+        updated_ms: now,
+        deleted: false,
+    };
+    custom.insert(id, def.clone());
+    persist_vault_line(&state, &VaultStateLine::CustomConnector(def.clone()));
+    Json(custom_connector_view(&def)).into_response()
+}
+
+async fn vault_custom_list(State(state): State<AppState>) -> Json<Vec<CustomConnectorView>> {
+    let mut defs: Vec<CustomConnectorView> = state
+        .vault_custom
+        .lock()
+        .expect("vault custom lock")
+        .values()
+        .filter(|d| !d.deleted)
+        .map(custom_connector_view)
+        .collect();
+    defs.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(defs)
+}
+
+#[derive(Debug, Deserialize)]
+struct CustomDeleteDto {
+    id: String,
+}
+
+async fn vault_custom_delete(
+    State(state): State<AppState>,
+    Json(req): Json<CustomDeleteDto>,
+) -> impl IntoResponse {
+    let mut custom = state.vault_custom.lock().expect("vault custom lock");
+    let Some(def) = custom.get_mut(&req.id) else {
+        return unknown_custom_connector();
+    };
+    if def.deleted {
+        return unknown_custom_connector();
+    }
+    def.deleted = true;
+    let updated = def.clone();
+    persist_vault_line(&state, &VaultStateLine::CustomConnector(updated.clone()));
+    Json(custom_connector_view(&updated)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct CredentialRegisterDto {
+    handle: String,
+    secret: String,
+    provider: Option<String>,
+}
+
+async fn vault_credentials_register(
+    State(state): State<AppState>,
+    Json(req): Json<CredentialRegisterDto>,
+) -> impl IntoResponse {
+    let handle = req.handle.trim().to_string();
+    if handle.is_empty() || req.secret.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "handle and secret must not be empty" }))).into_response();
+    }
+    let provider = req.provider.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let mut slots = state.vault_slots.lock().expect("vault slots lock");
+    if slots.get(&handle).is_some_and(|s| !s.deleted) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "credential already exists" }))).into_response();
+    }
+    if state.vault_secrets.store(&handle, &req.secret).is_err() {
+        return store_failed();
+    }
+    let now = now_ms();
+    let slot = CredentialSlot {
+        handle: handle.clone(),
+        provider: provider.clone(),
+        created_ms: now,
+        updated_ms: now,
+        deleted: false,
+    };
+    slots.insert(handle, slot.clone());
+    persist_vault_line(&state, &VaultStateLine::Credential(slot.clone()));
+    drop(slots);
+    if let Some(provider) = &provider {
+        ensure_catalog_entry(&state, provider, now);
+    }
+    Json(credential_view(&state, &slot)).into_response()
+}
+
+async fn vault_credentials_list(State(state): State<AppState>) -> Json<Vec<CredentialSlotView>> {
+    let slots = state.vault_slots.lock().expect("vault slots lock");
+    let mut views: Vec<CredentialSlotView> = slots
+        .values()
+        .filter(|s| !s.deleted)
+        .map(|s| credential_view(&state, s))
+        .collect();
+    views.sort_by(|a, b| a.handle.cmp(&b.handle));
+    Json(views)
+}
+
+#[derive(Debug, Deserialize)]
+struct CredentialDeleteDto {
+    handle: String,
+}
+
+async fn vault_credentials_delete(
+    State(state): State<AppState>,
+    Json(req): Json<CredentialDeleteDto>,
+) -> impl IntoResponse {
+    let mut slots = state.vault_slots.lock().expect("vault slots lock");
+    let Some(slot) = slots.get_mut(&req.handle) else {
+        return unknown_credential();
+    };
+    if slot.deleted {
+        return unknown_credential();
+    }
+    // Real erasure: a missing backend entry is already-gone, any
+    // other backend failure aborts before the tombstone.
+    match state.vault_secrets.remove(&req.handle) {
+        Ok(()) => {}
+        Err(err) if err.code == agent_desktop::ErrorCode::InvalidInput => {}
+        Err(_) => return store_failed(),
+    }
+    slot.deleted = true;
+    let updated = slot.clone();
+    persist_vault_line(&state, &VaultStateLine::Credential(updated.clone()));
+    Json(credential_view(&state, &updated)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct CredentialCaptureDto {
+    handle: String,
+    secret: String,
+}
+
+async fn vault_credentials_capture(
+    State(state): State<AppState>,
+    Json(req): Json<CredentialCaptureDto>,
+) -> impl IntoResponse {
+    if req.secret.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "secret must not be empty" }))).into_response();
+    }
+    let mut slots = state.vault_slots.lock().expect("vault slots lock");
+    let Some(slot) = slots.get_mut(&req.handle) else {
+        return unknown_credential();
+    };
+    if slot.deleted {
+        return unknown_credential();
+    }
+    if state.vault_secrets.store(&req.handle, &req.secret).is_err() {
+        return store_failed();
+    }
+    slot.updated_ms = now_ms();
+    let updated = slot.clone();
+    persist_vault_line(&state, &VaultStateLine::Credential(updated.clone()));
+    Json(credential_view(&state, &updated)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct CaptureRequestDto {
+    provider: String,
+    handle: String,
+}
+
+async fn vault_capture_request(
+    State(state): State<AppState>,
+    Json(req): Json<CaptureRequestDto>,
+) -> impl IntoResponse {
+    let provider = req.provider.trim().to_string();
+    if provider.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "provider must not be empty" }))).into_response();
+    }
+    {
+        let slots = state.vault_slots.lock().expect("vault slots lock");
+        if live_slot(&slots, &req.handle).is_none() {
+            return unknown_credential();
+        }
+    }
+    let mut next = state.next_ticket_id.lock().expect("ticket id lock");
+    let now = now_ms();
+    let ticket = CaptureTicket {
+        ticket_id: format!("ticket-{}", *next),
+        provider,
+        handle: req.handle,
+        status: TicketStatus::Pending,
+        created_ms: now,
+        expires_ms: now + TICKET_TTL_MS,
+    };
+    *next += 1;
+    state
+        .vault_tickets
+        .lock()
+        .expect("vault tickets lock")
+        .insert(ticket.ticket_id.clone(), ticket.clone());
+    persist_vault_line(&state, &VaultStateLine::Ticket(ticket.clone()));
+    Json(ticket_view(&ticket)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct CaptureFulfillDto {
+    ticket_id: String,
+    secret: String,
+}
+
+async fn vault_capture_fulfill(
+    State(state): State<AppState>,
+    Json(req): Json<CaptureFulfillDto>,
+) -> impl IntoResponse {
+    let ticket = {
+        let mut tickets = state.vault_tickets.lock().expect("vault tickets lock");
+        let Some(ticket) = tickets.get_mut(&req.ticket_id) else {
+            return unknown_ticket();
+        };
+        if ticket.status != TicketStatus::Pending {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "ticket already fulfilled" }))).into_response();
+        }
+        if ticket_expired(ticket, now_ms()) {
+            ticket.status = TicketStatus::Expired;
+            let updated = ticket.clone();
+            persist_vault_line(&state, &VaultStateLine::Ticket(updated));
+            return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "ticket expired" }))).into_response();
+        }
+        ticket.clone()
+    };
+    if req.secret.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "secret must not be empty" }))).into_response();
+    }
+    let updated = {
+        let mut slots = state.vault_slots.lock().expect("vault slots lock");
+        let Some(slot) = slots.get_mut(&ticket.handle) else {
+            return unknown_credential();
+        };
+        if slot.deleted {
+            return unknown_credential();
+        }
+        if state.vault_secrets.store(&ticket.handle, &req.secret).is_err() {
+            return store_failed();
+        }
+        slot.updated_ms = now_ms();
+        let updated = slot.clone();
+        persist_vault_line(&state, &VaultStateLine::Credential(updated.clone()));
+        updated
+    };
+    let mut tickets = state.vault_tickets.lock().expect("vault tickets lock");
+    let Some(ticket) = tickets.get_mut(&req.ticket_id) else {
+        return unknown_ticket();
+    };
+    if ticket.status != TicketStatus::Pending {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "ticket already fulfilled" }))).into_response();
+    }
+    ticket.status = TicketStatus::Fulfilled;
+    let updated_ticket = ticket.clone();
+    persist_vault_line(&state, &VaultStateLine::Ticket(updated_ticket));
+    Json(credential_view(&state, &updated)).into_response()
+}
+
+async fn vault_catalog_list(State(state): State<AppState>) -> Json<Vec<CatalogView>> {
+    let mut entries: Vec<CatalogView> = state
+        .vault_catalog
+        .lock()
+        .expect("vault catalog lock")
+        .values()
+        .filter(|e| !e.deleted)
+        .map(catalog_view)
+        .collect();
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(entries)
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogDetailsQuery {
+    id: String,
+}
+
+async fn vault_catalog_details(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<CatalogDetailsQuery>,
+) -> impl IntoResponse {
+    let catalog = state.vault_catalog.lock().expect("vault catalog lock");
+    match catalog.get(&query.id).filter(|e| !e.deleted) {
+        Some(entry) => Json(catalog_view(entry)).into_response(),
+        None => unknown_catalog_entry(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogUpdateDto {
+    id: String,
+    display_name: Option<String>,
+    description: Option<String>,
+}
+
+async fn vault_catalog_update(
+    State(state): State<AppState>,
+    Json(req): Json<CatalogUpdateDto>,
+) -> impl IntoResponse {
+    let display_name_provided = req.display_name.is_some();
+    let display_name = req.display_name.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    if display_name_provided && display_name.is_none() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "display_name must not be empty" }))).into_response();
+    }
+    let mut catalog = state.vault_catalog.lock().expect("vault catalog lock");
+    let Some(entry) = catalog.get_mut(&req.id) else {
+        return unknown_catalog_entry();
+    };
+    if entry.deleted {
+        return unknown_catalog_entry();
+    }
+    if let Some(display_name) = display_name {
+        entry.display_name = display_name;
+    }
+    if let Some(description) = req.description {
+        let description = description.trim().to_string();
+        entry.description = if description.is_empty() { None } else { Some(description) };
+    }
+    entry.updated_ms = now_ms();
+    let updated = entry.clone();
+    persist_vault_line(&state, &VaultStateLine::Catalog(updated.clone()));
+    Json(catalog_view(&updated)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogDeleteDto {
+    id: String,
+}
+
+async fn vault_catalog_delete(
+    State(state): State<AppState>,
+    Json(req): Json<CatalogDeleteDto>,
+) -> impl IntoResponse {
+    let mut catalog = state.vault_catalog.lock().expect("vault catalog lock");
+    let Some(entry) = catalog.get_mut(&req.id) else {
+        return unknown_catalog_entry();
+    };
+    if entry.deleted {
+        return unknown_catalog_entry();
+    }
+    entry.deleted = true;
+    let updated = entry.clone();
+    persist_vault_line(&state, &VaultStateLine::Catalog(updated.clone()));
+    Json(catalog_view(&updated)).into_response()
+}
+
 /// CORS for browser/WebView clients. The Rust CLIs and curl
 /// are not subject to CORS, which is why every CLI and smoke
 /// test passed while the Tauri window (page origin
@@ -3484,6 +4044,19 @@ pub fn app(state: AppState) -> Router {
         .route("/connectors/{id}/connect/info", get(connectors_connect_info))
         .route("/connectors/{id}/connect", post(connectors_connect))
         .route("/connectors/{id}/disconnect", post(connectors_disconnect))
+        .route("/v1/custom-connectors/register", post(vault_custom_register))
+        .route("/v1/custom-connectors/list", post(vault_custom_list))
+        .route("/v1/custom-connectors/delete", post(vault_custom_delete))
+        .route("/v1/credentials/register", post(vault_credentials_register))
+        .route("/v1/credentials/list", get(vault_credentials_list))
+        .route("/v1/credentials/delete", post(vault_credentials_delete))
+        .route("/v1/credentials/capture", post(vault_credentials_capture))
+        .route("/v1/credentials/capture/external-provider/request", post(vault_capture_request))
+        .route("/v1/credentials/capture/external-provider/fulfill", post(vault_capture_fulfill))
+        .route("/v1/credentials/catalog", get(vault_catalog_list))
+        .route("/v1/credentials/catalog/details", get(vault_catalog_details))
+        .route("/v1/credentials/catalog/update", post(vault_catalog_update))
+        .route("/v1/credentials/catalog/delete", post(vault_catalog_delete))
         .route("/tasks/create", post(tasks_create))
         .route("/tasks/list", get(tasks_list))
         .route("/tasks/get", get(tasks_get))
