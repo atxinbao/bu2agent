@@ -295,12 +295,12 @@ pub fn connector_accounts(id: String) -> Result<Vec<ConnectorAccount>, String> {
     connector_client()?.accounts(&id).map_err(agent_err_string)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn connector_account_link(id: String, display_name: Option<String>) -> Result<ConnectorAccount, String> {
     connector_client()?.link_account(&id, display_name.as_deref()).map_err(agent_err_string)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn connector_account_unlink(id: String, account_id: String) -> Result<ConnectorAccount, String> {
     connector_client()?.unlink_account(&id, &account_id).map_err(agent_err_string)
 }
