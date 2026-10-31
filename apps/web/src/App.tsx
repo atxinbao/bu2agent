@@ -32,6 +32,9 @@ import { InvokeConfigClient } from "./domain/invoke_config_client";
 import { PeerClient, type PeerGateway } from "./domain/peer_client";
 import { InvokePeerClient } from "./domain/invoke_peer_client";
 import { PeersView } from "./views/PeersView";
+import { SpaceClient, type SpaceGateway } from "./domain/space_client";
+import { InvokeSpaceClient } from "./domain/invoke_space_client";
+import { SpacesView } from "./views/SpacesView";
 import {
   TaskClient,
   type TaskGateway,
@@ -97,9 +100,10 @@ interface Clients {
   loops: LoopGateway;
   sessions: SessionGateway;
   peers: PeerGateway;
+  spaces: SpaceGateway;
 }
 
-type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "peers" | "settings";
+type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "peers" | "spaces" | "settings";
 
 // Visible navigation: the workbench (sessions) is the only
 // chat entry and the default view (R1, 2026-10-28). The legacy
@@ -114,6 +118,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "devices", label: "Devices" },
   { id: "loops", label: "Loops" },
   { id: "peers", label: "Peers" },
+  { id: "spaces", label: "Spaces" },
   { id: "settings", label: "设置" },
 ];
 
@@ -175,6 +180,7 @@ export function App() {
           loops: new InvokeLoopClient(),
           sessions: new InvokeSessionClient(),
           peers: new InvokePeerClient(),
+          spaces: new InvokeSpaceClient(),
         };
         transportName = "invoke (Rust client)";
       } catch {
@@ -192,6 +198,7 @@ export function App() {
           loops: new LoopClient(MOCK_BASE_URL),
           sessions: new SessionClient(MOCK_BASE_URL),
           peers: new PeerClient(MOCK_BASE_URL),
+          spaces: new SpaceClient(MOCK_BASE_URL),
         };
         transportName = "http (browser preview)";
       }
@@ -487,6 +494,12 @@ export function App() {
           <p className="empty">Choosing transport…</p>
         ) : (
           <PeersView client={clients.peers} />
+        ))}
+      {tab === "spaces" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : (
+          <SpacesView client={clients.spaces} />
         ))}
       {tab === "tasks" &&
         (clients === null ? (

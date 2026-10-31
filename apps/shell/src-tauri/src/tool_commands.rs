@@ -34,6 +34,7 @@ use agent_desktop::permission_policy_client::{
 use agent_desktop::model_client::{ModelClient, ModelView};
 use agent_desktop::config_client::{ConfigClient, ConfigView};
 use agent_desktop::peer_client::{Peer, PeerClient, PeerInboxMessage, PeerInvite, PeerRequest, PeerStatus};
+use agent_desktop::space_client::{Space, SpaceClient, SpaceItem};
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
@@ -679,6 +680,34 @@ pub fn peer_requests_list() -> Result<Vec<PeerRequest>, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn peer_status() -> Result<PeerStatus, String> {
     peer_client()?.get_status().map_err(agent_err_string)
+}
+
+// --- Spaces surface (Task 16, v2 record subset) ---
+//
+// All commands carry rename_all = "snake_case" (Task 9
+// lesson): the invoke client sends snake_case params.
+
+fn space_client() -> Result<SpaceClient, String> {
+    SpaceClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn space_list() -> Result<Vec<Space>, String> {
+    space_client()?.list_spaces().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn space_save(
+    slug: String,
+    title: Option<String>,
+    items: Vec<SpaceItem>,
+) -> Result<Space, String> {
+    space_client()?.save_space(&slug, title.as_deref(), &items).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn space_delete(slug: String) -> Result<Space, String> {
+    space_client()?.delete_space(&slug).map_err(agent_err_string)
 }
 
 // --- Tasks (deterministic task loop) ---

@@ -114,6 +114,7 @@ use crate::peer_store::{
     append_peer_state, load_peer_state, next_invite_number, next_message_number, Peer,
     PeerInboxMessage, PeerInvite, PeerRequest, PeerStateLine,
 };
+use crate::space_store::{append_space_state, load_space_state, Space, SpaceItem, SpaceStateLine};
 use agent_desktop::credential_store::{redact, CredentialStore, KeychainCredentialStore};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
@@ -326,6 +327,8 @@ pub struct AppState {
     peer_inbox: Arc<Mutex<HashMap<String, PeerInboxMessage>>>,
     peer_requests: Arc<Mutex<HashMap<String, PeerRequest>>>,
     peer_state_path: Option<PathBuf>,
+    spaces: Arc<Mutex<HashMap<String, Space>>>,
+    space_state_path: Option<PathBuf>,
 }
 
 impl Default for AppState {
@@ -390,6 +393,9 @@ impl AppState {
         }
         if let Ok(peer_state_path) = std::env::var("MOCK_PEER_STATE_PATH") {
             state = state.with_peer_state_path(PathBuf::from(peer_state_path));
+        }
+        if let Ok(space_state_path) = std::env::var("MOCK_SPACE_STATE_PATH") {
+            state = state.with_space_state_path(PathBuf::from(space_state_path));
         }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
@@ -497,6 +503,8 @@ impl AppState {
             peer_inbox: Arc::new(Mutex::new(HashMap::new())),
             peer_requests: Arc::new(Mutex::new(HashMap::new())),
             peer_state_path: None,
+            spaces: Arc::new(Mutex::new(HashMap::new())),
+            space_state_path: None,
         }
     }
 
@@ -936,6 +944,20 @@ impl AppState {
         self.peer_inbox = Arc::new(Mutex::new(inbox_map));
         self.peer_requests = Arc::new(Mutex::new(request_map));
         self.peer_state_path = Some(path);
+        self
+    }
+
+    /// Test seam: load saved-space state from a tagged
+    /// JSONL file, mirroring with_peer_state_path.
+    /// Production state reads MOCK_SPACE_STATE_PATH.
+    pub fn with_space_state_path(mut self, path: PathBuf) -> Self {
+        let spaces = load_space_state(&path);
+        let mut space_map = HashMap::new();
+        for record in &spaces {
+            space_map.insert(record.slug.clone(), record.clone());
+        }
+        self.spaces = Arc::new(Mutex::new(space_map));
+        self.space_state_path = Some(path);
         self
     }
 
@@ -4222,6 +4244,120 @@ async fn peers_status(State(state): State<AppState>) -> Json<serde_json::Value> 
     }))
 }
 
+// --- Spaces surface (Task 16, v2 record subset) ---
+//
+// Local semantics only (see space_store.rs): save
+// upserts a named collection of session/file references;
+// delete is a tombstone; the ?source=saved_space variant
+// has the same record effect as a plain delete.
+
+fn persist_space_line(state: &AppState, line: &SpaceStateLine) {
+    let Some(path) = &state.space_state_path else { return };
+    append_space_state(path, line);
+}
+
+async fn spaces_list(State(state): State<AppState>) -> Json<Vec<Space>> {
+    let mut spaces: Vec<Space> = state
+        .spaces
+        .lock()
+        .expect("space lock")
+        .values()
+        .filter(|s| !s.deleted)
+        .cloned()
+        .collect();
+    spaces.sort_by(|a, b| a.slug.cmp(&b.slug));
+    Json(spaces)
+}
+
+#[derive(Debug, Deserialize)]
+struct SpaceSaveDto {
+    title: Option<String>,
+    items: Option<Vec<SpaceItemDto>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpaceItemDto {
+    kind: String,
+    #[serde(rename = "ref")]
+    reference: String,
+}
+
+async fn spaces_save(
+    State(state): State<AppState>,
+    axum::extract::Path(slug): axum::extract::Path<String>,
+    Json(req): Json<SpaceSaveDto>,
+) -> impl IntoResponse {
+    let title = match req.title {
+        Some(raw) => {
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() {
+                return bad_request("title must not be empty").into_response();
+            }
+            trimmed
+        }
+        None => slug.clone(),
+    };
+    let mut items = Vec::new();
+    for item in req.items.unwrap_or_default() {
+        let kind = item.kind.trim().to_string();
+        let reference = item.reference.trim().to_string();
+        if kind != "session" && kind != "file" {
+            return bad_request("item kind must be session or file").into_response();
+        }
+        if reference.is_empty() {
+            return bad_request("item ref must not be empty").into_response();
+        }
+        items.push(SpaceItem { kind, reference });
+    }
+    let now = now_ms();
+    let mut spaces = state.spaces.lock().expect("space lock");
+    let space = match spaces.get_mut(&slug) {
+        // Resurrecting a deleted slug starts fresh: the
+        // old created_ms does not survive the tombstone.
+        Some(existing) if !existing.deleted => {
+            existing.title = title;
+            existing.items = items;
+            existing.updated_ms = now;
+            existing.clone()
+        }
+        _ => {
+            let fresh = Space {
+                slug: slug.clone(),
+                title,
+                items,
+                created_ms: now,
+                updated_ms: now,
+                deleted: false,
+            };
+            spaces.insert(slug, fresh.clone());
+            fresh
+        }
+    };
+    persist_space_line(&state, &SpaceStateLine::Space(space.clone()));
+    Json(space).into_response()
+}
+
+async fn spaces_delete(
+    State(state): State<AppState>,
+    axum::extract::Path(slug): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut spaces = state.spaces.lock().expect("space lock");
+    let Some(space) = spaces.get_mut(&slug) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown space" })))
+            .into_response();
+    };
+    // Idempotent: deleting an already-deleted space
+    // succeeds without a new record.
+    if !space.deleted {
+        space.deleted = true;
+        space.updated_ms = now_ms();
+        let updated = space.clone();
+        persist_space_line(&state, &SpaceStateLine::Space(updated.clone()));
+        return Json(updated).into_response();
+    }
+    Json(space.clone()).into_response()
+}
+
 // --- Tasks (deterministic task loop) ---
 //
 // A task is a directory + a report artifact. The manual flow stays
@@ -5446,6 +5582,9 @@ pub fn app(state: AppState) -> Router {
         .route("/peers/inbox/deliver", post(peers_inbox_deliver))
         .route("/peers/requests", get(peers_requests_list))
         .route("/peers/status", get(peers_status))
+        .route("/spaces/v2", get(spaces_list))
+        .route("/spaces/v2/{slug}/save", post(spaces_save))
+        .route("/spaces/v2/{slug}", delete(spaces_delete))
         .route("/tasks/create", post(tasks_create))
         .route("/tasks/list", get(tasks_list))
         .route("/tasks/get", get(tasks_get))

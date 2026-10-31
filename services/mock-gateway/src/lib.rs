@@ -28,6 +28,7 @@ pub mod vault_store;
 pub mod policy_store;
 pub mod model_store;
 pub mod peer_store;
+pub mod space_store;
 pub mod device_store;
 pub mod device_backend;
 
