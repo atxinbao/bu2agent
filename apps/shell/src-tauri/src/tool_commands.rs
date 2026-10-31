@@ -33,6 +33,7 @@ use agent_desktop::permission_policy_client::{
 };
 use agent_desktop::model_client::{ModelClient, ModelView};
 use agent_desktop::config_client::{ConfigClient, ConfigView};
+use agent_desktop::peer_client::{Peer, PeerClient, PeerInboxMessage, PeerInvite, PeerRequest, PeerStatus};
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
@@ -595,6 +596,89 @@ fn config_client() -> Result<ConfigClient, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn config_get() -> Result<ConfigView, String> {
     config_client()?.get_config().map_err(agent_err_string)
+}
+
+// --- Peers surface (Task 15, record subset) ---
+//
+// All commands carry rename_all = "snake_case" (Task 9
+// lesson): the invoke client sends snake_case params.
+
+fn peer_client() -> Result<PeerClient, String> {
+    PeerClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn peer_list() -> Result<Vec<Peer>, String> {
+    peer_client()?.list_peers().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn peer_get(muse_id: String) -> Result<Peer, String> {
+    peer_client()?.get_peer(&muse_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn peer_update(
+    muse_id: String,
+    display_name: Option<String>,
+    status: Option<String>,
+) -> Result<Peer, String> {
+    peer_client()?.update_peer(&muse_id, display_name.as_deref(), status.as_deref()).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn peer_disconnect(muse_id: String) -> Result<Peer, String> {
+    peer_client()?.disconnect_peer(&muse_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn peer_invites_list() -> Result<Vec<PeerInvite>, String> {
+    peer_client()?.list_invites().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn peer_invite_create(muse_id: String, display_name: String) -> Result<PeerInvite, String> {
+    peer_client()?.create_invite(&muse_id, &display_name).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn peer_invite_accept(invite_id: String) -> Result<PeerInvite, String> {
+    peer_client()?.accept_invite(&invite_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn peer_invite_open(invite_id: String) -> Result<PeerInvite, String> {
+    peer_client()?.open_invite(&invite_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn peer_invite_revoke(invite_id: String) -> Result<PeerInvite, String> {
+    peer_client()?.revoke_invite(&invite_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn peer_inbox_list() -> Result<Vec<PeerInboxMessage>, String> {
+    peer_client()?.list_inbox().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn peer_inbox_deliver(from_muse_id: String, text: String) -> Result<PeerInboxMessage, String> {
+    peer_client()?.deliver_inbox(&from_muse_id, &text).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn peer_inbox_decline(message_id: String) -> Result<PeerInboxMessage, String> {
+    peer_client()?.decline_inbox(&message_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn peer_requests_list() -> Result<Vec<PeerRequest>, String> {
+    peer_client()?.list_requests().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn peer_status() -> Result<PeerStatus, String> {
+    peer_client()?.get_status().map_err(agent_err_string)
 }
 
 // --- Tasks (deterministic task loop) ---

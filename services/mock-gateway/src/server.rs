@@ -110,6 +110,10 @@ use crate::policy_store::{
     NetworkRule, PolicyDefaults, PolicyOverrides, PolicyStateLine, ScopeRecord,
 };
 use crate::model_store::{append_model_state, load_model_state, ModelStateLine, StagedModel};
+use crate::peer_store::{
+    append_peer_state, load_peer_state, next_invite_number, next_message_number, Peer,
+    PeerInboxMessage, PeerInvite, PeerRequest, PeerStateLine,
+};
 use agent_desktop::credential_store::{redact, CredentialStore, KeychainCredentialStore};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
@@ -317,6 +321,11 @@ pub struct AppState {
     policy_state_path: Option<PathBuf>,
     model_staged: Arc<Mutex<Option<StagedModel>>>,
     model_state_path: Option<PathBuf>,
+    peer_peers: Arc<Mutex<HashMap<String, Peer>>>,
+    peer_invites: Arc<Mutex<HashMap<String, PeerInvite>>>,
+    peer_inbox: Arc<Mutex<HashMap<String, PeerInboxMessage>>>,
+    peer_requests: Arc<Mutex<HashMap<String, PeerRequest>>>,
+    peer_state_path: Option<PathBuf>,
 }
 
 impl Default for AppState {
@@ -378,6 +387,9 @@ impl AppState {
         }
         if let Ok(policy_state_path) = std::env::var("MOCK_POLICY_STATE_PATH") {
             state = state.with_policy_state_path(PathBuf::from(policy_state_path));
+        }
+        if let Ok(peer_state_path) = std::env::var("MOCK_PEER_STATE_PATH") {
+            state = state.with_peer_state_path(PathBuf::from(peer_state_path));
         }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
@@ -480,6 +492,11 @@ impl AppState {
             policy_state_path: None,
             model_staged: Arc::new(Mutex::new(None)),
             model_state_path: None,
+            peer_peers: Arc::new(Mutex::new(HashMap::new())),
+            peer_invites: Arc::new(Mutex::new(HashMap::new())),
+            peer_inbox: Arc::new(Mutex::new(HashMap::new())),
+            peer_requests: Arc::new(Mutex::new(HashMap::new())),
+            peer_state_path: None,
         }
     }
 
@@ -890,6 +907,35 @@ impl AppState {
         let staged = load_model_state(&path);
         self.model_staged = Arc::new(Mutex::new(staged));
         self.model_state_path = Some(path);
+        self
+    }
+
+    /// Test seam: load peer relationship state from a
+    /// tagged JSONL file, mirroring with_connector_state_path.
+    /// Production state reads MOCK_PEER_STATE_PATH.
+    pub fn with_peer_state_path(mut self, path: PathBuf) -> Self {
+        let (peers, invites, inbox, requests) = load_peer_state(&path);
+        let mut peer_map = HashMap::new();
+        for record in &peers {
+            peer_map.insert(record.muse_id.clone(), record.clone());
+        }
+        let mut invite_map = HashMap::new();
+        for record in &invites {
+            invite_map.insert(record.invite_id.clone(), record.clone());
+        }
+        let mut inbox_map = HashMap::new();
+        for record in &inbox {
+            inbox_map.insert(record.message_id.clone(), record.clone());
+        }
+        let mut request_map = HashMap::new();
+        for record in &requests {
+            request_map.insert(record.relationship_generation_id.clone(), record.clone());
+        }
+        self.peer_peers = Arc::new(Mutex::new(peer_map));
+        self.peer_invites = Arc::new(Mutex::new(invite_map));
+        self.peer_inbox = Arc::new(Mutex::new(inbox_map));
+        self.peer_requests = Arc::new(Mutex::new(request_map));
+        self.peer_state_path = Some(path);
         self
     }
 
@@ -3804,6 +3850,378 @@ async fn config_get(State(state): State<AppState>) -> Json<ConfigView> {
     })
 }
 
+// --- Peers surface (Task 15, record subset) ---
+//
+// Local semantics only (see peer_store.rs): peers form by
+// accepting an invite; an invite doubles as its request
+// record; inbox deliver creates a pending item, decline
+// resolves it. SAS, avatar/photo, and the fs/write
+// discretion route are excluded.
+
+fn persist_peer_line(state: &AppState, line: &PeerStateLine) {
+    let Some(path) = &state.peer_state_path else { return };
+    append_peer_state(path, line);
+}
+
+fn peer_not_found() -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown peer" })))
+}
+
+fn invite_not_found() -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown invite" })))
+}
+
+fn message_not_found() -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown inbox message" })))
+}
+
+fn conflict(message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::CONFLICT, Json(serde_json::json!({ "error": message })))
+}
+
+async fn peers_list(State(state): State<AppState>) -> Json<Vec<Peer>> {
+    let mut peers: Vec<Peer> = state
+        .peer_peers
+        .lock()
+        .expect("peer lock")
+        .values()
+        .filter(|p| !p.disconnected)
+        .cloned()
+        .collect();
+    peers.sort_by(|a, b| a.muse_id.cmp(&b.muse_id));
+    Json(peers)
+}
+
+async fn peers_get(
+    State(state): State<AppState>,
+    axum::extract::Path(muse_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.peer_peers.lock().expect("peer lock").get(&muse_id) {
+        Some(peer) => Json(peer.clone()).into_response(),
+        None => peer_not_found().into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PeerUpdateDto {
+    display_name: Option<String>,
+    status: Option<String>,
+}
+
+async fn peers_update(
+    State(state): State<AppState>,
+    axum::extract::Path(muse_id): axum::extract::Path<String>,
+    Json(req): Json<PeerUpdateDto>,
+) -> impl IntoResponse {
+    let display_name = match req.display_name {
+        Some(raw) => {
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() {
+                return bad_request("display_name must not be empty").into_response();
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+    let status = match req.status {
+        Some(raw) => {
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() {
+                return bad_request("status must not be empty").into_response();
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+    let mut peers = state.peer_peers.lock().expect("peer lock");
+    let Some(peer) = peers.get_mut(&muse_id) else {
+        return peer_not_found().into_response();
+    };
+    if peer.disconnected {
+        return peer_not_found().into_response();
+    }
+    if let Some(name) = display_name {
+        peer.display_name = name;
+    }
+    if let Some(status) = status {
+        peer.status = status;
+    }
+    peer.updated_ms = now_ms();
+    let updated = peer.clone();
+    persist_peer_line(&state, &PeerStateLine::Peer(updated.clone()));
+    Json(updated).into_response()
+}
+
+async fn peers_disconnect(
+    State(state): State<AppState>,
+    axum::extract::Path(muse_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut peers = state.peer_peers.lock().expect("peer lock");
+    let Some(peer) = peers.get_mut(&muse_id) else {
+        return peer_not_found().into_response();
+    };
+    // Idempotent: disconnecting an already-disconnected
+    // peer succeeds without a new record.
+    if !peer.disconnected {
+        peer.disconnected = true;
+        peer.updated_ms = now_ms();
+        let updated = peer.clone();
+        persist_peer_line(&state, &PeerStateLine::Peer(updated.clone()));
+        return Json(updated).into_response();
+    }
+    Json(peer.clone()).into_response()
+}
+
+async fn peers_invites_list(State(state): State<AppState>) -> Json<Vec<PeerInvite>> {
+    let mut invites: Vec<PeerInvite> = state
+        .peer_invites
+        .lock()
+        .expect("peer lock")
+        .values()
+        .filter(|i| !i.revoked)
+        .cloned()
+        .collect();
+    invites.sort_by_key(|i| (i.created_ms, i.invite_id.clone()));
+    Json(invites)
+}
+
+#[derive(Debug, Deserialize)]
+struct PeerInviteCreateDto {
+    muse_id: String,
+    display_name: String,
+}
+
+async fn peers_invites_create(
+    State(state): State<AppState>,
+    Json(req): Json<PeerInviteCreateDto>,
+) -> impl IntoResponse {
+    let muse_id = req.muse_id.trim().to_string();
+    let display_name = req.display_name.trim().to_string();
+    if muse_id.is_empty() || display_name.is_empty() {
+        return bad_request("muse_id and display_name must not be empty").into_response();
+    }
+    let now = now_ms();
+    let invite_id = {
+        let invites = state.peer_invites.lock().expect("peer lock");
+        let records: Vec<PeerInvite> = invites.values().cloned().collect();
+        format!("invite-{}", next_invite_number(&records))
+    };
+    let invite = PeerInvite {
+        invite_id: invite_id.clone(),
+        muse_id: muse_id.clone(),
+        display_name: display_name.clone(),
+        status: "pending".to_string(),
+        created_ms: now,
+        updated_ms: now,
+        revoked: false,
+    };
+    let request = PeerRequest {
+        relationship_generation_id: invite_id.clone(),
+        muse_id,
+        display_name,
+        status: "pending".to_string(),
+        created_ms: now,
+    };
+    state.peer_invites.lock().expect("peer lock").insert(invite_id, invite.clone());
+    state.peer_requests.lock().expect("peer lock").insert(request.relationship_generation_id.clone(), request.clone());
+    persist_peer_line(&state, &PeerStateLine::Invite(invite.clone()));
+    persist_peer_line(&state, &PeerStateLine::Request(request));
+    Json(invite).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct PeerInviteIdDto {
+    invite_id: String,
+}
+
+async fn peers_invites_accept(
+    State(state): State<AppState>,
+    Json(req): Json<PeerInviteIdDto>,
+) -> impl IntoResponse {
+    let mut invites = state.peer_invites.lock().expect("peer lock");
+    let Some(invite) = invites.get_mut(&req.invite_id) else {
+        return invite_not_found().into_response();
+    };
+    if invite.revoked {
+        return conflict("invite revoked").into_response();
+    }
+    // Idempotent: accepting an already-accepted invite
+    // succeeds without duplicating the peer.
+    if invite.status != "accepted" {
+        invite.status = "accepted".to_string();
+        invite.updated_ms = now_ms();
+        let updated = invite.clone();
+        let mut peers = state.peer_peers.lock().expect("peer lock");
+        let peer = Peer {
+            muse_id: updated.muse_id.clone(),
+            display_name: updated.display_name.clone(),
+            status: "connected".to_string(),
+            updated_ms: now_ms(),
+            disconnected: false,
+        };
+        peers.insert(peer.muse_id.clone(), peer.clone());
+        let mut requests = state.peer_requests.lock().expect("peer lock");
+        if let Some(request) = requests.get_mut(&req.invite_id) {
+            request.status = "accepted".to_string();
+            let request = request.clone();
+            persist_peer_line(&state, &PeerStateLine::Request(request));
+        }
+        persist_peer_line(&state, &PeerStateLine::Invite(updated.clone()));
+        persist_peer_line(&state, &PeerStateLine::Peer(peer));
+        return Json(updated).into_response();
+    }
+    Json(invite.clone()).into_response()
+}
+
+async fn peers_invites_open(
+    State(state): State<AppState>,
+    Json(req): Json<PeerInviteIdDto>,
+) -> impl IntoResponse {
+    let mut invites = state.peer_invites.lock().expect("peer lock");
+    let Some(invite) = invites.get_mut(&req.invite_id) else {
+        return invite_not_found().into_response();
+    };
+    if invite.revoked {
+        return conflict("invite revoked").into_response();
+    }
+    if invite.status == "accepted" {
+        return conflict("invite already accepted").into_response();
+    }
+    if invite.status != "opened" {
+        invite.status = "opened".to_string();
+        invite.updated_ms = now_ms();
+        let updated = invite.clone();
+        persist_peer_line(&state, &PeerStateLine::Invite(updated.clone()));
+        return Json(updated).into_response();
+    }
+    Json(invite.clone()).into_response()
+}
+
+async fn peers_invites_revoke(
+    State(state): State<AppState>,
+    axum::extract::Path(invite_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut invites = state.peer_invites.lock().expect("peer lock");
+    let Some(invite) = invites.get_mut(&invite_id) else {
+        return invite_not_found().into_response();
+    };
+    // Idempotent: revoking an already-revoked invite succeeds.
+    if !invite.revoked {
+        invite.revoked = true;
+        invite.updated_ms = now_ms();
+        let updated = invite.clone();
+        let mut requests = state.peer_requests.lock().expect("peer lock");
+        if let Some(request) = requests.get_mut(&invite_id) {
+            request.status = "revoked".to_string();
+            let request = request.clone();
+            persist_peer_line(&state, &PeerStateLine::Request(request));
+        }
+        persist_peer_line(&state, &PeerStateLine::Invite(updated.clone()));
+        return Json(updated).into_response();
+    }
+    Json(invite.clone()).into_response()
+}
+
+async fn peers_inbox_list(State(state): State<AppState>) -> Json<Vec<PeerInboxMessage>> {
+    let mut messages: Vec<PeerInboxMessage> =
+        state.peer_inbox.lock().expect("peer lock").values().cloned().collect();
+    messages.sort_by_key(|m| (m.created_ms, m.message_id.clone()));
+    Json(messages)
+}
+
+#[derive(Debug, Deserialize)]
+struct PeerInboxDeliverDto {
+    from_muse_id: String,
+    text: String,
+}
+
+async fn peers_inbox_deliver(
+    State(state): State<AppState>,
+    Json(req): Json<PeerInboxDeliverDto>,
+) -> impl IntoResponse {
+    let from_muse_id = req.from_muse_id.trim().to_string();
+    let text = req.text.trim().to_string();
+    if from_muse_id.is_empty() || text.is_empty() {
+        return bad_request("from_muse_id and text must not be empty").into_response();
+    }
+    let message_id = {
+        let inbox = state.peer_inbox.lock().expect("peer lock");
+        let records: Vec<PeerInboxMessage> = inbox.values().cloned().collect();
+        format!("inbox-{}", next_message_number(&records))
+    };
+    let message = PeerInboxMessage {
+        message_id: message_id.clone(),
+        from_muse_id,
+        text,
+        status: "pending".to_string(),
+        created_ms: now_ms(),
+    };
+    state.peer_inbox.lock().expect("peer lock").insert(message_id, message.clone());
+    persist_peer_line(&state, &PeerStateLine::Inbox(message.clone()));
+    Json(message).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct PeerInboxDeclineDto {
+    message_id: String,
+}
+
+async fn peers_inbox_decline(
+    State(state): State<AppState>,
+    Json(req): Json<PeerInboxDeclineDto>,
+) -> impl IntoResponse {
+    let mut inbox = state.peer_inbox.lock().expect("peer lock");
+    let Some(message) = inbox.get_mut(&req.message_id) else {
+        return message_not_found().into_response();
+    };
+    // Idempotent: declining an already-declined message succeeds.
+    if message.status != "declined" {
+        message.status = "declined".to_string();
+        let updated = message.clone();
+        persist_peer_line(&state, &PeerStateLine::Inbox(updated.clone()));
+        return Json(updated).into_response();
+    }
+    Json(message.clone()).into_response()
+}
+
+async fn peers_requests_list(State(state): State<AppState>) -> Json<Vec<PeerRequest>> {
+    let mut requests: Vec<PeerRequest> =
+        state.peer_requests.lock().expect("peer lock").values().cloned().collect();
+requests.sort_by_key(|r| (r.created_ms, r.relationship_generation_id.clone()));
+    Json(requests)
+}
+
+async fn peers_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let peers = state.peer_peers.lock().expect("peer lock").values().filter(|p| !p.disconnected).count();
+    let pending_invites = state
+        .peer_invites
+        .lock()
+        .expect("peer lock")
+        .values()
+        .filter(|i| !i.revoked && (i.status == "pending" || i.status == "opened"))
+        .count();
+    let pending_inbox = state
+        .peer_inbox
+        .lock()
+        .expect("peer lock")
+        .values()
+        .filter(|m| m.status == "pending")
+        .count();
+    let pending_requests = state
+        .peer_requests
+        .lock()
+        .expect("peer lock")
+        .values()
+        .filter(|r| r.status == "pending")
+        .count();
+    Json(serde_json::json!({
+        "peers": peers,
+        "pending_invites": pending_invites,
+        "pending_inbox": pending_inbox,
+        "pending_requests": pending_requests,
+    }))
+}
+
 // --- Tasks (deterministic task loop) ---
 //
 // A task is a directory + a report artifact. The manual flow stays
@@ -5014,6 +5432,20 @@ pub fn app(state: AppState) -> Router {
         .route("/model", get(model_get))
         .route("/model", post(model_set))
         .route("/config", get(config_get))
+        .route("/peers", get(peers_list))
+        .route("/peers/{muse_id}", get(peers_get))
+        .route("/peers/{muse_id}", patch(peers_update))
+        .route("/peers/{muse_id}", delete(peers_disconnect))
+        .route("/peers/invites", get(peers_invites_list))
+        .route("/peers/invites", post(peers_invites_create))
+        .route("/peers/invites/accept", post(peers_invites_accept))
+        .route("/peers/invites/open", post(peers_invites_open))
+        .route("/peers/invites/{invite_id}", delete(peers_invites_revoke))
+        .route("/peers/inbox", get(peers_inbox_list))
+        .route("/peers/inbox/decline", post(peers_inbox_decline))
+        .route("/peers/inbox/deliver", post(peers_inbox_deliver))
+        .route("/peers/requests", get(peers_requests_list))
+        .route("/peers/status", get(peers_status))
         .route("/tasks/create", post(tasks_create))
         .route("/tasks/list", get(tasks_list))
         .route("/tasks/get", get(tasks_get))

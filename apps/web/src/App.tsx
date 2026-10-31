@@ -29,6 +29,9 @@ import { InvokeCredentialVaultClient } from "./domain/invoke_credential_vault_cl
 import { InvokePermissionPolicyClient } from "./domain/invoke_permission_policy_client";
 import { InvokeModelClient } from "./domain/invoke_model_client";
 import { InvokeConfigClient } from "./domain/invoke_config_client";
+import { PeerClient, type PeerGateway } from "./domain/peer_client";
+import { InvokePeerClient } from "./domain/invoke_peer_client";
+import { PeersView } from "./views/PeersView";
 import {
   TaskClient,
   type TaskGateway,
@@ -93,9 +96,10 @@ interface Clients {
   devices: DeviceGateway;
   loops: LoopGateway;
   sessions: SessionGateway;
+  peers: PeerGateway;
 }
 
-type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "settings";
+type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "peers" | "settings";
 
 // Visible navigation: the workbench (sessions) is the only
 // chat entry and the default view (R1, 2026-10-28). The legacy
@@ -109,6 +113,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "tasks", label: "Tasks" },
   { id: "devices", label: "Devices" },
   { id: "loops", label: "Loops" },
+  { id: "peers", label: "Peers" },
   { id: "settings", label: "设置" },
 ];
 
@@ -169,6 +174,7 @@ export function App() {
           devices: new InvokeDeviceClient(),
           loops: new InvokeLoopClient(),
           sessions: new InvokeSessionClient(),
+          peers: new InvokePeerClient(),
         };
         transportName = "invoke (Rust client)";
       } catch {
@@ -185,6 +191,7 @@ export function App() {
           devices: new DeviceClient(MOCK_BASE_URL),
           loops: new LoopClient(MOCK_BASE_URL),
           sessions: new SessionClient(MOCK_BASE_URL),
+          peers: new PeerClient(MOCK_BASE_URL),
         };
         transportName = "http (browser preview)";
       }
@@ -474,6 +481,12 @@ export function App() {
           <p className="empty">Choosing transport…</p>
         ) : (
           <ConnectorsView client={clients.connectors} />
+        ))}
+      {tab === "peers" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : (
+          <PeersView client={clients.peers} />
         ))}
       {tab === "tasks" &&
         (clients === null ? (
