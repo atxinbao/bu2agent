@@ -2,11 +2,13 @@
 //! 协议消息仅存内存，执行与审计仍由循环状态机管理。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::deepseek::DeepSeekConfig;
+use crate::policy_store::NetworkRule;
 use crate::loop_engine::{
     BackendFuture, LoopModel, Message, ModelError, ModelReply, Proposal, WireCall,
 };
@@ -23,6 +25,9 @@ unknown 表示结果未确认，不能当作成功；后续读取只是观测，
 pub struct DeepSeekLoopModel {
     config: DeepSeekConfig,
     http: reqwest::Client,
+    /// Task 13: shared network-rules handle, same as the
+    /// chat client. None means no enforcement.
+    network_rules: Option<Arc<Mutex<Option<Vec<NetworkRule>>>>>,
 }
 
 impl DeepSeekLoopModel {
@@ -37,7 +42,23 @@ impl DeepSeekLoopModel {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| "cannot initialize loop HTTP client".to_string())?;
-        Ok(Some(Self { config, http }))
+        Ok(Some(Self { config, http, network_rules: None }))
+    }
+
+    pub fn with_network_rules(mut self, rules: Arc<Mutex<Option<Vec<NetworkRule>>>>) -> Self {
+        self.network_rules = Some(rules);
+        self
+    }
+
+    /// The deny pattern blocking this model's completions
+    /// URL, if any. Checked before every POST so a denied
+    /// host never receives the request or the key.
+    fn denied_pattern(&self) -> Option<String> {
+        let rules = self.network_rules.as_ref()?;
+        let guard = rules.lock().ok()?;
+        let rules = guard.clone().unwrap_or_default();
+        let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
+        crate::policy_store::denied_rule(&rules, &url)
     }
 }
 
@@ -53,6 +74,9 @@ impl LoopModel for DeepSeekLoopModel {
     ) -> BackendFuture<Result<ModelReply, ModelError>> {
         let this = self.clone();
         Box::pin(async move {
+            if let Some(pattern) = this.denied_pattern() {
+                return Err(ModelError::Denied(pattern));
+            }
             let request = json!({
                 "model": this.config.model,
                 "messages": wire_messages(messages)?,

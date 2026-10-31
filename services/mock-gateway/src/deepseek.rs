@@ -17,10 +17,13 @@
 //! truncated or empty completion is a failure, never a
 //! complete answer.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_desktop::credential_store::{CredentialStore, KeychainCredentialStore};
 use serde::{Deserialize, Serialize};
+
+use crate::policy_store::NetworkRule;
 
 /// Official DeepSeek API base URL (no `/v1` prefix).
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
@@ -82,6 +85,11 @@ pub enum DeepseekOutcome {
     Disabled,
     Replied(String),
     Failed(Option<u16>),
+    /// Task 13: a network rule denied the call before any
+    /// POST was made (the pattern is user-visible; the key
+    /// was never sent). Handled as 403 at the call sites,
+    /// never as a silent echo or a provider 502.
+    Denied(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,6 +133,10 @@ fn first_content(response: &ChatResponse) -> Option<String> {
 pub struct DeepSeekClient {
     config: DeepSeekConfig,
     http: reqwest::Client,
+    /// Task 13: shared network-rules handle (the same Arc
+    /// AppState holds, so rule edits apply live). None
+    /// means no enforcement (all pre-Task-13 call sites).
+    network_rules: Option<Arc<Mutex<Option<Vec<NetworkRule>>>>>,
 }
 
 impl DeepSeekClient {
@@ -134,7 +146,22 @@ impl DeepSeekClient {
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .build()
             .unwrap_or_default();
-        Self { config, http }
+        Self { config, http, network_rules: None }
+    }
+
+    pub fn with_network_rules(mut self, rules: Arc<Mutex<Option<Vec<NetworkRule>>>>) -> Self {
+        self.network_rules = Some(rules);
+        self
+    }
+
+    /// The deny pattern blocking this client's completions
+    /// URL, if any. Checked before every POST so a denied
+    /// host never receives the request or the key.
+    fn denied_pattern(&self) -> Option<String> {
+        let rules = self.network_rules.as_ref()?;
+        let guard = rules.lock().ok()?;
+        let rules = guard.clone().unwrap_or_default();
+        crate::policy_store::denied_rule(&rules, &self.config.completions_url())
     }
 
     pub fn config(&self) -> &DeepSeekConfig {
@@ -156,6 +183,9 @@ impl DeepSeekClient {
         let Some(key) = &self.config.api_key else {
             return DeepseekOutcome::Disabled;
         };
+        if let Some(pattern) = self.denied_pattern() {
+            return DeepseekOutcome::Denied(pattern);
+        }
         let mut messages: Vec<ChatMessage> = history
             .iter()
             .map(|(role, content)| ChatMessage { role: role.clone(), content: content.clone() })

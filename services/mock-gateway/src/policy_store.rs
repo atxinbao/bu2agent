@@ -103,6 +103,37 @@ impl NetworkRule {
     }
 }
 
+/// Task 13 enforcement: match a network rule against an
+/// outbound host, and find the deny rule that blocks a call.
+///
+/// Matching is exact host or dot-suffix (`example.com`
+/// matches `example.com` and `a.example.com`, but not
+/// `notexample.com`). Deny wins: any matching deny blocks,
+/// allow rules never imply a whitelist (adding one allow
+/// must not silently break everything else), and no rules
+/// means allow (rules are opt-in restrictions).
+pub fn host_of_url(url: &str) -> Option<String> {
+    let stripped = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let host_port = stripped.split('/').next().unwrap_or("");
+    let host = host_port.split(':').next().unwrap_or("");
+    if host.is_empty() { None } else { Some(host.to_ascii_lowercase()) }
+}
+
+pub fn rule_matches(pattern: &str, host: &str) -> bool {
+    let pattern = pattern.trim().to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+    !pattern.is_empty() && (host == pattern || host.ends_with(&format!(".{pattern}")))
+}
+
+/// The deny pattern blocking `url`, if any. Unparseable
+/// URLs fail open here: the subsequent POST fails on its
+/// own, and a malformed base URL must not be mistaken for
+/// a policy decision.
+pub fn denied_rule(rules: &[NetworkRule], url: &str) -> Option<String> {
+    let host = host_of_url(url)?;
+    rules.iter().find(|rule| rule.action == "deny" && rule_matches(&rule.pattern, &host)).map(|rule| rule.pattern.clone())
+}
+
 /// One granted scope, keyed by (scope_type, scope_id). PATCH is
 /// an upsert (the spec has no scope create route); revoke is a
 /// tombstone, so GET on a revoked scope 404s.
@@ -231,5 +262,29 @@ mod tests {
         assert!(NetworkRule { pattern: "example.com".to_string(), action: "deny".to_string() }.valid());
         assert!(!NetworkRule { pattern: "  ".to_string(), action: "allow".to_string() }.valid());
         assert!(!NetworkRule { pattern: "example.com".to_string(), action: "block".to_string() }.valid());
+    }
+
+    #[test]
+    fn network_rule_matching() {
+        assert!(rule_matches("example.com", "example.com"));
+        assert!(rule_matches("example.com", "a.example.com"));
+        assert!(!rule_matches("example.com", "notexample.com"));
+        assert!(!rule_matches("example.com", "example.com.evil.com"));
+        assert!(rule_matches("EXAMPLE.com", "a.example.COM"));
+        assert_eq!(host_of_url("https://api.deepseek.com/chat/completions"), Some("api.deepseek.com".to_string()));
+        assert_eq!(host_of_url("http://127.0.0.1:3001/x"), Some("127.0.0.1".to_string()));
+        assert_eq!(host_of_url("not a url"), None);
+    }
+
+    #[test]
+    fn network_rule_deny_wins_default_allow() {
+        let rules = vec![
+            NetworkRule { pattern: "example.com".to_string(), action: "allow".to_string() },
+            NetworkRule { pattern: "api.deepseek.com".to_string(), action: "deny".to_string() },
+        ];
+        assert_eq!(denied_rule(&rules, "https://api.deepseek.com/chat/completions"), Some("api.deepseek.com".to_string()));
+        // An allow rule never blocks anything else.
+        assert_eq!(denied_rule(&rules, "https://other.example.com/x"), None);
+        assert_eq!(denied_rule(&[], "https://anything.example/x"), None);
     }
 }

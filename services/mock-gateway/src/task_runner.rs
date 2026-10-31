@@ -320,6 +320,10 @@ async fn generate_body(state: AppState, record: TaskFileRecord) {
             fail(&state, &task_id, "模型未配置");
             return;
         }
+        DeepseekOutcome::Denied(pattern) => {
+            fail(&state, &task_id, &format!("网络规则拒绝模型调用：{pattern}"));
+            return;
+        }
         DeepseekOutcome::Failed(_) => {
             fail(&state, &task_id, "模型调用失败");
             return;

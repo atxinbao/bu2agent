@@ -274,6 +274,10 @@ impl ToolOutcome {
 pub enum ModelError {
     Failed,
     Timeout,
+    /// Task 13: a network rule denied the call before any
+    /// POST was made (the pattern is user-visible; the key
+    /// was never sent).
+    Denied(String),
 }
 
 pub trait LoopModel: Send + Sync {

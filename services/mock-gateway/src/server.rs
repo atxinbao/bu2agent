@@ -352,7 +352,8 @@ impl AppState {
             config = merge_staged_config(config, &staged, env_model, env_base);
         }
         let loops_path = std::env::var("MOCK_LOOPS_PATH").ok().map(PathBuf::from);
-        state = state.with_deepseek_backends(config, loops_path)
+        let network_rules = state.policy_rules.clone();
+        state = state.with_deepseek_backends(config, loops_path, Some(network_rules))
             .expect("invalid loop configuration or audit");
         if let Some(path) = model_path {
             state = state.with_model_state_path(path);
@@ -489,11 +490,31 @@ impl AppState {
     }
 
     /// 聊天与循环共用配置；缺少 key 时聊天回显、循环不可用。
-    pub fn with_deepseek_backends(self, config: DeepSeekConfig, path: Option<PathBuf>) -> Result<Self, String> {
+    /// Task 13: `network_rules` is the AppState policy_rules
+    /// Arc (or None in tests). It is shared, not copied, so
+    /// rule edits apply to in-flight clients live. Callers
+    /// must pass the Arc that later loads will fill in
+    /// place (see with_policy_state_path), never a copy.
+    pub fn with_deepseek_backends(
+        self,
+        config: DeepSeekConfig,
+        path: Option<PathBuf>,
+        network_rules: Option<Arc<Mutex<Option<Vec<NetworkRule>>>>>,
+    ) -> Result<Self, String> {
         let model = crate::deepseek_loop::DeepSeekLoopModel::new(config.clone())?
-            .map(|m| Arc::new(m) as Arc<dyn LoopModel>);
+            .map(|m| {
+                let m = match &network_rules {
+                    Some(rules) => m.with_network_rules(rules.clone()),
+                    None => m,
+                };
+                Arc::new(m) as Arc<dyn LoopModel>
+            });
         let timeouts = self.loop_fault.timeouts();
-        self.with_deepseek(DeepSeekClient::new(config))
+        let deepseek = match &network_rules {
+            Some(rules) => DeepSeekClient::new(config).with_network_rules(rules.clone()),
+            None => DeepSeekClient::new(config),
+        };
+        self.with_deepseek(deepseek)
             .with_loop_backends(path, model, None, timeouts)
     }
 
@@ -888,7 +909,11 @@ impl AppState {
         self.policy_defaults = Arc::new(Mutex::new(defaults));
         self.policy_overrides = Arc::new(Mutex::new(overrides));
         self.policy_connectors = Arc::new(Mutex::new(connector_map));
-        self.policy_rules = Arc::new(Mutex::new(rules));
+        // Task 13: fill the rules Arc in place, do NOT
+        // replace it — the DeepSeek clients built earlier
+        // hold this exact Arc, and replacing it would
+        // silently unplug enforcement.
+        *self.policy_rules.lock().expect("policy rules lock") = rules;
         self.policy_scopes = Arc::new(Mutex::new(scope_map));
         self.policy_state_path = Some(path);
         self
@@ -1452,6 +1477,16 @@ async fn stream_start(
     let reply = match state.deepseek.reply(&req.text).await {
         DeepseekOutcome::Disabled => req.text.clone(),
         DeepseekOutcome::Replied(text) => text,
+        DeepseekOutcome::Denied(pattern) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "network rule denied model call",
+                    "rule": pattern,
+                })),
+            )
+                .into_response();
+        }
         DeepseekOutcome::Failed(status) => {
             eprintln!("warning: deepseek request failed: status {status:?}");
             return (
@@ -4323,6 +4358,16 @@ async fn sessions_send(
         DeepseekOutcome::Disabled => (text.clone(), None, None),
         DeepseekOutcome::Replied(reply) => {
             (reply, Some(state.deepseek.config().model.clone()), Some("stop".to_string()))
+        }
+        DeepseekOutcome::Denied(pattern) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "network rule denied model call",
+                    "rule": pattern,
+                })),
+            )
+                .into_response();
         }
         DeepseekOutcome::Failed(status) => {
             // The user turn is already persisted; a failed model

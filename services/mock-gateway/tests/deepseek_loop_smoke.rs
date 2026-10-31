@@ -833,7 +833,7 @@ async fn cancel_pending_http_response_archives_without_enqueuing_calls() {
 async fn configured_production_builder_enables_loop_and_keeps_chat_request_unchanged() {
     let mut h = Harness::new(vec![final_reply(), final_reply()]).await;
     let state = AppState::with_files_root_and_approvals(h.dir.join("files"), None)
-        .with_deepseek_backends(h.config.clone(), Some(h.dir.join("production-loops.jsonl")))
+        .with_deepseek_backends(h.config.clone(), Some(h.dir.join("production-loops.jsonl")), None)
         .unwrap()
         .with_auto_drive(false);
     let (url, server) = serve(app(state)).await;
@@ -858,7 +858,7 @@ async fn configured_production_builder_enables_loop_and_keeps_chat_request_uncha
 async fn no_key_builder_keeps_loop_503_and_chat_echo() {
     let mut h = Harness::new(vec![]).await;
     let state = AppState::with_files_root_and_approvals(h.dir.join("files"), None)
-        .with_deepseek_backends(DeepSeekConfig::disabled(), None)
+        .with_deepseek_backends(DeepSeekConfig::disabled(), None, None)
         .unwrap();
     let (url, server) = serve(app(state)).await;
     h.url = url;
