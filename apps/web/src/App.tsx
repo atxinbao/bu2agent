@@ -27,6 +27,7 @@ import {
 import { InvokeConnectorClient } from "./domain/invoke_connector_client";
 import { InvokeCredentialVaultClient } from "./domain/invoke_credential_vault_client";
 import { InvokePermissionPolicyClient } from "./domain/invoke_permission_policy_client";
+import { InvokeModelClient } from "./domain/invoke_model_client";
 import {
   TaskClient,
   type TaskGateway,
@@ -498,6 +499,7 @@ export function App() {
           settings={new InvokeSettingsClient()}
           vault={new InvokeCredentialVaultClient()}
           policy={new InvokePermissionPolicyClient()}
+          model={new InvokeModelClient()}
           isInvoke={isInvoke}
           gatewayStatus={gatewayStatus}
           onSettingsChanged={() => void refreshSettings()}

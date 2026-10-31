@@ -139,6 +139,8 @@ fn main() {
             tool_commands::policy_settings_get,
             tool_commands::policy_settings_update,
             tool_commands::policy_connector_permissions,
+            tool_commands::model_get,
+            tool_commands::model_set,
             tool_commands::task_create,
             tool_commands::task_list,
             tool_commands::task_get,

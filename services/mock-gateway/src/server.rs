@@ -109,7 +109,8 @@ use crate::policy_store::{
     append_policy_state, effective_policy, load_policy_state, ConnectorPolicy, EffectivePolicy,
     NetworkRule, PolicyDefaults, PolicyOverrides, PolicyStateLine, ScopeRecord,
 };
-use agent_desktop::credential_store::{CredentialStore, KeychainCredentialStore};
+use crate::model_store::{append_model_state, load_model_state, ModelStateLine, StagedModel};
+use agent_desktop::credential_store::{redact, CredentialStore, KeychainCredentialStore};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
 
@@ -314,6 +315,8 @@ pub struct AppState {
     policy_rules: Arc<Mutex<Option<Vec<NetworkRule>>>>,
     policy_scopes: Arc<Mutex<HashMap<String, ScopeRecord>>>,
     policy_state_path: Option<PathBuf>,
+    model_staged: Arc<Mutex<Option<StagedModel>>>,
+    model_state_path: Option<PathBuf>,
 }
 
 impl Default for AppState {
@@ -353,6 +356,9 @@ impl AppState {
         }
         if let Ok(policy_state_path) = std::env::var("MOCK_POLICY_STATE_PATH") {
             state = state.with_policy_state_path(PathBuf::from(policy_state_path));
+        }
+        if let Ok(model_state_path) = std::env::var("MOCK_MODEL_STATE_PATH") {
+            state = state.with_model_state_path(PathBuf::from(model_state_path));
         }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
@@ -453,6 +459,8 @@ impl AppState {
             policy_rules: Arc::new(Mutex::new(None)),
             policy_scopes: Arc::new(Mutex::new(HashMap::new())),
             policy_state_path: None,
+            model_staged: Arc::new(Mutex::new(None)),
+            model_state_path: None,
         }
     }
 
@@ -833,6 +841,16 @@ impl AppState {
     /// Test seam: swap the secret backend (memory store in tests).
     pub fn with_vault_secrets(mut self, backend: Arc<dyn CredentialStore + Send + Sync>) -> Self {
         self.vault_secrets = backend;
+        self
+    }
+
+    /// Test seam: load the staged model selection from a
+    /// tagged JSONL file, mirroring with_policy_state_path.
+    /// Production state reads MOCK_MODEL_STATE_PATH.
+    pub fn with_model_state_path(mut self, path: PathBuf) -> Self {
+        let staged = load_model_state(&path);
+        self.model_staged = Arc::new(Mutex::new(staged));
+        self.model_state_path = Some(path);
         self
     }
 
@@ -3469,6 +3487,111 @@ async fn connectors_permissions(
     Json(connector_policy_view(&state, &id)).into_response()
 }
 
+// --- Model surface (Task 12) ---
+//
+// GET reports the running model config plus any staged
+// selection; POST stages a selection that takes effect only
+// after a restart. The running DeepSeekClient is never
+// rebuilt mid-flight. The key is never accepted here and
+// never appears in a response: only configured + the same
+// ****last-4 redaction the Settings key status uses.
+
+fn persist_model_line(state: &AppState, line: &ModelStateLine) {
+    let Some(path) = &state.model_state_path else { return };
+    append_model_state(path, line);
+}
+
+#[derive(Debug, Serialize)]
+struct ModelView {
+    provider: &'static str,
+    model: String,
+    base_url: String,
+    key_configured: bool,
+    key_redacted: Option<String>,
+    staged_model: Option<String>,
+    staged_base_url: Option<String>,
+    restart_needed: bool,
+}
+
+fn model_view(state: &AppState) -> ModelView {
+    let running = state.deepseek.config();
+    let staged = state.model_staged.lock().expect("model staged lock").clone().unwrap_or_default();
+    let model = staged.model.clone().unwrap_or_else(|| running.model.clone());
+    let base_url = staged.base_url.clone().unwrap_or_else(|| running.base_url.clone());
+    let restart_needed = staged.model.as_ref().is_some_and(|m| m != &running.model)
+        || staged.base_url.as_ref().is_some_and(|u| u != &running.base_url);
+    let (key_configured, key_redacted) = match &running.api_key {
+        Some(key) => (true, Some(redact(key))),
+        None => (false, None),
+    };
+    ModelView {
+        provider: "deepseek",
+        model,
+        base_url,
+        key_configured,
+        key_redacted,
+        staged_model: staged.model,
+        staged_base_url: staged.base_url,
+        restart_needed,
+    }
+}
+
+async fn model_get(State(state): State<AppState>) -> Json<ModelView> {
+    Json(model_view(&state))
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelSetDto {
+    model: Option<String>,
+    base_url: Option<String>,
+}
+
+async fn model_set(
+    State(state): State<AppState>,
+    Json(req): Json<ModelSetDto>,
+) -> impl IntoResponse {
+    let model = match req.model {
+        Some(raw) => {
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "model must not be empty" })))
+                    .into_response();
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+    let base_url = match req.base_url {
+        Some(raw) => {
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty()
+                || (!trimmed.starts_with("http://") && !trimmed.starts_with("https://"))
+            {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "invalid base_url" })))
+                    .into_response();
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+    // All-absent body is a no-op success: it changes nothing
+    // and reports the current view, mirroring idempotent reads.
+    if model.is_none() && base_url.is_none() {
+        return Json(model_view(&state)).into_response();
+    }
+    let mut staged = state.model_staged.lock().expect("model staged lock").clone().unwrap_or_default();
+    if let Some(m) = model {
+        staged.model = Some(m);
+    }
+    if let Some(u) = base_url {
+        staged.base_url = Some(u);
+    }
+    staged.updated_ms = now_ms();
+    *state.model_staged.lock().expect("model staged lock") = Some(staged.clone());
+    persist_model_line(&state, &ModelStateLine::Model(staged));
+    Json(model_view(&state)).into_response()
+}
+
 // --- Tasks (deterministic task loop) ---
 //
 // A task is a directory + a report artifact. The manual flow stays
@@ -4666,6 +4789,8 @@ pub fn app(state: AppState) -> Router {
         .route("/permissions/settings", get(policy_settings_get))
         .route("/permissions/settings", patch(policy_settings_update))
         .route("/connectors/{id}/permissions", get(connectors_permissions))
+        .route("/model", get(model_get))
+        .route("/model", post(model_set))
         .route("/tasks/create", post(tasks_create))
         .route("/tasks/list", get(tasks_list))
         .route("/tasks/get", get(tasks_get))

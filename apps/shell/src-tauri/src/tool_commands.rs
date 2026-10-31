@@ -31,6 +31,7 @@ use agent_desktop::permission_policy_client::{
     ConnectorPolicyView, EffectivePolicyView, HitlView, NetworkRuleView, PermissionPolicyClient,
     PolicyDefaultsView, PolicyInventoryView, PolicyView, RevokeView, ScopeView, SwitchView,
 };
+use agent_desktop::model_client::{ModelClient, ModelView};
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
@@ -553,6 +554,32 @@ pub fn policy_settings_update(
 #[tauri::command(rename_all = "snake_case")]
 pub fn policy_connector_permissions(connector: String) -> Result<ConnectorPolicyView, String> {
     policy_client()?.connector_permissions(&connector).map_err(agent_err_string)
+}
+
+// --- Model surface (Task 12) ---
+//
+// Every command carries rename_all = "snake_case" (Task 9
+// lesson). Model calls carry no approval loop (same decision
+// as the Task 9/10/11 metadata calls). POST stages a
+// selection that takes effect only after a gateway restart;
+// the running client is never rebuilt here, and no key is
+// ever accepted or returned on this surface.
+
+fn model_client() -> Result<ModelClient, String> {
+    ModelClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn model_get() -> Result<ModelView, String> {
+    model_client()?.get_model().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn model_set(
+    model: Option<String>,
+    base_url: Option<String>,
+) -> Result<ModelView, String> {
+    model_client()?.set_model(model.as_deref(), base_url.as_deref()).map_err(agent_err_string)
 }
 
 // --- Tasks (deterministic task loop) ---

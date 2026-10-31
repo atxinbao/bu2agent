@@ -16,6 +16,8 @@ import type {
   Policy,
 } from "../domain/permission_policy_client";
 import type { InvokePermissionPolicyClient } from "../domain/invoke_permission_policy_client";
+import type { ModelState } from "../domain/model_client";
+import type { InvokeModelClient } from "../domain/invoke_model_client";
 
 // Settings page (invoke-only). Save and effective state are
 // separate on purpose: a credential or directory save lands
@@ -38,6 +40,7 @@ interface SettingsViewProps {
   settings: InvokeSettingsClient;
   vault: InvokeCredentialVaultClient;
   policy: InvokePermissionPolicyClient;
+  model: InvokeModelClient;
   isInvoke: boolean;
   gatewayStatus: GatewayStatusView | null;
   onSettingsChanged: () => void;
@@ -70,6 +73,7 @@ export function SettingsView({
   settings,
   vault,
   policy,
+  model,
   isInvoke,
   gatewayStatus,
   onSettingsChanged,
@@ -114,6 +118,13 @@ export function SettingsView({
   const [snoozeMs, setSnoozeMs] = useState("");
   const [pendingPolicyReset, setPendingPolicyReset] = useState(false);
   const [pendingRevokeAll, setPendingRevokeAll] = useState(false);
+  // Model section (Task 12). POST stages a selection that
+  // takes effect only after a gateway restart; the key is
+  // never shown or edited here (Settings key management above
+  // owns it), only configured + redacted.
+  const [modelDoc, setModelDoc] = useState<ModelState | null>(null);
+  const [modelInput, setModelInput] = useState("");
+  const [baseUrlInput, setBaseUrlInput] = useState("");
 
   async function refreshVault() {
     try {
@@ -141,6 +152,14 @@ export function SettingsView({
     }
   }
 
+  async function refreshModel() {
+    try {
+      setModelDoc(await model.getModel());
+    } catch {
+      setModelDoc(null);
+    }
+  }
+
   async function refresh() {
     setBusy(true);
     setError(null);
@@ -158,6 +177,7 @@ export function SettingsView({
       }
       await refreshVault();
       await refreshPolicy();
+      await refreshModel();
     } catch (err) {
       setError(errText(err));
     } finally {
@@ -688,6 +708,29 @@ export function SettingsView({
     }
   }
 
+  async function saveModel() {
+    const nextModel = modelInput.trim() === "" ? null : modelInput.trim();
+    const nextBaseUrl = baseUrlInput.trim() === "" ? null : baseUrlInput.trim();
+    if (nextModel === null && nextBaseUrl === null) {
+      setError("模型与 base_url 至少填一项。");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await model.setModel({ model: nextModel, baseUrl: nextBaseUrl });
+      setModelInput("");
+      setBaseUrlInput("");
+      await refreshModel();
+      setNotice("模型选择已暂存，重启网关后生效。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="view">
       <h2>设置</h2>
@@ -1165,6 +1208,50 @@ export function SettingsView({
                 撤销全部 scope
               </button>
             )}
+          </div>
+        </div>
+      )}
+
+      <h3>模型（Model）</h3>
+      <p className="note">
+        模型选择只暂存、不立即生效：保存后重启网关才切换，正在跑的对话不受影响。
+        密钥不在这里管理（上方模型凭据处），页面只显示是否配置与尾号。
+      </p>
+      {modelDoc === null ? (
+        <p className="empty">模型未知（状态查询失败）。</p>
+      ) : (
+        <div>
+          <p>
+            当前：{modelDoc.provider} · {modelDoc.model} · {modelDoc.baseUrl}
+          </p>
+          <p>
+            凭据：
+            {modelDoc.keyConfigured
+              ? `已配置 ${modelDoc.keyRedacted ?? ""}`
+              : "未配置（将回显 Mock）"}
+          </p>
+          {modelDoc.restartNeeded && (
+            <p className="notice">
+              已暂存：模型 {modelDoc.stagedModel ?? "（不变）"} · base_url{" "}
+              {modelDoc.stagedBaseUrl ?? "（不变）"}，重启网关后生效。
+            </p>
+          )}
+          <div className="row">
+            <input
+              type="text"
+              value={modelInput}
+              placeholder="模型（如 deepseek-flash）"
+              onChange={(event) => setModelInput(event.target.value)}
+            />
+            <input
+              type="text"
+              value={baseUrlInput}
+              placeholder="base_url（可选，https://…）"
+              onChange={(event) => setBaseUrlInput(event.target.value)}
+            />
+            <button type="button" onClick={() => void saveModel()} disabled={busy}>
+              暂存模型选择
+            </button>
           </div>
         </div>
       )}

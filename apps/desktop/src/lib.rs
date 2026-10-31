@@ -21,6 +21,7 @@ pub mod approval;
 pub mod connector_client;
 pub mod credential_vault_client;
 pub mod permission_policy_client;
+pub mod model_client;
 pub mod credential_store;
 pub mod egress;
 pub mod retry;

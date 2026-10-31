@@ -82,8 +82,10 @@ impl CredentialStore for MemoryCredentialStore {
 }
 
 /// Last-4 redaction shared by both stores: a log line can prove
-/// a slot is filled without leaking the secret.
-fn redact(secret: &str) -> String {
+/// a slot is filled without leaking the secret. Public so the
+/// gateway's model surface can redact the DeepSeek key the
+/// same way without duplicating the logic.
+pub fn redact(secret: &str) -> String {
     let tail: String = secret.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
     format!("****{tail}")
 }
