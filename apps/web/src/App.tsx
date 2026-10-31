@@ -35,6 +35,9 @@ import { PeersView } from "./views/PeersView";
 import { SpaceClient, type SpaceGateway } from "./domain/space_client";
 import { InvokeSpaceClient } from "./domain/invoke_space_client";
 import { SpacesView } from "./views/SpacesView";
+import { FeedClient, type FeedGateway } from "./domain/feed_client";
+import { InvokeFeedClient } from "./domain/invoke_feed_client";
+import { FeedView } from "./views/FeedView";
 import {
   TaskClient,
   type TaskGateway,
@@ -101,9 +104,10 @@ interface Clients {
   sessions: SessionGateway;
   peers: PeerGateway;
   spaces: SpaceGateway;
+  feed: FeedGateway;
 }
 
-type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "peers" | "spaces" | "settings";
+type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "peers" | "spaces" | "feed" | "settings";
 
 // Visible navigation: the workbench (sessions) is the only
 // chat entry and the default view (R1, 2026-10-28). The legacy
@@ -119,6 +123,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "loops", label: "Loops" },
   { id: "peers", label: "Peers" },
   { id: "spaces", label: "Spaces" },
+  { id: "feed", label: "Feed" },
   { id: "settings", label: "设置" },
 ];
 
@@ -181,6 +186,7 @@ export function App() {
           sessions: new InvokeSessionClient(),
           peers: new InvokePeerClient(),
           spaces: new InvokeSpaceClient(),
+          feed: new InvokeFeedClient(),
         };
         transportName = "invoke (Rust client)";
       } catch {
@@ -199,6 +205,7 @@ export function App() {
           sessions: new SessionClient(MOCK_BASE_URL),
           peers: new PeerClient(MOCK_BASE_URL),
           spaces: new SpaceClient(MOCK_BASE_URL),
+          feed: new FeedClient(MOCK_BASE_URL),
         };
         transportName = "http (browser preview)";
       }
@@ -500,6 +507,12 @@ export function App() {
           <p className="empty">Choosing transport…</p>
         ) : (
           <SpacesView client={clients.spaces} />
+        ))}
+      {tab === "feed" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : (
+          <FeedView client={clients.feed} />
         ))}
       {tab === "tasks" &&
         (clients === null ? (

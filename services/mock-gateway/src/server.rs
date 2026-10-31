@@ -115,6 +115,9 @@ use crate::peer_store::{
     PeerInboxMessage, PeerInvite, PeerRequest, PeerStateLine,
 };
 use crate::space_store::{append_space_state, load_space_state, Space, SpaceItem, SpaceStateLine};
+use crate::feed_store::{
+    append_feed_state, load_feed_state, seed_feed_units, FeedStateLine, FeedUnit,
+};
 use agent_desktop::credential_store::{redact, CredentialStore, KeychainCredentialStore};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
@@ -329,6 +332,8 @@ pub struct AppState {
     peer_state_path: Option<PathBuf>,
     spaces: Arc<Mutex<HashMap<String, Space>>>,
     space_state_path: Option<PathBuf>,
+    feed_units: Arc<Mutex<HashMap<String, FeedUnit>>>,
+    feed_state_path: Option<PathBuf>,
 }
 
 impl Default for AppState {
@@ -396,6 +401,9 @@ impl AppState {
         }
         if let Ok(space_state_path) = std::env::var("MOCK_SPACE_STATE_PATH") {
             state = state.with_space_state_path(PathBuf::from(space_state_path));
+        }
+        if let Ok(feed_state_path) = std::env::var("MOCK_FEED_STATE_PATH") {
+            state = state.with_feed_state_path(PathBuf::from(feed_state_path));
         }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
@@ -505,6 +513,10 @@ impl AppState {
             peer_state_path: None,
             spaces: Arc::new(Mutex::new(HashMap::new())),
             space_state_path: None,
+            feed_units: Arc::new(Mutex::new(
+                seed_feed_units().into_iter().map(|u| (u.unit_id.clone(), u)).collect(),
+            )),
+            feed_state_path: None,
         }
     }
 
@@ -958,6 +970,21 @@ impl AppState {
         }
         self.spaces = Arc::new(Mutex::new(space_map));
         self.space_state_path = Some(path);
+        self
+    }
+
+    /// Test seam: load feed overlays from a tagged JSONL
+    /// file over the Mock seeds (last-wins by unit_id),
+    /// mirroring with_space_state_path. Production state
+    /// reads MOCK_FEED_STATE_PATH.
+    pub fn with_feed_state_path(mut self, path: PathBuf) -> Self {
+        let mut unit_map: HashMap<String, FeedUnit> =
+            seed_feed_units().into_iter().map(|u| (u.unit_id.clone(), u)).collect();
+        for record in load_feed_state(&path) {
+            unit_map.insert(record.unit_id.clone(), record);
+        }
+        self.feed_units = Arc::new(Mutex::new(unit_map));
+        self.feed_state_path = Some(path);
         self
     }
 
@@ -4358,6 +4385,162 @@ async fn spaces_delete(
     Json(space.clone()).into_response()
 }
 
+// --- Feed surface (Task 17, unit subset) ---
+//
+// Local semantics only (see feed_store.rs): Mock seed
+// units with list/infinite/status/get/delete/reaction/
+// tap/seen. Prompt, regenerate, reorder, search,
+// social-source-icon, and media are excluded.
+
+fn persist_feed_line(state: &AppState, line: &FeedStateLine) {
+    let Some(path) = &state.feed_state_path else { return };
+    append_feed_state(path, line);
+}
+
+fn feed_visible_units(state: &AppState) -> Vec<FeedUnit> {
+    let mut units: Vec<FeedUnit> = state
+        .feed_units
+        .lock()
+        .expect("feed lock")
+        .values()
+        .filter(|u| !u.deleted)
+        .cloned()
+        .collect();
+    units.sort_by_key(|u| (u.created_ms, u.unit_id.clone()));
+    units
+}
+
+async fn feed_list(State(state): State<AppState>) -> Json<Vec<FeedUnit>> {
+    Json(feed_visible_units(&state))
+}
+
+// Infinite scroll returns the same visible units: without
+// a known pagination schema, inventing cursor params
+// would be a fake semantic, so this is a documented alias.
+async fn feed_infinite(State(state): State<AppState>) -> Json<Vec<FeedUnit>> {
+    Json(feed_visible_units(&state))
+}
+
+async fn feed_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let units = state.feed_units.lock().expect("feed lock");
+    let visible: Vec<&FeedUnit> = units.values().filter(|u| !u.deleted).collect();
+    Json(serde_json::json!({
+        "units": visible.len(),
+        "unseen": visible.iter().filter(|u| !u.seen).count(),
+    }))
+}
+
+async fn feed_unit_get(
+    State(state): State<AppState>,
+    axum::extract::Path(unit_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.feed_units.lock().expect("feed lock").get(&unit_id) {
+        Some(unit) => Json(unit.clone()).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown unit" })))
+            .into_response(),
+    }
+}
+
+async fn feed_unit_delete(
+    State(state): State<AppState>,
+    axum::extract::Path(unit_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut units = state.feed_units.lock().expect("feed lock");
+    let Some(unit) = units.get_mut(&unit_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown unit" })))
+            .into_response();
+    };
+    // Idempotent: deleting an already-deleted unit
+    // succeeds without a new record.
+    if !unit.deleted {
+        unit.deleted = true;
+        unit.updated_ms = now_ms();
+        let updated = unit.clone();
+        persist_feed_line(&state, &FeedStateLine::Unit(updated.clone()));
+        return Json(updated).into_response();
+    }
+    Json(unit.clone()).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct FeedReactionDto {
+    reaction: String,
+}
+
+async fn feed_unit_reaction(
+    State(state): State<AppState>,
+    axum::extract::Path(unit_id): axum::extract::Path<String>,
+    Json(req): Json<FeedReactionDto>,
+) -> impl IntoResponse {
+    let reaction = req.reaction.trim().to_string();
+    if reaction.is_empty() {
+        return bad_request("reaction must not be empty").into_response();
+    }
+    let mut units = state.feed_units.lock().expect("feed lock");
+    let Some(unit) = units.get_mut(&unit_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown unit" })))
+            .into_response();
+    };
+    if unit.deleted {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown unit" })))
+            .into_response();
+    }
+    unit.reaction = Some(reaction);
+    unit.updated_ms = now_ms();
+    let updated = unit.clone();
+    persist_feed_line(&state, &FeedStateLine::Unit(updated.clone()));
+    Json(updated).into_response()
+}
+
+async fn feed_unit_tap(
+    State(state): State<AppState>,
+    axum::extract::Path(unit_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut units = state.feed_units.lock().expect("feed lock");
+    let Some(unit) = units.get_mut(&unit_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown unit" })))
+            .into_response();
+    };
+    if unit.deleted {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown unit" })))
+            .into_response();
+    }
+    unit.tap_count += 1;
+    unit.updated_ms = now_ms();
+    let updated = unit.clone();
+    persist_feed_line(&state, &FeedStateLine::Unit(updated.clone()));
+    Json(updated).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct FeedSeenDto {
+    unit_ids: Vec<String>,
+}
+
+async fn feed_units_seen(
+    State(state): State<AppState>,
+    Json(req): Json<FeedSeenDto>,
+) -> Json<serde_json::Value> {
+    let mut units = state.feed_units.lock().expect("feed lock");
+    let mut seen = Vec::new();
+    let mut unknown = Vec::new();
+    for unit_id in req.unit_ids {
+        match units.get_mut(&unit_id) {
+            Some(unit) if !unit.deleted => {
+                if !unit.seen {
+                    unit.seen = true;
+                    unit.updated_ms = now_ms();
+                    let updated = unit.clone();
+                    persist_feed_line(&state, &FeedStateLine::Unit(updated.clone()));
+                }
+                seen.push(unit_id);
+            }
+            _ => unknown.push(unit_id),
+        }
+    }
+    Json(serde_json::json!({ "seen": seen, "unknown": unknown }))
+}
+
 // --- Tasks (deterministic task loop) ---
 //
 // A task is a directory + a report artifact. The manual flow stays
@@ -5585,6 +5768,14 @@ pub fn app(state: AppState) -> Router {
         .route("/spaces/v2", get(spaces_list))
         .route("/spaces/v2/{slug}/save", post(spaces_save))
         .route("/spaces/v2/{slug}", delete(spaces_delete))
+        .route("/api/feed", get(feed_list))
+        .route("/api/feed/infinite", get(feed_infinite))
+        .route("/api/feed/status", get(feed_status))
+        .route("/api/feed/units/{unit_id}", get(feed_unit_get))
+        .route("/api/feed/units/{unit_id}", delete(feed_unit_delete))
+        .route("/api/feed/units/{unit_id}/reaction", post(feed_unit_reaction))
+        .route("/api/feed/units/{unit_id}/tap", post(feed_unit_tap))
+        .route("/api/feed/units/seen", post(feed_units_seen))
         .route("/tasks/create", post(tasks_create))
         .route("/tasks/list", get(tasks_list))
         .route("/tasks/get", get(tasks_get))

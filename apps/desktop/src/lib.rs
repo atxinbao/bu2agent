@@ -25,6 +25,7 @@ pub mod model_client;
 pub mod config_client;
 pub mod peer_client;
 pub mod space_client;
+pub mod feed_client;
 pub mod credential_store;
 pub mod egress;
 pub mod retry;

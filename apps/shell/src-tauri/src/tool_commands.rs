@@ -35,6 +35,7 @@ use agent_desktop::model_client::{ModelClient, ModelView};
 use agent_desktop::config_client::{ConfigClient, ConfigView};
 use agent_desktop::peer_client::{Peer, PeerClient, PeerInboxMessage, PeerInvite, PeerRequest, PeerStatus};
 use agent_desktop::space_client::{Space, SpaceClient, SpaceItem};
+use agent_desktop::feed_client::{FeedClient, FeedSeenResult, FeedStatus, FeedUnit};
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
@@ -708,6 +709,50 @@ pub fn space_save(
 #[tauri::command(rename_all = "snake_case")]
 pub fn space_delete(slug: String) -> Result<Space, String> {
     space_client()?.delete_space(&slug).map_err(agent_err_string)
+}
+
+// --- Feed surface (Task 17, unit subset) ---
+//
+// All commands carry rename_all = "snake_case" (Task 9
+// lesson): the invoke client sends snake_case params.
+
+fn feed_client() -> Result<FeedClient, String> {
+    FeedClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn feed_list() -> Result<Vec<FeedUnit>, String> {
+    feed_client()?.list_units().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn feed_get(unit_id: String) -> Result<FeedUnit, String> {
+    feed_client()?.get_unit(&unit_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn feed_delete(unit_id: String) -> Result<FeedUnit, String> {
+    feed_client()?.delete_unit(&unit_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn feed_react(unit_id: String, reaction: String) -> Result<FeedUnit, String> {
+    feed_client()?.react_unit(&unit_id, &reaction).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn feed_tap(unit_id: String) -> Result<FeedUnit, String> {
+    feed_client()?.tap_unit(&unit_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn feed_seen(unit_ids: Vec<String>) -> Result<FeedSeenResult, String> {
+    feed_client()?.seen_units(&unit_ids).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn feed_status() -> Result<FeedStatus, String> {
+    feed_client()?.get_status().map_err(agent_err_string)
 }
 
 // --- Tasks (deterministic task loop) ---
