@@ -27,6 +27,10 @@ use agent_desktop::connector_client::{
 use agent_desktop::credential_vault_client::{
     CaptureTicketView, CatalogEntryView, CredentialSlotView, CredentialVaultClient, CustomConnectorView,
 };
+use agent_desktop::permission_policy_client::{
+    ConnectorPolicyView, EffectivePolicyView, HitlView, NetworkRuleView, PermissionPolicyClient,
+    PolicyDefaultsView, PolicyInventoryView, PolicyView, RevokeView, ScopeView, SwitchView,
+};
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
@@ -408,6 +412,147 @@ pub fn vault_custom_list() -> Result<Vec<CustomConnectorView>, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn vault_custom_delete(id: String) -> Result<CustomConnectorView, String> {
     vault_client()?.custom_delete(&id).map_err(agent_err_string)
+}
+
+// --- Permissions policy (Task 11) ---
+//
+// Every command carries rename_all = "snake_case": the Task 9
+// link/unlink failure was exactly these attributes missing
+// while the frontend sent snake_case keys. Policy calls carry
+// no approval loop (same decision as the Task 9/10 registry
+// and vault calls); the gateway stores policy data only.
+
+fn policy_client() -> Result<PermissionPolicyClient, String> {
+    PermissionPolicyClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_get() -> Result<PolicyView, String> {
+    policy_client()?.get_policy().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_active_get() -> Result<EffectivePolicyView, String> {
+    policy_client()?.get_active().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_active_update(
+    hitl_enabled: Option<bool>,
+    mitm_enabled: Option<bool>,
+    tproxy_enabled: Option<bool>,
+    sni_rejection_enabled: Option<bool>,
+    hitl_snoozed_until_ms: Option<Option<u64>>,
+) -> Result<EffectivePolicyView, String> {
+    policy_client()?
+        .update_active(
+            hitl_enabled,
+            mitm_enabled,
+            tproxy_enabled,
+            sni_rejection_enabled,
+            hitl_snoozed_until_ms,
+        )
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_connector_update(
+    connector: String,
+    allowed: bool,
+) -> Result<ConnectorPolicyView, String> {
+    policy_client()?.update_connector(&connector, allowed).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_connector_reset(connector: String) -> Result<ConnectorPolicyView, String> {
+    policy_client()?.reset_connector(&connector).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_hitl_update(
+    enabled: Option<bool>,
+    snoozed_until_ms: Option<Option<u64>>,
+) -> Result<HitlView, String> {
+    policy_client()?.update_hitl(enabled, snoozed_until_ms).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_hitl_snooze_delete() -> Result<HitlView, String> {
+    policy_client()?.delete_hitl_snooze().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_mitm_update(enabled: bool) -> Result<SwitchView, String> {
+    policy_client()?.update_mitm(enabled).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_tproxy_update(enabled: bool) -> Result<SwitchView, String> {
+    policy_client()?.update_tproxy(enabled).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_sni_rejection_update(enabled: bool) -> Result<SwitchView, String> {
+    policy_client()?.update_sni_rejection(enabled).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_network_rules_update(rules: Vec<NetworkRuleView>) -> Result<Vec<NetworkRuleView>, String> {
+    policy_client()?.update_network_rules(rules).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_reset() -> Result<PolicyView, String> {
+    policy_client()?.reset_policy().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_revoke(
+    scope_type: Option<String>,
+    scope_id: Option<String>,
+) -> Result<RevokeView, String> {
+    policy_client()?.revoke(scope_type.as_deref(), scope_id.as_deref()).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_scope_get(scope_type: String, scope_id: String) -> Result<ScopeView, String> {
+    policy_client()?.get_scope(&scope_type, &scope_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_scope_update(
+    scope_type: String,
+    scope_id: String,
+    granted: Option<bool>,
+) -> Result<ScopeView, String> {
+    policy_client()?.update_scope(&scope_type, &scope_id, granted).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_inventory() -> Result<PolicyInventoryView, String> {
+    policy_client()?.get_inventory().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_settings_get() -> Result<PolicyDefaultsView, String> {
+    policy_client()?.get_settings().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_settings_update(
+    hitl_enabled: Option<bool>,
+    mitm_enabled: Option<bool>,
+    tproxy_enabled: Option<bool>,
+    sni_rejection_enabled: Option<bool>,
+) -> Result<PolicyDefaultsView, String> {
+    policy_client()?
+        .update_settings(hitl_enabled, mitm_enabled, tproxy_enabled, sni_rejection_enabled)
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policy_connector_permissions(connector: String) -> Result<ConnectorPolicyView, String> {
+    policy_client()?.connector_permissions(&connector).map_err(agent_err_string)
 }
 
 // --- Tasks (deterministic task loop) ---

@@ -48,6 +48,7 @@ pub struct GatewayPaths {
     pub sessions_path: PathBuf,
     pub connector_state_path: PathBuf,
     pub vault_state_path: PathBuf,
+    pub policy_state_path: PathBuf,
 }
 
 pub fn gateway_paths(working_dir: &Path) -> GatewayPaths {
@@ -62,6 +63,7 @@ pub fn gateway_paths(working_dir: &Path) -> GatewayPaths {
         sessions_path: data.join("sessions.jsonl"),
         connector_state_path: data.join("connectors.jsonl"),
         vault_state_path: data.join("vault.jsonl"),
+        policy_state_path: data.join("policies.jsonl"),
     }
 }
 
@@ -87,6 +89,7 @@ pub fn gateway_env(paths: &GatewayPaths, addr: &str) -> Vec<(String, String)> {
     push("MOCK_SESSIONS_PATH", &paths.sessions_path.to_string_lossy());
     push("MOCK_CONNECTOR_STATE_PATH", &paths.connector_state_path.to_string_lossy());
     push("MOCK_VAULT_STATE_PATH", &paths.vault_state_path.to_string_lossy());
+    push("MOCK_POLICY_STATE_PATH", &paths.policy_state_path.to_string_lossy());
     // The daily app uses the real EventKit backend on macOS; a developer
     // override (already set) still wins via the gap-fill rule above.
     #[cfg(target_os = "macos")]

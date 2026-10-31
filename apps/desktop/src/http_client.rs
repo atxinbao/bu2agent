@@ -140,4 +140,29 @@ impl HttpClient {
         serde_json::from_str(&resp_body)
             .map_err(|_| transport_error("mock gateway returned invalid JSON"))
     }
+
+    /// PATCH with a JSON body, mirroring post_json (Task 11:
+    /// the permissions surface is the first PATCH consumer).
+    pub fn patch_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &str,
+    ) -> Result<T> {
+        let (status, resp_body) = self.request("PATCH", path, Some(body))?;
+        if !(200..300).contains(&status) {
+            return Err(gateway_error(status));
+        }
+        serde_json::from_str(&resp_body)
+            .map_err(|_| transport_error("mock gateway returned invalid JSON"))
+    }
+
+    /// DELETE with no body, mirroring get_json (Task 11: the
+    /// connector-reset and hitl-snooze routes).
+    pub fn delete_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let (status, body) = self.request("DELETE", path, None)?;
+        if !(200..300).contains(&status) {
+            return Err(gateway_error(status));
+        }
+        serde_json::from_str(&body).map_err(|_| transport_error("mock gateway returned invalid JSON"))
+    }
 }

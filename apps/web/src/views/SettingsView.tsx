@@ -11,6 +11,11 @@ import type {
   CustomConnector,
 } from "../domain/credential_vault_client";
 import type { InvokeCredentialVaultClient } from "../domain/invoke_credential_vault_client";
+import type {
+  ConnectorPolicy,
+  Policy,
+} from "../domain/permission_policy_client";
+import type { InvokePermissionPolicyClient } from "../domain/invoke_permission_policy_client";
 
 // Settings page (invoke-only). Save and effective state are
 // separate on purpose: a credential or directory save lands
@@ -32,6 +37,7 @@ interface GatewayStatusView {
 interface SettingsViewProps {
   settings: InvokeSettingsClient;
   vault: InvokeCredentialVaultClient;
+  policy: InvokePermissionPolicyClient;
   isInvoke: boolean;
   gatewayStatus: GatewayStatusView | null;
   onSettingsChanged: () => void;
@@ -63,6 +69,7 @@ function remindersText(status: string | null): string {
 export function SettingsView({
   settings,
   vault,
+  policy,
   isInvoke,
   gatewayStatus,
   onSettingsChanged,
@@ -96,6 +103,17 @@ export function SettingsView({
   const [customName, setCustomName] = useState("");
   const [renameValues, setRenameValues] = useState<Record<string, string>>({});
   const [pendingSlotDelete, setPendingSlotDelete] = useState<string | null>(null);
+  // Policy section (Task 11). Data only: the switches and
+  // rules below are stored, never enforced — they do not
+  // change the approval gates and do not intercept traffic.
+  const [policyDoc, setPolicyDoc] = useState<Policy | null>(null);
+  const [rulePattern, setRulePattern] = useState("");
+  const [ruleAction, setRuleAction] = useState("deny");
+  const [scopeType, setScopeType] = useState("");
+  const [scopeId, setScopeId] = useState("");
+  const [snoozeMs, setSnoozeMs] = useState("");
+  const [pendingPolicyReset, setPendingPolicyReset] = useState(false);
+  const [pendingRevokeAll, setPendingRevokeAll] = useState(false);
 
   async function refreshVault() {
     try {
@@ -115,6 +133,14 @@ export function SettingsView({
     }
   }
 
+  async function refreshPolicy() {
+    try {
+      setPolicyDoc(await policy.getPolicy());
+    } catch {
+      setPolicyDoc(null);
+    }
+  }
+
   async function refresh() {
     setBusy(true);
     setError(null);
@@ -131,6 +157,7 @@ export function SettingsView({
         setReminders(null);
       }
       await refreshVault();
+      await refreshPolicy();
     } catch (err) {
       setError(errText(err));
     } finally {
@@ -442,6 +469,225 @@ export function SettingsView({
   const owned = gatewayStatus?.ownership === "owned";
   const attached = gatewayStatus?.ownership === "attached";
 
+  function connectorPolicyRow(connector: string): ConnectorPolicy {
+    const found = policyDoc?.connectors.find((c) => c.connectorId === connector);
+    return found ?? { connectorId: connector, allowed: true, updatedMs: 0 };
+  }
+
+  async function toggleEffective(key: "hitl" | "mitm" | "tproxy" | "sni") {
+    if (policyDoc === null) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const active = policyDoc.active;
+      if (key === "hitl") {
+        await policy.updateHitl(!active.hitlEnabled);
+      } else if (key === "mitm") {
+        await policy.updateMitm(!active.mitmEnabled);
+      } else if (key === "tproxy") {
+        await policy.updateTproxy(!active.tproxyEnabled);
+      } else {
+        await policy.updateSniRejection(!active.sniRejectionEnabled);
+      }
+      await refreshPolicy();
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleDefault(key: "hitl" | "mitm" | "tproxy" | "sni") {
+    if (policyDoc === null) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const defaults = policyDoc.defaults;
+      const patch =
+        key === "hitl"
+          ? { hitlEnabled: !defaults.hitlEnabled }
+          : key === "mitm"
+            ? { mitmEnabled: !defaults.mitmEnabled }
+            : key === "tproxy"
+              ? { tproxyEnabled: !defaults.tproxyEnabled }
+              : { sniRejectionEnabled: !defaults.sniRejectionEnabled };
+      await policy.updateSettings(patch);
+      await refreshPolicy();
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function setSnooze() {
+    const ms = Number(snoozeMs);
+    if (snoozeMs.trim() === "" || !Number.isFinite(ms) || ms < 0) {
+      setError("snooze 到期时间须为非负毫秒数。");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await policy.updateHitl(undefined, ms);
+      setSnoozeMs("");
+      await refreshPolicy();
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clearSnooze() {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await policy.deleteHitlSnooze();
+      await refreshPolicy();
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addRule() {
+    if (policyDoc === null || rulePattern.trim() === "") {
+      setError("规则 pattern 不能为空。");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await policy.updateNetworkRules([
+        ...policyDoc.networkRules,
+        { pattern: rulePattern.trim(), action: ruleAction },
+      ]);
+      setRulePattern("");
+      await refreshPolicy();
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeRule(index: number) {
+    if (policyDoc === null) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await policy.updateNetworkRules(policyDoc.networkRules.filter((_, i) => i !== index));
+      await refreshPolicy();
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleConnector(connector: string) {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const current = connectorPolicyRow(connector);
+      await policy.updateConnector(connector, !current.allowed);
+      await refreshPolicy();
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resetConnector(connector: string) {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await policy.resetConnector(connector);
+      await refreshPolicy();
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function grantScope() {
+    if (scopeType.trim() === "" || scopeId.trim() === "") {
+      setError("scope 类型与 id 均不能为空。");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await policy.updateScope(scopeType.trim(), scopeId.trim(), true);
+      setScopeType("");
+      setScopeId("");
+      await refreshPolicy();
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revokeScope(scopeType: string, scopeId: string) {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await policy.revoke(scopeType, scopeId);
+      await refreshPolicy();
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resetPolicy() {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await policy.resetPolicy();
+      setPendingPolicyReset(false);
+      await refreshPolicy();
+      setNotice("策略已恢复全部默认（覆盖、连接器策略、scope 与规则已清空）。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revokeAllScopes() {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await policy.revoke();
+      setPendingRevokeAll(false);
+      await refreshPolicy();
+      setNotice("全部 scope 授权已撤销。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="view">
       <h2>设置</h2>
@@ -736,6 +982,193 @@ export function SettingsView({
 
       <h3>状态检查</h3>
       <p className="note">三项分开展示：网关状态、模型凭据配置、提醒事项授权。此行只反映凭据配置与网关可达，不做真实模型调用。</p>
+      <h3>权限策略（Permissions）</h3>
+      <p className="note">
+        本地策略记录，不拦截真实流量，也不改变审批门：这里的开关与规则只存取、不执行。
+        生效值 = 基准 + 覆盖；基准改动影响未覆盖项，覆盖改动只影响对应项。
+      </p>
+      {policyDoc === null ? (
+        <p className="empty">策略未知（状态查询失败）。</p>
+      ) : (
+        <div>
+          <p>
+            生效开关：
+            hitl {policyDoc.active.hitlEnabled ? "开" : "关"} · mitm{" "}
+            {policyDoc.active.mitmEnabled ? "开" : "关"} · tproxy{" "}
+            {policyDoc.active.tproxyEnabled ? "开" : "关"} · sni-rejection{" "}
+            {policyDoc.active.sniRejectionEnabled ? "开" : "关"}
+            {policyDoc.active.hitlSnoozedUntilMs !== null &&
+              ` · hitl snooze 至 ${policyDoc.active.hitlSnoozedUntilMs}`}
+          </p>
+          <div className="row">
+            <button type="button" onClick={() => void toggleEffective("hitl")} disabled={busy}>
+              生效 hitl {policyDoc.active.hitlEnabled ? "关" : "开"}
+            </button>
+            <button type="button" onClick={() => void toggleEffective("mitm")} disabled={busy}>
+              生效 mitm {policyDoc.active.mitmEnabled ? "关" : "开"}
+            </button>
+            <button type="button" onClick={() => void toggleEffective("tproxy")} disabled={busy}>
+              生效 tproxy {policyDoc.active.tproxyEnabled ? "关" : "开"}
+            </button>
+            <button type="button" onClick={() => void toggleEffective("sni")} disabled={busy}>
+              生效 sni-rejection {policyDoc.active.sniRejectionEnabled ? "关" : "开"}
+            </button>
+          </div>
+          <p>
+            基准开关：
+            hitl {policyDoc.defaults.hitlEnabled ? "开" : "关"} · mitm{" "}
+            {policyDoc.defaults.mitmEnabled ? "开" : "关"} · tproxy{" "}
+            {policyDoc.defaults.tproxyEnabled ? "开" : "关"} · sni-rejection{" "}
+            {policyDoc.defaults.sniRejectionEnabled ? "开" : "关"}
+          </p>
+          <div className="row">
+            <button type="button" onClick={() => void toggleDefault("hitl")} disabled={busy}>
+              基准 hitl {policyDoc.defaults.hitlEnabled ? "关" : "开"}
+            </button>
+            <button type="button" onClick={() => void toggleDefault("mitm")} disabled={busy}>
+              基准 mitm {policyDoc.defaults.mitmEnabled ? "关" : "开"}
+            </button>
+            <button type="button" onClick={() => void toggleDefault("tproxy")} disabled={busy}>
+              基准 tproxy {policyDoc.defaults.tproxyEnabled ? "关" : "开"}
+            </button>
+            <button type="button" onClick={() => void toggleDefault("sni")} disabled={busy}>
+              基准 sni-rejection {policyDoc.defaults.sniRejectionEnabled ? "关" : "开"}
+            </button>
+          </div>
+          <div className="row">
+            <input
+              type="text"
+              value={snoozeMs}
+              placeholder="hitl snooze 到期毫秒（如 4242）"
+              onChange={(event) => setSnoozeMs(event.target.value)}
+            />
+            <button type="button" onClick={() => void setSnooze()} disabled={busy}>
+              设 snooze
+            </button>
+            <button type="button" onClick={() => void clearSnooze()} disabled={busy}>
+              清 snooze
+            </button>
+          </div>
+          <p>
+            网络规则：
+            {policyDoc.networkRules.length === 0
+              ? "无"
+              : policyDoc.networkRules.map((r) => `${r.pattern} ${r.action}`).join(" · ")}
+          </p>
+          <div className="row">
+            <input
+              type="text"
+              value={rulePattern}
+              placeholder="规则 pattern（如 example.com）"
+              onChange={(event) => setRulePattern(event.target.value)}
+            />
+            <select value={ruleAction} onChange={(event) => setRuleAction(event.target.value)}>
+              <option value="deny">deny</option>
+              <option value="allow">allow</option>
+            </select>
+            <button type="button" onClick={() => void addRule()} disabled={busy}>
+              添加规则
+            </button>
+          </div>
+          {policyDoc.networkRules.map((rule, index) => (
+            <div className="row" key={`${rule.pattern}-${rule.action}-${index}`}>
+              <span>
+                {rule.pattern} {rule.action}
+              </span>
+              <button type="button" onClick={() => void removeRule(index)} disabled={busy}>
+                删除
+              </button>
+            </div>
+          ))}
+          <p>连接器策略：</p>
+          {["notes", "mail"].map((connector) => {
+            const row = connectorPolicyRow(connector);
+            return (
+              <div className="row" key={connector}>
+                <span>
+                  {connector}：{row.allowed ? "允许" : "禁止"}
+                </span>
+                <button type="button" onClick={() => void toggleConnector(connector)} disabled={busy}>
+                  {row.allowed ? "禁" : "允许"}
+                </button>
+                <button type="button" onClick={() => void resetConnector(connector)} disabled={busy}>
+                  恢复基准
+                </button>
+              </div>
+            );
+          })}
+          <p>
+            scope：
+            {policyDoc.scopes.length === 0
+              ? "无"
+              : policyDoc.scopes.map((s) => `${s.scopeType}/${s.scopeId}`).join(" · ")}
+          </p>
+          <div className="row">
+            <input
+              type="text"
+              value={scopeType}
+              placeholder="scope 类型"
+              onChange={(event) => setScopeType(event.target.value)}
+            />
+            <input
+              type="text"
+              value={scopeId}
+              placeholder="scope id"
+              onChange={(event) => setScopeId(event.target.value)}
+            />
+            <button type="button" onClick={() => void grantScope()} disabled={busy}>
+              授权
+            </button>
+          </div>
+          {policyDoc.scopes.map((scope) => (
+            <div className="row" key={`${scope.scopeType}/${scope.scopeId}`}>
+              <span>
+                {scope.scopeType}/{scope.scopeId}
+              </span>
+              <button
+                type="button"
+                onClick={() => void revokeScope(scope.scopeType, scope.scopeId)}
+                disabled={busy}
+              >
+                撤销
+              </button>
+            </div>
+          ))}
+          <div className="row">
+            {pendingPolicyReset ? (
+              <>
+                <span>恢复全部默认将清空覆盖、连接器策略、scope 与规则，不可撤销。确认？</span>
+                <button type="button" onClick={() => void resetPolicy()} disabled={busy}>
+                  确认恢复
+                </button>
+                <button type="button" onClick={() => setPendingPolicyReset(false)} disabled={busy}>
+                  取消
+                </button>
+              </>
+            ) : (
+              <button type="button" onClick={() => setPendingPolicyReset(true)} disabled={busy}>
+                恢复全部默认
+              </button>
+            )}
+            {pendingRevokeAll ? (
+              <>
+                <span>撤销全部 scope 授权，不可撤销。确认？</span>
+                <button type="button" onClick={() => void revokeAllScopes()} disabled={busy}>
+                  确认撤销全部
+                </button>
+                <button type="button" onClick={() => setPendingRevokeAll(false)} disabled={busy}>
+                  取消
+                </button>
+              </>
+            ) : (
+              <button type="button" onClick={() => setPendingRevokeAll(true)} disabled={busy}>
+                撤销全部 scope
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       <p>
         网关：
         {gatewayStatus === null

@@ -72,7 +72,7 @@ use axum::{
     extract::{Query, State},
     http::{header, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, patch, post},
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use base64::Engine;
@@ -104,6 +104,10 @@ use crate::connector_store::{
 use crate::vault_store::{
     append_vault_state, load_vault_state, next_ticket_number, ticket_expired, CatalogEntry,
     CaptureTicket, CredentialSlot, CustomConnectorDef, TicketStatus, VaultStateLine, TICKET_TTL_MS,
+};
+use crate::policy_store::{
+    append_policy_state, effective_policy, load_policy_state, ConnectorPolicy, EffectivePolicy,
+    NetworkRule, PolicyDefaults, PolicyOverrides, PolicyStateLine, ScopeRecord,
 };
 use agent_desktop::credential_store::{CredentialStore, KeychainCredentialStore};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
@@ -304,6 +308,12 @@ pub struct AppState {
     next_ticket_id: Arc<Mutex<u64>>,
     vault_state_path: Option<PathBuf>,
     vault_secrets: Arc<dyn CredentialStore + Send + Sync>,
+    policy_defaults: Arc<Mutex<Option<PolicyDefaults>>>,
+    policy_overrides: Arc<Mutex<Option<PolicyOverrides>>>,
+    policy_connectors: Arc<Mutex<HashMap<String, ConnectorPolicy>>>,
+    policy_rules: Arc<Mutex<Option<Vec<NetworkRule>>>>,
+    policy_scopes: Arc<Mutex<HashMap<String, ScopeRecord>>>,
+    policy_state_path: Option<PathBuf>,
 }
 
 impl Default for AppState {
@@ -340,6 +350,9 @@ impl AppState {
         }
         if let Ok(vault_state_path) = std::env::var("MOCK_VAULT_STATE_PATH") {
             state = state.with_vault_state_path(PathBuf::from(vault_state_path));
+        }
+        if let Ok(policy_state_path) = std::env::var("MOCK_POLICY_STATE_PATH") {
+            state = state.with_policy_state_path(PathBuf::from(policy_state_path));
         }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
@@ -434,6 +447,12 @@ impl AppState {
             next_ticket_id: Arc::new(Mutex::new(1)),
             vault_state_path: None,
             vault_secrets: Arc::new(KeychainCredentialStore::new()),
+            policy_defaults: Arc::new(Mutex::new(None)),
+            policy_overrides: Arc::new(Mutex::new(None)),
+            policy_connectors: Arc::new(Mutex::new(HashMap::new())),
+            policy_rules: Arc::new(Mutex::new(None)),
+            policy_scopes: Arc::new(Mutex::new(HashMap::new())),
+            policy_state_path: None,
         }
     }
 
@@ -814,6 +833,28 @@ impl AppState {
     /// Test seam: swap the secret backend (memory store in tests).
     pub fn with_vault_secrets(mut self, backend: Arc<dyn CredentialStore + Send + Sync>) -> Self {
         self.vault_secrets = backend;
+        self
+    }
+
+    /// Test seam: load permission policy state from a tagged
+    /// JSONL file, mirroring with_vault_state_path. Production
+    /// state reads MOCK_POLICY_STATE_PATH.
+    pub fn with_policy_state_path(mut self, path: PathBuf) -> Self {
+        let (defaults, overrides, connectors, rules, scopes) = load_policy_state(&path);
+        let mut connector_map = HashMap::new();
+        for record in &connectors {
+            connector_map.insert(record.connector_id.clone(), record.clone());
+        }
+        let mut scope_map = HashMap::new();
+        for record in &scopes {
+            scope_map.insert(record.key(), record.clone());
+        }
+        self.policy_defaults = Arc::new(Mutex::new(defaults));
+        self.policy_overrides = Arc::new(Mutex::new(overrides));
+        self.policy_connectors = Arc::new(Mutex::new(connector_map));
+        self.policy_rules = Arc::new(Mutex::new(rules));
+        self.policy_scopes = Arc::new(Mutex::new(scope_map));
+        self.policy_state_path = Some(path);
         self
     }
 
@@ -2875,8 +2916,557 @@ fn cors_layer() -> CorsLayer {
             HeaderValue::from_static("http://localhost:5173"),
             HeaderValue::from_static("http://127.0.0.1:5173"),
         ]))
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
         .allow_headers([header::CONTENT_TYPE])
+}
+
+// --- Permissions policy (Task 11) ---
+//
+// Local policy DATA surface: defaults, overrides, per-connector
+// policies, network rules, and scopes. Nothing here enforces
+// anything: the approval gates and the EgressPolicy allowlist
+// keep their existing behaviour, and the mitm/tproxy/sni
+// switches do not intercept real traffic (the Mock has no
+// network machinery for that). The Settings UI says so plainly.
+// Persistence is tagged JSONL in policy_store.rs; reset and
+// revoke append tombstones so a restart cannot resurrect
+// cleared records.
+
+fn persist_policy_line(state: &AppState, line: &PolicyStateLine) {
+    let Some(path) = &state.policy_state_path else { return };
+    append_policy_state(path, line);
+}
+
+fn policy_defaults(state: &AppState) -> PolicyDefaults {
+    state
+        .policy_defaults
+        .lock()
+        .expect("policy defaults lock")
+        .clone()
+        .unwrap_or_default()
+}
+
+fn policy_overrides(state: &AppState) -> PolicyOverrides {
+    state
+        .policy_overrides
+        .lock()
+        .expect("policy overrides lock")
+        .clone()
+        .unwrap_or_default()
+}
+
+fn policy_effective(state: &AppState) -> EffectivePolicy {
+    effective_policy(&policy_defaults(state), &policy_overrides(state))
+}
+
+fn store_policy_overrides(state: &AppState, overrides: PolicyOverrides) {
+    *state.policy_overrides.lock().expect("policy overrides lock") = Some(overrides.clone());
+    persist_policy_line(state, &PolicyStateLine::Overrides(overrides));
+}
+
+fn store_policy_defaults(state: &AppState, defaults: PolicyDefaults) {
+    *state.policy_defaults.lock().expect("policy defaults lock") = Some(defaults.clone());
+    persist_policy_line(state, &PolicyStateLine::Defaults(defaults));
+}
+
+#[derive(Debug, Serialize)]
+struct ConnectorPolicyView {
+    connector_id: String,
+    allowed: bool,
+    updated_ms: u64,
+}
+
+fn connector_policy_view(state: &AppState, connector_id: &str) -> ConnectorPolicyView {
+    let map = state.policy_connectors.lock().expect("policy connectors lock");
+    match map.get(connector_id).filter(|r| !r.deleted) {
+        Some(record) => ConnectorPolicyView {
+            connector_id: record.connector_id.clone(),
+            allowed: record.allowed,
+            updated_ms: record.updated_ms,
+        },
+        None => ConnectorPolicyView { connector_id: connector_id.to_string(), allowed: true, updated_ms: 0 },
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ScopeView {
+    scope_type: String,
+    scope_id: String,
+    granted: bool,
+    updated_ms: u64,
+}
+
+fn scope_view(record: &ScopeRecord) -> ScopeView {
+    ScopeView {
+        scope_type: record.scope_type.clone(),
+        scope_id: record.scope_id.clone(),
+        granted: record.granted,
+        updated_ms: record.updated_ms,
+    }
+}
+
+fn unknown_scope() -> Response {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown scope" }))).into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyView {
+    defaults: PolicyDefaults,
+    active: EffectivePolicy,
+    overrides: PolicyOverrides,
+    connectors: Vec<ConnectorPolicyView>,
+    scopes: Vec<ScopeView>,
+    network_rules: Vec<NetworkRule>,
+}
+
+fn policy_view(state: &AppState) -> PolicyView {
+    let mut connectors: Vec<ConnectorPolicyView> = state
+        .policy_connectors
+        .lock()
+        .expect("policy connectors lock")
+        .values()
+        .filter(|r| !r.deleted)
+        .map(|r| ConnectorPolicyView {
+            connector_id: r.connector_id.clone(),
+            allowed: r.allowed,
+            updated_ms: r.updated_ms,
+        })
+        .collect();
+    connectors.sort_by(|a, b| a.connector_id.cmp(&b.connector_id));
+    let mut scopes: Vec<ScopeView> = state
+        .policy_scopes
+        .lock()
+        .expect("policy scopes lock")
+        .values()
+        .filter(|r| !r.deleted)
+        .map(scope_view)
+        .collect();
+    scopes.sort_by(|a, b| (&a.scope_type, &a.scope_id).cmp(&(&b.scope_type, &b.scope_id)));
+    let rules = state
+        .policy_rules
+        .lock()
+        .expect("policy rules lock")
+        .clone()
+        .unwrap_or_default();
+    PolicyView {
+        defaults: policy_defaults(state),
+        active: policy_effective(state),
+        overrides: policy_overrides(state),
+        connectors,
+        scopes,
+        network_rules: rules,
+    }
+}
+
+async fn policy_get(State(state): State<AppState>) -> Json<PolicyView> {
+    Json(policy_view(&state))
+}
+
+async fn policy_active_get(State(state): State<AppState>) -> Json<EffectivePolicy> {
+    Json(policy_effective(&state))
+}
+
+/// Three-state snooze field: absent means "no change", explicit
+/// null means "clear", a number means "set". Plain
+/// `Option<Option<u64>>` collapses absent and null into one
+/// value under serde_json, so this helper keeps them apart.
+fn deserialize_snooze<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let inner = Option::<u64>::deserialize(deserializer)?;
+    Ok(Some(inner))
+}
+
+#[derive(Debug, Deserialize)]
+struct PolicyActiveDto {
+    hitl_enabled: Option<bool>,
+    mitm_enabled: Option<bool>,
+    tproxy_enabled: Option<bool>,
+    sni_rejection_enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_snooze")]
+    hitl_snoozed_until_ms: Option<Option<u64>>,
+}
+
+async fn policy_active_update(
+    State(state): State<AppState>,
+    Json(req): Json<PolicyActiveDto>,
+) -> Json<EffectivePolicy> {
+    let mut overrides = policy_overrides(&state);
+    if let Some(v) = req.hitl_enabled {
+        overrides.hitl_enabled = Some(v);
+    }
+    if let Some(v) = req.mitm_enabled {
+        overrides.mitm_enabled = Some(v);
+    }
+    if let Some(v) = req.tproxy_enabled {
+        overrides.tproxy_enabled = Some(v);
+    }
+    if let Some(v) = req.sni_rejection_enabled {
+        overrides.sni_rejection_enabled = Some(v);
+    }
+    if let Some(v) = req.hitl_snoozed_until_ms {
+        overrides.hitl_snoozed_until_ms = v;
+    }
+    overrides.updated_ms = now_ms();
+    store_policy_overrides(&state, overrides);
+    Json(policy_effective(&state))
+}
+
+#[derive(Debug, Deserialize)]
+struct ConnectorPolicyDto {
+    allowed: bool,
+}
+
+async fn policy_connector_update(
+    State(state): State<AppState>,
+    axum::extract::Path(connector): axum::extract::Path<String>,
+    Json(req): Json<ConnectorPolicyDto>,
+) -> impl IntoResponse {
+    if registry_entry(&connector).is_none() {
+        return unknown_connector();
+    }
+    let record = ConnectorPolicy {
+        connector_id: connector.clone(),
+        allowed: req.allowed,
+        updated_ms: now_ms(),
+        deleted: false,
+    };
+    state
+        .policy_connectors
+        .lock()
+        .expect("policy connectors lock")
+        .insert(connector.clone(), record.clone());
+    persist_policy_line(&state, &PolicyStateLine::ConnectorPolicy(record));
+    Json(connector_policy_view(&state, &connector)).into_response()
+}
+
+async fn policy_connector_reset(
+    State(state): State<AppState>,
+    axum::extract::Path(connector): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if registry_entry(&connector).is_none() {
+        return unknown_connector();
+    }
+    let mut map = state.policy_connectors.lock().expect("policy connectors lock");
+    if let Some(record) = map.get_mut(&connector).filter(|r| !r.deleted) {
+        record.deleted = true;
+        record.updated_ms = now_ms();
+        let updated = record.clone();
+        persist_policy_line(&state, &PolicyStateLine::ConnectorPolicy(updated));
+    }
+    drop(map);
+    Json(connector_policy_view(&state, &connector)).into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct HitlView {
+    enabled: bool,
+    snoozed_until_ms: Option<u64>,
+}
+
+fn hitl_view(state: &AppState) -> HitlView {
+    let effective = policy_effective(state);
+    HitlView { enabled: effective.hitl_enabled, snoozed_until_ms: effective.hitl_snoozed_until_ms }
+}
+
+#[derive(Debug, Deserialize)]
+struct HitlDto {
+    enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_snooze")]
+    snoozed_until_ms: Option<Option<u64>>,
+}
+
+async fn policy_hitl_update(
+    State(state): State<AppState>,
+    Json(req): Json<HitlDto>,
+) -> Json<HitlView> {
+    let mut overrides = policy_overrides(&state);
+    if let Some(v) = req.enabled {
+        overrides.hitl_enabled = Some(v);
+    }
+    if let Some(v) = req.snoozed_until_ms {
+        overrides.hitl_snoozed_until_ms = v;
+    }
+    overrides.updated_ms = now_ms();
+    store_policy_overrides(&state, overrides);
+    Json(hitl_view(&state))
+}
+
+async fn policy_hitl_snooze_delete(State(state): State<AppState>) -> Json<HitlView> {
+    let mut overrides = policy_overrides(&state);
+    if overrides.hitl_snoozed_until_ms.is_some() {
+        overrides.hitl_snoozed_until_ms = None;
+        overrides.updated_ms = now_ms();
+        store_policy_overrides(&state, overrides);
+    }
+    Json(hitl_view(&state))
+}
+
+#[derive(Debug, Deserialize)]
+struct SwitchDto {
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SwitchView {
+    enabled: bool,
+}
+
+async fn policy_mitm_update(
+    State(state): State<AppState>,
+    Json(req): Json<SwitchDto>,
+) -> Json<SwitchView> {
+    let mut overrides = policy_overrides(&state);
+    overrides.mitm_enabled = Some(req.enabled);
+    overrides.updated_ms = now_ms();
+    store_policy_overrides(&state, overrides);
+    Json(SwitchView { enabled: policy_effective(&state).mitm_enabled })
+}
+
+async fn policy_tproxy_update(
+    State(state): State<AppState>,
+    Json(req): Json<SwitchDto>,
+) -> Json<SwitchView> {
+    let mut overrides = policy_overrides(&state);
+    overrides.tproxy_enabled = Some(req.enabled);
+    overrides.updated_ms = now_ms();
+    store_policy_overrides(&state, overrides);
+    Json(SwitchView { enabled: policy_effective(&state).tproxy_enabled })
+}
+
+async fn policy_sni_rejection_update(
+    State(state): State<AppState>,
+    Json(req): Json<SwitchDto>,
+) -> Json<SwitchView> {
+    let mut overrides = policy_overrides(&state);
+    overrides.sni_rejection_enabled = Some(req.enabled);
+    overrides.updated_ms = now_ms();
+    store_policy_overrides(&state, overrides);
+    Json(SwitchView { enabled: policy_effective(&state).sni_rejection_enabled })
+}
+
+#[derive(Debug, Deserialize)]
+struct NetworkRulesDto {
+    rules: Vec<NetworkRule>,
+}
+
+async fn policy_network_rules_update(
+    State(state): State<AppState>,
+    Json(req): Json<NetworkRulesDto>,
+) -> impl IntoResponse {
+    if req.rules.iter().any(|r| !r.valid()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "invalid network rule" })))
+            .into_response();
+    }
+    *state.policy_rules.lock().expect("policy rules lock") = Some(req.rules.clone());
+    persist_policy_line(&state, &PolicyStateLine::NetworkRules { rules: req.rules.clone() });
+    Json(req.rules).into_response()
+}
+
+async fn policy_reset(State(state): State<AppState>) -> Json<PolicyView> {
+    let now = now_ms();
+    store_policy_defaults(&state, PolicyDefaults { updated_ms: now, ..Default::default() });
+    store_policy_overrides(&state, PolicyOverrides { updated_ms: now, ..Default::default() });
+    *state.policy_rules.lock().expect("policy rules lock") = Some(Vec::new());
+    persist_policy_line(&state, &PolicyStateLine::NetworkRules { rules: Vec::new() });
+    let mut connectors = state.policy_connectors.lock().expect("policy connectors lock");
+    for record in connectors.values_mut().filter(|r| !r.deleted) {
+        record.deleted = true;
+        record.updated_ms = now;
+        let updated = record.clone();
+        persist_policy_line(&state, &PolicyStateLine::ConnectorPolicy(updated));
+    }
+    connectors.retain(|_, r| !r.deleted);
+    drop(connectors);
+    let mut scopes = state.policy_scopes.lock().expect("policy scopes lock");
+    for record in scopes.values_mut().filter(|r| !r.deleted) {
+        record.deleted = true;
+        record.updated_ms = now;
+        let updated = record.clone();
+        persist_policy_line(&state, &PolicyStateLine::Scope(updated));
+    }
+    scopes.retain(|_, r| !r.deleted);
+    drop(scopes);
+    Json(policy_view(&state))
+}
+
+#[derive(Debug, Deserialize)]
+struct RevokeDto {
+    scope_type: Option<String>,
+    scope_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RevokeView {
+    revoked: Vec<String>,
+}
+
+async fn policy_revoke(
+    State(state): State<AppState>,
+    Json(req): Json<RevokeDto>,
+) -> Json<RevokeView> {
+    let now = now_ms();
+    let mut revoked = Vec::new();
+    let mut scopes = state.policy_scopes.lock().expect("policy scopes lock");
+    let target = match (&req.scope_type, &req.scope_id) {
+        (Some(t), Some(i)) => Some(format!("{t}/{i}")),
+        _ => None,
+    };
+    for record in scopes.values_mut().filter(|r| !r.deleted) {
+        if target.as_ref().is_some_and(|t| t != &record.key()) {
+            continue;
+        }
+        record.deleted = true;
+        record.updated_ms = now;
+        let updated = record.clone();
+        persist_policy_line(&state, &PolicyStateLine::Scope(updated));
+        revoked.push(record.key());
+    }
+    scopes.retain(|_, r| !r.deleted);
+    revoked.sort();
+    Json(RevokeView { revoked })
+}
+
+async fn policy_scope_get(
+    State(state): State<AppState>,
+    axum::extract::Path((scope_type, scope_id)): axum::extract::Path<(String, String)>,
+) -> impl IntoResponse {
+    let key = format!("{scope_type}/{scope_id}");
+    let scopes = state.policy_scopes.lock().expect("policy scopes lock");
+    match scopes.get(&key).filter(|r| !r.deleted) {
+        Some(record) => Json(scope_view(record)).into_response(),
+        None => unknown_scope(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopeDto {
+    granted: Option<bool>,
+}
+
+async fn policy_scope_update(
+    State(state): State<AppState>,
+    axum::extract::Path((scope_type, scope_id)): axum::extract::Path<(String, String)>,
+    Json(req): Json<ScopeDto>,
+) -> Json<ScopeView> {
+    let record = ScopeRecord {
+        scope_type: scope_type.clone(),
+        scope_id: scope_id.clone(),
+        granted: req.granted.unwrap_or(true),
+        updated_ms: now_ms(),
+        deleted: false,
+    };
+    state
+        .policy_scopes
+        .lock()
+        .expect("policy scopes lock")
+        .insert(record.key(), record.clone());
+    persist_policy_line(&state, &PolicyStateLine::Scope(record.clone()));
+    Json(scope_view(&record))
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyInventoryView {
+    sections: Vec<&'static str>,
+    connector_policies: usize,
+    scopes: usize,
+    network_rules: usize,
+    defaults_customized: bool,
+}
+
+async fn policy_inventory(State(state): State<AppState>) -> Json<PolicyInventoryView> {
+    let connector_policies = state
+        .policy_connectors
+        .lock()
+        .expect("policy connectors lock")
+        .values()
+        .filter(|r| !r.deleted)
+        .count();
+    let scopes = state
+        .policy_scopes
+        .lock()
+        .expect("policy scopes lock")
+        .values()
+        .filter(|r| !r.deleted)
+        .count();
+    let network_rules = state
+        .policy_rules
+        .lock()
+        .expect("policy rules lock")
+        .clone()
+        .unwrap_or_default()
+        .len();
+    // "Customized" means the stored defaults differ from the
+    // built-in ones: a reset stores a builtin-valued snapshot,
+    // which must not report as customized.
+    let defaults_customized = state
+        .policy_defaults
+        .lock()
+        .expect("policy defaults lock")
+        .as_ref()
+        .is_some_and(|d| {
+            d.hitl_enabled || d.mitm_enabled || d.tproxy_enabled || d.sni_rejection_enabled
+        });
+    Json(PolicyInventoryView {
+        sections: vec![
+            "hitl",
+            "mitm",
+            "tproxy",
+            "sni_rejection",
+            "network_rules",
+            "connectors",
+            "scopes",
+        ],
+        connector_policies,
+        scopes,
+        network_rules,
+        defaults_customized,
+    })
+}
+
+async fn policy_settings_get(State(state): State<AppState>) -> Json<PolicyDefaults> {
+    Json(policy_defaults(&state))
+}
+
+#[derive(Debug, Deserialize)]
+struct PolicySettingsDto {
+    hitl_enabled: Option<bool>,
+    mitm_enabled: Option<bool>,
+    tproxy_enabled: Option<bool>,
+    sni_rejection_enabled: Option<bool>,
+}
+
+async fn policy_settings_update(
+    State(state): State<AppState>,
+    Json(req): Json<PolicySettingsDto>,
+) -> Json<PolicyDefaults> {
+    let mut defaults = policy_defaults(&state);
+    if let Some(v) = req.hitl_enabled {
+        defaults.hitl_enabled = v;
+    }
+    if let Some(v) = req.mitm_enabled {
+        defaults.mitm_enabled = v;
+    }
+    if let Some(v) = req.tproxy_enabled {
+        defaults.tproxy_enabled = v;
+    }
+    if let Some(v) = req.sni_rejection_enabled {
+        defaults.sni_rejection_enabled = v;
+    }
+    defaults.updated_ms = now_ms();
+    store_policy_defaults(&state, defaults);
+    Json(policy_defaults(&state))
+}
+
+async fn connectors_permissions(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if registry_entry(&id).is_none() {
+        return unknown_connector();
+    }
+    Json(connector_policy_view(&state, &id)).into_response()
 }
 
 // --- Tasks (deterministic task loop) ---
@@ -4057,6 +4647,25 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/credentials/catalog/details", get(vault_catalog_details))
         .route("/v1/credentials/catalog/update", post(vault_catalog_update))
         .route("/v1/credentials/catalog/delete", post(vault_catalog_delete))
+        .route("/permissions", get(policy_get))
+        .route("/permissions/active", get(policy_active_get))
+        .route("/permissions/active", patch(policy_active_update))
+        .route("/permissions/connectors/{connector}", patch(policy_connector_update))
+        .route("/permissions/connectors/{connector}", delete(policy_connector_reset))
+        .route("/permissions/hitl", patch(policy_hitl_update))
+        .route("/permissions/hitl/snooze", delete(policy_hitl_snooze_delete))
+        .route("/permissions/mitm", patch(policy_mitm_update))
+        .route("/permissions/network-rules", patch(policy_network_rules_update))
+        .route("/permissions/reset", post(policy_reset))
+        .route("/permissions/revoke", post(policy_revoke))
+        .route("/permissions/scopes/{scope_type}/{scope_id}", get(policy_scope_get))
+        .route("/permissions/scopes/{scope_type}/{scope_id}", patch(policy_scope_update))
+        .route("/permissions/sni-rejection", patch(policy_sni_rejection_update))
+        .route("/permissions/tproxy", patch(policy_tproxy_update))
+        .route("/permissions/inventory", get(policy_inventory))
+        .route("/permissions/settings", get(policy_settings_get))
+        .route("/permissions/settings", patch(policy_settings_update))
+        .route("/connectors/{id}/permissions", get(connectors_permissions))
         .route("/tasks/create", post(tasks_create))
         .route("/tasks/list", get(tasks_list))
         .route("/tasks/get", get(tasks_get))
