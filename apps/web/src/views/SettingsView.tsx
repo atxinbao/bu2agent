@@ -18,6 +18,8 @@ import type {
 import type { InvokePermissionPolicyClient } from "../domain/invoke_permission_policy_client";
 import type { ModelState } from "../domain/model_client";
 import type { InvokeModelClient } from "../domain/invoke_model_client";
+import type { ConfigState } from "../domain/config_client";
+import type { InvokeConfigClient } from "../domain/invoke_config_client";
 
 // Settings page (invoke-only). Save and effective state are
 // separate on purpose: a credential or directory save lands
@@ -41,6 +43,7 @@ interface SettingsViewProps {
   vault: InvokeCredentialVaultClient;
   policy: InvokePermissionPolicyClient;
   model: InvokeModelClient;
+  config: InvokeConfigClient;
   isInvoke: boolean;
   gatewayStatus: GatewayStatusView | null;
   onSettingsChanged: () => void;
@@ -74,6 +77,7 @@ export function SettingsView({
   vault,
   policy,
   model,
+  config,
   isInvoke,
   gatewayStatus,
   onSettingsChanged,
@@ -125,6 +129,10 @@ export function SettingsView({
   const [modelDoc, setModelDoc] = useState<ModelState | null>(null);
   const [modelInput, setModelInput] = useState("");
   const [baseUrlInput, setBaseUrlInput] = useState("");
+  // Config section (Task 14, GET only). No edit controls
+  // exist on purpose: the gateway has no runtime-mutable
+  // self-owned config to write.
+  const [configDoc, setConfigDoc] = useState<ConfigState | null>(null);
 
   async function refreshVault() {
     try {
@@ -160,6 +168,14 @@ export function SettingsView({
     }
   }
 
+  async function refreshConfig() {
+    try {
+      setConfigDoc(await config.getConfig());
+    } catch {
+      setConfigDoc(null);
+    }
+  }
+
   async function refresh() {
     setBusy(true);
     setError(null);
@@ -178,6 +194,7 @@ export function SettingsView({
       await refreshVault();
       await refreshPolicy();
       await refreshModel();
+      await refreshConfig();
     } catch (err) {
       setError(errText(err));
     } finally {
@@ -1253,6 +1270,21 @@ export function SettingsView({
               暂存模型选择
             </button>
           </div>
+        </div>
+      )}
+
+      <h3>网关配置（Config，只读）</h3>
+      <p className="note">
+        网关事实只读：写面（PATCH）本轮不出——网关没有运行时可改的自有配置（文件根是启动值，模型归模型面，密钥归钥匙串）。
+      </p>
+      {configDoc === null ? (
+        <p className="empty">网关配置未知（状态查询失败）。</p>
+      ) : (
+        <div>
+          <p>文件根：{configDoc.filesRoot}</p>
+          <p>
+            监听地址：{configDoc.gatewayAddr} · 提供方：{configDoc.provider}
+          </p>
         </div>
       )}
 

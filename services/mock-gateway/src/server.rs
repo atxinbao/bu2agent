@@ -3776,6 +3776,34 @@ mod model_merge_tests {
     }
 }
 
+// --- Config surface (Task 14, GET only) ---
+//
+// GET /config reports gateway facts, read-only. PATCH is
+// deliberately NOT implemented: the gateway has no
+// runtime-mutable self-owned config to write (files_root
+// is a startup jail root, model belongs to /model, the
+// key belongs to the Keychain), so a PATCH would invent
+// a dangerous write semantic. Axum answers PATCH on this
+// path with 405, which the smoke test asserts.
+
+#[derive(Debug, Serialize)]
+struct ConfigView {
+    files_root: String,
+    gateway_addr: String,
+    provider: &'static str,
+}
+
+async fn config_get(State(state): State<AppState>) -> Json<ConfigView> {
+    // Same fallback as the binary's bind address in main.rs.
+    let gateway_addr =
+        std::env::var("MOCK_GATEWAY_ADDR").unwrap_or_else(|_| "127.0.0.1:3001".to_string());
+    Json(ConfigView {
+        files_root: state.files_root.display().to_string(),
+        gateway_addr,
+        provider: "deepseek",
+    })
+}
+
 // --- Tasks (deterministic task loop) ---
 //
 // A task is a directory + a report artifact. The manual flow stays
@@ -4985,6 +5013,7 @@ pub fn app(state: AppState) -> Router {
         .route("/connectors/{id}/permissions", get(connectors_permissions))
         .route("/model", get(model_get))
         .route("/model", post(model_set))
+        .route("/config", get(config_get))
         .route("/tasks/create", post(tasks_create))
         .route("/tasks/list", get(tasks_list))
         .route("/tasks/get", get(tasks_get))

@@ -32,6 +32,7 @@ use agent_desktop::permission_policy_client::{
     PolicyDefaultsView, PolicyInventoryView, PolicyView, RevokeView, ScopeView, SwitchView,
 };
 use agent_desktop::model_client::{ModelClient, ModelView};
+use agent_desktop::config_client::{ConfigClient, ConfigView};
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
@@ -580,6 +581,20 @@ pub fn model_set(
     base_url: Option<String>,
 ) -> Result<ModelView, String> {
     model_client()?.set_model(model.as_deref(), base_url.as_deref()).map_err(agent_err_string)
+}
+
+// --- Config surface (Task 14, GET only) ---
+//
+// No config_set command exists on purpose: the gateway
+// has no runtime-mutable self-owned config to write.
+
+fn config_client() -> Result<ConfigClient, String> {
+    ConfigClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn config_get() -> Result<ConfigView, String> {
+    config_client()?.get_config().map_err(agent_err_string)
 }
 
 // --- Tasks (deterministic task loop) ---
