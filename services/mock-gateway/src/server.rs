@@ -333,9 +333,30 @@ impl AppState {
         let mut state = AppState::with_files_root_and_approvals(PathBuf::from(root), approvals_path);
         state.loop_fault = crate::loop_fault::LoopFault::from_env(&state.files_root)
             .expect("invalid test-only loop fault configuration");
+        // Task 12 U4 fix: the staged model selection must be
+        // merged into the config BEFORE the backends are
+        // built, because with_deepseek_backends builds both
+        // the chat client and the loop model from this one
+        // config. Merging only state.deepseek afterwards
+        // would leave chat and loops on different models.
+        // The staged record is kept as the persisted
+        // preference (not consumed), so a second restart
+        // keeps the applied model; an explicit env value
+        // still wins over staged on every restart.
+        let mut config = config;
+        let model_path = std::env::var("MOCK_MODEL_STATE_PATH").ok().map(PathBuf::from);
+        if let Some(path) = &model_path {
+            let staged = load_model_state(path);
+            let env_model = std::env::var("DEEPSEEK_MODEL").ok().filter(|s| !s.is_empty());
+            let env_base = std::env::var("DEEPSEEK_BASE_URL").ok().filter(|s| !s.is_empty());
+            config = merge_staged_config(config, &staged, env_model, env_base);
+        }
         let loops_path = std::env::var("MOCK_LOOPS_PATH").ok().map(PathBuf::from);
         state = state.with_deepseek_backends(config, loops_path)
             .expect("invalid loop configuration or audit");
+        if let Some(path) = model_path {
+            state = state.with_model_state_path(path);
+        }
         if let Ok(tasks_path) = std::env::var("MOCK_TASKS_PATH") {
             state = state.with_tasks_path(PathBuf::from(tasks_path));
         }
@@ -356,9 +377,6 @@ impl AppState {
         }
         if let Ok(policy_state_path) = std::env::var("MOCK_POLICY_STATE_PATH") {
             state = state.with_policy_state_path(PathBuf::from(policy_state_path));
-        }
-        if let Ok(model_state_path) = std::env::var("MOCK_MODEL_STATE_PATH") {
-            state = state.with_model_state_path(PathBuf::from(model_state_path));
         }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
@@ -3513,13 +3531,63 @@ struct ModelView {
     restart_needed: bool,
 }
 
+/// Merge a staged model selection over a running config.
+/// An explicit env value wins over staged on every restart;
+/// otherwise a staged field replaces the running one. Pure
+/// (env values passed in) so tests can cover it without
+/// mutating process env. Public so the smoke test can build
+/// a restarted state through the same merge production
+/// uses at startup (from_deepseek_config).
+pub fn merge_staged_config(
+    mut config: DeepSeekConfig,
+    staged: &Option<StagedModel>,
+    env_model: Option<String>,
+    env_base_url: Option<String>,
+) -> DeepSeekConfig {
+    let Some(staged) = staged else { return config };
+    if env_model.as_ref().is_none_or(|m| m.is_empty()) {
+        if let Some(m) = &staged.model {
+            config.model = m.clone();
+        }
+    }
+    if env_base_url.as_ref().is_none_or(|u| u.is_empty()) {
+        if let Some(u) = &staged.base_url {
+            config.base_url = u.clone();
+        }
+    }
+    config
+}
+
+/// Is there a staged value a restart would still apply?
+/// A staged field counts only when it differs from the
+/// running config AND no env override explains the
+/// difference (env wins over staged, so a staged value
+/// shadowed by env is dormant, not pending). Pure for
+/// the same reason as merge_staged_config.
+fn model_restart_needed(
+    running: &DeepSeekConfig,
+    staged: &StagedModel,
+    env_model: Option<&str>,
+    env_base_url: Option<&str>,
+) -> bool {
+    let model_pending = staged.model.as_ref().is_some_and(|m| {
+        m != &running.model && env_model.is_none_or(|e| e.is_empty())
+    });
+    let base_pending = staged.base_url.as_ref().is_some_and(|u| {
+        u != &running.base_url && env_base_url.is_none_or(|e| e.is_empty())
+    });
+    model_pending || base_pending
+}
+
 fn model_view(state: &AppState) -> ModelView {
     let running = state.deepseek.config();
     let staged = state.model_staged.lock().expect("model staged lock").clone().unwrap_or_default();
     let model = staged.model.clone().unwrap_or_else(|| running.model.clone());
     let base_url = staged.base_url.clone().unwrap_or_else(|| running.base_url.clone());
-    let restart_needed = staged.model.as_ref().is_some_and(|m| m != &running.model)
-        || staged.base_url.as_ref().is_some_and(|u| u != &running.base_url);
+    let env_model = std::env::var("DEEPSEEK_MODEL").ok().filter(|s| !s.is_empty());
+    let env_base = std::env::var("DEEPSEEK_BASE_URL").ok().filter(|s| !s.is_empty());
+    let restart_needed =
+        model_restart_needed(running, &staged, env_model.as_deref(), env_base.as_deref());
     let (key_configured, key_redacted) = match &running.api_key {
         Some(key) => (true, Some(redact(key))),
         None => (false, None),
@@ -3590,6 +3658,87 @@ async fn model_set(
     *state.model_staged.lock().expect("model staged lock") = Some(staged.clone());
     persist_model_line(&state, &ModelStateLine::Model(staged));
     Json(model_view(&state)).into_response()
+}
+
+#[cfg(test)]
+mod model_merge_tests {
+    use super::*;
+    use crate::deepseek::DeepSeekConfig;
+
+    fn running() -> DeepSeekConfig {
+        DeepSeekConfig {
+            base_url: "https://api.deepseek.com".to_string(),
+            model: "deepseek-flash".to_string(),
+            api_key: None,
+        }
+    }
+
+    fn staged() -> StagedModel {
+        StagedModel {
+            model: Some("deepseek-chat".to_string()),
+            base_url: Some("https://staged.example.com".to_string()),
+            updated_ms: 1,
+        }
+    }
+
+    #[test]
+    fn merge_applies_staged_without_env() {
+        let merged = merge_staged_config(running(), &Some(staged()), None, None);
+        assert_eq!(merged.model, "deepseek-chat");
+        assert_eq!(merged.base_url, "https://staged.example.com");
+        assert_eq!(merged.api_key, None);
+    }
+
+    #[test]
+    fn merge_env_wins_over_staged() {
+        // The caller (from_env_and_keychain) already put the
+        // env values into config; merge only decides whether
+        // staged may override. With env present, staged is
+        // ignored and the env-carrying config stands.
+        let mut env_config = running();
+        env_config.model = "deepseek-reasoner".to_string();
+        env_config.base_url = "https://env.example.com".to_string();
+        let merged = merge_staged_config(
+            env_config,
+            &Some(staged()),
+            Some("deepseek-reasoner".to_string()),
+            Some("https://env.example.com".to_string()),
+        );
+        assert_eq!(merged.model, "deepseek-reasoner");
+        assert_eq!(merged.base_url, "https://env.example.com");
+    }
+
+    #[test]
+    fn merge_partial_staged_only_touches_set_fields() {
+        let partial = StagedModel {
+            model: Some("deepseek-chat".to_string()),
+            base_url: None,
+            updated_ms: 1,
+        };
+        let merged = merge_staged_config(running(), &Some(partial), None, None);
+        assert_eq!(merged.model, "deepseek-chat");
+        assert_eq!(merged.base_url, "https://api.deepseek.com");
+    }
+
+    #[test]
+    fn restart_needed_env_shadow_is_dormant_not_pending() {
+        let run = running();
+        let stage = staged();
+        assert!(model_restart_needed(&run, &stage, None, None));
+        // After a restart that applied staged, running == staged.
+        let mut applied = run.clone();
+        applied.model = "deepseek-chat".to_string();
+        applied.base_url = "https://staged.example.com".to_string();
+        assert!(!model_restart_needed(&applied, &stage, None, None));
+        // With env overrides explaining both differences, the
+        // staged values are dormant, not pending.
+        assert!(!model_restart_needed(
+            &run,
+            &stage,
+            Some("deepseek-reasoner"),
+            Some("https://env.example.com")
+        ));
+    }
 }
 
 // --- Tasks (deterministic task loop) ---

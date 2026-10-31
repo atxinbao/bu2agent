@@ -8,7 +8,8 @@
 //! leaked: only configured + ****last-4 appear.
 
 use mock_gateway::deepseek::{DeepSeekClient, DeepSeekConfig};
-use mock_gateway::server::{app, AppState};
+use mock_gateway::model_store::load_model_state;
+use mock_gateway::server::{app, merge_staged_config, AppState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -91,17 +92,31 @@ async fn model_get_post_and_restart() {
     assert!(head.contains("200"), "{head}");
     assert_eq!(view["staged_model"], "deepseek-chat");
 
-    // Restart recovery: a fresh state on the same file keeps
-    // the staged selection (tombstone-free, single record).
+    // Restart recovery through the production merge: a fresh
+    // state that merges staged into its config (what
+    // from_deepseek_config does at startup) RUNS the staged
+    // model and reports nothing pending — this is the U4
+    // behavior that was missing before the fix. A second
+    // restart keeps it: staged is a persisted preference,
+    // not a record consumed on first apply.
+    // NOTE: the restart_needed=true assertion above assumes
+    // DEEPSEEK_MODEL/DEEPSEEK_BASE_URL are unset in the
+    // test env, like the disabled test state.
     handle.abort();
-    let state = AppState::default().with_model_state_path(path);
-    let (addr, handle) = start_server(state).await;
-    let (head, view) = get(addr).await;
-    assert!(head.contains("200"), "{head}");
-    assert_eq!(view["model"], "deepseek-chat");
-    assert_eq!(view["staged_model"], "deepseek-chat");
-    assert_eq!(view["restart_needed"], true);
-    handle.abort();
+    for _ in 0..2 {
+        let staged = load_model_state(&path);
+        let config = merge_staged_config(DeepSeekConfig::disabled(), &staged, None, None);
+        let state = AppState::default()
+            .with_deepseek(DeepSeekClient::new(config))
+            .with_model_state_path(path.clone());
+        let (addr, handle) = start_server(state).await;
+        let (head, view) = get(addr).await;
+        assert!(head.contains("200"), "{head}");
+        assert_eq!(view["model"], "deepseek-chat");
+        assert_eq!(view["staged_model"], "deepseek-chat");
+        assert_eq!(view["restart_needed"], false);
+        handle.abort();
+    }
 }
 
 #[tokio::test]
