@@ -37,6 +37,8 @@ import { InvokeSpaceClient } from "./domain/invoke_space_client";
 import { SpacesView } from "./views/SpacesView";
 import { FeedClient, type FeedGateway } from "./domain/feed_client";
 import { InvokeFeedClient } from "./domain/invoke_feed_client";
+import { ChatRecordsClient, type ChatRecordsGateway } from "./domain/chat_records_client";
+import { InvokeChatRecordsClient } from "./domain/invoke_chat_records_client";
 import { FeedView } from "./views/FeedView";
 import {
   TaskClient,
@@ -105,6 +107,7 @@ interface Clients {
   peers: PeerGateway;
   spaces: SpaceGateway;
   feed: FeedGateway;
+  chatRecords: ChatRecordsGateway;
 }
 
 type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "peers" | "spaces" | "feed" | "settings";
@@ -187,6 +190,7 @@ export function App() {
           peers: new InvokePeerClient(),
           spaces: new InvokeSpaceClient(),
           feed: new InvokeFeedClient(),
+          chatRecords: new InvokeChatRecordsClient(),
         };
         transportName = "invoke (Rust client)";
       } catch {
@@ -206,6 +210,7 @@ export function App() {
           peers: new PeerClient(MOCK_BASE_URL),
           spaces: new SpaceClient(MOCK_BASE_URL),
           feed: new FeedClient(MOCK_BASE_URL),
+          chatRecords: new ChatRecordsClient(MOCK_BASE_URL),
         };
         transportName = "http (browser preview)";
       }
@@ -471,6 +476,7 @@ export function App() {
             loops={clients.loops}
             agent={clients.agent}
             files={clients.files}
+            chatRecords={clients.chatRecords}
             onNavigate={(target) => setTab(target)}
           />
         ))}
@@ -541,6 +547,7 @@ export function App() {
           policy={new InvokePermissionPolicyClient()}
           model={new InvokeModelClient()}
           config={new InvokeConfigClient()}
+          chatRecords={new InvokeChatRecordsClient()}
           isInvoke={isInvoke}
           gatewayStatus={gatewayStatus}
           onSettingsChanged={() => void refreshSettings()}

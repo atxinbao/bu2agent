@@ -46,6 +46,13 @@ pub struct SessionTurn {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// Task 18: chat.delete-turn is a tombstone, not erasure.
+    /// Deleted turns stay in the snapshot lines (like deleted
+    /// sessions) but are hidden from the message list, the
+    /// history window, search results, and model context.
+    /// Old snapshots predate the field and read as false.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,11 +127,17 @@ pub fn title_from(text: &str) -> String {
 /// newest-first selection under both caps, returned oldest-first.
 /// A pair that alone exceeds the byte cap is excluded, never cut.
 pub fn select_context(turns: &[SessionTurn]) -> Vec<(String, String)> {
+    // Task 18: deleted turns never enter model context. Pairs
+    // are originally-adjacent user+assistant entries, both
+    // visible: a tombstone breaks its pair instead of letting
+    // a question pair with another turn's answer.
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     let mut index = 0;
     while index < turns.len() {
-        if turns[index].role == "user"
+        if !turns[index].deleted
+            && turns[index].role == "user"
             && index + 1 < turns.len()
+            && !turns[index + 1].deleted
             && turns[index + 1].role == "assistant"
         {
             pairs.push((turns[index].text.len() + turns[index + 1].text.len(), index));
@@ -156,7 +169,7 @@ mod tests {
     use super::*;
 
     fn turn(role: &str, text: &str) -> SessionTurn {
-        SessionTurn { role: role.to_string(), text: text.to_string(), created_ms: 0, model: None, finish_reason: None }
+        SessionTurn { role: role.to_string(), text: text.to_string(), created_ms: 0, model: None, finish_reason: None, deleted: false }
     }
 
     fn pair_turns(count: usize) -> Vec<SessionTurn> {
@@ -197,6 +210,24 @@ mod tests {
         let context = select_context(&turns);
         assert_eq!(context.len(), 4);
         assert!(!context.iter().any(|(_, text)| text == "pending"));
+    }
+
+    #[test]
+    fn context_skips_deleted_turns() {
+        let mut turns = pair_turns(2);
+        turns[1].deleted = true;
+        turns[2].deleted = true;
+        // Both original pairs are broken by a tombstone, so
+        // nothing pairs across the gap; deleted texts never
+        // appear, and neither does a mismatched pairing.
+        let context = select_context(&turns);
+        assert!(context.is_empty());
+        let mut intact = pair_turns(2);
+        intact[0].deleted = true;
+        let context = select_context(&intact);
+        assert_eq!(context.len(), 2);
+        assert_eq!(context[0].1, "q1");
+        assert_eq!(context[1].1, "a1");
     }
 
     #[test]

@@ -36,6 +36,10 @@ use agent_desktop::config_client::{ConfigClient, ConfigView};
 use agent_desktop::peer_client::{Peer, PeerClient, PeerInboxMessage, PeerInvite, PeerRequest, PeerStatus};
 use agent_desktop::space_client::{Space, SpaceClient, SpaceItem};
 use agent_desktop::feed_client::{FeedClient, FeedSeenResult, FeedStatus, FeedUnit};
+use agent_desktop::chat_records_client::{
+    ChatRecordsClient, ChatThemes, ChatTurnView, HistoryWindow, SearchMatch, SeenResult,
+    UnreadCount,
+};
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
@@ -967,4 +971,57 @@ pub fn device_action_get(action_id: String) -> Result<DeviceActionOut, String> {
         .get_action(&action_id)
         .map_err(|e| err_string(&e))
         .map(DeviceActionOut::from)
+}
+
+// --- Chat records surface (Task 18, record subset) ---
+//
+// All commands carry rename_all = "snake_case" (Task 9
+// lesson): the invoke client sends snake_case params.
+
+fn chat_records_client() -> Result<ChatRecordsClient, String> {
+    ChatRecordsClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn chat_themes_get() -> Result<ChatThemes, String> {
+    chat_records_client()?.themes().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn chat_themes_set(theme: String) -> Result<ChatThemes, String> {
+    chat_records_client()?.set_theme(&theme).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn chat_unread_count() -> Result<UnreadCount, String> {
+    chat_records_client()?.unread_count().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn chat_mark_seen(thread_id: String, index: Option<usize>) -> Result<SeenResult, String> {
+    chat_records_client()?.mark_seen(&thread_id, index).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn chat_delete_turn(thread_id: String, index: usize) -> Result<ChatTurnView, String> {
+    chat_records_client()?.delete_turn(&thread_id, index).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn chat_message_get(thread_id: String, index: usize) -> Result<ChatTurnView, String> {
+    chat_records_client()?.message(&thread_id, index).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn chat_history_window(
+    thread_id: String,
+    offset: usize,
+    limit: usize,
+) -> Result<HistoryWindow, String> {
+    chat_records_client()?.history_window(&thread_id, offset, limit).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn chat_search(query: String) -> Result<Vec<SearchMatch>, String> {
+    chat_records_client()?.search(&query).map_err(agent_err_string)
 }

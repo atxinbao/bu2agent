@@ -17,6 +17,7 @@ export interface SessionTurn {
   createdMs: number;
   model: string | null;
   finishReason: string | null;
+  deleted: boolean;
 }
 
 export interface SessionRecord {
@@ -46,6 +47,7 @@ interface ServerSessionTurn {
   created_ms: number;
   model: string | null;
   finish_reason: string | null;
+  deleted?: boolean;
 }
 
 interface ServerSessionRecord {
@@ -76,6 +78,7 @@ function toTurn(server: ServerSessionTurn): SessionTurn {
     createdMs: server.created_ms,
     model: server.model,
     finishReason: server.finish_reason,
+    deleted: server.deleted ?? false,
   };
 }
 

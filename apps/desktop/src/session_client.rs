@@ -19,6 +19,10 @@ pub struct SessionTurn {
     pub created_ms: u64,
     pub model: Option<String>,
     pub finish_reason: Option<String>,
+    /// Task 18: tombstoned turns are hidden by the view but
+    /// still travel in the record with their stored index.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

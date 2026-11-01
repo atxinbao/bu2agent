@@ -118,6 +118,10 @@ use crate::space_store::{append_space_state, load_space_state, Space, SpaceItem,
 use crate::feed_store::{
     append_feed_state, load_feed_state, seed_feed_units, FeedStateLine, FeedUnit,
 };
+use crate::chat_store::{
+    append_chat_state, load_chat_state, ChatStateLine, SeenMarker, CHAT_THEMES,
+    DEFAULT_CHAT_THEME,
+};
 use agent_desktop::credential_store::{redact, CredentialStore, KeychainCredentialStore};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
@@ -334,6 +338,9 @@ pub struct AppState {
     space_state_path: Option<PathBuf>,
     feed_units: Arc<Mutex<HashMap<String, FeedUnit>>>,
     feed_state_path: Option<PathBuf>,
+    chat_seen: Arc<Mutex<HashMap<String, usize>>>,
+    chat_theme: Arc<Mutex<String>>,
+    chat_state_path: Option<PathBuf>,
 }
 
 impl Default for AppState {
@@ -404,6 +411,9 @@ impl AppState {
         }
         if let Ok(feed_state_path) = std::env::var("MOCK_FEED_STATE_PATH") {
             state = state.with_feed_state_path(PathBuf::from(feed_state_path));
+        }
+        if let Ok(chat_state_path) = std::env::var("MOCK_CHAT_STATE_PATH") {
+            state = state.with_chat_state_path(PathBuf::from(chat_state_path));
         }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
@@ -517,6 +527,9 @@ impl AppState {
                 seed_feed_units().into_iter().map(|u| (u.unit_id.clone(), u)).collect(),
             )),
             feed_state_path: None,
+            chat_seen: Arc::new(Mutex::new(HashMap::new())),
+            chat_theme: Arc::new(Mutex::new(DEFAULT_CHAT_THEME.to_string())),
+            chat_state_path: None,
         }
     }
 
@@ -985,6 +998,21 @@ impl AppState {
         }
         self.feed_units = Arc::new(Mutex::new(unit_map));
         self.feed_state_path = Some(path);
+        self
+    }
+
+    /// Test seam: load chat seen markers and theme from a
+    /// tagged JSONL file, mirroring with_feed_state_path.
+    /// Production state reads MOCK_CHAT_STATE_PATH.
+    pub fn with_chat_state_path(mut self, path: PathBuf) -> Self {
+        let (markers, theme) = load_chat_state(&path);
+        let mut seen_map = HashMap::new();
+        for marker in &markers {
+            seen_map.insert(marker.thread_id.clone(), marker.marker);
+        }
+        self.chat_seen = Arc::new(Mutex::new(seen_map));
+        self.chat_theme = Arc::new(Mutex::new(theme));
+        self.chat_state_path = Some(path);
         self
     }
 
@@ -4385,6 +4413,259 @@ async fn spaces_delete(
     Json(space.clone()).into_response()
 }
 
+// --- Chat record surface (Task 18, record subset) ---
+//
+// Threads are sessions (thread_id == session_id); the static
+// /chat/history seed is untouched. Message indices are stored
+// positions (oldest-first), stable across tombstones; views
+// hide deleted turns but report stored indices. Stream,
+// subscribe, stream-events, poke, cancel, and sxs.select are
+// excluded (see the Task 18 plan).
+
+fn chat_turn_view(thread_id: &str, index: usize, turn: &SessionTurn) -> serde_json::Value {
+    serde_json::json!({
+        "thread_id": thread_id,
+        "index": index,
+        "role": turn.role,
+        "text": turn.text,
+        "created_ms": turn.created_ms,
+        "model": turn.model,
+        "finish_reason": turn.finish_reason,
+        "deleted": turn.deleted,
+    })
+}
+
+fn persist_chat_line(state: &AppState, line: &ChatStateLine) {
+    let Some(path) = &state.chat_state_path else { return };
+    append_chat_state(path, line);
+}
+
+/// Unread entries for one record: visible turns at or after
+/// the thread's seen watermark.
+fn thread_unread(record: &SessionRecord, marker: usize) -> usize {
+    record
+        .turns
+        .iter()
+        .enumerate()
+        .filter(|(index, turn)| !turn.deleted && *index >= marker)
+        .count()
+}
+
+async fn chat_themes(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let theme = state.chat_theme.lock().expect("chat theme lock").clone();
+    Json(serde_json::json!({ "theme": theme, "available": CHAT_THEMES }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatThemeSetDto {
+    theme: String,
+}
+
+async fn chat_themes_set(
+    State(state): State<AppState>,
+    Json(req): Json<ChatThemeSetDto>,
+) -> impl IntoResponse {
+    if !CHAT_THEMES.contains(&req.theme.as_str()) {
+        return bad_request("unknown theme").into_response();
+    }
+    *state.chat_theme.lock().expect("chat theme lock") = req.theme.clone();
+    persist_chat_line(&state, &ChatStateLine::Theme { theme: req.theme.clone() });
+    Json(serde_json::json!({ "theme": req.theme, "available": CHAT_THEMES })).into_response()
+}
+
+async fn chat_unread_count(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let seen = state.chat_seen.lock().expect("chat seen lock");
+    let sessions = state.sessions.lock().expect("session lock");
+    let mut records: Vec<&SessionRecord> = sessions.values().filter(|r| !r.deleted).collect();
+    records.sort_by_key(|r| (!r.pinned, session_number(&r.session_id)));
+    let mut threads = Vec::new();
+    let mut total = 0;
+    for record in records {
+        let marker = seen.get(&record.session_id).copied().unwrap_or(0);
+        let unread = thread_unread(record, marker);
+        total += unread;
+        threads.push(serde_json::json!({ "thread_id": record.session_id, "unread": unread }));
+    }
+    Json(serde_json::json!({ "unread_count": total, "threads": threads }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatSeenDto {
+    index: Option<usize>,
+}
+
+async fn chat_mark_seen(
+    State(state): State<AppState>,
+    axum::extract::Path(thread_id): axum::extract::Path<String>,
+    Json(req): Json<ChatSeenDto>,
+) -> impl IntoResponse {
+    let mut sessions = state.sessions.lock().expect("session lock");
+    let Some(record) = sessions.get_mut(&thread_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown thread" })))
+            .into_response();
+    };
+    if record.deleted {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown thread" })))
+            .into_response();
+    }
+    let len = record.turns.len();
+    let marker = match req.index {
+        Some(index) if index >= len => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown turn" })))
+                .into_response();
+        }
+        Some(index) => index + 1,
+        None => len,
+    };
+    let unread = thread_unread(record, marker);
+    state.chat_seen.lock().expect("chat seen lock").insert(thread_id.clone(), marker);
+    persist_chat_line(
+        &state,
+        &ChatStateLine::Seen(SeenMarker { thread_id: thread_id.clone(), marker, updated_ms: now_ms() }),
+    );
+    Json(serde_json::json!({ "thread_id": thread_id, "marker": marker, "unread": unread }))
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatDeleteTurnDto {
+    thread_id: String,
+    index: usize,
+}
+
+async fn chat_delete_turn(
+    State(state): State<AppState>,
+    Json(req): Json<ChatDeleteTurnDto>,
+) -> impl IntoResponse {
+    let mut sessions = state.sessions.lock().expect("session lock");
+    let Some(record) = sessions.get_mut(&req.thread_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown thread" })))
+            .into_response();
+    };
+    if record.deleted {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown thread" })))
+            .into_response();
+    }
+    if req.index >= record.turns.len() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown turn" })))
+            .into_response();
+    }
+    if !record.turns[req.index].deleted {
+        record.turns[req.index].deleted = true;
+        record.updated_ms = now_ms();
+        let updated = record.clone();
+        persist_session(&state, &updated);
+    }
+    let view = chat_turn_view(&req.thread_id, req.index, &record.turns[req.index]);
+    Json(view).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatMessageQuery {
+    thread_id: String,
+    index: usize,
+}
+
+async fn chat_message(
+    State(state): State<AppState>,
+    Query(query): Query<ChatMessageQuery>,
+) -> impl IntoResponse {
+    let sessions = state.sessions.lock().expect("session lock");
+    let Some(record) = sessions.get(&query.thread_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown thread" })))
+            .into_response();
+    };
+    if record.deleted {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown thread" })))
+            .into_response();
+    }
+    let Some(turn) = record.turns.get(query.index) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown turn" })))
+            .into_response();
+    };
+    Json(chat_turn_view(&query.thread_id, query.index, turn)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatHistoryWindowQuery {
+    thread_id: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+async fn chat_history_window(
+    State(state): State<AppState>,
+    Query(query): Query<ChatHistoryWindowQuery>,
+) -> impl IntoResponse {
+    let sessions = state.sessions.lock().expect("session lock");
+    let Some(record) = sessions.get(&query.thread_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown thread" })))
+            .into_response();
+    };
+    if record.deleted {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown thread" })))
+            .into_response();
+    }
+    let visible: Vec<(usize, &SessionTurn)> =
+        record.turns.iter().enumerate().filter(|(_, turn)| !turn.deleted).collect();
+    let total_visible = visible.len();
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(50).min(200);
+    let entries: Vec<serde_json::Value> = visible
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(index, turn)| chat_turn_view(&query.thread_id, *index, turn))
+        .collect();
+    Json(serde_json::json!({
+        "thread_id": query.thread_id,
+        "total_visible": total_visible,
+        "entries": entries,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatSearchQuery {
+    q: String,
+}
+
+async fn chat_search(
+    State(state): State<AppState>,
+    Query(query): Query<ChatSearchQuery>,
+) -> impl IntoResponse {
+    let needle = query.q.trim().to_lowercase();
+    if needle.is_empty() {
+        return bad_request("search query must not be empty").into_response();
+    }
+    let sessions = state.sessions.lock().expect("session lock");
+    let mut records: Vec<&SessionRecord> = sessions.values().filter(|r| !r.deleted).collect();
+    records.sort_by_key(|r| (!r.pinned, session_number(&r.session_id)));
+    let mut matches = Vec::new();
+    for record in records {
+        for (index, turn) in record.turns.iter().enumerate() {
+            if turn.deleted {
+                continue;
+            }
+            if turn.text.to_lowercase().contains(&needle) {
+                matches.push(serde_json::json!({
+                    "thread_id": record.session_id,
+                    "index": index,
+                    "role": turn.role,
+                    "text": turn.text,
+                }));
+                if matches.len() >= 50 {
+                    break;
+                }
+            }
+        }
+        if matches.len() >= 50 {
+            break;
+        }
+    }
+    Json(matches).into_response()
+}
+
 // --- Feed surface (Task 17, unit subset) ---
 //
 // Local semantics only (see feed_store.rs): Mock seed
@@ -5043,7 +5324,9 @@ fn session_summary(record: &SessionRecord) -> SessionSummary {
         title: record.title.clone(),
         created_ms: record.created_ms,
         updated_ms: record.updated_ms,
-        turn_count: record.turns.len(),
+        // Task 18: tombstoned turns are hidden everywhere, so
+        // the count reports visible turns only.
+        turn_count: record.turns.iter().filter(|turn| !turn.deleted).count(),
         pinned: record.pinned,
         archived: record.archived,
     }
@@ -5109,6 +5392,7 @@ async fn sessions_send(
             created_ms: now,
             model: None,
             finish_reason: None,
+            deleted: false,
         });
         if first_message && record.title.is_empty() {
             record.title = title_from(&text);
@@ -5161,6 +5445,7 @@ async fn sessions_send(
         created_ms: now_ms(),
         model,
         finish_reason,
+        deleted: false,
     });
     record.updated_ms = now_ms();
     let updated = record.clone();
@@ -5675,6 +5960,14 @@ pub fn app(state: AppState) -> Router {
         .route("/chat/stream/start", post(stream_start))
         .route("/chat/stream/apply", post(stream_apply))
         .route("/chat/stream/cancel", post(stream_cancel))
+        .route("/api/chat/themes", get(chat_themes))
+        .route("/api/chat/themes/set", post(chat_themes_set))
+        .route("/chat/unread-count", get(chat_unread_count))
+        .route("/chat/{thread_id}/seen", post(chat_mark_seen))
+        .route("/api/chat/delete-turn", post(chat_delete_turn))
+        .route("/chat/message", get(chat_message))
+        .route("/chat/history-window", get(chat_history_window))
+        .route("/chat/search", get(chat_search))
         .route("/approval/check", post(approval_check))
         .route("/files/list", get(files_list))
         .route("/files/read", get(files_read))

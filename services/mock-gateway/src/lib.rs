@@ -30,6 +30,7 @@ pub mod model_store;
 pub mod peer_store;
 pub mod space_store;
 pub mod feed_store;
+pub mod chat_store;
 pub mod device_store;
 pub mod device_backend;
 

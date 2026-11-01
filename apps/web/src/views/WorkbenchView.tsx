@@ -8,6 +8,10 @@ import type {
   SessionRecord,
 } from "../domain/session_client";
 import type { TaskDraft, TaskGateway, TaskRecord } from "../domain/task_client";
+import type {
+  ChatRecordsGateway,
+  SearchMatch,
+} from "../domain/chat_records_client";
 import { LoopReminderApproval } from "./LoopReminderApproval";
 
 // Workbench (Round 3, 3a+3b): one list on the left, a timeline in
@@ -85,11 +89,12 @@ export interface WorkbenchViewProps {
   loops: LoopGateway;
   agent: AgentGateway;
   files: FileGateway;
+  chatRecords: ChatRecordsGateway;
   onNavigate: (tab: "tasks" | "loops" | "files") => void;
 }
 
 export function WorkbenchView(props: WorkbenchViewProps) {
-  const { sessions, tasks, loops, agent, files, onNavigate } = props;
+  const { sessions, tasks, loops, agent, files, chatRecords, onNavigate } = props;
   const [items, setItems] = useState<WorkItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -114,6 +119,17 @@ export function WorkbenchView(props: WorkbenchViewProps) {
   const [preview, setPreview] = useState<Preview | null>(null);
   const [previewError, setPreviewError] = useState("");
   const [loopBusy, setLoopBusy] = useState(false);
+  // Chat records (Task 18): per-thread unread counts from
+  // /chat/unread-count, plus a local message search over the
+  // gateway's /chat/search. Stored indices are the array
+  // positions of sessionDetail.turns (the gateway returns
+  // all turns, tombstones included, in stored order).
+  const [unreadByThread, setUnreadByThread] = useState<Record<string, number>>({});
+  const [chatNotice, setChatNotice] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchMatch[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
   const selectionToken = useRef(0);
 
   // 详情查询与显式操作共用同一快照更新列表，避免已执行项仍被标为待审批。
@@ -253,6 +269,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
 
   useEffect(() => {
     void refreshList();
+    void refreshUnread();
     // Mount only: refreshes come from explicit actions below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -270,6 +287,8 @@ export function WorkbenchView(props: WorkbenchViewProps) {
     setRenaming(false);
     setPreview(null);
     setPreviewError("");
+    setSearchResults(null);
+    setSearchError("");
     try {
       if (item.kind === "session") setSessionDetail(await sessions.get(item.id));
       else if (item.kind === "task") await syncTask(await tasks.get(item.id));
@@ -309,6 +328,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
       setSessionDetail(updated);
       setComposer("");
       await refreshList();
+      await refreshUnread();
     } catch (e) {
       setDetailError(errText(e));
     } finally {
@@ -327,6 +347,72 @@ export function WorkbenchView(props: WorkbenchViewProps) {
       await refreshList();
     } catch (e) {
       setDetailError(errText(e));
+    }
+  }
+
+  async function refreshUnread() {
+    try {
+      const counts = await chatRecords.getUnreadCount();
+      const next: Record<string, number> = {};
+      for (const thread of counts.threads) next[thread.threadId] = thread.unread;
+      setUnreadByThread(next);
+    } catch {
+      // Unread counts are decorative; a failed refresh must
+      // never block the message list.
+    }
+  }
+
+  async function markSeenCurrent() {
+    if (!sessionDetail) return;
+    setChatNotice("");
+    try {
+      await chatRecords.markSeen(sessionDetail.sessionId, null);
+      setSessionDetail(await sessions.get(sessionDetail.sessionId));
+      await refreshUnread();
+      setChatNotice("已标为已读。");
+    } catch (e) {
+      setDetailError(errText(e));
+    }
+  }
+
+  async function deleteTurn(index: number) {
+    if (!sessionDetail) return;
+    setChatNotice("");
+    try {
+      await chatRecords.deleteTurn(sessionDetail.sessionId, index);
+      setSessionDetail(await sessions.get(sessionDetail.sessionId));
+      await refreshList();
+      await refreshUnread();
+      setChatNotice("已删除该条消息。删除是 tombstone：记录文件旧行仍在，不会从磁盘擦除。");
+    } catch (e) {
+      setDetailError(errText(e));
+    }
+  }
+
+  async function runSearch() {
+    if (!searchQuery.trim()) {
+      setSearchResults(null);
+      setSearchError("");
+      return;
+    }
+    setSearching(true);
+    setSearchError("");
+    try {
+      setSearchResults(await chatRecords.search(searchQuery.trim()));
+    } catch (e) {
+      setSearchError(errText(e));
+      setSearchResults(null);
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  async function openSearchResult(match: SearchMatch) {
+    const item = items.find((entry) => entry.kind === "session" && entry.id === match.threadId);
+    if (item) {
+      await select(item);
+    } else {
+      setChatNotice("该会话不在当前列表中（可能已归档或被隐藏）。");
     }
   }
 
@@ -542,6 +628,9 @@ export function WorkbenchView(props: WorkbenchViewProps) {
               >
                 {item.title} · {item.status}
                 {item.pendingLabel && <span className="pending-badge"> · {item.pendingLabel}</span>}
+                {item.kind === "session" && (unreadByThread[item.id] ?? 0) > 0 && (
+                  <span className="pending-badge"> · 未读 {unreadByThread[item.id]} 条</span>
+                )}
               </button>
             </li>
           ))}
@@ -599,17 +688,57 @@ export function WorkbenchView(props: WorkbenchViewProps) {
             <>
               <h3>{sessionDetail.title || "新会话"}</h3>
               <p className="note">整段回复：当前回复一次显示全部内容，不按 token 流式呈现。</p>
-              {sessionDetail.turns.length === 0 && <p className="empty">还没有消息。</p>}
-              <div className="messages">
-                {sessionDetail.turns.map((turn, index) => (
-                  <div key={`${turn.createdMs}-${index}`} className={`message ${turn.role}`}>
-                    <div className="role">
-                      {turn.role === "user" ? "你" : "助手"}
-                      {turn.model ? ` · ${turn.model}` : ""}
+              <div className="row">
+                <span>未读 {unreadByThread[sessionDetail.sessionId] ?? 0} 条</span>
+                <button type="button" onClick={() => void markSeenCurrent()}>标为已读</button>
+              </div>
+              {chatNotice && <p className="note">{chatNotice}</p>}
+              <div className="row">
+                <input
+                  aria-label="聊天记录搜索"
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="搜索消息…"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void runSearch();
+                  }}
+                />
+                <button type="button" onClick={() => void runSearch()} disabled={searching}>
+                  {searching ? "搜索中…" : "搜索"}
+                </button>
+              </div>
+              {searchError && <p className="error" role="alert">{searchError}</p>}
+              {searchResults !== null && (
+                <div className="messages">
+                  {searchResults.length === 0 && <p className="empty">没有匹配的消息。</p>}
+                  {searchResults.map((match) => (
+                    <div key={`${match.threadId}-${match.index}`} className={`message ${match.role}`}>
+                      <div className="role">
+                        {match.role === "user" ? "你" : "助手"} · {match.threadId}
+                      </div>
+                      <div className="text">{match.text}</div>
+                      <button type="button" onClick={() => void openSearchResult(match)}>打开会话</button>
                     </div>
-                    <div className="text">{turn.text}</div>
-                  </div>
-                ))}
+                  ))}
+                </div>
+              )}
+              {sessionDetail.turns.filter((turn) => !turn.deleted).length === 0 && (
+                <p className="empty">还没有消息。</p>
+              )}
+              <div className="messages">
+                {sessionDetail.turns.map((turn, index) =>
+                  turn.deleted ? null : (
+                    <div key={`${turn.createdMs}-${index}`} className={`message ${turn.role}`}>
+                      <div className="role">
+                        {turn.role === "user" ? "你" : "助手"}
+                        {turn.model ? ` · ${turn.model}` : ""}
+                      </div>
+                      <div className="text">{turn.text}</div>
+                      <button type="button" onClick={() => void deleteTurn(index)}>删除</button>
+                    </div>
+                  ),
+                )}
               </div>
               <div className="row">
                 <input

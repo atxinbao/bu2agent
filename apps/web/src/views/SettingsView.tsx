@@ -20,6 +20,8 @@ import type { ModelState } from "../domain/model_client";
 import type { InvokeModelClient } from "../domain/invoke_model_client";
 import type { ConfigState } from "../domain/config_client";
 import type { InvokeConfigClient } from "../domain/invoke_config_client";
+import type { ChatThemes } from "../domain/chat_records_client";
+import type { InvokeChatRecordsClient } from "../domain/invoke_chat_records_client";
 
 // Settings page (invoke-only). Save and effective state are
 // separate on purpose: a credential or directory save lands
@@ -44,6 +46,7 @@ interface SettingsViewProps {
   policy: InvokePermissionPolicyClient;
   model: InvokeModelClient;
   config: InvokeConfigClient;
+  chatRecords: InvokeChatRecordsClient;
   isInvoke: boolean;
   gatewayStatus: GatewayStatusView | null;
   onSettingsChanged: () => void;
@@ -78,6 +81,7 @@ export function SettingsView({
   policy,
   model,
   config,
+  chatRecords,
   isInvoke,
   gatewayStatus,
   onSettingsChanged,
@@ -127,6 +131,10 @@ export function SettingsView({
   // never shown or edited here (Settings key management above
   // owns it), only configured + redacted.
   const [modelDoc, setModelDoc] = useState<ModelState | null>(null);
+  // Theme section (Task 18). Record-only: setting a theme
+  // persists the preference, it does not restyle the UI.
+  const [themeDoc, setThemeDoc] = useState<ChatThemes | null>(null);
+  const [themeInput, setThemeInput] = useState("");
   const [modelInput, setModelInput] = useState("");
   const [baseUrlInput, setBaseUrlInput] = useState("");
   // Config section (Task 14, GET only). No edit controls
@@ -176,6 +184,14 @@ export function SettingsView({
     }
   }
 
+  async function refreshTheme() {
+    try {
+      setThemeDoc(await chatRecords.getThemes());
+    } catch {
+      setThemeDoc(null);
+    }
+  }
+
   async function refresh() {
     setBusy(true);
     setError(null);
@@ -195,6 +211,7 @@ export function SettingsView({
       await refreshPolicy();
       await refreshModel();
       await refreshConfig();
+      await refreshTheme();
     } catch (err) {
       setError(errText(err));
     } finally {
@@ -748,6 +765,26 @@ export function SettingsView({
     }
   }
 
+  async function saveTheme() {
+    if (themeInput.trim() === "") {
+      setError("主题不能为空。");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await chatRecords.setTheme(themeInput.trim());
+      setThemeInput("");
+      await refreshTheme();
+      setNotice("主题已保存（只记录、不换肤）。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="view">
       <h2>设置</h2>
@@ -1268,6 +1305,29 @@ export function SettingsView({
             />
             <button type="button" onClick={() => void saveModel()} disabled={busy}>
               暂存模型选择
+            </button>
+          </div>
+        </div>
+      )}
+
+      <h3>主题（Theme，只记录）</h3>
+      <p className="note">
+        主题只记录、不换肤：保存后界面外观不变，值持久化在网关 chat.jsonl 中，重启后仍在。
+      </p>
+      {themeDoc === null ? (
+        <p className="empty">主题未知（状态查询失败）。</p>
+      ) : (
+        <div>
+          <p>当前：{themeDoc.theme} · 可选：{themeDoc.available.join("、")}</p>
+          <div className="row">
+            <input
+              type="text"
+              value={themeInput}
+              placeholder="主题（system / light / dark）"
+              onChange={(event) => setThemeInput(event.target.value)}
+            />
+            <button type="button" onClick={() => void saveTheme()} disabled={busy}>
+              保存主题
             </button>
           </div>
         </div>
