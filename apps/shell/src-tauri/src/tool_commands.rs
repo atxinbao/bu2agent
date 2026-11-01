@@ -40,6 +40,7 @@ use agent_desktop::chat_records_client::{
     ChatRecordsClient, ChatThemes, ChatTurnView, HistoryWindow, SearchMatch, SeenResult,
     UnreadCount,
 };
+use agent_desktop::node_client::{Node, NodeClient};
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
@@ -1024,4 +1025,38 @@ pub fn chat_history_window(
 #[tauri::command(rename_all = "snake_case")]
 pub fn chat_search(query: String) -> Result<Vec<SearchMatch>, String> {
     chat_records_client()?.search(&query).map_err(agent_err_string)
+}
+
+// --- Node registry surface (Task 19, record subset) ---
+//
+// All commands carry rename_all = "snake_case" (Task 9
+// lesson): the invoke client sends snake_case params.
+
+fn node_client() -> Result<NodeClient, String> {
+    NodeClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn node_register(name: Option<String>) -> Result<Node, String> {
+    node_client()?.register_node(name.as_deref()).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn node_list(status: Option<String>) -> Result<Vec<Node>, String> {
+    node_client()?.list_nodes(status.as_deref()).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn node_heartbeat(node_id: String) -> Result<Node, String> {
+    node_client()?.heartbeat_node(&node_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn node_disconnect(node_id: String) -> Result<Node, String> {
+    node_client()?.disconnect_node(&node_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn node_unpair(node_id: String) -> Result<Node, String> {
+    node_client()?.unpair_node(&node_id).map_err(agent_err_string)
 }

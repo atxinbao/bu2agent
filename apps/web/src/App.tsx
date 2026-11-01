@@ -39,6 +39,8 @@ import { FeedClient, type FeedGateway } from "./domain/feed_client";
 import { InvokeFeedClient } from "./domain/invoke_feed_client";
 import { ChatRecordsClient, type ChatRecordsGateway } from "./domain/chat_records_client";
 import { InvokeChatRecordsClient } from "./domain/invoke_chat_records_client";
+import { NodeClient, type NodeGateway } from "./domain/node_client";
+import { InvokeNodeClient } from "./domain/invoke_node_client";
 import { FeedView } from "./views/FeedView";
 import {
   TaskClient,
@@ -108,6 +110,7 @@ interface Clients {
   spaces: SpaceGateway;
   feed: FeedGateway;
   chatRecords: ChatRecordsGateway;
+  nodes: NodeGateway;
 }
 
 type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "peers" | "spaces" | "feed" | "settings";
@@ -191,6 +194,7 @@ export function App() {
           spaces: new InvokeSpaceClient(),
           feed: new InvokeFeedClient(),
           chatRecords: new InvokeChatRecordsClient(),
+          nodes: new InvokeNodeClient(),
         };
         transportName = "invoke (Rust client)";
       } catch {
@@ -211,6 +215,7 @@ export function App() {
           spaces: new SpaceClient(MOCK_BASE_URL),
           feed: new FeedClient(MOCK_BASE_URL),
           chatRecords: new ChatRecordsClient(MOCK_BASE_URL),
+          nodes: new NodeClient(MOCK_BASE_URL),
         };
         transportName = "http (browser preview)";
       }
@@ -537,7 +542,7 @@ export function App() {
         (clients === null ? (
           <p className="empty">Choosing transport…</p>
         ) : (
-          <DevicesView agent={clients.agent} devices={clients.devices} />
+          <DevicesView agent={clients.agent} devices={clients.devices} nodes={clients.nodes} />
         ))}
       {tab === "loops" && clients && <LoopsView loops={clients.loops} agent={clients.agent} />}
       {tab === "settings" && (

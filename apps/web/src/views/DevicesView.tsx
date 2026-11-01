@@ -5,6 +5,7 @@ import type {
   DeviceGateway,
   DeviceReminder,
 } from "../domain/device_client";
+import type { Node, NodeGateway } from "../domain/node_client";
 
 // Devices view: the B-layer single-device validation loop,
 // driven step by step from the frontend (see the device-loop
@@ -24,13 +25,14 @@ import type {
 interface DevicesViewProps {
   agent: AgentGateway;
   devices: DeviceGateway;
+  nodes: NodeGateway;
 }
 
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-export function DevicesView({ agent, devices }: DevicesViewProps) {
+export function DevicesView({ agent, devices, nodes }: DevicesViewProps) {
   const [reminders, setReminders] = useState<DeviceReminder[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [targetCompleted, setTargetCompleted] = useState(true);
@@ -39,6 +41,61 @@ export function DevicesView({ agent, devices }: DevicesViewProps) {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // Nodes section (Task 19): the node registry lives on
+  // the Devices tab (concept-adjacent, no new tab). Unpair
+  // is a tombstone: the record stays in nodes.jsonl but
+  // leaves the list and reads as unknown afterwards.
+  const [nodeList, setNodeList] = useState<Node[]>([]);
+  const [nodeName, setNodeName] = useState("");
+  const [nodeMessage, setNodeMessage] = useState("");
+  const [nodeError, setNodeError] = useState("");
+
+  async function refreshNodes() {
+    try {
+      setNodeList(await nodes.listNodes(null));
+    } catch (e) {
+      setNodeError(errText(e));
+    }
+  }
+
+  useEffect(() => {
+    void refreshNodes();
+    // Mount only: refreshes come from explicit actions below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function registerNode() {
+    setNodeError("");
+    setNodeMessage("");
+    try {
+      const record = await nodes.registerNode(nodeName.trim() === "" ? null : nodeName.trim());
+      setNodeName("");
+      await refreshNodes();
+      setNodeMessage(`已登记节点 ${record.nodeId}。`);
+    } catch (e) {
+      setNodeError(errText(e));
+    }
+  }
+
+  async function actOnNode(nodeId: string, action: "heartbeat" | "disconnect" | "unpair") {
+    setNodeError("");
+    setNodeMessage("");
+    try {
+      if (action === "heartbeat") await nodes.heartbeatNode(nodeId);
+      else if (action === "disconnect") await nodes.disconnectNode(nodeId);
+      else await nodes.unpairNode(nodeId);
+      await refreshNodes();
+      setNodeMessage(
+        action === "heartbeat"
+          ? `节点 ${nodeId} 心跳已更新。`
+          : action === "disconnect"
+            ? `节点 ${nodeId} 已下线（心跳可重新上线）。`
+            : `节点 ${nodeId} 已解配（tombstone：记录文件旧行仍在）。`,
+      );
+    } catch (e) {
+      setNodeError(errText(e));
+    }
+  }
 
   async function refreshReminders() {
     try {
@@ -277,6 +334,50 @@ export function DevicesView({ agent, devices }: DevicesViewProps) {
       )}
       {message !== "" && <p>{message}</p>}
       {error !== "" && <p>错误：{error}</p>}
+      <h3>节点（Nodes）</h3>
+      <p className="note">
+        节点注册表：登记、心跳、下线、解配。解配是 tombstone，不从磁盘擦除旧记录；
+        下线可逆，心跳可重新上线。调用回执与同步（invoke-ack、invoke-result、sync）不在本轮范围。
+      </p>
+      <div className="row">
+        <input
+          aria-label="节点名字"
+          type="text"
+          value={nodeName}
+          onChange={(e) => setNodeName(e.target.value)}
+          placeholder="节点名字（可选，缺省用编号）"
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void registerNode();
+          }}
+        />
+        <button type="button" onClick={() => void registerNode()}>
+          登记节点
+        </button>
+        <button type="button" onClick={() => void refreshNodes()}>
+          刷新
+        </button>
+      </div>
+      {nodeMessage !== "" && <p>{nodeMessage}</p>}
+      {nodeError !== "" && <p>错误：{nodeError}</p>}
+      <ul>
+        {nodeList.map((node) => (
+          <li key={node.nodeId}>
+            {node.nodeId} · {node.name} · {node.status}
+            {" "}
+            <button type="button" onClick={() => void actOnNode(node.nodeId, "heartbeat")}>
+              心跳
+            </button>
+            {" "}
+            <button type="button" onClick={() => void actOnNode(node.nodeId, "disconnect")}>
+              下线
+            </button>
+            {" "}
+            <button type="button" onClick={() => void actOnNode(node.nodeId, "unpair")}>
+              解配
+            </button>
+          </li>
+        ))}
+      </ul>
       <h3>动作列表</h3>
       <ul>
         {actionList.map((a) => (

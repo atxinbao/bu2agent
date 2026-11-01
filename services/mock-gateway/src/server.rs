@@ -122,6 +122,9 @@ use crate::chat_store::{
     append_chat_state, load_chat_state, ChatStateLine, SeenMarker, CHAT_THEMES,
     DEFAULT_CHAT_THEME,
 };
+use crate::node_store::{
+    append_node, load_nodes, next_node_number, Node, NODE_DISCONNECTED, NODE_ONLINE,
+};
 use agent_desktop::credential_store::{redact, CredentialStore, KeychainCredentialStore};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
@@ -341,6 +344,9 @@ pub struct AppState {
     chat_seen: Arc<Mutex<HashMap<String, usize>>>,
     chat_theme: Arc<Mutex<String>>,
     chat_state_path: Option<PathBuf>,
+    nodes: Arc<Mutex<HashMap<String, Node>>>,
+    next_node_id: Arc<Mutex<u64>>,
+    node_state_path: Option<PathBuf>,
 }
 
 impl Default for AppState {
@@ -414,6 +420,9 @@ impl AppState {
         }
         if let Ok(chat_state_path) = std::env::var("MOCK_CHAT_STATE_PATH") {
             state = state.with_chat_state_path(PathBuf::from(chat_state_path));
+        }
+        if let Ok(node_state_path) = std::env::var("MOCK_NODE_STATE_PATH") {
+            state = state.with_node_state_path(PathBuf::from(node_state_path));
         }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
@@ -530,6 +539,9 @@ impl AppState {
             chat_seen: Arc::new(Mutex::new(HashMap::new())),
             chat_theme: Arc::new(Mutex::new(DEFAULT_CHAT_THEME.to_string())),
             chat_state_path: None,
+            nodes: Arc::new(Mutex::new(HashMap::new())),
+            next_node_id: Arc::new(Mutex::new(1)),
+            node_state_path: None,
         }
     }
 
@@ -1013,6 +1025,21 @@ impl AppState {
         self.chat_seen = Arc::new(Mutex::new(seen_map));
         self.chat_theme = Arc::new(Mutex::new(theme));
         self.chat_state_path = Some(path);
+        self
+    }
+
+    /// Test seam: load node records from a JSONL file,
+    /// mirroring with_sessions_path. Production state reads
+    /// MOCK_NODE_STATE_PATH.
+    pub fn with_node_state_path(mut self, path: PathBuf) -> Self {
+        let records = load_nodes(&path);
+        let mut nodes = HashMap::new();
+        for record in &records {
+            nodes.insert(record.node_id.clone(), record.clone());
+        }
+        self.next_node_id = Arc::new(Mutex::new(next_node_number(&records)));
+        self.nodes = Arc::new(Mutex::new(nodes));
+        self.node_state_path = Some(path);
         self
     }
 
@@ -4413,6 +4440,136 @@ async fn spaces_delete(
     Json(space.clone()).into_response()
 }
 
+// --- Node registry surface (Task 19, record subset) ---
+//
+// Invoke-ack, invoke-result, and sync are excluded (see
+// the Task 19 plan): receipt/sync protocol with a real
+// node, and there is no local counterpart.
+
+fn persist_node(state: &AppState, record: &Node) {
+    let Some(path) = &state.node_state_path else { return };
+    append_node(path, record);
+}
+
+fn node_number(node_id: &str) -> u64 {
+    node_id.strip_prefix("node-").and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeRegisterDto {
+    name: Option<String>,
+}
+
+async fn nodes_register(
+    State(state): State<AppState>,
+    Json(req): Json<NodeRegisterDto>,
+) -> Json<Node> {
+    let mut next = state.next_node_id.lock().expect("node id lock");
+    let id = format!("node-{}", *next);
+    *next += 1;
+    let now = now_ms();
+    let record = Node {
+        node_id: id.clone(),
+        name: req.name.filter(|n| !n.trim().is_empty()).unwrap_or(id),
+        status: NODE_ONLINE.to_string(),
+        last_heartbeat_ms: now,
+        created_ms: now,
+        updated_ms: now,
+        unpaired: false,
+    };
+    state.nodes.lock().expect("node lock").insert(record.node_id.clone(), record.clone());
+    persist_node(&state, &record);
+    Json(record)
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeListDto {
+    status: Option<String>,
+}
+
+async fn nodes_list(
+    State(state): State<AppState>,
+    Json(req): Json<NodeListDto>,
+) -> impl IntoResponse {
+    if let Some(status) = &req.status {
+        if status != NODE_ONLINE && status != NODE_DISCONNECTED {
+            return bad_request("unknown node status").into_response();
+        }
+    }
+    let nodes = state.nodes.lock().expect("node lock");
+    let mut records: Vec<Node> = nodes
+        .values()
+        .filter(|n| !n.unpaired && req.status.as_ref().is_none_or(|s| s == &n.status))
+        .cloned()
+        .collect();
+    records.sort_by_key(|n| node_number(&n.node_id));
+    Json(records).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeIdDto {
+    node_id: String,
+}
+
+/// Shared mutation path for heartbeat/disconnect: unknown
+/// ids and tombstoned nodes both read as 404; the mutation
+/// bumps `updated_ms` and appends a fresh snapshot.
+fn mutate_node(state: &AppState, node_id: &str, mutate: impl FnOnce(&mut Node)) -> Response {
+    let mut nodes = state.nodes.lock().expect("node lock");
+    let Some(record) = nodes.get_mut(node_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown node" })))
+            .into_response();
+    };
+    if record.unpaired {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown node" })))
+            .into_response();
+    }
+    mutate(record);
+    record.updated_ms = now_ms();
+    let updated = record.clone();
+    persist_node(state, &updated);
+    Json(updated).into_response()
+}
+
+async fn nodes_heartbeat(
+    State(state): State<AppState>,
+    Json(req): Json<NodeIdDto>,
+) -> impl IntoResponse {
+    mutate_node(&state, &req.node_id, |n| {
+        n.status = NODE_ONLINE.to_string();
+        n.last_heartbeat_ms = now_ms();
+    })
+}
+
+async fn nodes_disconnect(
+    State(state): State<AppState>,
+    Json(req): Json<NodeIdDto>,
+) -> impl IntoResponse {
+    mutate_node(&state, &req.node_id, |n| {
+        n.status = NODE_DISCONNECTED.to_string();
+    })
+}
+
+async fn nodes_unpair(
+    State(state): State<AppState>,
+    Json(req): Json<NodeIdDto>,
+) -> impl IntoResponse {
+    let mut nodes = state.nodes.lock().expect("node lock");
+    let Some(record) = nodes.get_mut(&req.node_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown node" })))
+            .into_response();
+    };
+    if !record.unpaired {
+        record.unpaired = true;
+        record.updated_ms = now_ms();
+        let updated = record.clone();
+        persist_node(&state, &updated);
+    }
+    // Re-unpair is idempotent success, mirroring the
+    // delete-turn tombstone: no new snapshot, same record.
+    Json(record.clone()).into_response()
+}
+
 // --- Chat record surface (Task 18, record subset) ---
 //
 // Threads are sessions (thread_id == session_id); the static
@@ -5968,6 +6125,11 @@ pub fn app(state: AppState) -> Router {
         .route("/chat/message", get(chat_message))
         .route("/chat/history-window", get(chat_history_window))
         .route("/chat/search", get(chat_search))
+        .route("/api/nodes/register", post(nodes_register))
+        .route("/api/nodes/list", post(nodes_list))
+        .route("/api/nodes/heartbeat", post(nodes_heartbeat))
+        .route("/api/nodes/disconnect", post(nodes_disconnect))
+        .route("/api/nodes/unpair", post(nodes_unpair))
         .route("/approval/check", post(approval_check))
         .route("/files/list", get(files_list))
         .route("/files/read", get(files_read))
