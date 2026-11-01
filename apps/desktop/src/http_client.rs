@@ -5,7 +5,11 @@
 //! only, no TLS: this is a Mock-only client. The real gateway
 //! adapter must add TLS before any non-Mock target is used.
 //! Error bodies are never copied into `UnifiedError`: they may
-//! contain user text. Only the HTTP status is reported.
+//! contain user text. Only the HTTP status is reported, with
+//! one structured exception: a network-rule denial carries a
+//! `rule` field naming user-configured policy (not user
+//! text), and that field alone is surfaced so a blocked call
+//! can say which rule blocked it.
 //!
 //! Phase 5: every socket gets a connect, read, and write
 //! timeout (default 10 seconds), so a hung Mock server fails
@@ -35,6 +39,33 @@ pub fn gateway_error(status: u16) -> UnifiedError {
         retryable: status >= 500,
         user_action: UserAction::Retry,
         redacted_detail: format!("mock gateway returned HTTP {status}"),
+    }
+}
+
+/// Detail for a gateway error response. The body is never
+/// copied wholesale; only the structured `rule` field of a
+/// network-rule denial is appended, so the window can name
+/// the blocking rule (Task 13 window validation: the 403
+/// itself passed, but the rule name never reached the UI).
+fn gateway_error_detail(status: u16, body: &str) -> String {
+    let base = format!("mock gateway returned HTTP {status}");
+    let rule = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("rule")?.as_str().map(str::to_string))
+        .filter(|rule| !rule.is_empty());
+    match rule {
+        Some(rule) => format!("{base} (network rule: {rule})"),
+        None => base,
+    }
+}
+
+pub fn gateway_error_with_body(status: u16, body: &str) -> UnifiedError {
+    UnifiedError {
+        code: ErrorCode::Gateway,
+        capability: Some("gateway".to_string()),
+        retryable: status >= 500,
+        user_action: UserAction::Retry,
+        redacted_detail: gateway_error_detail(status, body),
     }
 }
 
@@ -123,7 +154,7 @@ impl HttpClient {
     pub fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let (status, body) = self.request("GET", path, None)?;
         if !(200..300).contains(&status) {
-            return Err(gateway_error(status));
+            return Err(gateway_error_with_body(status, &body));
         }
         serde_json::from_str(&body).map_err(|_| transport_error("mock gateway returned invalid JSON"))
     }
@@ -135,7 +166,7 @@ impl HttpClient {
     ) -> Result<T> {
         let (status, resp_body) = self.request("POST", path, Some(body))?;
         if !(200..300).contains(&status) {
-            return Err(gateway_error(status));
+            return Err(gateway_error_with_body(status, &resp_body));
         }
         serde_json::from_str(&resp_body)
             .map_err(|_| transport_error("mock gateway returned invalid JSON"))
@@ -150,7 +181,7 @@ impl HttpClient {
     ) -> Result<T> {
         let (status, resp_body) = self.request("PATCH", path, Some(body))?;
         if !(200..300).contains(&status) {
-            return Err(gateway_error(status));
+            return Err(gateway_error_with_body(status, &resp_body));
         }
         serde_json::from_str(&resp_body)
             .map_err(|_| transport_error("mock gateway returned invalid JSON"))
@@ -161,8 +192,39 @@ impl HttpClient {
     pub fn delete_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let (status, body) = self.request("DELETE", path, None)?;
         if !(200..300).contains(&status) {
-            return Err(gateway_error(status));
+            return Err(gateway_error_with_body(status, &body));
         }
         serde_json::from_str(&body).map_err(|_| transport_error("mock gateway returned invalid JSON"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn denial_detail_names_the_rule() {
+        let detail = gateway_error_detail(
+            403,
+            r#"{"error":"network rule denied model call","rule":"api.deepseek.com"}"#,
+        );
+        assert_eq!(
+            detail,
+            "mock gateway returned HTTP 403 (network rule: api.deepseek.com)"
+        );
+    }
+
+    #[test]
+    fn other_bodies_stay_redacted() {
+        // No rule field: only the status survives, never body text.
+        let detail = gateway_error_detail(502, r#"{"error":"user secret text here"}"#);
+        assert_eq!(detail, "mock gateway returned HTTP 502");
+        assert!(!detail.contains("secret"));
+        // A non-string rule is not surfaced either.
+        let detail = gateway_error_detail(403, r#"{"error":"x","rule":42}"#);
+        assert_eq!(detail, "mock gateway returned HTTP 403");
+        // Malformed body degrades to the plain status form.
+        let detail = gateway_error_detail(403, "not json");
+        assert_eq!(detail, "mock gateway returned HTTP 403");
     }
 }
