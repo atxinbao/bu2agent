@@ -125,6 +125,11 @@ use crate::chat_store::{
 use crate::node_store::{
     append_node, load_nodes, next_node_number, Node, NODE_DISCONNECTED, NODE_ONLINE,
 };
+use crate::stream_store::{
+    append_stream_line, events_after, last_event_id, load_stream_state, next_poke_order,
+    next_stream_number, next_subscription_number, project_thread_events, StreamLine,
+    StreamOpen, StreamPoke, StreamSubscription, SxsSelection,
+};
 use agent_desktop::credential_store::{redact, CredentialStore, KeychainCredentialStore};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
@@ -347,6 +352,13 @@ pub struct AppState {
     nodes: Arc<Mutex<HashMap<String, Node>>>,
     next_node_id: Arc<Mutex<u64>>,
     node_state_path: Option<PathBuf>,
+    stream_subscriptions: Arc<Mutex<HashMap<String, StreamSubscription>>>,
+    next_subscription_id: Arc<Mutex<u64>>,
+    next_stream_id: Arc<Mutex<u64>>,
+    stream_pokes: Arc<Mutex<Vec<StreamPoke>>>,
+    next_poke_order: Arc<Mutex<u64>>,
+    stream_selections: Arc<Mutex<HashMap<String, SxsSelection>>>,
+    stream_state_path: Option<PathBuf>,
 }
 
 impl Default for AppState {
@@ -423,6 +435,9 @@ impl AppState {
         }
         if let Ok(node_state_path) = std::env::var("MOCK_NODE_STATE_PATH") {
             state = state.with_node_state_path(PathBuf::from(node_state_path));
+        }
+        if let Ok(stream_state_path) = std::env::var("MOCK_STREAM_STATE_PATH") {
+            state = state.with_stream_state_path(PathBuf::from(stream_state_path));
         }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
@@ -542,6 +557,13 @@ impl AppState {
             nodes: Arc::new(Mutex::new(HashMap::new())),
             next_node_id: Arc::new(Mutex::new(1)),
             node_state_path: None,
+            stream_subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            next_subscription_id: Arc::new(Mutex::new(1)),
+            next_stream_id: Arc::new(Mutex::new(1)),
+            stream_pokes: Arc::new(Mutex::new(Vec::new())),
+            next_poke_order: Arc::new(Mutex::new(1)),
+            stream_selections: Arc::new(Mutex::new(HashMap::new())),
+            stream_state_path: None,
         }
     }
 
@@ -1040,6 +1062,31 @@ impl AppState {
         self.next_node_id = Arc::new(Mutex::new(next_node_number(&records)));
         self.nodes = Arc::new(Mutex::new(nodes));
         self.node_state_path = Some(path);
+        self
+    }
+
+    /// Test seam: load stream subscriptions, opens, pokes,
+    /// and selections from a tagged JSONL file, mirroring
+    /// with_node_state_path. Production state reads
+    /// MOCK_STREAM_STATE_PATH.
+    pub fn with_stream_state_path(mut self, path: PathBuf) -> Self {
+        let data = load_stream_state(&path);
+        let mut subscriptions = HashMap::new();
+        for record in &data.subscriptions {
+            subscriptions.insert(record.subscription_id.clone(), record.clone());
+        }
+        let mut selections = HashMap::new();
+        for record in &data.selections {
+            selections.insert(record.thread_id.clone(), record.clone());
+        }
+        self.next_subscription_id =
+            Arc::new(Mutex::new(next_subscription_number(&data.subscriptions)));
+        self.next_stream_id = Arc::new(Mutex::new(next_stream_number(&data.opens)));
+        self.next_poke_order = Arc::new(Mutex::new(next_poke_order(&data.pokes)));
+        self.stream_subscriptions = Arc::new(Mutex::new(subscriptions));
+        self.stream_pokes = Arc::new(Mutex::new(data.pokes));
+        self.stream_selections = Arc::new(Mutex::new(selections));
+        self.stream_state_path = Some(path);
         self
     }
 
@@ -4575,9 +4622,10 @@ async fn nodes_unpair(
 // Threads are sessions (thread_id == session_id); the static
 // /chat/history seed is untouched. Message indices are stored
 // positions (oldest-first), stable across tombstones; views
-// hide deleted turns but report stored indices. Stream,
-// subscribe, stream-events, poke, cancel, and sxs.select are
-// excluded (see the Task 18 plan).
+// hide deleted turns but report stored indices. The stream
+// form (subscribe, stream-events, cancel, stream, poke,
+// sxs.select) is covered separately in Task 20; see
+// stream_store.rs.
 
 fn chat_turn_view(thread_id: &str, index: usize, turn: &SessionTurn) -> serde_json::Value {
     serde_json::json!({
@@ -4821,6 +4869,317 @@ async fn chat_search(
         }
     }
     Json(matches).into_response()
+}
+
+// --- Chat stream surface (Task 20, stream form subset) ---
+//
+// Local semantics only (see stream_store.rs and the Task 20
+// plan): subscribe + stream-events as a long-poll record
+// channel over a thread's visible turns, thread-level
+// cancel, subscription-style stream open, poke event
+// injection, and record-only sxs.select. Events are a
+// projection, not a live token stream; cancel stops
+// delivery, never an in-flight model call.
+
+fn stream_thread_exists(state: &AppState, thread_id: &str) -> bool {
+    let sessions = state.sessions.lock().expect("session lock");
+    sessions.get(thread_id).is_some_and(|r| !r.deleted)
+}
+
+fn stream_thread_turns(state: &AppState, thread_id: &str) -> Option<Vec<SessionTurn>> {
+    let sessions = state.sessions.lock().expect("session lock");
+    let record = sessions.get(thread_id)?;
+    if record.deleted {
+        return None;
+    }
+    Some(record.turns.clone())
+}
+
+fn stream_thread_pokes(state: &AppState, thread_id: &str) -> Vec<StreamPoke> {
+    state
+        .stream_pokes
+        .lock()
+        .expect("stream pokes lock")
+        .iter()
+        .filter(|p| p.thread_id == thread_id)
+        .cloned()
+        .collect()
+}
+
+fn persist_stream_line(state: &AppState, line: &StreamLine) {
+    let Some(path) = &state.stream_state_path else {
+        return;
+    };
+    append_stream_line(path, line);
+}
+
+fn stream_event_view(event: &crate::stream_store::ProjectedEvent) -> serde_json::Value {
+    serde_json::json!({
+        "id": event.id,
+        "type": event.event_type,
+        "turn_index": event.turn_index,
+        "text": event.text,
+        "created_ms": event.created_ms,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamThreadDto {
+    thread_id: String,
+}
+
+async fn chat_subscribe(
+    State(state): State<AppState>,
+    Json(req): Json<StreamThreadDto>,
+) -> impl IntoResponse {
+    let Some(turns) = stream_thread_turns(&state, &req.thread_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown thread" })))
+            .into_response();
+    };
+    let pokes = stream_thread_pokes(&state, &req.thread_id);
+    let events = project_thread_events(&turns, &pokes, &req.thread_id);
+    let cursor = last_event_id(&events);
+    let mut id_guard = state.next_subscription_id.lock().expect("subscription id lock");
+    let number = *id_guard;
+    *id_guard += 1;
+    drop(id_guard);
+    let record = StreamSubscription {
+        subscription_id: format!("sub-{number}"),
+        thread_id: req.thread_id.clone(),
+        created_ms: now_ms(),
+        cancelled: false,
+    };
+    state
+        .stream_subscriptions
+        .lock()
+        .expect("stream subscriptions lock")
+        .insert(record.subscription_id.clone(), record.clone());
+    persist_stream_line(&state, &StreamLine::Subscription(record.clone()));
+    Json(serde_json::json!({
+        "subscription_id": record.subscription_id,
+        "thread_id": record.thread_id,
+        "cursor": cursor,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamEventsDto {
+    subscription_id: String,
+    cursor: Option<String>,
+    wait_ms: Option<u64>,
+}
+
+async fn chat_stream_events(
+    State(state): State<AppState>,
+    Json(req): Json<StreamEventsDto>,
+) -> impl IntoResponse {
+    let cursor = req.cursor.clone().unwrap_or_default();
+    let wait = req.wait_ms.unwrap_or(0).min(25_000);
+    let Some(subscription) = state
+        .stream_subscriptions
+        .lock()
+        .expect("stream subscriptions lock")
+        .get(&req.subscription_id)
+        .cloned()
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown subscription" })),
+        )
+            .into_response();
+    };
+    if subscription.cancelled {
+        return Json(serde_json::json!({
+            "subscription_id": subscription.subscription_id,
+            "cursor": cursor,
+            "events": [],
+            "cancelled": true,
+        }))
+        .into_response();
+    }
+    // Long-poll mirroring files_subscribe: re-check each
+    // round so a cancel or a new turn lands promptly.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(wait);
+    loop {
+        let cancelled = state
+            .stream_subscriptions
+            .lock()
+            .expect("stream subscriptions lock")
+            .get(&req.subscription_id)
+            .is_some_and(|s| s.cancelled);
+        if cancelled {
+            return Json(serde_json::json!({
+                "subscription_id": subscription.subscription_id,
+                "cursor": cursor,
+                "events": [],
+                "cancelled": true,
+            }))
+            .into_response();
+        }
+        let Some(turns) = stream_thread_turns(&state, &subscription.thread_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "unknown thread" })),
+            )
+                .into_response();
+        };
+        let pokes = stream_thread_pokes(&state, &subscription.thread_id);
+        let events = project_thread_events(&turns, &pokes, &subscription.thread_id);
+        match events_after(&events, &cursor) {
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "unknown cursor" })),
+                )
+                    .into_response();
+            }
+            Some(delivered) if !delivered.is_empty() || wait == 0 => {
+                let next_cursor = delivered
+                    .last()
+                    .map(|e| e.id.clone())
+                    .unwrap_or(cursor.clone());
+                return Json(serde_json::json!({
+                    "subscription_id": subscription.subscription_id,
+                    "cursor": next_cursor,
+                    "events": delivered.iter().map(stream_event_view).collect::<Vec<_>>(),
+                    "cancelled": false,
+                }))
+                .into_response();
+            }
+            Some(_) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Json(serde_json::json!({
+                        "subscription_id": subscription.subscription_id,
+                        "cursor": cursor,
+                        "events": [],
+                        "cancelled": false,
+                    }))
+                    .into_response();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+async fn chat_cancel(
+    State(state): State<AppState>,
+    Json(req): Json<StreamThreadDto>,
+) -> impl IntoResponse {
+    if !stream_thread_exists(&state, &req.thread_id) {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown thread" })))
+            .into_response();
+    }
+    let mut cancelled_lines = Vec::new();
+    let mut count = 0;
+    {
+        let mut subscriptions = state.stream_subscriptions.lock().expect("stream subscriptions lock");
+        for subscription in subscriptions
+            .values_mut()
+            .filter(|s| s.thread_id == req.thread_id && !s.cancelled)
+        {
+            subscription.cancelled = true;
+            count += 1;
+            cancelled_lines.push(StreamLine::Subscription(subscription.clone()));
+        }
+    }
+    for line in &cancelled_lines {
+        persist_stream_line(&state, line);
+    }
+    Json(serde_json::json!({
+        "thread_id": req.thread_id,
+        "cancelled_subscriptions": count,
+    }))
+    .into_response()
+}
+
+async fn chat_stream_open(
+    State(state): State<AppState>,
+    Json(req): Json<StreamThreadDto>,
+) -> impl IntoResponse {
+    if !stream_thread_exists(&state, &req.thread_id) {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown thread" })))
+            .into_response();
+    }
+    let mut id_guard = state.next_stream_id.lock().expect("stream id lock");
+    let number = *id_guard;
+    *id_guard += 1;
+    drop(id_guard);
+    let record = StreamOpen {
+        stream_id: format!("stream-{number}"),
+        thread_id: req.thread_id.clone(),
+        created_ms: now_ms(),
+    };
+    persist_stream_line(&state, &StreamLine::StreamOpen(record.clone()));
+    Json(serde_json::json!({
+        "stream_id": record.stream_id,
+        "thread_id": record.thread_id,
+    }))
+    .into_response()
+}
+
+async fn chat_poke(
+    State(state): State<AppState>,
+    Json(req): Json<StreamThreadDto>,
+) -> impl IntoResponse {
+    if !stream_thread_exists(&state, &req.thread_id) {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown thread" })))
+            .into_response();
+    }
+    let mut order_guard = state.next_poke_order.lock().expect("poke order lock");
+    let order = *order_guard;
+    *order_guard += 1;
+    drop(order_guard);
+    let record = StreamPoke { thread_id: req.thread_id.clone(), created_ms: now_ms(), order };
+    state.stream_pokes.lock().expect("stream pokes lock").push(record.clone());
+    persist_stream_line(&state, &StreamLine::Poke(record.clone()));
+    Json(serde_json::json!({
+        "thread_id": record.thread_id,
+        "event_id": format!("poke:{order}"),
+        "created_ms": record.created_ms,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct SxsSelectDto {
+    thread_id: String,
+    index: usize,
+}
+
+async fn chat_sxs_select(
+    State(state): State<AppState>,
+    Json(req): Json<SxsSelectDto>,
+) -> impl IntoResponse {
+    let Some(turns) = stream_thread_turns(&state, &req.thread_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown thread" })))
+            .into_response();
+    };
+    let Some(turn) = turns.get(req.index) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown turn" })))
+            .into_response();
+    };
+    if turn.deleted {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown turn" })))
+            .into_response();
+    }
+    let record = SxsSelection {
+        thread_id: req.thread_id.clone(),
+        index: req.index,
+        updated_ms: now_ms(),
+    };
+    state
+        .stream_selections
+        .lock()
+        .expect("stream selections lock")
+        .insert(req.thread_id.clone(), record.clone());
+    persist_stream_line(&state, &StreamLine::SxsSelect(record.clone()));
+    Json(serde_json::json!({
+        "thread_id": req.thread_id,
+        "index": req.index,
+    }))
+    .into_response()
 }
 
 // --- Feed surface (Task 17, unit subset) ---
@@ -6125,6 +6484,12 @@ pub fn app(state: AppState) -> Router {
         .route("/chat/message", get(chat_message))
         .route("/chat/history-window", get(chat_history_window))
         .route("/chat/search", get(chat_search))
+        .route("/chat/subscribe", post(chat_subscribe))
+        .route("/chat/stream-events", post(chat_stream_events))
+        .route("/chat/cancel", post(chat_cancel))
+        .route("/chat/stream", post(chat_stream_open))
+        .route("/chat/poke", post(chat_poke))
+        .route("/api/chat/sxs/select", post(chat_sxs_select))
         .route("/api/nodes/register", post(nodes_register))
         .route("/api/nodes/list", post(nodes_list))
         .route("/api/nodes/heartbeat", post(nodes_heartbeat))

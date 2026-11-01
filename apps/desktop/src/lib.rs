@@ -28,6 +28,7 @@ pub mod space_client;
 pub mod feed_client;
 pub mod chat_records_client;
 pub mod node_client;
+pub mod stream_client;
 pub mod credential_store;
 pub mod egress;
 pub mod retry;

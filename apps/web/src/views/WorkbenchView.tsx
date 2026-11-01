@@ -12,6 +12,7 @@ import type {
   ChatRecordsGateway,
   SearchMatch,
 } from "../domain/chat_records_client";
+import type { StreamEvent, StreamGateway } from "../domain/stream_client";
 import { LoopReminderApproval } from "./LoopReminderApproval";
 
 // Workbench (Round 3, 3a+3b): one list on the left, a timeline in
@@ -90,11 +91,12 @@ export interface WorkbenchViewProps {
   agent: AgentGateway;
   files: FileGateway;
   chatRecords: ChatRecordsGateway;
+  streams: StreamGateway;
   onNavigate: (tab: "tasks" | "loops" | "files") => void;
 }
 
 export function WorkbenchView(props: WorkbenchViewProps) {
-  const { sessions, tasks, loops, agent, files, chatRecords, onNavigate } = props;
+  const { sessions, tasks, loops, agent, files, chatRecords, streams, onNavigate } = props;
   const [items, setItems] = useState<WorkItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -130,6 +132,15 @@ export function WorkbenchView(props: WorkbenchViewProps) {
   const [searchResults, setSearchResults] = useState<SearchMatch[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
+  // Chat stream (Task 20): subscription + event replay for the
+  // current session. Events are a record projection, not a
+  // live token stream; the copy below says so.
+  const [streamSubscriptionId, setStreamSubscriptionId] = useState<string | null>(null);
+  const [streamCursor, setStreamCursor] = useState<string | null>(null);
+  const [streamEvents, setStreamEvents] = useState<StreamEvent[]>([]);
+  const [streamCancelled, setStreamCancelled] = useState(false);
+  const [streamNotice, setStreamNotice] = useState("");
+  const [streamBusy, setStreamBusy] = useState(false);
   const selectionToken = useRef(0);
 
   // 详情查询与显式操作共用同一快照更新列表，避免已执行项仍被标为待审批。
@@ -404,6 +415,69 @@ export function WorkbenchView(props: WorkbenchViewProps) {
       setSearchResults(null);
     } finally {
       setSearching(false);
+    }
+  }
+
+  // Switching sessions drops the stream view: subscriptions
+  // belong to one thread, and the event list must not leak
+  // across threads.
+  useEffect(() => {
+    setStreamSubscriptionId(null);
+    setStreamCursor(null);
+    setStreamEvents([]);
+    setStreamCancelled(false);
+    setStreamNotice("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionDetail?.sessionId]);
+
+  async function subscribeStream() {
+    if (!sessionDetail) return;
+    setStreamNotice("");
+    setStreamBusy(true);
+    try {
+      const sub = await streams.subscribe(sessionDetail.sessionId);
+      setStreamSubscriptionId(sub.subscriptionId);
+      setStreamCancelled(false);
+      // Replay from the start so the user sees the projection;
+      // later pulls use the cursor and only fetch new events.
+      const replay = await streams.streamEvents(sub.subscriptionId, null, null);
+      setStreamEvents(replay.events);
+      setStreamCursor(replay.cursor);
+      setStreamNotice(`已订阅，订阅号 ${sub.subscriptionId}。`);
+    } catch (e) {
+      setDetailError(errText(e));
+    } finally {
+      setStreamBusy(false);
+    }
+  }
+
+  async function pullStreamEvents() {
+    if (!streamSubscriptionId) return;
+    setStreamBusy(true);
+    try {
+      const page = await streams.streamEvents(streamSubscriptionId, streamCursor, null);
+      setStreamEvents((previous) => [...previous, ...page.events]);
+      setStreamCursor(page.cursor);
+      setStreamCancelled(page.cancelled);
+      if (page.cancelled) setStreamNotice("该订阅已取消，不再投递事件。");
+    } catch (e) {
+      setDetailError(errText(e));
+    } finally {
+      setStreamBusy(false);
+    }
+  }
+
+  async function cancelStream() {
+    if (!sessionDetail) return;
+    setStreamNotice("");
+    try {
+      const result = await streams.cancel(sessionDetail.sessionId);
+      setStreamCancelled(true);
+      setStreamNotice(
+        `已取消 ${result.cancelledSubscriptions} 个订阅。取消只停事件投递，不中断模型调用。`,
+      );
+    } catch (e) {
+      setDetailError(errText(e));
     }
   }
 
@@ -721,6 +795,38 @@ export function WorkbenchView(props: WorkbenchViewProps) {
                       <button type="button" onClick={() => void openSearchResult(match)}>打开会话</button>
                     </div>
                   ))}
+                </div>
+              )}
+              <p className="note">流事件是记录重放，不是实时 token 流。</p>
+              <div className="row">
+                <button type="button" onClick={() => void subscribeStream()} disabled={streamBusy}>
+                  订阅流事件
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void pullStreamEvents()}
+                  disabled={streamBusy || !streamSubscriptionId}
+                >
+                  拉取新事件
+                </button>
+                <button type="button" onClick={() => void cancelStream()}>
+                  取消订阅
+                </button>
+              </div>
+              {streamNotice && <p className="note">{streamNotice}</p>}
+              {streamSubscriptionId && (
+                <div className="messages">
+                  {streamEvents.length === 0 && <p className="empty">暂无流事件。</p>}
+                  {streamEvents.map((event) => (
+                    <div key={event.id} className="message">
+                      <div className="role">
+                        {event.type}
+                        {event.turnIndex !== null ? ` · turn ${event.turnIndex}` : ""}
+                      </div>
+                      {event.text && <div className="text">{event.text}</div>}
+                    </div>
+                  ))}
+                  {streamCancelled && <p className="note">该订阅已取消。</p>}
                 </div>
               )}
               {sessionDetail.turns.filter((turn) => !turn.deleted).length === 0 && (

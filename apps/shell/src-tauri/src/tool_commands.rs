@@ -41,6 +41,10 @@ use agent_desktop::chat_records_client::{
     UnreadCount,
 };
 use agent_desktop::node_client::{Node, NodeClient};
+use agent_desktop::stream_client::{
+    StreamCancelResult, StreamClient, StreamEvents, StreamOpen, StreamPoke, StreamSubscription,
+    SxsSelection,
+};
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
@@ -1059,4 +1063,49 @@ pub fn node_disconnect(node_id: String) -> Result<Node, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn node_unpair(node_id: String) -> Result<Node, String> {
     node_client()?.unpair_node(&node_id).map_err(agent_err_string)
+}
+
+// --- Chat stream surface (Task 20, stream form subset) ---
+//
+// All commands carry rename_all = "snake_case" (Task 9
+// lesson): the invoke client sends snake_case params.
+
+fn stream_client() -> Result<StreamClient, String> {
+    StreamClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn chat_subscribe(thread_id: String) -> Result<StreamSubscription, String> {
+    stream_client()?.subscribe(&thread_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn chat_stream_events(
+    subscription_id: String,
+    cursor: Option<String>,
+    wait_ms: Option<u64>,
+) -> Result<StreamEvents, String> {
+    stream_client()?
+        .stream_events(&subscription_id, cursor.as_deref(), wait_ms)
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn chat_cancel(thread_id: String) -> Result<StreamCancelResult, String> {
+    stream_client()?.cancel(&thread_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn chat_stream_open(thread_id: String) -> Result<StreamOpen, String> {
+    stream_client()?.open_stream(&thread_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn chat_poke(thread_id: String) -> Result<StreamPoke, String> {
+    stream_client()?.poke(&thread_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn chat_sxs_select(thread_id: String, index: usize) -> Result<SxsSelection, String> {
+    stream_client()?.sxs_select(&thread_id, index).map_err(agent_err_string)
 }

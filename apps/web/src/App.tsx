@@ -41,6 +41,8 @@ import { ChatRecordsClient, type ChatRecordsGateway } from "./domain/chat_record
 import { InvokeChatRecordsClient } from "./domain/invoke_chat_records_client";
 import { NodeClient, type NodeGateway } from "./domain/node_client";
 import { InvokeNodeClient } from "./domain/invoke_node_client";
+import { StreamClient, type StreamGateway } from "./domain/stream_client";
+import { InvokeStreamClient } from "./domain/invoke_stream_client";
 import { FeedView } from "./views/FeedView";
 import {
   TaskClient,
@@ -111,6 +113,7 @@ interface Clients {
   feed: FeedGateway;
   chatRecords: ChatRecordsGateway;
   nodes: NodeGateway;
+  streams: StreamGateway;
 }
 
 type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "peers" | "spaces" | "feed" | "settings";
@@ -195,6 +198,7 @@ export function App() {
           feed: new InvokeFeedClient(),
           chatRecords: new InvokeChatRecordsClient(),
           nodes: new InvokeNodeClient(),
+          streams: new InvokeStreamClient(),
         };
         transportName = "invoke (Rust client)";
       } catch {
@@ -216,6 +220,7 @@ export function App() {
           feed: new FeedClient(MOCK_BASE_URL),
           chatRecords: new ChatRecordsClient(MOCK_BASE_URL),
           nodes: new NodeClient(MOCK_BASE_URL),
+          streams: new StreamClient(MOCK_BASE_URL),
         };
         transportName = "http (browser preview)";
       }
@@ -482,6 +487,7 @@ export function App() {
             agent={clients.agent}
             files={clients.files}
             chatRecords={clients.chatRecords}
+            streams={clients.streams}
             onNavigate={(target) => setTab(target)}
           />
         ))}
