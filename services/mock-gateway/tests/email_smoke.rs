@@ -4,7 +4,7 @@
 //! stands in for Mail.app on this Linux VM; the packaged
 //! Mac app uses the AppleScript source instead.
 
-use mock_gateway::mail_source::MockMailSource;
+use mock_gateway::mail_source::{MockMailSource, UnavailableMailSource};
 use mock_gateway::server::{app, AppState};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -121,9 +121,16 @@ async fn email_smoke() {
 
 #[tokio::test]
 async fn email_unavailable_smoke() {
-    // Default state (no mail source override) answers 501
-    // on every email route, never fake data.
-    let (addr, handle) = start_server(AppState::default()).await;
+    // The unavailable source is injected explicitly:
+    // AppState::default() goes through from_deepseek_config,
+    // which installs the AppleScript source on macOS (and
+    // that source answers 502 when Mail is not running),
+    // so a bare Default would assert 501 on Linux/Windows
+    // but 502 on macOS. Explicit injection keeps this test
+    // platform-independent: every email route answers 501,
+    // never fake data.
+    let state = AppState::default().with_mail_source(Arc::new(UnavailableMailSource));
+    let (addr, handle) = start_server(state).await;
     let (status, body) = call(addr, "GET", "/api/email/mailbox").await;
     assert_eq!(status, 501);
     assert!(body["error"].as_str().unwrap_or("").contains("unavailable"));
