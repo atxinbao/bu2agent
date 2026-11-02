@@ -8,6 +8,8 @@
 - 当前实现：Tauri 2 + Rust 客户端/网关 + React/Vite/TypeScript 前端 + Mock Gateway
 - 参考来源：Muse、Ambi、DSH-superagent 的逆向和源码研究
 
+本文保留 `Goal`、`Project`、`Workspace`、`Task` 等通用产品词，但它们不是一棵严格的父子树。规范关系是：`Goal / Project → Task → Execution`；`Workspace` 是 Execution 使用的资源与权限边界；`Policy` 横向约束整个流程。
+
 ## 1. 结论先行
 
 `bu2agent` 不应只是“带工具调用的聊天客户端”，而应成为：
@@ -71,103 +73,120 @@ Agent 应安静工作，只在以下情况打扰用户：需要授权、需要�
 
 ## 3. PA 核心领域模型
 
-### 3.1 Goal、Project、Workspace
+### 3.1 关系总图
 
 ```text
-Goal
-  └── Project
-        └── Workspace
-              ├── Worktree
-              ├── Session
-              ├── Files
-              ├── Policy
-              └── Tasks / Executions / Artifacts
+Goal ───────────────┐
+                    ▼
+Project? ────────► Task
+                    │
+                    │ 1..N attempts
+                    ▼
+                Execution
+                    ├── Workspace Snapshot
+                    ├── Session / Worker Session
+                    ├── Loop Driver
+                    ├── Worktree?
+                    ├── Effects
+                    ├── Artifacts
+                    └── Evidence
+
+Policy / Mandate / Approval
+    └── 横向约束 Task、Workspace、Execution 和 Effect
 ```
 
-- **Goal**：用户长期想达成的目标，可以生成多个 Task。
-- **Project**：用户理解的长期工作对象，例如一个代码仓库或研究主题。
-- **Workspace**：Agent 可以访问的资源、权限和上下文边界。
-- **Worktree**：一次执行实际使用的目录、Git 分支、容器或沙箱。
-- **Session**：某个 Agent 的上下文和交互历史。
+这不是严格的父子树：Goal 和 Project 是 Task 的关联上下文，Workspace 是 Execution 的工作边界，Policy 是横向治理机制。
 
-`Project / Workspace / Worktree` 是当前 `bu2agent` 重要的结构缺口。没有这层，Agent 只能在“文件根 + Session”上工作，无法可靠表达工程边界、并行执行、分支隔离和代码变更审查。
+### 3.2 Goal
 
-### 3.2 Task / Ticket
+Goal 是用户希望达成的结果，回答“为什么做”。它可以产生多个 Task，也可以跨越多个 Project 和 Workspace。
 
-Task 表达“要完成什么”，不表达某一次工具调用。一个 Task 可以有多次 Execution：
+```text
+Goal：让 bu2agent 成为可恢复的个人 Agent 平台
+```
+
+Goal 不负责文件目录、工具调用、审批或模型会话。当前 README 中的目标记录是项目元数据，未来才需要成为可关联多个 Task 的领域对象。
+
+### 3.3 Project
+
+Project 是一个稳定的工作主题或工程对象，回答“关于什么”。例如 `bu2agent`、家庭旅行或个人财务。
+
+Project 不是 Goal 的下级容器，也不是文件夹。Task 可以属于 Project，也可以没有 Project；一个 Goal 可以跨多个 Project。当前仓库本身可以作为第一个 Project，但不需要为了建模立即引入完整 Project 表。
+
+### 3.4 Workspace
+
+Workspace 是 Agent 工作时使用的资源、上下文和权限边界，回答“在哪里、基于什么工作”。它可以包含：
+
+```text
+Workspace
+├── file roots
+├── repository bindings
+├── connector / device bindings
+├── instructions
+├── memory scope
+└── policy bindings
+```
+
+当前 `MOCK_FILES_ROOT`、文件作用域、Connector Egress、Device 权限和部分 Policy Scope，都是 Workspace 的分散组成部分。Workspace 不是当前的 `Space`、文件目录、Git Worktree、Session 或 Loop。
+
+一次 Execution 使用的是 Workspace 的不可变快照；这样 Workspace 后续变更不会改写历史执行的权限边界。
+
+### 3.5 Task
+
+Task 是可执行、可追踪、可验证的工作单元，回答“具体要完成什么”。它是 Goal、Project、Workspace 和 Execution 之间的连接点。
+
+```text
+Task
+├── goal_id?
+├── project_id?
+├── workspace_id?
+├── desired outcome
+├── acceptance criteria
+├── status
+└── executions
+```
+
+Task 不等于一次执行。一个 Task 可以有多次 Execution：
 
 ```text
 Task
   ├── Execution 1：失败
-  ├── Execution 2：需要用户补充信息
+  ├── Execution 2：等待审批
   └── Execution 3：完成并通过验证
 ```
 
-建议状态：
+Task 建议使用较粗粒度的状态：
 
 ```text
-created → admitted → planned → queued → running
-  → awaiting_input | awaiting_approval | awaiting_review
-  → blocked | completed | failed | cancelled
+created → active → blocked → completed | failed | cancelled
 ```
 
-拒绝某个操作不应自动删除 Task；Task 的完成必须由产物或验证证据确认，不能只由模型最后一句话确认。
+`draft_ready`、`awaiting_approval` 等更细状态应逐步移动到 Execution 或 Effect。
 
-### 3.3 Mandate / Policy / Permission / Approval
+### 3.6 Execution、Session、Loop、Worktree
 
-授权至少分为以下层次：
+- **Execution**：一个 Task 的一次具体、可恢复的执行尝试，是运行时中心；
+- **Session**：当前项目中的持久化聊天上下文，未来通过类型区分 conversation session 和 worker session；
+- **Loop**：模型驱动工具循环，是一种 Execution Driver，不应永久作为与 Task 并列的业务对象；
+- **Worktree**：代码类 Execution 使用的具体 Git 工作树、目录、容器或沙箱，不等于 Workspace。
 
-1. **Admission**：请求是否允许进入系统；
-2. **Mandate**：该 Task 允许达成什么目标；
-3. **Capability**：可使用哪些能力以及作用域；
-4. **Approval**：某个具体副作用是否由用户批准；
-5. **System Permission**：macOS TCC 等系统权限是否允许；
-6. **Credential Access**：是否允许使用某个账号或密钥；
-7. **Delivery Permission**：结果是否可以发给外部对象。
-
-Mandate 不是 Prompt，而是可审计的授权快照：
-
-```text
-mandate_id
-task_id
-policy_version
-allowed_capabilities
-allowed_scopes
-forbidden_actions
-approval_mode
-budget / deadline
-actor
-created_at / expires_at
-```
-
-当前文件写入、连接器写入和提醒事项写入已经验证了“客户端门 + 服务端复核 + 操作绑定”的方向。下一步应把它们统一为版本化 Policy 和 Mandate，而不是继续为每个功能单独实现审批。
-
-### 3.4 Execution / Assignment / Worker Session
+目标关系：
 
 ```text
 Task
   └── Execution
-        ├── Assignment
-        ├── WorkerSession
-        ├── Worktree
+        ├── Workspace Snapshot
+        ├── Session / Worker Session
+        ├── Loop Driver
+        ├── Worktree?
         ├── Effects
         ├── Checkpoints
         └── Reports
 ```
 
-- **Execution**：一次可恢复的执行尝试；
-- **Assignment**：将执行交给哪个 Worker；
-- **WorkerSession**：模型、子进程或其他运行时的实际工作会话；
-- **Checkpoint**：执行中可恢复的进度；
-- **Report**：Worker 对结果、阻塞和下一步的结构化报告。
+### 3.7 Effect、Artifact、Evidence
 
-当前 Task Runner 和 Loop Engine 各自拥有状态机。目标架构要求两者最终都落到统一 Execution 上，避免任务、模型循环、设备动作和连接器调用分别发明不同的生命周期。
-
-### 3.5 Effect / Artifact / CodeChange / Evidence
-
-所有外部副作用都必须成为 Effect，例如文件写入、Git 操作、邮件发送、日历修改、提醒事项修改、设备控制和外部 API 调用。
-
-Effect 至少需要记录：
+所有外部副作用都应成为 Effect，例如文件写入、提醒事项修改、连接器写入、Git 操作和设备控制。
 
 ```text
 effect_id
@@ -189,7 +208,20 @@ reconciliation
 - **Evidence**：测试结果、真实状态读取和验证摘要；
 - **Report**：面向用户的结论和下一步。
 
-### 3.6 Inbox / Attention / Delivery
+### 3.8 Space、Workbench 和 Inbox
+
+当前 `Space` 是保存 Session、File 等引用的命名集合，不是 Workspace：
+
+```text
+Space
+  └── saved references
+        ├── sessions
+        ├── files
+        ├── tasks
+        └── artifacts
+```
+
+Workbench 是 Session、Task、Loop/Execution 的统一 UI 投影，不是真实领域实体。当前视图中的 `WorkItem` 也是 UI 联合类型，后续应避免与领域 Task 混淆。
 
 Inbox 是用户真正需要处理的事项，而不是所有事件的转储：
 
@@ -204,7 +236,21 @@ unknown_requires_reconciliation
 conflict
 ```
 
-每个 Inbox 项目应支持 approve、reject、edit、answer、retry、reconcile、snooze 和 dismiss。Workbench 只负责展示和触发命令；选择项目本身不能隐式批准或恢复执行。
+选择 Workbench 项目或 Inbox 项目不能隐式批准或恢复执行。
+
+### 3.9 Policy、Mandate、Permission、Approval
+
+授权至少分为：
+
+1. Admission：请求是否进入系统；
+2. Mandate：Task/Execution 允许达成什么目标；
+3. Capability：可以使用哪些能力以及作用域；
+4. Approval：具体 Effect 是否由用户批准；
+5. System Permission：macOS TCC 等系统权限；
+6. Credential Access：是否可以使用某个账号或密钥；
+7. Delivery Permission：结果是否可以发给外部对象。
+
+Policy 是可继承的长期规则，Mandate 是 Task/Execution 的授权快照，Approval 绑定某一个具体 Effect。当前文件、连接器和提醒事项已经验证了“客户端门 + 服务端复核 + 操作绑定”的方向。
 
 ## 4. 统一执行生命周期
 
@@ -215,15 +261,17 @@ Source/Event
   → Intake
   → Admission
   → Task + Mandate
-  → Plan
+  → Workspace selection
   → Execution / Assignment
+  → Loop / Worker
   → Effect
   → Approval / Permission
-  → Worker / Tool
   → Verification
   → Report / Artifact
   → Delivery / Attention
 ```
+
+纯聊天可以停在 Conversation/Session，不必把每个只读问题都强行创建为 Task。只有当用户请求持续工作、外部副作用或可交付产物时，才创建 Task 和 Execution。
 
 ### 4.2 Effect 状态
 
@@ -258,6 +306,20 @@ planned → authorized → started
 
 当前 JSONL 已经验证了普通停服重启场景，但不等同于断电耐久的事务事件日志。目标架构应逐步迁移到 SQLite 事务状态 + 事件/Outbox 表，保留脱敏审计视图。
 
+### 4.4 当前实现到目标模型的映射
+
+| 当前实现 | 目标含义 | 调整方向 |
+| --- | --- | --- |
+| `TaskFileRecord` / `TaskRunner` | Task 加上部分执行状态 | 保留 Task，逐步把 `draft_ready` 和执行字段移到 Execution |
+| `LoopRecord` / `LoopEngine` | 一次 Execution 的模型循环 | 让 Loop 成为 Execution Driver，而不是长期并列的业务实体 |
+| `CallRecord` | Effect | 增加统一 `execution_id`、幂等和 Reconciliation |
+| `DeviceActionRecord` | Effect | 与文件、连接器写操作共享生命周期 |
+| Connector 写操作 | Effect | 记录 Task/Execution、作用域和交付结果 |
+| `ApprovalState` | Effect Approval | 保留参数摘要、操作摘要和消费语义 |
+| `SessionRecord` | Conversation Session | 关联 Task/Execution，但不作为执行状态本身 |
+| `Space` | Saved Collection | 保持独立，不改作 Workspace |
+| `MOCK_FILES_ROOT` 等全局边界 | Workspace Resource Binding | 逐步收敛成 Workspace |
+
 ## 5. 运行时分层
 
 ```text
@@ -288,43 +350,79 @@ Tools / Connectors / Devices / Model Providers
 
 这延续了 Muse 的统一 Gateway、Ambi 的长生命周期 Native Runtime 和 DSH 的 Engine/Store/Effects/SourceRegistry 分层，但不把任何一个逆向产品的服务端 schema 当作已验证事实。
 
-## 6. DSH 到 bu2agent 的映射
+## 6. DSH 到 bu2agent 的映射规则与边界
 
-| DSH | bu2agent 目标对象 |
-| --- | --- |
-| Source | Connector、Device、Local Watcher、Scheduler |
-| Trigger | Durable Event / Incoming Event |
-| Thread | Conversation、Project Context、External Thread |
-| Eval | Admission / Intent Evaluation |
-| Ticket | Task / Work Item |
-| Mandate | Task Authority / Policy Snapshot |
-| Assignment | Execution Assignment |
-| Worker | Agent Worker / Process / Model Session |
-| Report | Execution Report |
-| Attention | Inbox Item |
-| Channel | Delivery Target |
-| Policy | Permission Policy |
-| Effects | Durable External Effects |
-| Outbox | Delivery and Effect Outbox |
-| SourceRegistry | Connector and Device Registry |
-| HealthBoard | Runtime Health and Dependency Status |
+DSH 的映射不是同名替换，也不是把 DSH 源码复制进来。只有满足以下规则才吸收一个 DSH 概念：
 
-DSH 最值得迁移的是：
+1. **责任相同**：两个对象解决的是同一个业务问题；
+2. **边界相同**：状态、权限和数据的所有者一致；
+3. **生命周期保留**：映射后仍保留等待、失败、unknown、迟到和恢复语义；
+4. **授权不扩大**：外部消息和模型输出不能通过映射获得新权限；
+5. **适配本地单用户**：团队身份、GitHub/飞书特定规则不能直接成为 PA 核心；
+6. **可以独立验收**：每个吸收项必须有契约、失败路径和恢复验收。
+
+### 6.1 概念映射
+
+| DSH | `bu2agent` 规范对象 | 当前状态 |
+| --- | --- | --- |
+| Source | Connector、Device、File Watcher、Scheduler | 尚未统一 |
+| Trigger | Event / Incoming Event | 尚未形成统一事件模型 |
+| Eval | Admission / Intent Evaluation | 部分存在，未独立建模 |
+| Ticket | Task | 已有，但当前主要是文件报告任务 |
+| Mandate | Task/Execution 授权快照 | 尚未独立建模 |
+| Assignment | Execution Assignment | 尚未统一 |
+| Worker | Loop Worker、Task Runner、子进程 | 已有碎片 |
+| Worker Session | Worker Session | 当前 Session 主要是聊天会话 |
+| Report | Task Report、Loop Result、Device Result | 已有碎片 |
+| Attention | Workbench 待审批/待复核/失败投影 | 有 UI 投影，尚无独立 Inbox |
+| Channel | Workbench、通知、Connector Delivery | 尚未统一 |
+| Policy | Permission Policy、Connector Policy、Egress | 已有部分 |
+| Effects | CallRecord、DeviceAction、File/Connector Write | 多套实现，尚未统一 |
+| Outbox | Durable Delivery/Effect Outbox | 缺口 |
+| SourceRegistry | Connector/Device/Local Source Registry | Connector Registry 已有，未统一 |
+| Store | 当前各组 JSONL Store | 有持久化，非统一事务 Store |
+| Engine | Rust Gateway 内的协调器 | 已有碎片，未统一 |
+
+### 6.2 现在吸收什么
+
+当前吸收 DSH 的重点是四组规则：
 
 ```text
 事件接入 → 是否受理 → 生成受约束任务 → 分配 Worker
 → 持久化执行 → 产生报告 → 交付结果 → 等待下一次事件
 ```
 
-个人 PA 不应固定围绕 GitHub 或飞书，而应允许用户输入、文件变化、Git、日历、提醒事项、邮件、消息、设备、语音和定时规则成为 Source。
+具体优先级：
+
+- 现在：Task、Execution、Effect、Mandate、Recovery 的语义；
+- 下一步：SQLite 事务状态、Inbox、Outbox、租约、心跳和 Reconciliation；
+- 后续：Source、Trigger、Admission 和主动规则；
+- 暂不引入：DSH Runtime、Cordis、DeepSeek Harness、GitHub/飞书连接器和团队身份模型。
+
+DSH 设计的是团队/仓库 Agent；`bu2agent` 是本地单用户 PA。个人 PA 的 Source 将来可以包括用户输入、文件变化、Git、日历、提醒事项、邮件、消息、设备、语音和定时规则，但这些适配器不应反过来定义核心领域模型。
+
+### 6.3 是否引入 DSH-superagent
+
+当前不整体引入 DSH-superagent 代码。原因是 `bu2agent` 已经有自己的 Rust Gateway、Task Runner、Loop Engine、Device Action、Workbench 和审批体系；直接引入 DSH 会产生两套 Task/Ticket、Execution/Assignment、Session/Worker 和 Store/Engine。
+
+正确策略是：
+
+```text
+吸收 DSH 的编排规则
+  → 统一 bu2agent 已有的 Task/Loop/Device 执行模型
+    → 建立 Durable Execution
+      → 再引入 Source/Trigger/Proactive Agent
+```
 
 ## 7. 当前实现与目标设计的关系
 
 ### 7.1 已有且可作为基础的能力
 
 - Workbench 已统一展示 Session、Task、Loop；
+- `Space` 已实现为带墓碑的保存引用集合，不应误认为 Workspace；
 - Task 草稿、审批绑定、产物查看和普通重启恢复已验收；
 - Loop 已覆盖审批、预算、取消、unknown、迟到结果和恢复；
+- Device Action 已具备 unknown、重查、幂等和设备权限/Agent 审批分离语义；
 - 文件工具和 Fake/EventKit 提醒事项已形成闭环；
 - OS Keychain、客户端注册表门和服务端审批复核已有实现；
 - Tauri + Rust + React/TypeScript + Mock Gateway 主路线已建立；
@@ -332,28 +430,30 @@ DSH 最值得迁移的是：
 
 ### 7.2 主要架构缺口
 
-1. `Project / Workspace / Worktree` 尚未成为一等对象；
+1. `Goal / Project / Workspace` 尚未成为一等对象；
 2. Task、Loop、Device Action 尚未共享统一 `Execution / Effect`；
-3. Inbox、Outbox、事件游标和消费幂等尚未统一；
-4. JSONL 尚不能承担生产级事务事件日志和断电恢复；
-5. Approval 尚未升级为版本化 Policy + Mandate；
-6. Worker 进程、租约、心跳和 Checkpoint 尚未完整建立；
-7. Git、CodeChange、diff 和验证证据尚未成为一等模型；
-8. Session 上下文与长期记忆尚未分层；
-9. Connector、Device、Local Watcher 尚未统一为 Source Registry；
-10. 用户注意力和通知策略尚未由 Inbox 统一承载。
+3. 当前 `Space` 仍是保存引用集合，不能承担 Workspace 职责；
+4. Inbox、Outbox、事件游标和消费幂等尚未统一；
+5. JSONL 尚不能承担生产级事务事件日志和断电恢复；
+6. Approval 尚未升级为版本化 Policy + Mandate；
+7. Worker 进程、租约、心跳和 Checkpoint 尚未完整建立；
+8. Git、CodeChange、diff 和验证证据尚未成为一等模型；
+9. Session 上下文与长期记忆尚未分层；
+10. Connector、Device、Local Watcher 尚未统一为 Source Registry；
+11. 用户注意力和通知策略尚未由 Inbox 统一承载。
 
 ## 8. 建设路线
 
 ### P0：统一执行内核
 
-1. 增加 `Project / Workspace / Worktree`；
-2. 定义 `Execution / Assignment / WorkerSession`；
-3. 定义统一 `Effect` 和 `unknown` 语义；
-4. 让 Task Runner、Loop Engine、Device Action 共享 Execution；
-5. 建立 SQLite 事务状态、事件日志、Inbox 和 Outbox；
-6. 统一 Policy、Mandate、Approval、Permission 契约；
-7. 完成租约、幂等键、恢复和 Reconciliation 验收。
+1. 定义 `Execution`，不改变现有 Goal/Workspace/Task 用户词；
+2. 让 Task Runner 和 Loop Engine 创建 Execution；
+3. 将 `CallRecord`、Device Action、Connector/File Write 统一为 Effect；
+4. 为 Task/Execution 增加 Workspace 选择和不可变 Workspace Snapshot；
+5. 统一 Policy、Mandate、Approval、Permission 契约；
+6. 建立 SQLite 事务状态、事件日志、Inbox 和 Outbox；
+7. 完成租约、幂等键、恢复和 Reconciliation 验收；
+8. **不把 DSH Runtime、Cordis 或 Harness 作为 P0 依赖。**
 
 ### P1：可审查的工程 Agent
 

@@ -14,6 +14,7 @@
 
 - 本地单机、单用户：Tauri 2 窗口与网关运行在同一台 Mac，默认网关地址为 `127.0.0.1:3001`。尚未交付局域网访问、外部鉴权、OAuth、多用户或 Noise。回环监听限制网络入口，不意味着本机其它进程不能访问。
 - 已有 Workbench / Files / Agent / Connectors / Tasks / Devices / Loops 七个可见入口；Workbench 是唯一聊天入口，旧 Chat 代码仅保留兼容层。窗口使用 Rust invoke；浏览器开发预览使用 HTTP。连接器演示不能等同于真实邮件或 OAuth 接入。
+- 当前 `Spaces` 是保存 Session/File 等引用的命名集合；它不是 PA 架构中的 `Workspace`，后者未来负责资源、上下文和权限边界。
 - 任务闭环已验收：读取材料、生成草稿、审批写入、查看产物，普通停服重启后任务和产物恢复。
 - B 层已验收 Fake 与 EventKit 提醒事项闭环；只验证过专用提醒的显式完成状态修改，不代表任意设备均已接通。见 [设备契约与验收](services/mock-gateway/DEVICES.md)。
 - 模型循环已验收真实 DeepSeek 成功/拒绝/取消/重启，以及假模型驱动的 unknown、重复未知写、工具在途取消；文件工具支持列目录、读取、写入，提醒事项支持列出与经审批设定完成状态。见 [循环协议](services/mock-gateway/LOOP.md)。
