@@ -235,7 +235,7 @@ pub fn parse_dump(text: &str) -> (Vec<RawMessageMeta>, HashMap<String, String>) 
     // AppleScript writes `return` as a bare CR on macOS;
     // split both CR and LF so the dump format is stable
     // across the gateway and test platforms.
-    for line in text.split(|ch| ch == '\r' || ch == '\n') {
+    for line in text.split(['\r', '\n']) {
         if line.trim().is_empty() {
             continue;
         }
@@ -678,7 +678,7 @@ end timeout"#,
         let script = script.replace("__WINDOW__", &INBOX_WINDOW.to_string());
         let names = Self::run_script(&script)?;
         Ok(names
-            .split(|ch| ch == '\r' || ch == '\n')
+            .split(['\r', '\n'])
             .filter(|line| !line.trim().is_empty())
             .map(str::to_string)
             .collect())
