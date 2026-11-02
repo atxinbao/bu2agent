@@ -45,6 +45,9 @@ use agent_desktop::stream_client::{
     StreamCancelResult, StreamClient, StreamEvents, StreamOpen, StreamPoke, StreamSubscription,
     SxsSelection,
 };
+use agent_desktop::email_client::{
+    EmailClient, MailboxInfo, MailboxSetup, MessageView, ThreadView,
+};
 use agent_desktop::voice_client::{
     ActiveVoice, CatalogFilters, CatalogVoice, CustomVoice, OnboardingReset, PipelineProfile,
     PipelineSelection, VoiceClient,
@@ -1179,4 +1182,44 @@ pub fn voice_active_voice_save(voice_id: String) -> Result<ActiveVoice, String> 
 #[tauri::command(rename_all = "snake_case")]
 pub fn voice_onboarding_reset() -> Result<OnboardingReset, String> {
     voice_client()?.onboarding_reset().map_err(agent_err_string)
+}
+
+// --- Email read surface (Task 22, batch 1, option A) ---
+//
+// All commands carry rename_all = "snake_case" (Task 9
+// lesson). Reads only; the attachment command returns
+// raw bytes (Tauri serializes Vec<u8> as a number array).
+
+fn email_client() -> Result<EmailClient, String> {
+    EmailClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn email_mailbox() -> Result<MailboxInfo, String> {
+    email_client()?.mailbox().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn email_mailbox_setup() -> Result<MailboxSetup, String> {
+    email_client()?.mailbox_setup().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn email_threads_list(limit: Option<usize>, offset: Option<usize>) -> Result<Vec<ThreadView>, String> {
+    email_client()?.threads_list(limit, offset).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn email_thread_get(thread_id: String) -> Result<ThreadView, String> {
+    email_client()?.thread_get(&thread_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn email_message_get(message_id: String) -> Result<MessageView, String> {
+    email_client()?.message_get(&message_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn email_message_attachment(message_id: String, index: usize) -> Result<Vec<u8>, String> {
+    email_client()?.attachment_download(&message_id, index).map_err(agent_err_string)
 }

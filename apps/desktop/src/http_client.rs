@@ -151,6 +151,59 @@ impl HttpClient {
         Ok((status, body.to_string()))
     }
 
+    /// Raw byte request, mirroring request() but without
+    /// the UTF-8 body assumption (Task 22: attachment
+    /// downloads are arbitrary bytes, not JSON).
+    pub fn request_bytes(&self, method: &str, path: &str) -> Result<(u16, Vec<u8>)> {
+        let timeout = Duration::from_millis(self.timeout_ms);
+        let addr = format!("{}:{}", self.host, self.port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| addrs.next())
+            .ok_or_else(|| transport_error("cannot resolve mock gateway host"))?;
+        let mut stream = TcpStream::connect_timeout(&addr, timeout)
+            .map_err(|_| transport_error("cannot connect to mock gateway"))?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|_| transport_error("cannot set mock gateway read timeout"))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|_| transport_error("cannot set mock gateway write timeout"))?;
+        let req = format!("{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", self.host);
+        stream
+            .write_all(req.as_bytes())
+            .map_err(|_| transport_error("cannot write mock gateway request"))?;
+        let mut raw = Vec::new();
+        stream
+            .read_to_end(&mut raw)
+            .map_err(|_| transport_error("cannot read mock gateway response"))?;
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|pos| pos + 4)
+            .unwrap_or(raw.len());
+        let (head, body) = raw.split_at(split);
+        let head = String::from_utf8_lossy(head);
+        let status: u16 = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .ok_or_else(|| transport_error("mock gateway returned an unreadable status"))?;
+        Ok((status, body.to_vec()))
+    }
+
+    /// GET returning raw bytes (Task 22: attachments).
+    /// On a non-2xx status the error body is deliberately
+    /// not copied into the error (redaction policy).
+    pub fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        let (status, body) = self.request_bytes("GET", path)?;
+        if !(200..300).contains(&status) {
+            return Err(gateway_error(status));
+        }
+        Ok(body)
+    }
+
     pub fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let (status, body) = self.request("GET", path, None)?;
         if !(200..300).contains(&status) {

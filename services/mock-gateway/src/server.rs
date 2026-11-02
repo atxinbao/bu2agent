@@ -130,6 +130,7 @@ use crate::stream_store::{
     next_stream_number, next_subscription_number, project_thread_events, StreamLine,
     StreamOpen, StreamPoke, StreamSubscription, SxsSelection,
 };
+use crate::mail_source::{clamp_limit, MailError, MailSource, UnavailableMailSource};
 use crate::voice_store::{
     append_voice_line, catalog_locales, catalog_voices, load_voice_state,
     merged_custom_voices, pipeline_profiles, ActiveVoiceRecord, CustomVoice,
@@ -368,6 +369,7 @@ pub struct AppState {
     voice_active: Arc<Mutex<Option<String>>>,
     voice_pipeline: Arc<Mutex<Option<String>>>,
     voice_state_path: Option<PathBuf>,
+    mail_source: Arc<dyn MailSource>,
 }
 
 impl Default for AppState {
@@ -450,6 +452,14 @@ impl AppState {
         }
         if let Ok(voice_state_path) = std::env::var("MOCK_VOICE_STATE_PATH") {
             state = state.with_voice_state_path(PathBuf::from(voice_state_path));
+        }
+        // Task 22: on macOS the production mail source asks
+        // Mail.app via AppleScript; every other platform
+        // keeps the Unavailable source (501, never fake
+        // data). Tests override via with_mail_source.
+        #[cfg(target_os = "macos")]
+        {
+            state = state.with_mail_source(Arc::new(crate::mail_source::AppleScriptMailSource::new()));
         }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
@@ -585,6 +595,7 @@ impl AppState {
             voice_active: Arc::new(Mutex::new(None)),
             voice_pipeline: Arc::new(Mutex::new(None)),
             voice_state_path: None,
+            mail_source: Arc::new(UnavailableMailSource),
         }
     }
 
@@ -1127,6 +1138,14 @@ impl AppState {
         self.voice_pipeline =
             Arc::new(Mutex::new(data.pipeline_selection.and_then(|r| r.profile_id)));
         self.voice_state_path = Some(path);
+        self
+    }
+
+    /// Test seam: replace the mail source (tests use the
+    /// mock source; production macOS uses AppleScript,
+    /// other platforms keep the Unavailable source).
+    pub fn with_mail_source(mut self, source: Arc<dyn MailSource>) -> Self {
+        self.mail_source = source;
         self
     }
 
@@ -5416,6 +5435,114 @@ async fn voice_onboarding_reset(State(state): State<AppState>) -> Json<serde_jso
     Json(serde_json::json!({ "voice_id": null, "profile_id": null }))
 }
 
+// --- Email read surface (Task 22, batch 1, option A) ---
+//
+// Live queries against the configured MailSource, no
+// sync cache, no approval loop (reads). Error mapping:
+// NotFound -> 404, Unavailable -> 501, Denied -> 403,
+// Upstream -> 502. The packaged Mac app uses the
+// AppleScript source; other platforms answer 501.
+
+fn mail_error_response(err: MailError, not_found_what: &'static str) -> axum::response::Response {
+    match err {
+        MailError::NotFound(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("unknown {not_found_what}") })),
+        )
+            .into_response(),
+        MailError::Unavailable(reason) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response(),
+        MailError::Denied => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "mail automation denied" })),
+        )
+            .into_response(),
+        MailError::Upstream(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "mail source error" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn email_mailbox(State(state): State<AppState>) -> impl IntoResponse {
+    match state.mail_source.mailbox() {
+        Ok(info) => Json(serde_json::to_value(info).unwrap_or(serde_json::Value::Null)).into_response(),
+        Err(err) => mail_error_response(err, "mailbox"),
+    }
+}
+
+async fn email_mailbox_setup(State(state): State<AppState>) -> impl IntoResponse {
+    match state.mail_source.setup() {
+        Ok(info) => Json(serde_json::to_value(info).unwrap_or(serde_json::Value::Null)).into_response(),
+        Err(err) => mail_error_response(err, "mailbox"),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EmailThreadsQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+async fn email_threads_list(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<EmailThreadsQuery>,
+) -> impl IntoResponse {
+    let limit = clamp_limit(query.limit);
+    let offset = query.offset.unwrap_or(0);
+    match state.mail_source.threads(limit, offset) {
+        Ok(threads) => Json(serde_json::to_value(threads).unwrap_or(serde_json::Value::Null)).into_response(),
+        Err(err) => mail_error_response(err, "threads"),
+    }
+}
+
+async fn email_thread_get(
+    State(state): State<AppState>,
+    axum::extract::Path(thread_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.mail_source.thread(&thread_id) {
+        Ok(thread) => Json(serde_json::to_value(thread).unwrap_or(serde_json::Value::Null)).into_response(),
+        Err(err) => mail_error_response(err, "thread"),
+    }
+}
+
+async fn email_message_get(
+    State(state): State<AppState>,
+    axum::extract::Path(message_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.mail_source.message(&message_id) {
+        Ok(message) => Json(serde_json::to_value(message).unwrap_or(serde_json::Value::Null)).into_response(),
+        Err(err) => mail_error_response(err, "message"),
+    }
+}
+
+async fn email_attachment_get(
+    State(state): State<AppState>,
+    axum::extract::Path((message_id, index)): axum::extract::Path<(String, usize)>,
+) -> impl IntoResponse {
+    match state.mail_source.attachment(&message_id, index) {
+        Ok(data) => {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_str(&data.content_type)
+                    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("application/octet-stream")),
+            );
+            headers.insert(
+                axum::http::header::CONTENT_DISPOSITION,
+                axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{}\"", data.filename))
+                    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment")),
+            );
+            (headers, axum::body::Bytes::from(data.bytes)).into_response()
+        }
+        Err(err) => mail_error_response(err, "attachment"),
+    }
+}
+
 // --- Feed surface (Task 17, unit subset) ---
 //
 // Local semantics only (see feed_store.rs): Mock seed
@@ -6741,6 +6868,15 @@ pub fn app(state: AppState) -> Router {
         .route("/api/voice/active-voice", get(voice_active_voice_get))
         .route("/api/voice/active-voice", post(voice_active_voice_save))
         .route("/api/voice/onboarding/reset", post(voice_onboarding_reset))
+        .route("/api/email/mailbox", get(email_mailbox))
+        .route("/api/email/mailbox/setup", get(email_mailbox_setup))
+        .route("/api/email/threads", get(email_threads_list))
+        .route("/api/email/threads/{thread_id}", get(email_thread_get))
+        .route("/api/email/messages/{message_id}", get(email_message_get))
+        .route(
+            "/api/email/messages/{message_id}/attachments/{index}",
+            get(email_attachment_get),
+        )
         .route("/api/nodes/register", post(nodes_register))
         .route("/api/nodes/list", post(nodes_list))
         .route("/api/nodes/heartbeat", post(nodes_heartbeat))

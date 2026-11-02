@@ -40,6 +40,10 @@ import { InvokeFeedClient } from "./domain/invoke_feed_client";
 import { ChatRecordsClient, type ChatRecordsGateway } from "./domain/chat_records_client";
 import { InvokeChatRecordsClient } from "./domain/invoke_chat_records_client";
 import { InvokeVoiceClient } from "./domain/invoke_voice_client";
+import { EmailClient } from "./domain/email_client";
+import type { EmailGateway } from "./domain/email_client";
+import { InvokeEmailClient } from "./domain/invoke_email_client";
+import { MailView } from "./views/MailView";
 import { NodeClient, type NodeGateway } from "./domain/node_client";
 import { InvokeNodeClient } from "./domain/invoke_node_client";
 import { StreamClient, type StreamGateway } from "./domain/stream_client";
@@ -115,9 +119,10 @@ interface Clients {
   chatRecords: ChatRecordsGateway;
   nodes: NodeGateway;
   streams: StreamGateway;
+  email: EmailGateway;
 }
 
-type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "peers" | "spaces" | "feed" | "settings";
+type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "peers" | "spaces" | "feed" | "mail" | "settings";
 
 // Visible navigation: the workbench (sessions) is the only
 // chat entry and the default view (R1, 2026-10-28). The legacy
@@ -134,6 +139,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "peers", label: "Peers" },
   { id: "spaces", label: "Spaces" },
   { id: "feed", label: "Feed" },
+  { id: "mail", label: "Mail" },
   { id: "settings", label: "设置" },
 ];
 
@@ -200,6 +206,7 @@ export function App() {
           chatRecords: new InvokeChatRecordsClient(),
           nodes: new InvokeNodeClient(),
           streams: new InvokeStreamClient(),
+          email: new InvokeEmailClient(),
         };
         transportName = "invoke (Rust client)";
       } catch {
@@ -222,6 +229,7 @@ export function App() {
           chatRecords: new ChatRecordsClient(MOCK_BASE_URL),
           nodes: new NodeClient(MOCK_BASE_URL),
           streams: new StreamClient(MOCK_BASE_URL),
+          email: new EmailClient(MOCK_BASE_URL),
         };
         transportName = "http (browser preview)";
       }
@@ -531,6 +539,12 @@ export function App() {
           <p className="empty">Choosing transport…</p>
         ) : (
           <FeedView client={clients.feed} />
+        ))}
+      {tab === "mail" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : (
+          <MailView email={clients.email} />
         ))}
       {tab === "tasks" &&
         (clients === null ? (
