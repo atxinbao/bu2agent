@@ -496,6 +496,13 @@ end timeout"#;
 }
 
 #[cfg(target_os = "macos")]
+impl Default for AppleScriptMailSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl MailSource for AppleScriptMailSource {
     fn mailbox(&self) -> Result<MailboxInfo, MailError> {
         if !Self::mail_running() {
