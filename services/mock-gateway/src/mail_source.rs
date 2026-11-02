@@ -39,10 +39,10 @@
 //! normalized to milliseconds).
 //!
 //! Batch-1 window (option A, approved 2026-11-03): every
-//! AppleScript loop scans at most the first 200 messages
+//! AppleScript loop scans at most the first 50 messages
 //! of the inbox, in Mail's inbox order, and the metadata
-//! dump carries each message's snippet, so threads/thread
-//! need exactly one script call. Whether Mail's inbox
+//! dump carries message metadata only, so threads/thread
+//! need exactly one cheap script call. Whether Mail's inbox
 //! order is newest-first or oldest-first is unverified;
 //! window re-validation checks the returned dates and
 //! flips the range if it is wrong. Messages outside the
@@ -232,7 +232,10 @@ pub fn group_threads(
 pub fn parse_dump(text: &str) -> (Vec<RawMessageMeta>, HashMap<String, String>) {
     let mut metas = Vec::new();
     let mut snippets = HashMap::new();
-    for line in text.lines() {
+    // AppleScript writes `return` as a bare CR on macOS;
+    // split both CR and LF so the dump format is stable
+    // across the gateway and test platforms.
+    for line in text.split(|ch| ch == '\r' || ch == '\n') {
         if line.trim().is_empty() {
             continue;
         }
@@ -445,7 +448,7 @@ use std::{
 /// AppleScript loop scans at most this many messages of
 /// the inbox, in Mail's inbox order.
 #[cfg(target_os = "macos")]
-const INBOX_WINDOW: usize = 200;
+const INBOX_WINDOW: usize = 50;
 
 /// Hard cap on one `osascript` invocation (see the
 /// module docs). Expiry maps to `Upstream` (502).
@@ -553,16 +556,21 @@ impl AppleScriptMailSource {
     fn inbox_metadata(&self) -> Result<(Vec<RawMessageMeta>, HashMap<String, String>), MailError> {
         // One line per message; fields separated by
         // character id 31: id, subject, sender, recipients
-        // (comma-joined), date, snippet (first 80 chars
-        // of the body, sanitized like subject/sender).
+        // (comma-joined), and date. Do not read message
+        // content in this pass: Mail.app materializes the
+        // body lazily, and doing that for the whole window makes
+        // the thread list exceed the gateway deadline. Full
+        // body reads stay in `message`, after the user picks
+        // a concrete message.
         // The loop scans at most INBOX_WINDOW messages:
         // it enumerates `messages of inbox` (the form
         // the pre-window script already proved) and
         // exits once the counter passes the window, so
         // a huge inbox never pays a full scan and no
-        // range form is needed at all. Carrying the
-        // snippet here is what lets threads/thread
-        // answer with one script call instead of N+1.
+        // range form is needed at all. Thread cards use an
+        // empty snippet for the AppleScript source; this is
+        // preferable to an unbounded body scan and does not
+        // affect grouping or the full message view.
         // `with timeout` bounds single Apple events only;
         // the process cap in run_script bounds the call.
         // AppleScript if grammar note: a single-line
@@ -580,24 +588,22 @@ impl AppleScriptMailSource {
 end cleanText
 with timeout of 60 seconds
   tell application "Mail"
+    set totalCount to count messages of inbox
+    if totalCount is 0 then
+      return ""
+    end if
+    set endIdx to totalCount
+    if endIdx > __WINDOW__ then
+      set endIdx to __WINDOW__
+    end if
+    set windowMessages to messages 1 thru endIdx of inbox
     set out to ""
-    set idx to 0
-    repeat with m in messages of inbox
-      set idx to idx + 1
-      if idx > __WINDOW__ then
-        exit repeat
-      end if
+    repeat with m in windowMessages
       set addrs to ""
       repeat with r in to recipients of m
         set addrs to addrs & address of r & ","
       end repeat
-      set fullContent to content of m
-      if (count of fullContent) > 80 then
-        set snip to text 1 thru 80 of fullContent
-      else
-        set snip to fullContent
-      end if
-      set out to out & (id of m as string) & (character id 31) & my cleanText(subject of m) & (character id 31) & my cleanText(sender of m) & (character id 31) & addrs & (character id 31) & (date received of m as string) & (character id 31) & my cleanText(snip) & return
+      set out to out & (id of m as string) & (character id 31) & my cleanText(subject of m) & (character id 31) & my cleanText(sender of m) & (character id 31) & addrs & (character id 31) & (date received of m as string) & return
     end repeat
     return out
   end tell
@@ -613,10 +619,38 @@ end timeout"#;
         if message_id.parse::<i64>().is_err() {
             return Err(MailError::NotFound("message"));
         }
-        self.inbox_metadata()?
-            .0
+        // A message id is globally unique in Mail. Query it
+        // directly instead of rescanning the first page of
+        // the inbox; older messages and attachments must
+        // remain readable after the list window is applied.
+        let script = format!(
+            r#"on cleanText(t)
+  set AppleScript's text item delimiters to {{tab, return, linefeed}}
+  set parts to text items of t
+  set AppleScript's text item delimiters to " "
+  return parts as string
+end cleanText
+with timeout of 30 seconds
+  tell application "Mail"
+    try
+      set m to first message of inbox whose id is {message_id}
+      set addrs to ""
+      repeat with r in to recipients of m
+        set addrs to addrs & address of r & ","
+      end repeat
+      return (id of m as string) & (character id 31) & my cleanText(subject of m) & (character id 31) & my cleanText(sender of m) & (character id 31) & addrs & (character id 31) & (date received of m as string) & return
+    on error
+      return "«BU2AGENT_MESSAGE_NOT_FOUND»"
+    end try
+  end tell
+end timeout"#,
+            message_id = message_id
+        );
+        let dump = Self::run_script(&script)?;
+        let (metas, _) = parse_dump(&dump);
+        metas
             .into_iter()
-            .find(|m| m.id == message_id)
+            .next()
             .ok_or(MailError::NotFound("message"))
     }
 
@@ -627,21 +661,16 @@ end timeout"#;
         let script = format!(
             r#"with timeout of 60 seconds
   tell application "Mail"
-    set idx to 0
-    repeat with m in messages of inbox
-      set idx to idx + 1
-      if idx > __WINDOW__ then
-        exit repeat
-      end if
-      if (id of m as string) = "{message_id}" then
-        set out to ""
-        repeat with a in mail attachments of m
-          set out to out & (name of a as string) & return
-        end repeat
-        return out
-      end if
-    end repeat
-    return ""
+    try
+      set m to first message of inbox whose id is {message_id}
+      set out to ""
+      repeat with a in mail attachments of m
+        set out to out & (name of a as string) & return
+      end repeat
+      return out
+    on error
+      return ""
+    end try
   end tell
 end timeout"#,
             message_id = message_id
@@ -649,7 +678,7 @@ end timeout"#,
         let script = script.replace("__WINDOW__", &INBOX_WINDOW.to_string());
         let names = Self::run_script(&script)?;
         Ok(names
-            .lines()
+            .split(|ch| ch == '\r' || ch == '\n')
             .filter(|line| !line.trim().is_empty())
             .map(str::to_string)
             .collect())
@@ -747,24 +776,20 @@ end timeout"#;
         let script = format!(
             r#"with timeout of 60 seconds
   tell application "Mail"
-    set idx to 0
-    repeat with m in messages of inbox
-      set idx to idx + 1
-      if idx > __WINDOW__ then
-        exit repeat
-      end if
-      if (id of m as string) = "{message_id}" then
-        return content of m
-      end if
-    end repeat
-    return "«BU2AGENT_MESSAGE_NOT_FOUND»"
+    try
+      set m to first message of inbox whose id is {message_id}
+      return content of m
+    on error
+      return "«BU2AGENT_MESSAGE_NOT_FOUND»"
+    end try
   end tell
 end timeout"#,
             message_id = message_id
         );
         let script = script.replace("__WINDOW__", &INBOX_WINDOW.to_string());
         let body = Self::run_script(&script)?;
-        let body = body.strip_suffix('\n').unwrap_or(&body).to_string();
+        let body = body.replace("\r\n", "\n").replace('\r', "\n");
+        let body = body.trim_end_matches('\n').to_string();
         if body.trim() == "«BU2AGENT_MESSAGE_NOT_FOUND»" {
             return Err(MailError::NotFound("message"));
         }
@@ -805,19 +830,18 @@ end timeout"#,
         let script = format!(
             r#"with timeout of 60 seconds
   tell application "Mail"
-    set idx to 0
-    repeat with m in messages of inbox
-      set idx to idx + 1
-      if idx > __WINDOW__ then
-        exit repeat
+    try
+      set m to first message of inbox whose id is {message_id}
+      set atts to mail attachments of m
+      if (count of atts) < {item} then
+        return "«BU2AGENT_ATTACHMENT_NOT_FOUND»"
       end if
-      if (id of m as string) = "{message_id}" then
-        set att to item {item} of (get mail attachments of m)
-        save att in file "{path_str}"
-        return "ok"
-      end if
-    end repeat
-    return "«BU2AGENT_MESSAGE_NOT_FOUND»"
+      set att to item {item} of atts
+      save att in POSIX file "{path_str}"
+      return "ok"
+    on error
+      return "«BU2AGENT_MESSAGE_NOT_FOUND»"
+    end try
   end tell
 end timeout"#,
             message_id = message_id,
@@ -846,7 +870,6 @@ end timeout"#,
                 })
             }
             Ok(_) => Err(MailError::NotFound("attachment")),
-            Err(MailError::Upstream(_)) => Err(MailError::NotFound("attachment")),
             Err(other) => Err(other),
         }
     }
@@ -889,6 +912,15 @@ mod tests {
         assert_eq!(metas.len(), 2);
         assert_eq!(snippets.get("1").map(String::as_str), Some("Hello body"));
         assert_eq!(snippets.get("2").map(String::as_str), Some("Hi body"));
+    }
+
+    #[test]
+    fn dump_parsing_accepts_macos_carriage_returns() {
+        let dump = "1\u{1f}Hello\u{1f}alice@x\u{1f}me@x\u{1f}2026-01-01\r2\u{1f}Re: Hello\u{1f}bob@x\u{1f}me@x\u{1f}2026-01-02\r";
+        let (metas, snippets) = parse_dump(dump);
+        assert_eq!(metas.len(), 2);
+        assert!(snippets.is_empty());
+        assert_eq!(metas[1].subject, "Re: Hello");
     }
 
     #[test]
