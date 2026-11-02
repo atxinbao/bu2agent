@@ -1,8 +1,14 @@
-# 个人 Agent 平台（首期）——项目文档
+# bu2agent：个人 Agent 平台——项目文档
 
 [![CI](https://github.com/atxinbao/bu2agent/actions/workflows/ci.yml/badge.svg)](https://github.com/atxinbao/bu2agent/actions/workflows/ci.yml)
 
 ## 当前能力与边界（2026-10-28，Codex 更新）
+
+### 当前产品定义
+
+`bu2agent` 的长期目标是本地单用户 Personal Agent 控制平面：在明确授权边界内持续理解用户目标、安排可恢复执行、验证真实结果，并尽量减少用户注意力成本。聊天、模型、连接器、设备和语音是入口或适配器，不是系统的事实中心。
+
+架构总览、领域模型、DSH 映射和 P0/P1/P2 路线见 [PA 底层架构](PA-ARCHITECTURE.md)。Muse 逆向基线到当前 Rust/TypeScript 模块的实现映射见 [客户端底层架构](ARCHITECTURE.md)。
 
 下文编号章节保留阶段推进历史；其中“未实现”“待跑”等描述是当时状态，当前以本节及所链接的专项文档为准。
 
@@ -20,7 +26,7 @@
 已观测的 CI 基线为 `b8e61ac`（用户报告 5 个任务全绿）；后续本地提交不能沿用这次 CI 结果。
 
 - 目标记录：`goal_a083c94c3d89`（bu2agent；2026-10-24 由旧目标 `goal_33244669e730` 重建，slug 统一为 bu2agent）
-- 最终目标（2026-10-24 用户确认）：逆向 Muse app，做一个完全一样的个人 Agent 客户端，并为此构建底层架构；首期先按 Rust 客户端 + TS 前端 + Mock Gateway 跑通主线，底层架构按契约先行、可替换设计。
+- 产品目标（长期）：建设一个本地单用户 Personal Agent 控制平面；Muse 是客户端结构和能力面的逆向参考，不是“服务端等价”或最终产品边界。首期仍按 Rust 客户端 + TS 前端 + Mock Gateway 跑通主线，底层架构按契约先行、可替换设计。
 - 基线文档：《Muse macOS 8.0 逆向工程与重建规格》（2026-10-24）
 - 详细规划：`~/workspace/goals/bu2agent/files/phase1-foundation-architecture-and-plan.md`
 - 本目录是 Mac 本地项目家目录：/Users/mac/Documents/bu2agent，先放项目文档与 Phase 0 契约骨架，代码实现按 Phase 0 → Phase 5 推进。
@@ -28,7 +34,7 @@
 
 ## 1. 一句话目标
 
-做一个首期可用的个人 Agent 平台：能聊天、能看 Agent 流式输出、能读写文件、每一次工具调用都可追踪、可审批。先让主线真正跑通，不追与原客户端完全等价。
+做一个首期可用的个人 Agent 平台：能聊天、能看 Agent 流式输出、能读写文件、每一次工具调用都可追踪、可审批，并为长期任务、恢复和可验证结果建立底层契约。先让主线真正跑通，不把 UI 相似误认为 PA 能力完成。
 
 ## 2. 方案（2026-10-24 调整后）
 
@@ -76,6 +82,8 @@ TS 前端 UI → Domain Store → Rust↔TS 桥
 ```text
 bu2agent/
   README.md                 # 本项目文档
+  PA-ARCHITECTURE.md        # PA 第一性原理、领域模型、长期执行与路线图
+  ARCHITECTURE.md           # Muse 基线到客户端代码模块的实现映射
   apps/desktop/             # Rust 客户端壳（Tauri 2 推荐）：窗口、桥、传输、文件、会话、权限、可观测性
   apps/web/                 # TS 前端：Shell、Domain Store、Agent/Approval 模型、连接器模型、FeatureConfig、i18n
   packages/contract/        # 共享契约：JSON Schema + Rust serde 类型 + TS 类型（本阶段先落 Schema）
@@ -120,9 +128,9 @@ bu2agent/
 5. 三系统打包的签名与公证策略。
 6. 首期内是否加入任务与 artifacts 的最小闭环，还是只保聊天、文件、审批三条主线？建议先保三条主线。
 
-## 10. 底层架构（已搭建骨架）
+## 10. 客户端底层架构（已搭建骨架）
 
-详见 `ARCHITECTURE.md`：Muse 模块映射、分层、核心接口、三条状态机、传输与文件、节点与工具、认证与存储、系统差异收敛、路由分批与等价验证策略。
+PA 的上位架构见 `PA-ARCHITECTURE.md`；客户端实现映射详见 `ARCHITECTURE.md`，包括 Muse 模块映射、分层、核心接口、三条状态机、传输与文件、节点与工具、认证与存储、系统差异收敛、路由分批与等价验证策略。
 
 骨架位置：`apps/desktop/src/`（Rust：gateway、transport、bridge、file_client、node、session、permission、approval、sync、tools、observability）、`apps/web/src/domain/`（TS：types、chat）。骨架是类型、trait 与状态机，未实现部分以 `todo!` / TODO 标记，不得当作已跑通。测试走混合回路（见第 13 节），不再以“VM 无 Rust”为由跳过编译校验。
 
