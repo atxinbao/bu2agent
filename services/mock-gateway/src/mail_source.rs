@@ -37,6 +37,20 @@
 //! message date is a display string (AppleScript's date
 //! string is locale-dependent; it is passed through, not
 //! normalized to milliseconds).
+//!
+//! Batch-1 window (option A, approved 2026-11-03): every
+//! AppleScript loop scans at most the first 200 messages
+//! of the inbox, in Mail's inbox order, and the metadata
+//! dump carries each message's snippet, so threads/thread
+//! need exactly one script call. Whether Mail's inbox
+//! order is newest-first or oldest-first is unverified;
+//! window re-validation checks the returned dates and
+//! flips the range if it is wrong. Messages outside the
+//! window read as 404. Each `osascript` invocation is
+//! capped at 30 seconds by the gateway (the AppleScript
+//! `with timeout` values bound single Apple events, not
+//! a whole loop, so they cannot bound a call); expiry is
+//! `Upstream` (502), never a hang.
 
 use std::collections::HashMap;
 
@@ -171,9 +185,10 @@ pub fn thread_id_for(normalized_subject: &str) -> String {
 /// Group metadata into threads, preserving first-seen
 /// order. The thread subject is the first message's
 /// original subject; the snippet is the first message's
-/// body, truncated to 80 chars. Bodies arrive separately
-/// (see `AppleScriptMailSource::message`), so grouping
-/// takes a body lookup for snippets.
+/// body, truncated to 80 chars. Grouping takes a lookup
+/// for snippets: the mock passes full bodies, the
+/// AppleScript source passes the snippets carried by its
+/// metadata dump.
 pub fn group_threads(
     metas: &[RawMessageMeta],
     bodies: &HashMap<String, String>,
@@ -207,17 +222,22 @@ pub fn group_threads(
 
 /// Parse the AppleScript metadata dump: one message per
 /// line, fields separated by ASCII 31, in the order id,
-/// subject, sender, recipients (comma-joined), date.
-/// Subjects and senders are sanitized by the script (no
-/// tabs or newlines); malformed lines are skipped.
-pub fn parse_dump(text: &str) -> Vec<RawMessageMeta> {
-    let mut out = Vec::new();
+/// subject, sender, recipients (comma-joined), date, and
+/// optionally a snippet (first 80 chars of the body).
+/// Subjects, senders and snippets are sanitized by the
+/// script (no tabs, newlines, or ASCII 31); malformed
+/// lines are skipped. Returns the metadata plus a
+/// snippet lookup by message id (5-field lines carry no
+/// snippet and are absent from the map).
+pub fn parse_dump(text: &str) -> (Vec<RawMessageMeta>, HashMap<String, String>) {
+    let mut metas = Vec::new();
+    let mut snippets = HashMap::new();
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
         }
         let fields: Vec<&str> = line.split('\u{1f}').collect();
-        if fields.len() != 5 {
+        if fields.len() != 5 && fields.len() != 6 {
             continue;
         }
         let recipients = fields[3]
@@ -226,7 +246,10 @@ pub fn parse_dump(text: &str) -> Vec<RawMessageMeta> {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
-        out.push(RawMessageMeta {
+        if fields.len() == 6 {
+            snippets.insert(fields[0].to_string(), fields[5].to_string());
+        }
+        metas.push(RawMessageMeta {
             id: fields[0].to_string(),
             subject: fields[1].to_string(),
             sender: fields[2].to_string(),
@@ -234,7 +257,7 @@ pub fn parse_dump(text: &str) -> Vec<RawMessageMeta> {
             date: fields[4].to_string(),
         });
     }
-    out
+    (metas, snippets)
 }
 
 /// Clamp a threads-list limit (plan S3): default 50,
@@ -411,7 +434,28 @@ fn content_type_for(filename: &str) -> String {
 pub struct AppleScriptMailSource;
 
 #[cfg(target_os = "macos")]
-use std::process::Command;
+use std::{
+    fs,
+    process::{Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
+
+/// Batch-1 read window (see the module docs): every
+/// AppleScript loop scans at most this many messages of
+/// the inbox, in Mail's inbox order.
+#[cfg(target_os = "macos")]
+const INBOX_WINDOW: usize = 200;
+
+/// Hard cap on one `osascript` invocation (see the
+/// module docs). Expiry maps to `Upstream` (502).
+#[cfg(target_os = "macos")]
+const SCRIPT_TIMEOUT_SECS: u64 = 30;
+
+/// Uniqueness for the temp files `run_script` captures
+/// output in (gateway requests run concurrently).
+#[cfg(target_os = "macos")]
+static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
 impl AppleScriptMailSource {
@@ -430,55 +474,127 @@ impl AppleScriptMailSource {
         }
     }
 
-    /// Run one AppleScript program. Maps automation
-    /// denial to `Denied` (the spec's MailSender detects
-    /// exactly this), a missing Mail to `Upstream`, and
-    /// everything else to a generic `Upstream`.
+    /// Run one AppleScript program, capped at
+    /// `SCRIPT_TIMEOUT_SECS`. Maps automation denial to
+    /// `Denied` (the spec's MailSender detects exactly
+    /// this), a missing Mail to `Upstream`, a timeout to
+    /// `Upstream`, and everything else to a generic
+    /// `Upstream`. Output goes to temp files, not pipes:
+    /// a large dump could fill a pipe buffer while the
+    /// parent polls, deadlocking the wait; temp files
+    /// also make the timeout kill clean (no leaked
+    /// process, temp files removed either way). Error
+    /// strings stay generic on purpose: automation
+    /// stderr can contain local paths.
     fn run_script(script: &str) -> Result<String, MailError> {
         if !Self::mail_running() {
             return Err(MailError::Upstream("Mail is not running".to_string()));
         }
-        let output = Command::new("osascript")
+        let n = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let stem = format!("bu2agent-mail-script-{}-{n}", std::process::id());
+        let out_path = std::env::temp_dir().join(format!("{stem}.out"));
+        let err_path = std::env::temp_dir().join(format!("{stem}.err"));
+        let out_file = fs::File::create(&out_path)
+            .map_err(|_| MailError::Upstream("could not capture Mail script output".to_string()))?;
+        let err_file = fs::File::create(&err_path)
+            .map_err(|_| MailError::Upstream("could not capture Mail script output".to_string()))?;
+        let mut child = Command::new("osascript")
             .arg("-e")
             .arg(script)
-            .output()
+            .stdout(Stdio::from(out_file))
+            .stderr(Stdio::from(err_file))
+            .spawn()
             .map_err(|_| MailError::Upstream("osascript unavailable".to_string()))?;
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+        let deadline = Instant::now() + Duration::from_secs(SCRIPT_TIMEOUT_SECS);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let stdout = fs::read(&out_path)
+                        .map(|b| String::from_utf8_lossy(&b).to_string())
+                        .unwrap_or_default();
+                    let stderr = fs::read(&err_path)
+                        .map(|b| String::from_utf8_lossy(&b).to_string())
+                        .unwrap_or_default();
+                    let _ = fs::remove_file(&out_path);
+                    let _ = fs::remove_file(&err_path);
+                    if status.success() {
+                        return Ok(stdout);
+                    }
+                    let lower = stderr.to_lowercase();
+                    if lower.contains("not allowed")
+                        || lower.contains("denied")
+                        || lower.contains("not authorized")
+                    {
+                        return Err(MailError::Denied);
+                    }
+                    return Err(MailError::Upstream("Mail automation failed".to_string()));
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = fs::remove_file(&out_path);
+                        let _ = fs::remove_file(&err_path);
+                        return Err(MailError::Upstream("Mail script timed out".to_string()));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = fs::remove_file(&out_path);
+                    let _ = fs::remove_file(&err_path);
+                    return Err(MailError::Upstream("Mail automation failed".to_string()));
+                }
+            }
         }
-        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-        if stderr.contains("not allowed") || stderr.contains("denied") || stderr.contains("not authorized") {
-            return Err(MailError::Denied);
-        }
-        Err(MailError::Upstream("Mail automation failed".to_string()))
     }
 
-    fn inbox_metadata(&self) -> Result<Vec<RawMessageMeta>, MailError> {
+    fn inbox_metadata(&self) -> Result<(Vec<RawMessageMeta>, HashMap<String, String>), MailError> {
         // One line per message; fields separated by
-        // character id 31. Subjects and senders are
-        // sanitized inside the script (no tabs/newlines).
-        // `with timeout` keeps a huge inbox from hanging
-        // the gateway call.
-        let script = r#"on cleanText(t)
-  set AppleScript's text item delimiters to {tab, return, linefeed}
+        // character id 31: id, subject, sender, recipients
+        // (comma-joined), date, snippet (first 80 chars
+        // of the body, sanitized like subject/sender).
+        // The loop scans at most INBOX_WINDOW messages:
+        // the prelude counts the inbox first, so a small
+        // inbox never hits an out-of-range error and a
+        // huge inbox never pays a full scan. Carrying
+        // the snippet here is what lets threads/thread
+        // answer with one script call instead of N+1.
+        // `with timeout` bounds single Apple events only;
+        // the process cap in run_script bounds the call.
+        let raw_script = r#"on cleanText(t)
+  set AppleScript's text item delimiters to {tab, return, linefeed, character id 31}
   set parts to text items of t
   set AppleScript's text item delimiters to " "
   return parts as string
 end cleanText
 with timeout of 60 seconds
   tell application "Mail"
+    set totalCount to count messages of inbox
+    set endIdx to totalCount
+    if endIdx > __WINDOW__ then set endIdx to __WINDOW__
+    end if
     set out to ""
-    repeat with m in messages of inbox
+    repeat with i from 1 to endIdx
+      set m to message i of inbox
       set addrs to ""
       repeat with r in to recipients of m
         set addrs to addrs & address of r & ","
       end repeat
-      set out to out & (id of m as string) & (character id 31) & my cleanText(subject of m) & (character id 31) & my cleanText(sender of m) & (character id 31) & addrs & (character id 31) & (date received of m as string) & return
+      set fullContent to content of m
+      if (count of fullContent) > 80 then
+        set snip to text 1 thru 80 of fullContent
+      else
+        set snip to fullContent
+      end if
+      set out to out & (id of m as string) & (character id 31) & my cleanText(subject of m) & (character id 31) & my cleanText(sender of m) & (character id 31) & addrs & (character id 31) & (date received of m as string) & (character id 31) & my cleanText(snip) & return
     end repeat
     return out
   end tell
 end timeout"#;
-        let dump = Self::run_script(script)?;
+        let script = raw_script.replace("__WINDOW__", &INBOX_WINDOW.to_string());
+        let dump = Self::run_script(&script)?;
         Ok(parse_dump(&dump))
     }
 
@@ -489,9 +605,45 @@ end timeout"#;
             return Err(MailError::NotFound("message"));
         }
         self.inbox_metadata()?
+            .0
             .into_iter()
             .find(|m| m.id == message_id)
             .ok_or(MailError::NotFound("message"))
+    }
+
+    /// Attachment names for one message, via a windowed
+    /// match-by-id loop (shared by `message` and
+    /// `attachment` so neither re-reads the full inbox).
+    fn attachment_names(&self, message_id: &str) -> Result<Vec<String>, MailError> {
+        let script = format!(
+            r#"with timeout of 60 seconds
+  tell application "Mail"
+    set totalCount to count messages of inbox
+    set endIdx to totalCount
+    if endIdx > __WINDOW__ then set endIdx to __WINDOW__
+    end if
+    repeat with i from 1 to endIdx
+      set m to message i of inbox
+      if (id of m as string) = "{message_id}" then
+        set out to ""
+        repeat with a in mail attachments of m
+          set out to out & (name of a as string) & return
+        end repeat
+        return out
+      end if
+    end repeat
+    return ""
+  end tell
+end timeout"#,
+            message_id = message_id
+        );
+        let script = script.replace("__WINDOW__", &INBOX_WINDOW.to_string());
+        let names = Self::run_script(&script)?;
+        Ok(names
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .collect())
     }
 }
 
@@ -558,38 +710,22 @@ end timeout"#;
     }
 
     fn threads(&self, limit: usize, offset: usize) -> Result<Vec<ThreadView>, MailError> {
-        let metas = self.inbox_metadata()?;
-        // Snippets need bodies; batch 1 fetches the first
-        // message's content per thread (bounded by the
-        // page size). Each content fetch re-reads inbox
-        // metadata (N+1 scripts) — slow for large pages,
-        // accepted as a batch-1 limitation, not hidden.
-        let grouped = group_threads(&metas, &HashMap::new());
-        let page: Vec<ThreadView> = grouped.into_iter().skip(offset).take(limit).collect();
-        let mut out = Vec::new();
-        for mut thread in page {
-            if let Some(first_id) = thread.message_ids.first().cloned() {
-                if let Ok(message) = self.message(&first_id) {
-                    thread.snippet = message.body_text.chars().take(80).collect();
-                }
-            }
-            out.push(thread);
-        }
-        Ok(out)
+        // One script total: the metadata dump already
+        // carries each message's snippet, so grouping
+        // needs no per-thread content fetch (the old N+1
+        // is gone). Limit/offset still apply in Rust,
+        // now over the windowed list.
+        let (metas, snippets) = self.inbox_metadata()?;
+        let grouped = group_threads(&metas, &snippets);
+        Ok(grouped.into_iter().skip(offset).take(limit).collect())
     }
 
     fn thread(&self, thread_id: &str) -> Result<ThreadView, MailError> {
-        let metas = self.inbox_metadata()?;
-        let mut thread = group_threads(&metas, &HashMap::new())
+        let (metas, snippets) = self.inbox_metadata()?;
+        group_threads(&metas, &snippets)
             .into_iter()
             .find(|t| t.thread_id == thread_id)
-            .ok_or(MailError::NotFound("thread"))?;
-        if let Some(first_id) = thread.message_ids.first().cloned() {
-            if let Ok(message) = self.message(&first_id) {
-                thread.snippet = message.body_text.chars().take(80).collect();
-            }
-        }
-        Ok(thread)
+            .ok_or(MailError::NotFound("thread"))
     }
 
     fn message(&self, message_id: &str) -> Result<MessageView, MailError> {
@@ -597,11 +733,17 @@ end timeout"#;
         // Loop-and-match avoids depending on Mail's
         // `message id` addressing form; a sentinel marks
         // "not found" (content is returned whole, so
-        // multiline bodies survive intact).
+        // multiline bodies survive intact). The loop is
+        // windowed like every other loop here.
         let script = format!(
             r#"with timeout of 60 seconds
   tell application "Mail"
-    repeat with m in messages of inbox
+    set totalCount to count messages of inbox
+    set endIdx to totalCount
+    if endIdx > __WINDOW__ then set endIdx to __WINDOW__
+    end if
+    repeat with i from 1 to endIdx
+      set m to message i of inbox
       if (id of m as string) = "{message_id}" then
         return content of m
       end if
@@ -611,38 +753,21 @@ end timeout"#;
 end timeout"#,
             message_id = message_id
         );
+        let script = script.replace("__WINDOW__", &INBOX_WINDOW.to_string());
         let body = Self::run_script(&script)?;
         let body = body.strip_suffix('\n').unwrap_or(&body).to_string();
         if body.trim() == "«BU2AGENT_MESSAGE_NOT_FOUND»" {
             return Err(MailError::NotFound("message"));
         }
         // Attachment metadata for this message.
-        let names_script = format!(
-            r#"with timeout of 60 seconds
-  tell application "Mail"
-    repeat with m in messages of inbox
-      if (id of m as string) = "{message_id}" then
-        set out to ""
-        repeat with a in mail attachments of m
-          set out to out & (name of a as string) & return
-        end repeat
-        return out
-      end if
-    end repeat
-    return ""
-  end tell
-end timeout"#,
-            message_id = message_id
-        );
-        let names = Self::run_script(&names_script)?;
+        let names = self.attachment_names(message_id)?;
         let attachments = names
-            .lines()
-            .filter(|line| !line.trim().is_empty())
+            .into_iter()
             .enumerate()
             .map(|(index, name)| AttachmentMeta {
                 index,
-                name: name.to_string(),
-                content_type: content_type_for(name),
+                name: name.clone(),
+                content_type: content_type_for(&name),
                 size: 0,
             })
             .collect();
@@ -671,7 +796,12 @@ end timeout"#,
         let script = format!(
             r#"with timeout of 60 seconds
   tell application "Mail"
-    repeat with m in messages of inbox
+    set totalCount to count messages of inbox
+    set endIdx to totalCount
+    if endIdx > __WINDOW__ then set endIdx to __WINDOW__
+    end if
+    repeat with i from 1 to endIdx
+      set m to message i of inbox
       if (id of m as string) = "{message_id}" then
         set att to item {item} of (get mail attachments of m)
         save att in file "{path_str}"
@@ -685,16 +815,20 @@ end timeout"#,
             item = index + 1,
             path_str = path_str
         );
+        let script = script.replace("__WINDOW__", &INBOX_WINDOW.to_string());
         match Self::run_script(&script) {
             Ok(out) if out.trim() == "ok" => {
                 let bytes = std::fs::read(&path).map_err(|_| {
                     MailError::Upstream("could not read saved attachment".to_string())
                 })?;
                 let _ = std::fs::remove_file(&path);
+                // Names only (not a full message read):
+                // a names-script failure still falls back
+                // to a synthetic filename, as before.
                 let filename = self
-                    .message(message_id)
+                    .attachment_names(message_id)
                     .ok()
-                    .and_then(|m| m.attachments.into_iter().nth(index).map(|a| a.name))
+                    .and_then(|names| names.into_iter().nth(index))
                     .unwrap_or_else(|| format!("attachment-{index}"));
                 Ok(AttachmentData {
                     content_type: content_type_for(&filename),
@@ -732,9 +866,48 @@ mod tests {
     #[test]
     fn dump_parsing_skips_malformed_lines() {
         let dump = "1\u{1f}Hello\u{1f}alice@x\u{1f}me@x\u{1f}2026-01-01\nbad line\n2\u{1f}Hi\u{1f}bob@x\u{1f}me@x,other@x\u{1f}2026-01-02";
-        let metas = parse_dump(dump);
+        let (metas, snippets) = parse_dump(dump);
         assert_eq!(metas.len(), 2);
         assert_eq!(metas[1].recipients, vec!["me@x", "other@x"]);
+        // 5-field lines carry no snippet.
+        assert!(snippets.is_empty());
+    }
+
+    #[test]
+    fn dump_parsing_reads_snippets() {
+        let dump = "1\u{1f}Hello\u{1f}alice@x\u{1f}me@x\u{1f}2026-01-01\u{1f}Hello body\nbad line\n2\u{1f}Hi\u{1f}bob@x\u{1f}me@x\u{1f}2026-01-02\u{1f}Hi body";
+        let (metas, snippets) = parse_dump(dump);
+        assert_eq!(metas.len(), 2);
+        assert_eq!(snippets.get("1").map(String::as_str), Some("Hello body"));
+        assert_eq!(snippets.get("2").map(String::as_str), Some("Hi body"));
+    }
+
+    #[test]
+    fn group_threads_uses_snippet_map() {
+        let metas = vec![
+            RawMessageMeta {
+                id: "1".to_string(),
+                subject: "Hello".to_string(),
+                sender: "alice@x".to_string(),
+                recipients: vec!["me@x".to_string()],
+                date: "2026-01-01".to_string(),
+            },
+            RawMessageMeta {
+                id: "2".to_string(),
+                subject: "Re: Hello".to_string(),
+                sender: "bob@x".to_string(),
+                recipients: vec!["me@x".to_string()],
+                date: "2026-01-02".to_string(),
+            },
+        ];
+        let snippets: HashMap<String, String> =
+            [("1".to_string(), "x".repeat(100))].into_iter().collect();
+        let threads = group_threads(&metas, &snippets);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].message_count, 2);
+        // Snippet is the first message's snippet, cut to 80 chars.
+        assert_eq!(threads[0].snippet.len(), 80);
+        assert!(threads[0].snippet.chars().all(|c| c == 'x'));
     }
 
     #[test]
