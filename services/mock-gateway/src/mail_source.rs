@@ -556,28 +556,37 @@ impl AppleScriptMailSource {
         // (comma-joined), date, snippet (first 80 chars
         // of the body, sanitized like subject/sender).
         // The loop scans at most INBOX_WINDOW messages:
-        // the prelude counts the inbox first, so a small
-        // inbox never hits an out-of-range error and a
-        // huge inbox never pays a full scan. Carrying
-        // the snippet here is what lets threads/thread
+        // it enumerates `messages of inbox` (the form
+        // the pre-window script already proved) and
+        // exits once the counter passes the window, so
+        // a huge inbox never pays a full scan and no
+        // range form is needed at all. Carrying the
+        // snippet here is what lets threads/thread
         // answer with one script call instead of N+1.
         // `with timeout` bounds single Apple events only;
         // the process cap in run_script bounds the call.
+        // AppleScript if grammar note: a single-line
+        // `if cond then statement` is self-contained
+        // and must NOT be followed by `end if`; every
+        // if below is therefore written multi-line
+        // (see the U2 502 fix: the v1 window prelude
+        // used the single-line form plus `end if`,
+        // which fails osascript compilation outright).
         let raw_script = r#"on cleanText(t)
-  set AppleScript's text item delimiters to {tab, return, linefeed, character id 31}
+  set AppleScript's text item delimiters to {tab, return, linefeed}
   set parts to text items of t
   set AppleScript's text item delimiters to " "
   return parts as string
 end cleanText
 with timeout of 60 seconds
   tell application "Mail"
-    set totalCount to count messages of inbox
-    set endIdx to totalCount
-    if endIdx > __WINDOW__ then set endIdx to __WINDOW__
-    end if
     set out to ""
-    repeat with i from 1 to endIdx
-      set m to message i of inbox
+    set idx to 0
+    repeat with m in messages of inbox
+      set idx to idx + 1
+      if idx > __WINDOW__ then
+        exit repeat
+      end if
       set addrs to ""
       repeat with r in to recipients of m
         set addrs to addrs & address of r & ","
@@ -618,12 +627,12 @@ end timeout"#;
         let script = format!(
             r#"with timeout of 60 seconds
   tell application "Mail"
-    set totalCount to count messages of inbox
-    set endIdx to totalCount
-    if endIdx > __WINDOW__ then set endIdx to __WINDOW__
-    end if
-    repeat with i from 1 to endIdx
-      set m to message i of inbox
+    set idx to 0
+    repeat with m in messages of inbox
+      set idx to idx + 1
+      if idx > __WINDOW__ then
+        exit repeat
+      end if
       if (id of m as string) = "{message_id}" then
         set out to ""
         repeat with a in mail attachments of m
@@ -738,12 +747,12 @@ end timeout"#;
         let script = format!(
             r#"with timeout of 60 seconds
   tell application "Mail"
-    set totalCount to count messages of inbox
-    set endIdx to totalCount
-    if endIdx > __WINDOW__ then set endIdx to __WINDOW__
-    end if
-    repeat with i from 1 to endIdx
-      set m to message i of inbox
+    set idx to 0
+    repeat with m in messages of inbox
+      set idx to idx + 1
+      if idx > __WINDOW__ then
+        exit repeat
+      end if
       if (id of m as string) = "{message_id}" then
         return content of m
       end if
@@ -796,12 +805,12 @@ end timeout"#,
         let script = format!(
             r#"with timeout of 60 seconds
   tell application "Mail"
-    set totalCount to count messages of inbox
-    set endIdx to totalCount
-    if endIdx > __WINDOW__ then set endIdx to __WINDOW__
-    end if
-    repeat with i from 1 to endIdx
-      set m to message i of inbox
+    set idx to 0
+    repeat with m in messages of inbox
+      set idx to idx + 1
+      if idx > __WINDOW__ then
+        exit repeat
+      end if
       if (id of m as string) = "{message_id}" then
         set att to item {item} of (get mail attachments of m)
         save att in file "{path_str}"
