@@ -39,6 +39,7 @@ import { FeedClient, type FeedGateway } from "./domain/feed_client";
 import { InvokeFeedClient } from "./domain/invoke_feed_client";
 import { ChatRecordsClient, type ChatRecordsGateway } from "./domain/chat_records_client";
 import { InvokeChatRecordsClient } from "./domain/invoke_chat_records_client";
+import { InvokeVoiceClient } from "./domain/invoke_voice_client";
 import { NodeClient, type NodeGateway } from "./domain/node_client";
 import { InvokeNodeClient } from "./domain/invoke_node_client";
 import { StreamClient, type StreamGateway } from "./domain/stream_client";
@@ -559,6 +560,7 @@ export function App() {
           model={new InvokeModelClient()}
           config={new InvokeConfigClient()}
           chatRecords={new InvokeChatRecordsClient()}
+          voices={new InvokeVoiceClient()}
           isInvoke={isInvoke}
           gatewayStatus={gatewayStatus}
           onSettingsChanged={() => void refreshSettings()}

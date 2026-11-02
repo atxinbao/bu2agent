@@ -33,6 +33,7 @@ pub mod feed_store;
 pub mod chat_store;
 pub mod node_store;
 pub mod stream_store;
+pub mod voice_store;
 pub mod device_store;
 pub mod device_backend;
 

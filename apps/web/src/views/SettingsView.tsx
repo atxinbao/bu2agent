@@ -18,6 +18,13 @@ import type {
 import type { InvokePermissionPolicyClient } from "../domain/invoke_permission_policy_client";
 import type { ModelState } from "../domain/model_client";
 import type { InvokeModelClient } from "../domain/invoke_model_client";
+import type { InvokeVoiceClient } from "../domain/invoke_voice_client";
+import type {
+  CatalogFilters,
+  CatalogVoice,
+  CustomVoice,
+  PipelineProfile,
+} from "../domain/voice_client";
 import type { ConfigState } from "../domain/config_client";
 import type { InvokeConfigClient } from "../domain/invoke_config_client";
 import type { ChatThemes } from "../domain/chat_records_client";
@@ -47,6 +54,7 @@ interface SettingsViewProps {
   model: InvokeModelClient;
   config: InvokeConfigClient;
   chatRecords: InvokeChatRecordsClient;
+  voices: InvokeVoiceClient;
   isInvoke: boolean;
   gatewayStatus: GatewayStatusView | null;
   onSettingsChanged: () => void;
@@ -82,6 +90,7 @@ export function SettingsView({
   model,
   config,
   chatRecords,
+  voices,
   isInvoke,
   gatewayStatus,
   onSettingsChanged,
@@ -141,6 +150,19 @@ export function SettingsView({
   // exist on purpose: the gateway has no runtime-mutable
   // self-owned config to write.
   const [configDoc, setConfigDoc] = useState<ConfigState | null>(null);
+  // Voice section (Task 21, record subset, D2). Record-only:
+  // the catalog and pipeline seeds are [Mock] data, the
+  // active voice and pipeline selections only persist a
+  // choice (no audio plays, no call is affected), and the
+  // onboarding reset clears just those two selections.
+  const [voiceCatalog, setVoiceCatalog] = useState<CatalogVoice[] | null>(null);
+  const [voiceFilters, setVoiceFilters] = useState<CatalogFilters | null>(null);
+  const [voiceProfiles, setVoiceProfiles] = useState<PipelineProfile[] | null>(null);
+  const [voiceCustoms, setVoiceCustoms] = useState<CustomVoice[] | null>(null);
+  const [voiceActiveId, setVoiceActiveId] = useState<string | null>(null);
+  const [voiceActiveInput, setVoiceActiveInput] = useState("");
+  const [voiceProfileInput, setVoiceProfileInput] = useState("");
+  const [voiceRenameValues, setVoiceRenameValues] = useState<Record<string, string>>({});
 
   async function refreshVault() {
     try {
@@ -174,6 +196,38 @@ export function SettingsView({
     } catch {
       setModelDoc(null);
     }
+  }
+
+  async function refreshVoice() {
+    try {
+      setVoiceCatalog(await voices.catalog());
+    } catch {
+      setVoiceCatalog(null);
+    }
+    try {
+      setVoiceFilters(await voices.catalogFilters());
+    } catch {
+      setVoiceFilters(null);
+    }
+    try {
+      setVoiceProfiles(await voices.pipelineProfiles());
+    } catch {
+      setVoiceProfiles(null);
+    }
+    try {
+      setVoiceCustoms(await voices.customVoices());
+    } catch {
+      setVoiceCustoms(null);
+    }
+    try {
+      setVoiceActiveId((await voices.activeVoice()).voiceId);
+    } catch {
+      setVoiceActiveId(null);
+    }
+    // Note: the pipeline selection has no read-back route
+    // in the spec (select is write-only, like sxs.select),
+    // so the page only shows the just-saved value via the
+    // notice below; it is not reloaded here.
   }
 
   async function refreshConfig() {
@@ -212,6 +266,7 @@ export function SettingsView({
       await refreshModel();
       await refreshConfig();
       await refreshTheme();
+      await refreshVoice();
     } catch (err) {
       setError(errText(err));
     } finally {
@@ -785,6 +840,96 @@ export function SettingsView({
     }
   }
 
+  async function saveVoiceActive() {
+    if (voiceActiveInput === "") {
+      setError("请先选一个活动 voice。");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await voices.saveActiveVoice(voiceActiveInput);
+      setVoiceActiveInput("");
+      await refreshVoice();
+      setNotice("活动 voice 已保存（只记录、不播放）。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveVoiceProfile() {
+    if (voiceProfileInput === "") {
+      setError("请先选一个管线 profile。");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await voices.selectPipelineProfile(voiceProfileInput);
+      setVoiceProfileInput("");
+      setNotice("管线选择已保存（只记录、不影响通话；无读回路由，刷新后不再显示）。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function renameVoiceCustom(savedVoiceId: string) {
+    const name = (voiceRenameValues[savedVoiceId] ?? "").trim();
+    if (name === "") {
+      setError("自定义 voice 的新名不能为空。");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await voices.renameCustomVoice(savedVoiceId, name);
+      setVoiceRenameValues((prev) => ({ ...prev, [savedVoiceId]: "" }));
+      await refreshVoice();
+      setNotice("自定义 voice 已改名。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteVoiceCustom(savedVoiceId: string) {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await voices.deleteCustomVoice(savedVoiceId);
+      await refreshVoice();
+      setNotice("自定义 voice 已删除（tombstone，列表隐藏）。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resetVoiceOnboarding() {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await voices.onboardingReset();
+      await refreshVoice();
+      setNotice("已清除活动 voice 与管线选择（自定义 voice 不动）。");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="view">
       <h2>设置</h2>
@@ -1345,6 +1490,110 @@ export function SettingsView({
           <p>
             监听地址：{configDoc.gatewayAddr} · 提供方：{configDoc.provider}
           </p>
+        </div>
+      )}
+
+      <h3>语音（Voice，只记录）</h3>
+      <p className="note">
+        目录与管线是 [Mock] 种子，不是原产品真实 voice；活动 voice 与管线选择只记录，不产生播放、不影响通话。
+        通话、dictation、化身视频不在本范围。自定义 voice 没有创建路由，列表只能缩小、不能增长。
+        管线选择没有读回路由，保存后只在提示里确认，刷新后不再显示。
+      </p>
+      {voiceCatalog === null ? (
+        <p className="empty">语音目录未知（状态查询失败）。</p>
+      ) : (
+        <div>
+          <p>
+            目录：{voiceCatalog.map((v) => `${v.name}（${v.voiceId} · ${v.locale}）`).join("、")}
+          </p>
+          <p>
+            过滤维度：{voiceFilters === null ? "未知" : voiceFilters.locales.join("、")}
+          </p>
+          <p>当前活动 voice：{voiceActiveId ?? "未设置"}</p>
+          <div className="row">
+            <select
+              value={voiceActiveInput}
+              onChange={(event) => setVoiceActiveInput(event.target.value)}
+            >
+              <option value="">选活动 voice…</option>
+              {voiceCatalog.map((v) => (
+                <option key={v.voiceId} value={v.voiceId}>
+                  {v.name}（{v.voiceId}）
+                </option>
+              ))}
+              {(voiceCustoms ?? []).map((v) => (
+                <option key={v.savedVoiceId} value={v.savedVoiceId}>
+                  {v.name}（{v.savedVoiceId} · 自定义）
+                </option>
+              ))}
+            </select>
+            <button type="button" onClick={() => void saveVoiceActive()} disabled={busy}>
+              保存活动 voice
+            </button>
+          </div>
+          <p>
+            管线：{(voiceProfiles ?? []).map((p) => `${p.name}（${p.profileId}）`).join("、")}
+          </p>
+          <div className="row">
+            <select
+              value={voiceProfileInput}
+              onChange={(event) => setVoiceProfileInput(event.target.value)}
+            >
+              <option value="">选管线 profile…</option>
+              {(voiceProfiles ?? []).map((p) => (
+                <option key={p.profileId} value={p.profileId}>
+                  {p.name}（{p.profileId}）
+                </option>
+              ))}
+            </select>
+            <button type="button" onClick={() => void saveVoiceProfile()} disabled={busy}>
+              保存管线选择
+            </button>
+          </div>
+          <p>自定义 voice：</p>
+          {(voiceCustoms ?? []).length === 0 ? (
+            <p className="empty">无自定义 voice。</p>
+          ) : (
+            <ul>
+              {(voiceCustoms ?? []).map((v) => (
+                <li key={v.savedVoiceId}>
+                  {v.name}（{v.savedVoiceId}）
+                  <div className="row">
+                    <input
+                      type="text"
+                      value={voiceRenameValues[v.savedVoiceId] ?? ""}
+                      placeholder="新名"
+                      onChange={(event) =>
+                        setVoiceRenameValues((prev) => ({
+                          ...prev,
+                          [v.savedVoiceId]: event.target.value,
+                        }))
+                      }
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void renameVoiceCustom(v.savedVoiceId)}
+                      disabled={busy}
+                    >
+                      改名
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void deleteVoiceCustom(v.savedVoiceId)}
+                      disabled={busy}
+                    >
+                      删除
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="row">
+            <button type="button" onClick={() => void resetVoiceOnboarding()} disabled={busy}>
+              重置（只清除活动 voice 与管线选择）
+            </button>
+          </div>
         </div>
       )}
 

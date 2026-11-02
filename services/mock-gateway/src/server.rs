@@ -130,6 +130,11 @@ use crate::stream_store::{
     next_stream_number, next_subscription_number, project_thread_events, StreamLine,
     StreamOpen, StreamPoke, StreamSubscription, SxsSelection,
 };
+use crate::voice_store::{
+    append_voice_line, catalog_locales, catalog_voices, load_voice_state,
+    merged_custom_voices, pipeline_profiles, ActiveVoiceRecord, CustomVoice,
+    PipelineSelectionRecord, VoiceLine,
+};
 use agent_desktop::credential_store::{redact, CredentialStore, KeychainCredentialStore};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
@@ -359,6 +364,10 @@ pub struct AppState {
     next_poke_order: Arc<Mutex<u64>>,
     stream_selections: Arc<Mutex<HashMap<String, SxsSelection>>>,
     stream_state_path: Option<PathBuf>,
+    voice_custom: Arc<Mutex<HashMap<String, CustomVoice>>>,
+    voice_active: Arc<Mutex<Option<String>>>,
+    voice_pipeline: Arc<Mutex<Option<String>>>,
+    voice_state_path: Option<PathBuf>,
 }
 
 impl Default for AppState {
@@ -438,6 +447,9 @@ impl AppState {
         }
         if let Ok(stream_state_path) = std::env::var("MOCK_STREAM_STATE_PATH") {
             state = state.with_stream_state_path(PathBuf::from(stream_state_path));
+        }
+        if let Ok(voice_state_path) = std::env::var("MOCK_VOICE_STATE_PATH") {
+            state = state.with_voice_state_path(PathBuf::from(voice_state_path));
         }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
@@ -564,6 +576,15 @@ impl AppState {
             next_poke_order: Arc::new(Mutex::new(1)),
             stream_selections: Arc::new(Mutex::new(HashMap::new())),
             stream_state_path: None,
+            voice_custom: Arc::new(Mutex::new(
+                crate::voice_store::custom_voice_seeds()
+                    .into_iter()
+                    .map(|v| (v.saved_voice_id.clone(), v))
+                    .collect(),
+            )),
+            voice_active: Arc::new(Mutex::new(None)),
+            voice_pipeline: Arc::new(Mutex::new(None)),
+            voice_state_path: None,
         }
     }
 
@@ -1087,6 +1108,25 @@ impl AppState {
         self.stream_pokes = Arc::new(Mutex::new(data.pokes));
         self.stream_selections = Arc::new(Mutex::new(selections));
         self.stream_state_path = Some(path);
+        self
+    }
+
+    /// Test seam: load voice records from a tagged JSONL
+    /// file, mirroring with_stream_state_path. Custom voice
+    /// seeds are merged with overlays (tombstones kept in
+    /// the map so delete can tell unknown from deleted).
+    /// Production state reads MOCK_VOICE_STATE_PATH.
+    pub fn with_voice_state_path(mut self, path: PathBuf) -> Self {
+        let data = load_voice_state(&path);
+        let mut customs = HashMap::new();
+        for record in merged_custom_voices(&data.custom_voices) {
+            customs.insert(record.saved_voice_id.clone(), record);
+        }
+        self.voice_custom = Arc::new(Mutex::new(customs));
+        self.voice_active = Arc::new(Mutex::new(data.active_voice.and_then(|r| r.voice_id)));
+        self.voice_pipeline =
+            Arc::new(Mutex::new(data.pipeline_selection.and_then(|r| r.profile_id)));
+        self.voice_state_path = Some(path);
         self
     }
 
@@ -5182,6 +5222,200 @@ async fn chat_sxs_select(
     .into_response()
 }
 
+// --- Voice record surface (Task 21, record subset, D2) ---
+//
+// Local semantics only (see voice_store.rs and the Task 21
+// plan): static [Mock] catalog and pipeline seeds, custom
+// voice rename/delete over seeds, record-only active voice
+// and pipeline selections, and an onboarding reset that
+// clears just those two selections. No audio plays here.
+
+fn persist_voice_line(state: &AppState, line: &VoiceLine) {
+    let Some(path) = &state.voice_state_path else {
+        return;
+    };
+    append_voice_line(path, line);
+}
+
+fn custom_voice_view(voice: &CustomVoice) -> serde_json::Value {
+    serde_json::json!({
+        "saved_voice_id": voice.saved_voice_id,
+        "name": voice.name,
+        "created_ms": voice.created_ms,
+        "updated_ms": voice.updated_ms,
+        "deleted": voice.deleted,
+    })
+}
+
+async fn voice_catalog() -> Json<Vec<crate::voice_store::CatalogVoice>> {
+    Json(catalog_voices())
+}
+
+async fn voice_catalog_filters() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "locales": catalog_locales() }))
+}
+
+async fn voice_available_voices() -> Json<Vec<crate::voice_store::CatalogVoice>> {
+    Json(catalog_voices().into_iter().filter(|v| v.available).collect())
+}
+
+async fn voice_pipeline_profiles() -> Json<Vec<crate::voice_store::PipelineProfile>> {
+    Json(pipeline_profiles())
+}
+
+#[derive(Debug, Deserialize)]
+struct VoiceProfileSelectDto {
+    profile_id: String,
+}
+
+async fn voice_pipeline_profile_select(
+    State(state): State<AppState>,
+    Json(req): Json<VoiceProfileSelectDto>,
+) -> impl IntoResponse {
+    if !pipeline_profiles().iter().any(|p| p.profile_id == req.profile_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown pipeline profile" })),
+        )
+            .into_response();
+    }
+    *state.voice_pipeline.lock().expect("voice pipeline lock") = Some(req.profile_id.clone());
+    persist_voice_line(
+        &state,
+        &VoiceLine::PipelineSelection(PipelineSelectionRecord {
+            profile_id: Some(req.profile_id.clone()),
+            updated_ms: now_ms(),
+        }),
+    );
+    Json(serde_json::json!({ "profile_id": req.profile_id })).into_response()
+}
+
+async fn voice_custom_voices_list(State(state): State<AppState>) -> Json<Vec<serde_json::Value>> {
+    let customs = state.voice_custom.lock().expect("voice custom lock");
+    let mut voices: Vec<&CustomVoice> = customs.values().filter(|v| !v.deleted).collect();
+    voices.sort_by(|a, b| a.saved_voice_id.cmp(&b.saved_voice_id));
+    Json(voices.iter().map(|v| custom_voice_view(v)).collect())
+}
+
+#[derive(Debug, Deserialize)]
+struct VoiceRenameDto {
+    name: String,
+}
+
+async fn voice_custom_voice_rename(
+    State(state): State<AppState>,
+    axum::extract::Path(saved_voice_id): axum::extract::Path<String>,
+    Json(req): Json<VoiceRenameDto>,
+) -> impl IntoResponse {
+    let mut customs = state.voice_custom.lock().expect("voice custom lock");
+    let Some(voice) = customs.get_mut(&saved_voice_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown custom voice" })),
+        )
+            .into_response();
+    };
+    if voice.deleted {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown custom voice" })),
+        )
+            .into_response();
+    }
+    if req.name.trim().is_empty() {
+        return bad_request("name must not be empty").into_response();
+    }
+    voice.name = req.name.clone();
+    voice.updated_ms = now_ms();
+    let updated = voice.clone();
+    drop(customs);
+    persist_voice_line(&state, &VoiceLine::CustomVoice(updated.clone()));
+    Json(custom_voice_view(&updated)).into_response()
+}
+
+async fn voice_custom_voice_delete(
+    State(state): State<AppState>,
+    axum::extract::Path(saved_voice_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut customs = state.voice_custom.lock().expect("voice custom lock");
+    let Some(voice) = customs.get_mut(&saved_voice_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown custom voice" })),
+        )
+            .into_response();
+    };
+    if !voice.deleted {
+        voice.deleted = true;
+        voice.updated_ms = now_ms();
+        let updated = voice.clone();
+        drop(customs);
+        persist_voice_line(&state, &VoiceLine::CustomVoice(updated.clone()));
+        return Json(custom_voice_view(&updated)).into_response();
+    }
+    let view = custom_voice_view(voice);
+    Json(view).into_response()
+}
+
+async fn voice_active_voice_get(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let voice_id = state.voice_active.lock().expect("voice active lock").clone();
+    Json(serde_json::json!({ "voice_id": voice_id }))
+}
+
+#[derive(Debug, Deserialize)]
+struct VoiceActiveSaveDto {
+    voice_id: String,
+}
+
+async fn voice_active_voice_save(
+    State(state): State<AppState>,
+    Json(req): Json<VoiceActiveSaveDto>,
+) -> impl IntoResponse {
+    let in_catalog = catalog_voices().iter().any(|v| v.voice_id == req.voice_id);
+    let in_custom = state
+        .voice_custom
+        .lock()
+        .expect("voice custom lock")
+        .get(&req.voice_id)
+        .is_some_and(|v| !v.deleted);
+    if !in_catalog && !in_custom {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown voice" })),
+        )
+            .into_response();
+    }
+    *state.voice_active.lock().expect("voice active lock") = Some(req.voice_id.clone());
+    persist_voice_line(
+        &state,
+        &VoiceLine::ActiveVoice(ActiveVoiceRecord {
+            voice_id: Some(req.voice_id.clone()),
+            updated_ms: now_ms(),
+        }),
+    );
+    Json(serde_json::json!({ "voice_id": req.voice_id })).into_response()
+}
+
+async fn voice_onboarding_reset(State(state): State<AppState>) -> Json<serde_json::Value> {
+    // D2: clears only the two selections, back to null.
+    // Custom voices are untouched.
+    *state.voice_active.lock().expect("voice active lock") = None;
+    *state.voice_pipeline.lock().expect("voice pipeline lock") = None;
+    let now = now_ms();
+    persist_voice_line(
+        &state,
+        &VoiceLine::ActiveVoice(ActiveVoiceRecord { voice_id: None, updated_ms: now }),
+    );
+    persist_voice_line(
+        &state,
+        &VoiceLine::PipelineSelection(PipelineSelectionRecord {
+            profile_id: None,
+            updated_ms: now,
+        }),
+    );
+    Json(serde_json::json!({ "voice_id": null, "profile_id": null }))
+}
+
 // --- Feed surface (Task 17, unit subset) ---
 //
 // Local semantics only (see feed_store.rs): Mock seed
@@ -6490,6 +6724,23 @@ pub fn app(state: AppState) -> Router {
         .route("/chat/stream", post(chat_stream_open))
         .route("/chat/poke", post(chat_poke))
         .route("/api/chat/sxs/select", post(chat_sxs_select))
+        .route("/api/voice/catalog", get(voice_catalog))
+        .route("/api/voice/catalog/filters", get(voice_catalog_filters))
+        .route("/api/voice/available-voices", get(voice_available_voices))
+        .route("/api/voice/pipeline-profiles", get(voice_pipeline_profiles))
+        .route("/api/voice/pipeline-profile", post(voice_pipeline_profile_select))
+        .route("/api/voice/custom-voices", get(voice_custom_voices_list))
+        .route(
+            "/api/voice/custom-voices/{saved_voice_id}",
+            patch(voice_custom_voice_rename),
+        )
+        .route(
+            "/api/voice/custom-voices/{saved_voice_id}",
+            delete(voice_custom_voice_delete),
+        )
+        .route("/api/voice/active-voice", get(voice_active_voice_get))
+        .route("/api/voice/active-voice", post(voice_active_voice_save))
+        .route("/api/voice/onboarding/reset", post(voice_onboarding_reset))
         .route("/api/nodes/register", post(nodes_register))
         .route("/api/nodes/list", post(nodes_list))
         .route("/api/nodes/heartbeat", post(nodes_heartbeat))

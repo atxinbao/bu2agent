@@ -45,6 +45,10 @@ use agent_desktop::stream_client::{
     StreamCancelResult, StreamClient, StreamEvents, StreamOpen, StreamPoke, StreamSubscription,
     SxsSelection,
 };
+use agent_desktop::voice_client::{
+    ActiveVoice, CatalogFilters, CatalogVoice, CustomVoice, OnboardingReset, PipelineProfile,
+    PipelineSelection, VoiceClient,
+};
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
@@ -1108,4 +1112,71 @@ pub fn chat_poke(thread_id: String) -> Result<StreamPoke, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn chat_sxs_select(thread_id: String, index: usize) -> Result<SxsSelection, String> {
     stream_client()?.sxs_select(&thread_id, index).map_err(agent_err_string)
+}
+
+// --- Voice record surface (Task 21, record subset, D2) ---
+//
+// All commands carry rename_all = "snake_case" (Task 9
+// lesson): the invoke client sends snake_case params.
+
+fn voice_client() -> Result<VoiceClient, String> {
+    VoiceClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn voice_catalog() -> Result<Vec<CatalogVoice>, String> {
+    voice_client()?.catalog().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn voice_catalog_filters() -> Result<CatalogFilters, String> {
+    voice_client()?.catalog_filters().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn voice_available_voices() -> Result<Vec<CatalogVoice>, String> {
+    voice_client()?.available_voices().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn voice_pipeline_profiles() -> Result<Vec<PipelineProfile>, String> {
+    voice_client()?.pipeline_profiles().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn voice_pipeline_profile_select(profile_id: String) -> Result<PipelineSelection, String> {
+    voice_client()?.select_pipeline_profile(&profile_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn voice_custom_voices_list() -> Result<Vec<CustomVoice>, String> {
+    voice_client()?.custom_voices().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn voice_custom_voice_rename(
+    saved_voice_id: String,
+    name: String,
+) -> Result<CustomVoice, String> {
+    voice_client()?.rename_custom_voice(&saved_voice_id, &name).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn voice_custom_voice_delete(saved_voice_id: String) -> Result<CustomVoice, String> {
+    voice_client()?.delete_custom_voice(&saved_voice_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn voice_active_voice_get() -> Result<ActiveVoice, String> {
+    voice_client()?.active_voice().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn voice_active_voice_save(voice_id: String) -> Result<ActiveVoice, String> {
+    voice_client()?.save_active_voice(&voice_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn voice_onboarding_reset() -> Result<OnboardingReset, String> {
+    voice_client()?.onboarding_reset().map_err(agent_err_string)
 }
