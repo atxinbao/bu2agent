@@ -915,6 +915,27 @@ export function SettingsView({
     }
   }
 
+  // U4 fix: the current active voice line used to show the
+  // raw voice id (e.g. saved-voice-1). Resolve it to the
+  // human-readable name from the catalog or the custom
+  // list; an id with no matching voice (e.g. its custom
+  // voice was deleted after being saved) falls back to
+  // the id itself rather than a blank.
+  function voiceActiveName(voiceId: string | null): string {
+    if (voiceId === null) {
+      return "未设置";
+    }
+    const fromCatalog = (voiceCatalog ?? []).find((v) => v.voiceId === voiceId);
+    if (fromCatalog) {
+      return fromCatalog.name;
+    }
+    const fromCustom = (voiceCustoms ?? []).find((v) => v.savedVoiceId === voiceId);
+    if (fromCustom) {
+      return fromCustom.name;
+    }
+    return voiceId;
+  }
+
   async function resetVoiceOnboarding() {
     setBusy(true);
     setError(null);
@@ -1509,7 +1530,7 @@ export function SettingsView({
           <p>
             过滤维度：{voiceFilters === null ? "未知" : voiceFilters.locales.join("、")}
           </p>
-          <p>当前活动 voice：{voiceActiveId ?? "未设置"}</p>
+          <p>当前活动 voice：{voiceActiveName(voiceActiveId)}</p>
           <div className="row">
             <select
               value={voiceActiveInput}
