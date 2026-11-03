@@ -22,6 +22,7 @@ pub mod deepseek_loop;
 pub mod server;
 pub mod task_store;
 pub mod task_runner;
+pub mod execution_store;
 pub mod session_store;
 pub mod connector_store;
 pub mod vault_store;

@@ -93,6 +93,9 @@ use crate::device_store::{
     append_action, load_actions, next_action_number, DeviceActionRecord,
 };
 use crate::task_store::{append_task, load_tasks, next_task_number, TaskFileRecord};
+use crate::execution_store::{
+    append_execution, load_executions, next_execution_number, ExecutionFileRecord,
+};
 use crate::session_store::{
     append_session, load_sessions, next_session_number, select_context, session_number, title_from,
     SessionRecord, SessionTurn, MAX_INPUT_BYTES,
@@ -310,6 +313,9 @@ pub struct AppState {
     pub(crate) tasks: Arc<Mutex<HashMap<String, TaskFileRecord>>>,
     next_task_id: Arc<Mutex<u64>>,
     tasks_path: Option<PathBuf>,
+    pub(crate) executions: Arc<Mutex<HashMap<String, ExecutionFileRecord>>>,
+    next_execution_id: Arc<Mutex<u64>>,
+    executions_path: Option<PathBuf>,
     pub(crate) task_drafts: Arc<Mutex<HashMap<String, String>>>,
     pub(crate) task_drafts_dir: Option<PathBuf>,
     sessions: Arc<Mutex<HashMap<String, SessionRecord>>>,
@@ -416,6 +422,9 @@ impl AppState {
         }
         if let Ok(drafts_dir) = std::env::var("MOCK_TASK_DRAFTS_PATH") {
             state = state.with_task_drafts_dir(PathBuf::from(drafts_dir));
+        }
+        if let Ok(executions_path) = std::env::var("MOCK_EXECUTIONS_PATH") {
+            state = state.with_executions_path(PathBuf::from(executions_path));
         }
         if let Ok(sessions_path) = std::env::var("MOCK_SESSIONS_PATH") {
             state = state.with_sessions_path(PathBuf::from(sessions_path));
@@ -529,6 +538,9 @@ impl AppState {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             next_task_id: Arc::new(Mutex::new(1)),
             tasks_path: None,
+            executions: Arc::new(Mutex::new(HashMap::new())),
+            next_execution_id: Arc::new(Mutex::new(1)),
+            executions_path: None,
             task_drafts: Arc::new(Mutex::new(HashMap::new())),
             task_drafts_dir: None,
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -919,6 +931,25 @@ impl AppState {
         self.task_drafts =
             Arc::new(Mutex::new(crate::task_runner::load_draft_dir(&dir)));
         self.task_drafts_dir = Some(dir);
+        self
+    }
+
+    /// Test seam + production path for execution records: load
+    /// `executions.jsonl` so a restart keeps the phase-1 shell
+    /// records and the counter resumes. Production reads
+    /// MOCK_EXECUTIONS_PATH. Phase 1 performs no restart
+    /// conversion: records keep the status they were created
+    /// with (always "running" in phase 1); restart semantics
+    /// are phase 4 work, not something this seam may invent.
+    pub fn with_executions_path(mut self, path: PathBuf) -> Self {
+        let records = load_executions(&path);
+        let mut executions = HashMap::new();
+        for record in &records {
+            executions.insert(record.execution_id.clone(), record.clone());
+        }
+        self.next_execution_id = Arc::new(Mutex::new(next_execution_number(&records)));
+        self.executions = Arc::new(Mutex::new(executions));
+        self.executions_path = Some(path);
         self
     }
 
@@ -5739,6 +5770,43 @@ pub(crate) fn persist_task(state: &AppState, record: &TaskFileRecord) {
     append_task(path, record);
 }
 
+pub(crate) fn persist_execution(state: &AppState, record: &ExecutionFileRecord) {
+    let Some(path) = &state.executions_path else { return };
+    append_execution(path, record);
+}
+
+fn execution_number(execution_id: &str) -> u64 {
+    execution_id.strip_prefix("execution-").and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)
+}
+
+/// Phase 1 creation entry: Task Runner and Loop Engine each call
+/// this when they start an attempt. The old task-N / loop-N id is
+/// kept as a reference; exactly one of the two is set. The record
+/// is created with status "running" and is not transitioned by
+/// phase 1 (state convergence is phase 4). A task resume spawns a
+/// fresh runner attempt, so it gets a fresh Execution; whether a
+/// resume continues the same Execution is a phase 4 (Q6) decision,
+/// not something this shell may pre-decide. Old paths are
+/// untouched: this only adds a record.
+pub(crate) fn create_execution(
+    state: &AppState,
+    task_id: Option<String>,
+    loop_id: Option<String>,
+) -> ExecutionFileRecord {
+    let mut next = state.next_execution_id.lock().expect("execution id lock");
+    let id = format!("execution-{}", *next);
+    *next += 1;
+    let record = ExecutionFileRecord {
+        execution_id: id,
+        task_id,
+        loop_id,
+        status: "running".to_string(),
+    };
+    state.executions.lock().expect("execution lock").insert(record.execution_id.clone(), record.clone());
+    persist_execution(state, &record);
+    record
+}
+
 fn task_number(task_id: &str) -> u64 {
     task_id.strip_prefix("task-").and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)
 }
@@ -5862,6 +5930,8 @@ async fn tasks_run(
     let updated = record.clone();
     persist_task(&state, &updated);
     drop(tasks);
+    // P0 phase 1: the runner attempt gets its Execution shell record.
+    create_execution(&state, Some(req.task_id.clone()), None);
     tokio::spawn(crate::task_runner::run_task(state.clone(), req.task_id));
     Json(updated).into_response()
 }
@@ -6045,6 +6115,9 @@ async fn tasks_resume(
     // callers poll until the status leaves interrupted. A
     // fabricated running record would lie about the runner's
     // state, and blocking here would stall on a model call.
+    // P0 phase 1: a resume spawns a fresh runner attempt, so it
+    // gets a fresh Execution shell record.
+    create_execution(&state, Some(req.task_id.clone()), None);
     tokio::spawn(crate::task_runner::run_task(state.clone(), req.task_id));
     Json(record).into_response()
 }
@@ -6109,6 +6182,36 @@ async fn tasks_cancel(
                 .into_response()
         }
         _ => (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not cancellable" })))
+            .into_response(),
+    }
+}
+
+// --- Execution shell (P0 phase 1) ---
+//
+// Read-only observability for the phase-1 shell records. Creation
+// happens only as a side effect of task-runner / loop attempts
+// (see create_execution); there is deliberately no create route
+// yet, and no status transitions until phase 4.
+
+#[derive(Debug, Deserialize)]
+struct ExecutionGetQuery {
+    execution_id: String,
+}
+
+async fn executions_list(State(state): State<AppState>) -> Json<Vec<ExecutionFileRecord>> {
+    let mut records: Vec<ExecutionFileRecord> =
+        state.executions.lock().expect("execution lock").values().cloned().collect();
+    records.sort_by_key(|r| execution_number(&r.execution_id));
+    Json(records)
+}
+
+async fn executions_get(
+    State(state): State<AppState>,
+    Query(query): Query<ExecutionGetQuery>,
+) -> impl IntoResponse {
+    match state.executions.lock().expect("execution lock").get(&query.execution_id) {
+        Some(record) => Json(record.clone()).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown execution" })))
             .into_response(),
     }
 }
@@ -6790,6 +6893,8 @@ async fn loop_start(
 ) -> axum::response::Response {
     let result = state.loops.start(req);
     if let Ok(view) = &result {
+        // P0 phase 1: the loop attempt gets its Execution shell record.
+        create_execution(&state, None, Some(view.record.loop_id.clone()));
         spawn_driver(&state, &view.record.loop_id);
     }
     loop_response(&state, result)
@@ -6993,6 +7098,8 @@ pub fn app(state: AppState) -> Router {
         .route("/tasks/reject", post(tasks_reject))
         .route("/tasks/resume", post(tasks_resume))
         .route("/tasks/cancel", post(tasks_cancel))
+        .route("/executions/list", get(executions_list))
+        .route("/executions/get", get(executions_get))
         .route("/sessions/create", post(sessions_create))
         .route("/sessions/list", get(sessions_list))
         .route("/sessions/get", get(sessions_get))
