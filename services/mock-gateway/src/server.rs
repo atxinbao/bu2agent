@@ -349,6 +349,20 @@ pub struct AppState {
     sqlite_backend: Arc<Mutex<StateBackend>>,
     sqlite_shadow_failures: Arc<Mutex<u64>>,
     sqlite_broken: Arc<Mutex<bool>>,
+    /// P0-E: the WorkerSession this process created at startup
+    /// (recovery scan) and stamps on new Executions. None in
+    /// pure JSONL mode (no WorkerSession concept there) and
+    /// before any SQLite-mode scan has run.
+    pub(crate) current_worker_session: Arc<Mutex<Option<String>>>,
+    /// P0-E: the recovery scan runs at most once per AppState
+    /// instance, so the with_sqlite_path and import-and-switch
+    /// call sites cannot scan twice (a second scan would end
+    /// the worker the first scan just created).
+    recovery_scanned: Arc<Mutex<bool>>,
+    /// P0-E: the recovery scan failed. The migrated-domain
+    /// surface is fail-closed (sqlite_broken is also set) and
+    /// the production binary refuses to start (see main.rs).
+    recovery_failed: Arc<Mutex<bool>>,
     /// Device this gateway instance records as the origin of new
     /// Execution and Effect rows (P0-A provenance). Resolved once
     /// at startup from MOCK_ORIGIN_DEVICE_ID, default "mac-local";
@@ -632,6 +646,9 @@ impl AppState {
             sqlite_backend: Arc::new(Mutex::new(StateBackend::Jsonl)),
             sqlite_shadow_failures: Arc::new(Mutex::new(0)),
             sqlite_broken: Arc::new(Mutex::new(false)),
+            current_worker_session: Arc::new(Mutex::new(None)),
+            recovery_scanned: Arc::new(Mutex::new(false)),
+            recovery_failed: Arc::new(Mutex::new(false)),
             origin_device_id: "mac-local".to_string(),
             task_drafts: Arc::new(Mutex::new(HashMap::new())),
             task_drafts_dir: None,
@@ -1450,6 +1467,13 @@ impl AppState {
                 self.sqlite = Some(Arc::new(Mutex::new(conn)));
                 self.sqlite_path = Some(path);
                 self.sqlite_backend = Arc::new(Mutex::new(backend));
+                // P0-E: a restart straight into SQLite mode
+                // (import_done already set) scans now; a fresh
+                // database in shadow mode scans after the
+                // import-and-switch below makes it SQLite.
+                if backend == StateBackend::Sqlite {
+                    self.run_recovery_scan();
+                }
             }
             Err(detail) => {
                 eprintln!("warning: P0-D SQLite open failed ({detail}); migrated-domain surface is fail-closed, no JSONL fallback");
@@ -1477,6 +1501,70 @@ impl AppState {
     /// unaffected (they never migrated).
     pub fn sqlite_is_broken(&self) -> bool {
         *self.sqlite_broken.lock().expect("sqlite broken lock")
+    }
+
+    /// P0-E: this process's current WorkerSession id, if the
+    /// recovery scan has run (SQLite mode only).
+    pub fn current_worker_session(&self) -> Option<String> {
+        self.current_worker_session.lock().expect("current worker lock").clone()
+    }
+
+    /// P0-E: whether the startup recovery scan failed. The
+    /// binary checks this before binding (see main.rs) and
+    /// refuses to start; in-process users fail closed through
+    /// `sqlite_is_broken` as well.
+    pub fn sqlite_recovery_failed(&self) -> bool {
+        *self.recovery_failed.lock().expect("recovery failed lock")
+    }
+
+    /// P0-E recovery scan driver (plan §2.2): at most once per
+    /// instance, SQLite mode only, never in pure JSONL mode
+    /// (no sqlite connection) and never in shadow mode (the
+    /// import-and-switch call site runs it once the backend
+    /// becomes SQLite). A scan failure marks the state broken
+    /// and records `recovery_failed`: a gateway that cannot
+    /// establish its own worker identity must not open.
+    fn run_recovery_scan(&self) {
+        let Some(sqlite) = &self.sqlite else {
+            return;
+        };
+        if *self.recovery_scanned.lock().expect("recovery scanned lock") {
+            return;
+        }
+        *self.recovery_scanned.lock().expect("recovery scanned lock") = true;
+        let mut conn = sqlite.lock().expect("sqlite lock");
+        match sqlite_store::recovery_scan(&mut conn, &self.origin_device_id) {
+            Ok(id) => {
+                *self.current_worker_session.lock().expect("current worker lock") = Some(id);
+            }
+            Err(detail) => {
+                eprintln!("P0-E ERROR: recovery scan failed ({detail}); migrated-domain surface is fail-closed, startup must not proceed");
+                *self.sqlite_broken.lock().expect("sqlite broken lock") = true;
+                *self.recovery_failed.lock().expect("recovery failed lock") = true;
+            }
+        }
+    }
+
+    /// P0-E clean-shutdown counterpart (plan §2.1), called by
+    /// `serve` after the graceful shutdown completes.
+    /// Best-effort: failures are logged and never block the
+    /// exit, and a kill -9 simply never reaches this — the
+    /// next startup's scan closes what this missed.
+    pub fn sqlite_shutdown_cleanup(&self) {
+        // Skipped when this process never established a current
+        // worker (pure JSONL mode, or shadow mode before any
+        // scan): a process with no worker identity of its own
+        // must not end sessions it did not create.
+        if self.current_worker_session().is_none() {
+            return;
+        }
+        let Some(sqlite) = &self.sqlite else {
+            return;
+        };
+        let mut conn = sqlite.lock().expect("sqlite lock");
+        if let Err(detail) = sqlite_store::shutdown_cleanup(&mut conn) {
+            eprintln!("warning: P0-E shutdown cleanup failed ({detail}); next startup scan will close the worker");
+        }
     }
 
     pub(crate) fn sqlite_mode(&self) -> StateBackend {
@@ -1573,6 +1661,14 @@ impl AppState {
         }
         *self.sqlite_backend.lock().expect("sqlite backend lock") = StateBackend::Sqlite;
         *self.sqlite_broken.lock().expect("sqlite broken lock") = false;
+        // P0-E: first entry into SQLite mode on this instance
+        // runs the recovery scan (guarded: a restart that
+        // already scanned in with_sqlite_path skips it).
+        // A scan failure marks the state broken again (see
+        // run_recovery_scan); the import itself still reports
+        // Ok, and the failure surfaces through
+        // sqlite_recovery_failed / sqlite_is_broken.
+        self.run_recovery_scan();
         Ok(report)
     }
 
@@ -7271,7 +7367,19 @@ fn sqlite_error_response() -> axum::response::Response {
 /// and regenerates the JSONL audit export best-effort; no
 /// JSONL append happens. A SQLite-mode failure marks the state
 /// broken so migrated-domain routes fail closed.
-pub(crate) fn persist_execution(state: &AppState, record: &ExecutionFileRecord) {
+/// Plus the P0-E creation-time workspace snapshot, written in
+/// the SAME SQLite transaction
+/// as the execution row (never a second transaction: a crash
+/// between the two would leave an execution without its locked
+/// snapshot, or a snapshot without its execution). Only
+/// `create_execution` passes a snapshot; every later write of
+/// the same execution passes None, so the snapshot row is
+/// created exactly once and never rewritten.
+pub(crate) fn persist_execution_with_snapshot(
+    state: &AppState,
+    record: &ExecutionFileRecord,
+    snapshot: Option<&sqlite_store::SnapshotRow>,
+) {
     match state.sqlite_mode() {
         StateBackend::Sqlite => {
             let Some(sqlite) = &state.sqlite else {
@@ -7280,7 +7388,11 @@ pub(crate) fn persist_execution(state: &AppState, record: &ExecutionFileRecord) 
                 return;
             };
             let mut conn = sqlite.lock().expect("sqlite lock");
-            match sqlite_store::upsert_execution(&mut conn, record) {
+            let result = match snapshot {
+                Some(row) => sqlite_store::upsert_execution_with_snapshot(&mut conn, record, row),
+                None => sqlite_store::upsert_execution(&mut conn, record),
+            };
+            match result {
                 Ok(()) => {
                     if let Some(path) = &state.executions_path {
                         if let Err(detail) = sqlite_store::export_executions(&conn, path) {
@@ -7300,7 +7412,13 @@ pub(crate) fn persist_execution(state: &AppState, record: &ExecutionFileRecord) 
             }
             if let Some(sqlite) = &state.sqlite {
                 let mut conn = sqlite.lock().expect("sqlite lock");
-                if let Err(detail) = sqlite_store::upsert_execution(&mut conn, record) {
+                let result = match snapshot {
+                    Some(row) => {
+                        sqlite_store::upsert_execution_with_snapshot(&mut conn, record, row)
+                    }
+                    None => sqlite_store::upsert_execution(&mut conn, record),
+                };
+                if let Err(detail) = result {
                     *state.sqlite_shadow_failures.lock().expect("shadow failures lock") += 1;
                     eprintln!("warning: P0-D shadow execution write failed: {detail}");
                 }
@@ -7327,32 +7445,145 @@ fn execution_number(execution_id: &str) -> u64 {
 /// resume continues the same Execution is a phase 4 (Q6) decision,
 /// not something this shell may pre-decide. Old paths are
 /// untouched: this only adds a record.
+/// P0-E snapshot content for one new Execution (plan §3.2).
+/// Every value comes from a store this process already holds;
+/// nothing is invented. `files_root` is the gateway state home
+/// (the SQLite file's parent directory when SQLite is
+/// configured, else the files root), made absolute — an
+/// APPROXIMATION, not a modelled Workspace root: no Workspace
+/// object exists yet, and this comment must stay attached to
+/// the value until one does. `policy_binding_ids_json` holds
+/// content digests, not record ids, because the policy store
+/// has no policy-record ids to reference (network rules are a
+/// list, permissions are a settings block). `memory_scope` is
+/// the literal "default" placeholder (no memory-scope concept
+/// exists yet; the column is NOT NULL, so it cannot be empty).
+/// The snapshot id is tied to the execution number
+/// (`snapshot-N` for `execution-N`): one execution, one
+/// snapshot, no second counter that could race the id lock.
+fn build_workspace_snapshot(
+    state: &AppState,
+    snapshot_id: &str,
+    instruction_digest: &str,
+) -> sqlite_store::SnapshotRow {
+    let home = match &state.sqlite_path {
+        Some(path) => path.parent().map(|parent| parent.to_path_buf()),
+        None => None,
+    }
+    .unwrap_or_else(|| state.files_root.clone());
+    let absolute = if home.is_absolute() {
+        home.clone()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(&home)
+    };
+    let files_root = absolute
+        .canonicalize()
+        .unwrap_or(absolute)
+        .to_string_lossy()
+        .into_owned();
+    // Connector ids: connected connections, excluding a
+    // connector whose accounts are all unlinked (connected
+    // lives on the connection row, unlinked on the account row;
+    // a connector with no accounts at all still counts when its
+    // connection says connected). Sorted, deduplicated.
+    let connections = state.connector_connections.lock().expect("connector connections lock");
+    let accounts = state.connector_accounts.lock().expect("connector accounts lock");
+    let mut connector_ids: Vec<String> = connections
+        .iter()
+        .filter(|(_, connected)| **connected)
+        .map(|(id, _)| id.clone())
+        .filter(|id| {
+            let rows: Vec<_> = accounts.values().filter(|a| &a.connector_id == id).collect();
+            rows.is_empty() || rows.iter().any(|a| !a.unlinked)
+        })
+        .collect();
+    drop(accounts);
+    drop(connections);
+    connector_ids.sort();
+    connector_ids.dedup();
+    let mut device_ids: Vec<String> = state
+        .nodes
+        .lock()
+        .expect("node lock")
+        .values()
+        .filter(|node| !node.unpaired)
+        .map(|node| node.node_id.clone())
+        .collect();
+    device_ids.sort();
+    device_ids.dedup();
+    let rules = state.policy_rules.lock().expect("policy rules lock").clone().unwrap_or_default();
+    let rules_json = serde_json::to_value(&rules).expect("network rules serialize");
+    let rules_digest = sqlite_store::sha256_hex(sqlite_store::canonical_json(&rules_json).as_bytes());
+    let effective = policy_effective(state);
+    let effective_json = serde_json::to_value(&effective).expect("effective policy serialize");
+    let permissions_digest =
+        sqlite_store::sha256_hex(sqlite_store::canonical_json(&effective_json).as_bytes());
+    let policy_binding_ids_json = serde_json::to_string(&[
+        format!("network-rules:sha256:{rules_digest}"),
+        format!("permissions:sha256:{permissions_digest}"),
+    ])
+    .expect("policy bindings serialize");
+    let mut row = sqlite_store::SnapshotRow {
+        snapshot_id: snapshot_id.to_string(),
+        content_sha256: String::new(),
+        files_root,
+        connector_ids_json: serde_json::to_string(&connector_ids).expect("connector ids serialize"),
+        device_ids_json: serde_json::to_string(&device_ids).expect("device ids serialize"),
+        policy_binding_ids_json,
+        memory_scope: "default".to_string(),
+        instruction_digest: instruction_digest.to_string(),
+        origin_device_id: state.origin_device_id.clone(),
+        schema_version: 1,
+    };
+    row.content_sha256 = sqlite_store::snapshot_content_sha256(&row);
+    row
+}
+
 pub(crate) fn create_execution(
     state: &AppState,
     task_id: Option<String>,
     loop_id: Option<String>,
 ) -> ExecutionFileRecord {
     let mut next = state.next_execution_id.lock().expect("execution id lock");
-    let id = format!("execution-{}", *next);
+    let number = *next;
     *next += 1;
-    // P0-A only adds provenance and reserved references: the
-    // session, worker session and snapshot fields stay None
-    // until their phases land, and the origin/schema pair is
-    // stamped from this instance. Status values and the
-    // creation paths are untouched.
+    drop(next);
+    let id = format!("execution-{number}");
+    // P0-E fills the two P0-A reserved fields at creation.
+    // Worker: the process's current WorkerSession, when one
+    // exists (SQLite mode after the recovery scan; pure JSONL
+    // mode has no WorkerSession concept, so this stays None).
+    // Instruction template digest (plan §3.3): the task prompt
+    // prefix, the loop system constant, or the empty string for
+    // adapter executions — the template, never a synthesized
+    // prompt (synthesis happens after creation, inside the
+    // driver, and cannot be snapshotted here).
+    let instruction_digest = if task_id.is_some() {
+        sqlite_store::sha256_hex(crate::task_runner::PROMPT_PREFIX.as_bytes())
+    } else if loop_id.is_some() {
+        sqlite_store::sha256_hex(crate::deepseek_loop::SYSTEM.as_bytes())
+    } else {
+        sqlite_store::sha256_hex(b"")
+    };
+    let worker_session_id = state.current_worker_session();
+    let snapshot = if state.sqlite.is_some() {
+        Some(build_workspace_snapshot(state, &format!("snapshot-{number}"), &instruction_digest))
+    } else {
+        None
+    };
     let record = ExecutionFileRecord {
         execution_id: id,
         task_id,
         loop_id,
         session_id: None,
-        worker_session_id: None,
-        workspace_snapshot_id: None,
+        worker_session_id,
+        workspace_snapshot_id: snapshot.as_ref().map(|row| row.snapshot_id.clone()),
         status: "running".to_string(),
         origin_device_id: state.origin_device_id.clone(),
         schema_version: 1,
     };
     state.executions.lock().expect("execution lock").insert(record.execution_id.clone(), record.clone());
-    persist_execution(state, &record);
+    persist_execution_with_snapshot(state, &record, snapshot.as_ref());
     record
 }
 
@@ -8382,6 +8613,52 @@ struct ExecutionGetQuery {
     execution_id: String,
 }
 
+/// P0-E read view: the stored record plus the two derived
+/// fields (plan §2.2). Additive only: old clients reading the
+/// record fields see no change. Both routes build views
+/// through this one function, which is the single supplier of
+/// the recoverability judgement — there is no second copy of
+/// the algorithm in the get path.
+#[derive(Debug, Serialize)]
+struct ExecutionView {
+    #[serde(flatten)]
+    record: ExecutionFileRecord,
+    recoverable: bool,
+    active_assignment_id: Option<String>,
+}
+
+/// Attach derived fields to records. In SQLite mode the
+/// driving-assignment map comes from one SQLite query; a
+/// failed map read fails the whole response closed (a view
+/// computed as "no drivers" from a broken read would lie
+/// about recoverability). Outside SQLite mode there is no
+/// assignment table, so the map is empty by construction.
+fn execution_views(
+    state: &AppState,
+    records: Vec<ExecutionFileRecord>,
+) -> Option<Vec<ExecutionView>> {
+    let active_map: HashMap<String, String> = if state.sqlite_mode() == StateBackend::Sqlite {
+        let sqlite = state.sqlite.as_ref()?;
+        let conn = sqlite.lock().expect("sqlite lock");
+        sqlite_store::active_assignments_map(&conn).ok()?
+    } else {
+        HashMap::new()
+    };
+    Some(
+        records
+            .into_iter()
+            .map(|record| {
+                let active = active_map.get(&record.execution_id).cloned();
+                let recoverable = crate::execution_store::execution_recoverable(
+                    &record.status,
+                    active.is_some(),
+                );
+                ExecutionView { record, recoverable, active_assignment_id: active }
+            })
+            .collect(),
+    )
+}
+
 async fn executions_list(State(state): State<AppState>) -> impl IntoResponse {
     // P0-D: SQLite mode reads SQLite; a broken database fails
     // closed (5xx) instead of serving a stale map.
@@ -8389,14 +8666,17 @@ async fn executions_list(State(state): State<AppState>) -> impl IntoResponse {
         let Some(records) = executions_snapshot(&state) else {
             return sqlite_error_response();
         };
-        let mut records = records;
-        records.sort_by_key(|r| execution_number(&r.execution_id));
-        return Json(records).into_response();
+        let Some(mut views) = execution_views(&state, records) else {
+            return sqlite_error_response();
+        };
+        views.sort_by_key(|v| execution_number(&v.record.execution_id));
+        return Json(views).into_response();
     }
     let mut records: Vec<ExecutionFileRecord> =
         state.executions.lock().expect("execution lock").values().cloned().collect();
     records.sort_by_key(|r| execution_number(&r.execution_id));
-    Json(records).into_response()
+    let views = execution_views(&state, records).expect("non-SQLite views cannot fail");
+    Json(views).into_response()
 }
 
 async fn executions_get(
@@ -8407,16 +8687,228 @@ async fn executions_get(
         let Some(records) = executions_snapshot(&state) else {
             return sqlite_error_response();
         };
-        return match records.into_iter().find(|r| r.execution_id == query.execution_id) {
-            Some(record) => Json(record).into_response(),
-            None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown execution" })))
-                .into_response(),
+        let Some(record) = records.into_iter().find(|r| r.execution_id == query.execution_id) else {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown execution" })))
+                .into_response();
         };
+        let Some(mut views) = execution_views(&state, vec![record]) else {
+            return sqlite_error_response();
+        };
+        return Json(views.remove(0)).into_response();
     }
     match state.executions.lock().expect("execution lock").get(&query.execution_id) {
-        Some(record) => Json(record.clone()).into_response(),
+        Some(record) => {
+            let views =
+                execution_views(&state, vec![record.clone()]).expect("non-SQLite views cannot fail");
+            Json(views.into_iter().next().expect("one view")).into_response()
+        }
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown execution" })))
             .into_response(),
+    }
+}
+
+/// P0-E: after a takeover or transition rewrites an execution
+/// row in SQLite mode, regenerate the JSONL audit export
+/// best-effort (the P0-D rule: exports refresh on writes, and
+/// a takeover/transition is a write even though it is not a
+/// persist_execution call).
+fn refresh_executions_export(state: &AppState) {
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return;
+    }
+    let (Some(sqlite), Some(path)) = (&state.sqlite, &state.executions_path) else {
+        return;
+    };
+    let conn = sqlite.lock().expect("sqlite lock");
+    if let Err(detail) = sqlite_store::export_executions(&conn, path) {
+        eprintln!("warning: P0-E executions audit export failed: {detail}");
+    }
+}
+
+// --- P0-E Assignment / Execution-transition routes (gateway
+// only, no client) ---
+//
+// Takeover and transition are SQLite-plane operations: they
+// require SQLite mode (not shadow, not JSONL). Shadow mode is
+// a transient pre-switch state in production (startup
+// auto-switches), and its JSONL authority would silently
+// diverge from a takeover's SQLite-only assignment rows, so
+// refusing there is the fail-closed choice, not an omission.
+// Assignment reads, by contrast, touch SQLite-only tables
+// with no JSONL counterpart, so they mirror the Inbox routes
+// and serve shadow mode too.
+
+#[derive(Debug, Deserialize)]
+struct TakeoverDto {
+    execution_id: String,
+    worker_session_id: Option<String>,
+}
+
+async fn assignments_takeover(
+    State(state): State<AppState>,
+    Json(req): Json<TakeoverDto>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let result = {
+        let mut conn = sqlite.lock().expect("sqlite lock");
+        sqlite_store::takeover_assignment(
+            &mut conn,
+            &req.execution_id,
+            req.worker_session_id.as_deref(),
+            &state.origin_device_id,
+        )
+    };
+    match result {
+        Ok(outcome) => {
+            // The connection guard is dropped before the map
+            // lock (persist sites take them in the opposite
+            // order); holding both at once would risk deadlock.
+            state
+                .executions
+                .lock()
+                .expect("execution lock")
+                .insert(outcome.execution.execution_id.clone(), outcome.execution.clone());
+            // JUDGEMENT CALL (plan is silent): after a
+            // takeover, this process drives AS the takeover
+            // worker, so it becomes the current worker: later
+            // executions stamp it, and a clean shutdown ends
+            // it (with its assignment) instead of only the
+            // scan worker. Without this, a takeover worker's
+            // assignment would survive a clean exit until the
+            // next scan, contradicting §2.1 convergence.
+            *state.current_worker_session.lock().expect("current worker lock") =
+                outcome.assignment.worker_session_id.clone();
+            refresh_executions_export(&state);
+            Json(serde_json::json!({
+                "assignment": outcome.assignment,
+                "execution": outcome.execution,
+                "checkpoint": outcome.checkpoint,
+                "superseded": outcome.superseded,
+            }))
+            .into_response()
+        }
+        Err(sqlite_store::TakeoverError::Refused(code)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": code })),
+        )
+            .into_response(),
+        Err(sqlite_store::TakeoverError::Internal(detail)) => {
+            *state.sqlite_broken.lock().expect("sqlite broken lock") = true;
+            eprintln!("warning: P0-E takeover failed: {detail}");
+            sqlite_error_response()
+        }
+    }
+}
+
+async fn assignments_list(State(state): State<AppState>) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite && state.sqlite_mode() != StateBackend::Shadow {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::list_assignments(&conn) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(detail) => {
+            eprintln!("warning: P0-E assignments list failed: {detail}");
+            sqlite_error_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AssignmentGetQuery {
+    assignment_id: String,
+}
+
+async fn assignments_get(
+    State(state): State<AppState>,
+    Query(query): Query<AssignmentGetQuery>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite && state.sqlite_mode() != StateBackend::Shadow {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::get_assignment(&conn, &query.assignment_id) {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown assignment" })))
+            .into_response(),
+        Err(detail) => {
+            eprintln!("warning: P0-E assignments get failed: {detail}");
+            sqlite_error_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecutionTransitionDto {
+    execution_id: String,
+    status: String,
+}
+
+async fn executions_transition(
+    State(state): State<AppState>,
+    Json(req): Json<ExecutionTransitionDto>,
+) -> impl IntoResponse {
+    if !crate::execution_store::valid_execution_status(&req.status) {
+        return bad_request("unknown execution status");
+    }
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let result = {
+        let mut conn = sqlite.lock().expect("sqlite lock");
+        sqlite_store::transition_execution(&mut conn, &req.execution_id, &req.status)
+    };
+    match result {
+        Ok(record) => {
+            state
+                .executions
+                .lock()
+                .expect("execution lock")
+                .insert(record.execution_id.clone(), record.clone());
+            refresh_executions_export(&state);
+            Json(record).into_response()
+        }
+        Err(sqlite_store::ExecutionTransitionError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown execution" })),
+        )
+            .into_response(),
+        Err(sqlite_store::ExecutionTransitionError::Illegal) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "execution_transition_refused" })),
+        )
+            .into_response(),
+        Err(sqlite_store::ExecutionTransitionError::Internal(detail)) => {
+            *state.sqlite_broken.lock().expect("sqlite broken lock") = true;
+            eprintln!("warning: P0-E execution transition failed: {detail}");
+            sqlite_error_response()
+        }
     }
 }
 
@@ -9811,6 +10303,10 @@ pub fn app(state: AppState) -> Router {
         .route("/tasks/cancel", post(tasks_cancel))
         .route("/executions/list", get(executions_list))
         .route("/executions/get", get(executions_get))
+        .route("/executions/transition", post(executions_transition))
+        .route("/assignments/takeover", post(assignments_takeover))
+        .route("/assignments/list", get(assignments_list))
+        .route("/assignments/get", get(assignments_get))
         .route("/effects/list", get(effects_list))
         .route("/effects/get", get(effects_get))
         .route("/effects/transition", post(effects_transition))
@@ -9853,7 +10349,98 @@ pub async fn serve(
         let _ = tokio::signal::ctrl_c().await;
         println!("mock-gateway shutting down");
     };
-    axum::serve(listener, app(state))
+    let result = axum::serve(listener, app(state.clone()))
         .with_graceful_shutdown(shutdown)
-        .await
+        .await;
+    // P0-E clean-shutdown hook: this is the ONE normal-exit
+    // path (Ctrl-C graceful shutdown). The cleanup runs after
+    // the listener stops, best-effort, and never changes the
+    // serve result: a failed cleanup is logged, and the next
+    // startup's recovery scan closes whatever it missed.
+    // SIGTERM has no handler here (pre-existing: only Ctrl-C
+    // is graceful), and kill -9 never reaches this by design.
+    state.sqlite_shutdown_cleanup();
+    result
+}
+
+#[cfg(test)]
+mod p0e_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mock-server-p0e-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// P0-E creation stamping, unit-level: the worker comes
+    /// from the scan, the snapshot id tracks the execution
+    /// number, and the instruction digest follows the driver
+    /// (task prefix / loop system / adapter empty string).
+    /// Pure JSONL mode (no SQLite) keeps both fields None.
+    #[test]
+    fn p0e_create_execution_stamps_worker_and_snapshot_per_driver() {
+        let dir = temp_dir("create");
+        let state = AppState::with_files_root_and_approvals(dir.join("files"), None)
+            .with_sqlite_path(dir.join("gateway.sqlite3"));
+        state.sqlite_import_and_switch().expect("switch");
+        assert_eq!(state.current_worker_session().as_deref(), Some("worker-1"));
+
+        let task_exec = create_execution(&state, Some("task-1".to_string()), None);
+        let loop_exec = create_execution(&state, None, Some("loop-1".to_string()));
+        let adapter_exec = create_execution(&state, None, None);
+        assert_eq!(task_exec.worker_session_id.as_deref(), Some("worker-1"));
+        assert_eq!(loop_exec.worker_session_id.as_deref(), Some("worker-1"));
+        assert_eq!(adapter_exec.worker_session_id.as_deref(), Some("worker-1"));
+        assert_eq!(
+            task_exec.workspace_snapshot_id.as_deref(),
+            Some("snapshot-1")
+        );
+        assert_eq!(
+            loop_exec.workspace_snapshot_id.as_deref(),
+            Some("snapshot-2")
+        );
+        assert_eq!(
+            adapter_exec.workspace_snapshot_id.as_deref(),
+            Some("snapshot-3")
+        );
+        let conn = state.sqlite.as_ref().unwrap().lock().expect("sqlite lock");
+        let task_snap = sqlite_store::get_snapshot(&conn, "snapshot-1")
+            .expect("snapshot-1")
+            .expect("snapshot-1 row");
+        assert_eq!(
+            task_snap.instruction_digest,
+            sqlite_store::sha256_hex(crate::task_runner::PROMPT_PREFIX.as_bytes())
+        );
+        let loop_snap = sqlite_store::get_snapshot(&conn, "snapshot-2")
+            .expect("snapshot-2")
+            .expect("snapshot-2 row");
+        assert_eq!(
+            loop_snap.instruction_digest,
+            sqlite_store::sha256_hex(crate::deepseek_loop::SYSTEM.as_bytes())
+        );
+        let adapter_snap = sqlite_store::get_snapshot(&conn, "snapshot-3")
+            .expect("snapshot-3")
+            .expect("snapshot-3 row");
+        assert_eq!(
+            adapter_snap.instruction_digest,
+            sqlite_store::sha256_hex(b"")
+        );
+        assert_ne!(
+            task_snap.instruction_digest,
+            loop_snap.instruction_digest
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Pure JSONL mode: no worker, no snapshot, unchanged.
+        let plain = AppState::with_files_root_and_approvals(dir.join("files"), None);
+        let record = create_execution(&plain, Some("task-9".to_string()), None);
+        assert_eq!(record.worker_session_id, None);
+        assert_eq!(record.workspace_snapshot_id, None);
+    }
 }

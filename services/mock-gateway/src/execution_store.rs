@@ -91,6 +91,42 @@ pub fn valid_execution_status(status: &str) -> bool {
     execution_status_group(status).is_some()
 }
 
+/// P0-E explicit transition edges (plan §4.2, mirroring the
+/// P0-C Effect lifecycle shape): terminal states
+/// (completed / failed / cancelled) have no outgoing edge.
+/// `needs_review` cannot return to `awaiting_approval` — a
+/// review outcome is a run, a completion or a failure, never
+/// a fresh approval wait.
+pub fn valid_execution_transition(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("running", "awaiting_approval")
+            | ("running", "needs_review")
+            | ("running", "completed")
+            | ("running", "failed")
+            | ("running", "cancelled")
+            | ("awaiting_approval", "running")
+            | ("awaiting_approval", "needs_review")
+            | ("awaiting_approval", "completed")
+            | ("awaiting_approval", "failed")
+            | ("awaiting_approval", "cancelled")
+            | ("needs_review", "running")
+            | ("needs_review", "completed")
+            | ("needs_review", "failed")
+            | ("needs_review", "cancelled")
+    )
+}
+
+/// P0-E recoverability (plan §2.2): a derived property, never
+/// a stored status word. An execution is recoverable exactly
+/// when its status is non-terminal AND no assignment is
+/// currently driving it. This one function supplies both the
+/// executions/list and executions/get derived fields, so the
+/// two routes cannot disagree.
+pub fn execution_recoverable(status: &str, has_active_assignment: bool) -> bool {
+    matches!(status, "running" | "awaiting_approval" | "needs_review") && !has_active_assignment
+}
+
 pub fn load_executions(path: &Path) -> Vec<ExecutionFileRecord> {
     let Ok(content) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -266,6 +302,52 @@ mod tests {
         assert_eq!(old_row.origin_device_id, "unknown");
         assert_eq!(old_row.schema_version, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p0e_transition_edges_and_recoverability() {
+        // Every allowed edge from the plan, and only those.
+        for (from, to) in [
+            ("running", "awaiting_approval"),
+            ("running", "needs_review"),
+            ("running", "completed"),
+            ("running", "failed"),
+            ("running", "cancelled"),
+            ("awaiting_approval", "running"),
+            ("awaiting_approval", "needs_review"),
+            ("awaiting_approval", "completed"),
+            ("awaiting_approval", "failed"),
+            ("awaiting_approval", "cancelled"),
+            ("needs_review", "running"),
+            ("needs_review", "completed"),
+            ("needs_review", "failed"),
+            ("needs_review", "cancelled"),
+        ] {
+            assert!(valid_execution_transition(from, to), "{from} -> {to}");
+        }
+        for (from, to) in [
+            ("running", "running"),
+            ("awaiting_approval", "awaiting_approval"),
+            ("needs_review", "needs_review"),
+            ("needs_review", "awaiting_approval"),
+            ("completed", "running"),
+            ("failed", "running"),
+            ("cancelled", "running"),
+            ("completed", "completed"),
+            ("bogus", "running"),
+            ("running", "bogus"),
+        ] {
+            assert!(!valid_execution_transition(from, to), "{from} -> {to}");
+        }
+        // Recoverability is derived, not a status word.
+        assert!(execution_recoverable("running", false));
+        assert!(execution_recoverable("awaiting_approval", false));
+        assert!(execution_recoverable("needs_review", false));
+        assert!(!execution_recoverable("running", true));
+        assert!(!execution_recoverable("completed", false));
+        assert!(!execution_recoverable("failed", false));
+        assert!(!execution_recoverable("cancelled", false));
+        assert!(!execution_recoverable("bogus", false));
     }
 
     #[test]

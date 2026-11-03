@@ -20,6 +20,13 @@ async fn main() {
     };
     println!("chat backend: {}", if config.api_key.is_some() { "deepseek" } else { "mock echo (no key configured or test mode)" });
     let state = mock_gateway::server::AppState::from_deepseek_config(config);
+    // P0-E fail-closed startup: if the recovery scan could not
+    // establish this process's worker identity, the gateway
+    // must not open with a half-scanned assignment table.
+    if state.sqlite_recovery_failed() {
+        eprintln!("mock-gateway refusing to start: P0-E recovery scan failed (see above); fix the database and restart");
+        std::process::exit(1);
+    }
     let addr =
         std::env::var("MOCK_GATEWAY_ADDR").unwrap_or_else(|_| "127.0.0.1:3001".to_string());
     let listener = tokio::net::TcpListener::bind(&addr)

@@ -41,7 +41,10 @@ use crate::task_store::TaskFileRecord;
 const MAX_FILE_BYTES: usize = 262144;
 
 /// Verbatim fixed prompt from the manual flow (TasksView).
-const PROMPT_PREFIX: &str =
+/// pub(crate): P0-E snapshots digest the driving template, so
+/// the server's snapshot builder reads this constant rather
+/// than a copy that could drift from it.
+pub(crate) const PROMPT_PREFIX: &str =
     "请把以下目录文本整理成一份结构清晰的报告（标题、要点、结论）：\n\n";
 
 fn draft_file_name(task_id: &str) -> String {

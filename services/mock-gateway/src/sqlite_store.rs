@@ -184,6 +184,7 @@ CREATE TABLE IF NOT EXISTS worker_sessions (
     worker_session_id TEXT PRIMARY KEY,
     origin_device_id TEXT NOT NULL,
     status TEXT NOT NULL,
+    detail TEXT,
     schema_version INTEGER NOT NULL,
     created_ms INTEGER,
     updated_at_ms INTEGER
@@ -272,6 +273,27 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
             [],
         )
         .map_err(err)?;
+    }
+    // P0-E additive column: databases migrated by P0-D have no
+    // worker_sessions.detail, but the approved plan's recovery
+    // scan records its note ("process ended" / "clean shutdown")
+    // there. Nullable, idempotent, schema version stays 1: this
+    // is a column backfill, not a v2 migration, and it changes
+    // no existing row (old rows read detail as NULL).
+    let has_detail: bool = {
+        let mut stmt = tx
+            .prepare("PRAGMA table_info(worker_sessions)")
+            .map_err(err)?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(err)?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(err)?;
+        names.iter().any(|name| name == "detail")
+    };
+    if !has_detail {
+        tx.execute("ALTER TABLE worker_sessions ADD COLUMN detail TEXT", [])
+            .map_err(err)?;
     }
     tx.commit().map_err(err)?;
     Ok(())
@@ -1585,8 +1607,14 @@ pub fn deliver_outbox_via_log_sink(
 }
 
 // --- P0-E tables: test-seam inserts only (no production driver) ---
+//
+// P0-E drives these tables through the transactional functions
+// further below (recovery scan, takeover, transition, snapshot
+// creation); the seams stay for unit-level tests. Row structs
+// are Serialize so event payloads and HTTP responses can carry
+// the post-state row verbatim.
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssignmentRow {
     pub assignment_id: String,
     pub execution_id: Option<String>,
@@ -1599,15 +1627,19 @@ pub struct AssignmentRow {
     pub schema_version: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerSessionRow {
     pub worker_session_id: String,
     pub origin_device_id: String,
     pub status: String,
+    /// P0-E scan / shutdown note ("process ended" /
+    /// "clean shutdown"); NULL for rows that never ended that
+    /// way. Added as a nullable column, not a v2 migration.
+    pub detail: Option<String>,
     pub schema_version: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointRow {
     pub checkpoint_id: String,
     pub execution_id: Option<String>,
@@ -1618,7 +1650,7 @@ pub struct CheckpointRow {
     pub schema_version: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotRow {
     pub snapshot_id: String,
     pub content_sha256: String,
@@ -1662,9 +1694,9 @@ pub fn insert_worker_session(conn: &mut Connection, row: &WorkerSessionRow) -> R
     let seq = seam_seq(conn, "worker_sessions", &row.worker_session_id)?;
     let now = now_ms() as i64;
     conn.execute(
-        "INSERT INTO worker_sessions (seq, worker_session_id, origin_device_id, status, schema_version, created_ms, updated_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-        params![seq, row.worker_session_id, row.origin_device_id, row.status, row.schema_version, now],
+        "INSERT INTO worker_sessions (seq, worker_session_id, origin_device_id, status, detail, schema_version, created_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        params![seq, row.worker_session_id, row.origin_device_id, row.status, row.detail, row.schema_version, now],
     )
     .map_err(err)?;
     Ok(())
@@ -1762,6 +1794,931 @@ pub fn shadow_compare(
         }
     }
     Ok(report)
+}
+
+// --- P0-E: recovery scan, takeover, execution transition,
+// workspace-snapshot creation, checkpoints ---
+//
+// All production writes here are single transactions: the state
+// row, its event row and any derived Assignment / Checkpoint
+// rows commit together or not at all. Event payloads are
+// post-state snapshots, exactly as in P0-D; `fold_matches_tables`
+// ignores the `assignment` / `worker_session` / `checkpoint` /
+// `workspace_snapshot` aggregate kinds, so the new event types
+// cannot break the execution / effect / approval fold — but the
+// execution events below (reassigned, transitioned) DO carry the
+// full execution record and therefore MUST match the executions
+// table row, or the fold fails. Both writers below guarantee
+// that by serializing the same record they just wrote.
+
+/// Canonical JSON for snapshot hashing (plan §3.2): object keys
+/// sorted recursively, UTF-8, compact, no whitespace. Sorting is
+/// done explicitly so the guarantee does not depend on
+/// serde_json's map implementation.
+pub fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = String::from("{");
+            for (i, key) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(key).expect("canonical key"));
+                out.push(':');
+                out.push_str(&canonical_json(&map[*key]));
+            }
+            out.push('}');
+            out
+        }
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", parts.join(","))
+        }
+        other => serde_json::to_string(other).expect("canonical value"),
+    }
+}
+
+/// SHA-256 hex, single implementation for the whole crate
+/// (operation_binding owns the hasher).
+pub fn sha256_hex(data: &[u8]) -> String {
+    crate::operation_binding::sha256_hex(data)
+}
+
+/// Content hash of a snapshot row (plan §3.2): canonical JSON
+/// of the row's content fields exactly as stored (the *_json
+/// fields as strings, not re-parsed), excluding content_sha256
+/// itself and the snapshot_id / seq / time columns.
+pub fn snapshot_content_sha256(row: &SnapshotRow) -> String {
+    let value = serde_json::json!({
+        "connector_ids_json": row.connector_ids_json,
+        "device_ids_json": row.device_ids_json,
+        "files_root": row.files_root,
+        "instruction_digest": row.instruction_digest,
+        "memory_scope": row.memory_scope,
+        "policy_binding_ids_json": row.policy_binding_ids_json,
+    });
+    sha256_hex(canonical_json(&value).as_bytes())
+}
+
+fn execution_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExecutionFileRecord> {
+    Ok(ExecutionFileRecord {
+        execution_id: row.get(0)?,
+        task_id: row.get(1)?,
+        loop_id: row.get(2)?,
+        session_id: row.get(3)?,
+        worker_session_id: row.get(4)?,
+        workspace_snapshot_id: row.get(5)?,
+        status: row.get(6)?,
+        origin_device_id: row.get(7)?,
+        schema_version: row.get::<_, i64>(8)? as u64,
+    })
+}
+
+fn effect_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EffectFileRecord> {
+    let (recon_result, recon_detail, recon_checked): (Option<String>, Option<String>, Option<i64>) =
+        (row.get(9)?, row.get(10)?, row.get(11)?);
+    let reconciliation = match (recon_result, recon_checked) {
+        (Some(result), Some(checked_ms)) => Some(crate::effect_store::Reconciliation {
+            result,
+            checked_ms: checked_ms as u64,
+            detail: recon_detail,
+        }),
+        (Some(result), None) => Some(crate::effect_store::Reconciliation {
+            result,
+            checked_ms: 0,
+            detail: recon_detail,
+        }),
+        _ => None,
+    };
+    Ok(EffectFileRecord {
+        effect_id: row.get(0)?,
+        execution_id: row.get(1)?,
+        capability: row.get(2)?,
+        operation: row.get(3)?,
+        scope: row.get(4)?,
+        input_digest: row.get(5)?,
+        approval_id: row.get(6)?,
+        idempotency_key: row.get(7)?,
+        status: row.get(8)?,
+        reconciliation,
+        detail: row.get(12)?,
+        origin_device_id: row.get(13)?,
+        schema_version: row.get::<_, i64>(14)? as u64,
+    })
+}
+
+fn assignment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssignmentRow> {
+    Ok(AssignmentRow {
+        assignment_id: row.get(0)?,
+        execution_id: row.get(1)?,
+        worker_session_id: row.get(2)?,
+        origin_device_id: row.get(3)?,
+        status: row.get(4)?,
+        detail: row.get(5)?,
+        lease_expires_ms: row.get(6)?,
+        heartbeat_ms: row.get(7)?,
+        schema_version: row.get(8)?,
+    })
+}
+
+fn worker_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerSessionRow> {
+    Ok(WorkerSessionRow {
+        worker_session_id: row.get(0)?,
+        origin_device_id: row.get(1)?,
+        status: row.get(2)?,
+        detail: row.get(3)?,
+        schema_version: row.get(4)?,
+    })
+}
+
+fn checkpoint_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointRow> {
+    Ok(CheckpointRow {
+        checkpoint_id: row.get(0)?,
+        execution_id: row.get(1)?,
+        execution_seq: row.get(2)?,
+        kind: row.get(3)?,
+        payload_json: row.get(4)?,
+        origin_device_id: row.get(5)?,
+        schema_version: row.get(6)?,
+    })
+}
+
+fn snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRow> {
+    Ok(SnapshotRow {
+        snapshot_id: row.get(0)?,
+        content_sha256: row.get(1)?,
+        files_root: row.get(2)?,
+        connector_ids_json: row.get(3)?,
+        device_ids_json: row.get(4)?,
+        policy_binding_ids_json: row.get(5)?,
+        memory_scope: row.get(6)?,
+        instruction_digest: row.get(7)?,
+        origin_device_id: row.get(8)?,
+        schema_version: row.get(9)?,
+    })
+}
+
+const EXECUTION_COLS: &str = "execution_id, task_id, loop_id, session_id, worker_session_id, workspace_snapshot_id, status, origin_device_id, schema_version";
+const EFFECT_COLS: &str = "effect_id, execution_id, capability, operation, scope, input_digest, approval_id, idempotency_key, status, reconciliation_result, reconciliation_detail, reconciliation_checked_ms, detail, origin_device_id, schema_version";
+const ASSIGNMENT_COLS: &str = "assignment_id, execution_id, worker_session_id, origin_device_id, status, detail, lease_expires_ms, heartbeat_ms, schema_version";
+const WORKER_COLS: &str = "worker_session_id, origin_device_id, status, detail, schema_version";
+const CHECKPOINT_COLS: &str = "checkpoint_id, execution_id, execution_seq, kind, payload_json, origin_device_id, schema_version";
+const SNAPSHOT_COLS: &str = "snapshot_id, content_sha256, files_root, connector_ids_json, device_ids_json, policy_binding_ids_json, memory_scope, instruction_digest, origin_device_id, schema_version";
+
+/// One transaction-local seq: the id suffix when the id carries
+/// one, else MAX(seq) + 1 (mirrors the seam convention).
+fn tx_seq(tx: &rusqlite::Transaction<'_>, table: &str, id: &str) -> Result<i64, String> {
+    let suffix = id_suffix(id);
+    if suffix > 0 {
+        return Ok(suffix);
+    }
+    let max: Option<i64> = tx
+        .query_row(&format!("SELECT MAX(seq) FROM {table}"), [], |row| row.get(0))
+        .map_err(err)?;
+    Ok(max.unwrap_or(0) + 1)
+}
+
+/// Next `prefix-N` id in a table: one past the largest numeric
+/// suffix present. Computed inside the caller's transaction, so
+/// under the single-writer connection mutex it cannot race.
+fn next_prefixed_id(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    id_col: &str,
+    prefix: &str,
+) -> Result<String, String> {
+    let mut stmt = tx
+        .prepare(&format!("SELECT {id_col} FROM {table}"))
+        .map_err(err)?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(err)?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(err)?;
+    let max = ids
+        .iter()
+        .filter_map(|id| id.strip_prefix(prefix)?.parse::<i64>().ok())
+        .max()
+        .unwrap_or(0);
+    Ok(format!("{prefix}{}", max + 1))
+}
+
+fn insert_worker_session_tx(
+    tx: &rusqlite::Transaction<'_>,
+    row: &WorkerSessionRow,
+) -> Result<(), String> {
+    let seq = tx_seq(tx, "worker_sessions", &row.worker_session_id)?;
+    let now = now_ms() as i64;
+    tx.execute(
+        "INSERT INTO worker_sessions (seq, worker_session_id, origin_device_id, status, detail, schema_version, created_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        params![seq, row.worker_session_id, row.origin_device_id, row.status, row.detail, row.schema_version, now],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+fn insert_assignment_tx(
+    tx: &rusqlite::Transaction<'_>,
+    row: &AssignmentRow,
+) -> Result<(), String> {
+    let seq = tx_seq(tx, "assignments", &row.assignment_id)?;
+    let now = now_ms() as i64;
+    tx.execute(
+        "INSERT INTO assignments (seq, assignment_id, execution_id, worker_session_id, origin_device_id, status, detail, lease_expires_ms, heartbeat_ms, schema_version, created_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+        params![seq, row.assignment_id, row.execution_id, row.worker_session_id, row.origin_device_id, row.status, row.detail, row.lease_expires_ms, row.heartbeat_ms, row.schema_version, now],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+fn insert_checkpoint_tx(
+    tx: &rusqlite::Transaction<'_>,
+    row: &CheckpointRow,
+) -> Result<(), String> {
+    let seq = tx_seq(tx, "checkpoints", &row.checkpoint_id)?;
+    let now = now_ms() as i64;
+    tx.execute(
+        "INSERT INTO checkpoints (seq, checkpoint_id, execution_id, execution_seq, kind, payload_json, origin_device_id, schema_version, created_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![seq, row.checkpoint_id, row.execution_id, row.execution_seq, row.kind, row.payload_json, row.origin_device_id, row.schema_version, now],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+fn insert_snapshot_tx(
+    tx: &rusqlite::Transaction<'_>,
+    row: &SnapshotRow,
+) -> Result<(), String> {
+    let seq = tx_seq(tx, "workspace_snapshots", &row.snapshot_id)?;
+    let now = now_ms() as i64;
+    tx.execute(
+        "INSERT INTO workspace_snapshots (seq, snapshot_id, content_sha256, files_root, connector_ids_json, device_ids_json, policy_binding_ids_json, memory_scope, instruction_digest, origin_device_id, schema_version, created_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![seq, row.snapshot_id, row.content_sha256, row.files_root, row.connector_ids_json, row.device_ids_json, row.policy_binding_ids_json, row.memory_scope, row.instruction_digest, row.origin_device_id, row.schema_version, now],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+fn append_assignment_event(
+    tx: &rusqlite::Transaction<'_>,
+    event_type: &str,
+    row: &AssignmentRow,
+) -> Result<(), String> {
+    let payload =
+        serde_json::to_string(row).map_err(|e| format!("sqlite: cannot encode assignment: {e}"))?;
+    append_event(
+        tx,
+        "assignment",
+        &row.assignment_id,
+        event_type,
+        &payload,
+        &row.origin_device_id,
+        now_ms() as i64,
+        row.schema_version,
+    )?;
+    Ok(())
+}
+
+fn execution_row_tx(
+    tx: &rusqlite::Transaction<'_>,
+    execution_id: &str,
+) -> Result<Option<ExecutionFileRecord>, String> {
+    tx.query_row(
+        &format!("SELECT {EXECUTION_COLS} FROM executions WHERE execution_id = ?1"),
+        params![execution_id],
+        execution_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+fn execution_seq_tx(tx: &rusqlite::Transaction<'_>, execution_id: &str) -> Result<i64, String> {
+    tx.query_row(
+        "SELECT seq FROM executions WHERE execution_id = ?1",
+        params![execution_id],
+        |row| row.get(0),
+    )
+    .map_err(err)
+}
+
+fn worker_row_tx(
+    tx: &rusqlite::Transaction<'_>,
+    worker_session_id: &str,
+) -> Result<Option<WorkerSessionRow>, String> {
+    tx.query_row(
+        &format!("SELECT {WORKER_COLS} FROM worker_sessions WHERE worker_session_id = ?1"),
+        params![worker_session_id],
+        worker_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// Assignments currently driving an execution: status
+/// `assigned` or `active`. `lost` and `done` are history, never
+/// drivers (plan §2.2 recoverability definition).
+fn active_assignments_tx(
+    tx: &rusqlite::Transaction<'_>,
+    execution_id: &str,
+) -> Result<Vec<AssignmentRow>, String> {
+    let mut stmt = tx
+        .prepare(&format!(
+            "SELECT {ASSIGNMENT_COLS} FROM assignments WHERE execution_id = ?1 AND status IN ('assigned', 'active') ORDER BY seq ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![execution_id], assignment_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+fn active_assignments_for_worker_tx(
+    tx: &rusqlite::Transaction<'_>,
+    worker_session_id: &str,
+) -> Result<Vec<AssignmentRow>, String> {
+    let mut stmt = tx
+        .prepare(&format!(
+            "SELECT {ASSIGNMENT_COLS} FROM assignments WHERE worker_session_id = ?1 AND status IN ('assigned', 'active') ORDER BY seq ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![worker_session_id], assignment_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+fn effects_for_execution_tx(
+    tx: &rusqlite::Transaction<'_>,
+    execution_id: &str,
+) -> Result<Vec<EffectFileRecord>, String> {
+    let mut stmt = tx
+        .prepare(&format!(
+            "SELECT {EFFECT_COLS} FROM effects WHERE execution_id = ?1 ORDER BY seq ASC, effect_id ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![execution_id], effect_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+fn mark_assignment_tx(
+    tx: &rusqlite::Transaction<'_>,
+    row: &AssignmentRow,
+    status: &str,
+    detail: &str,
+    event_type: Option<&str>,
+) -> Result<AssignmentRow, String> {
+    let now = now_ms() as i64;
+    let mut updated = row.clone();
+    updated.status = status.to_string();
+    updated.detail = Some(detail.to_string());
+    tx.execute(
+        "UPDATE assignments SET status = ?1, detail = ?2, updated_at_ms = ?3 WHERE assignment_id = ?4",
+        params![status, detail, now, row.assignment_id],
+    )
+    .map_err(err)?;
+    if let Some(event_type) = event_type {
+        append_assignment_event(tx, event_type, &updated)?;
+    }
+    Ok(updated)
+}
+
+// --- P0-E reads (connection-level, for routes and tests) ---
+
+pub fn get_execution(conn: &Connection, execution_id: &str) -> Result<Option<ExecutionFileRecord>, String> {
+    conn.query_row(
+        &format!("SELECT {EXECUTION_COLS} FROM executions WHERE execution_id = ?1"),
+        params![execution_id],
+        execution_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+pub fn list_assignments(conn: &Connection) -> Result<Vec<AssignmentRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ASSIGNMENT_COLS} FROM assignments ORDER BY seq ASC, assignment_id ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map([], assignment_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+pub fn get_assignment(conn: &Connection, assignment_id: &str) -> Result<Option<AssignmentRow>, String> {
+    conn.query_row(
+        &format!("SELECT {ASSIGNMENT_COLS} FROM assignments WHERE assignment_id = ?1"),
+        params![assignment_id],
+        assignment_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+pub fn list_worker_sessions(conn: &Connection) -> Result<Vec<WorkerSessionRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {WORKER_COLS} FROM worker_sessions ORDER BY seq ASC, worker_session_id ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map([], worker_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+/// The single driving assignment of an execution, if any.
+/// At most one exists in practice (takeover 409s on a second
+/// driver); the earliest wins if history ever disagrees.
+pub fn active_assignment_for_execution(
+    conn: &Connection,
+    execution_id: &str,
+) -> Result<Option<AssignmentRow>, String> {
+    conn.query_row(
+        &format!(
+            "SELECT {ASSIGNMENT_COLS} FROM assignments WHERE execution_id = ?1 AND status IN ('assigned', 'active') ORDER BY seq ASC LIMIT 1"
+        ),
+        params![execution_id],
+        assignment_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// Driving assignment per execution, for the derived read
+/// fields on executions/list (one query, not one per row).
+pub fn active_assignments_map(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT execution_id, assignment_id FROM assignments WHERE execution_id IS NOT NULL AND status IN ('assigned', 'active') ORDER BY seq ASC",
+        )
+        .map_err(err)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(err)?
+        .collect::<Result<Vec<(String, String)>, _>>()
+        .map_err(err)?;
+    let mut map = std::collections::HashMap::new();
+    for (execution_id, assignment_id) in rows {
+        map.entry(execution_id).or_insert(assignment_id);
+    }
+    Ok(map)
+}
+
+pub fn list_checkpoints_for_execution(
+    conn: &Connection,
+    execution_id: &str,
+) -> Result<Vec<CheckpointRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {CHECKPOINT_COLS} FROM checkpoints WHERE execution_id = ?1 ORDER BY seq ASC, checkpoint_id ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![execution_id], checkpoint_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+/// Latest `execution.plan_position` checkpoint for an
+/// execution: highest checkpoint seq (insertion order).
+/// NOTE on plan §4.3's "按 execution_seq 最大": a checkpoint's
+/// execution_seq is its execution's seq, constant across all
+/// checkpoints of one execution, so it cannot order them; the
+/// checkpoint's own seq is the insertion order and is what
+/// "latest" means here. Checkpoint rows are append-only.
+pub fn latest_plan_position(
+    conn: &Connection,
+    execution_id: &str,
+) -> Result<Option<CheckpointRow>, String> {
+    conn.query_row(
+        &format!(
+            "SELECT {CHECKPOINT_COLS} FROM checkpoints WHERE execution_id = ?1 AND kind = 'execution.plan_position' ORDER BY seq DESC LIMIT 1"
+        ),
+        params![execution_id],
+        checkpoint_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+pub fn get_snapshot(conn: &Connection, snapshot_id: &str) -> Result<Option<SnapshotRow>, String> {
+    conn.query_row(
+        &format!("SELECT {SNAPSHOT_COLS} FROM workspace_snapshots WHERE snapshot_id = ?1"),
+        params![snapshot_id],
+        snapshot_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+// --- P0-E writes ---
+
+/// P0-E startup recovery scan (plan §2.2, SQLite mode only).
+/// One transaction: every still-`active` WorkerSession →
+/// `ended` (detail "process ended"); each such session's
+/// `assigned` / `active` Assignments → `lost` (detail
+/// "worker stopped", with an `assignment.lost` event each);
+/// then a new `active` WorkerSession for this process, whose
+/// id is returned and becomes the process's current worker.
+/// Assignments under sessions that were already ended, or
+/// with no session at all, are untouched: the scan closes
+/// exactly the sessions it ends, nothing it did not see die.
+/// A failure leaves the transaction uncommitted; the caller
+/// fails the startup closed (no partial scan ever lands).
+pub fn recovery_scan(conn: &mut Connection, origin_device_id: &str) -> Result<String, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let now = now_ms() as i64;
+    let ended: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT worker_session_id FROM worker_sessions WHERE status = 'active'")
+            .map_err(err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(err)?;
+        rows
+    };
+    for worker_id in &ended {
+        tx.execute(
+            "UPDATE worker_sessions SET status = 'ended', detail = 'process ended', updated_at_ms = ?1 WHERE worker_session_id = ?2",
+            params![now, worker_id],
+        )
+        .map_err(err)?;
+    }
+    for worker_id in &ended {
+        for row in active_assignments_for_worker_tx(&tx, worker_id)? {
+            mark_assignment_tx(&tx, &row, "lost", "worker stopped", Some("assignment.lost"))?;
+        }
+    }
+    let new_id = next_prefixed_id(&tx, "worker_sessions", "worker_session_id", "worker-")?;
+    insert_worker_session_tx(
+        &tx,
+        &WorkerSessionRow {
+            worker_session_id: new_id.clone(),
+            origin_device_id: origin_device_id.to_string(),
+            status: "active".to_string(),
+            detail: None,
+            schema_version: 1,
+        },
+    )?;
+    tx.commit().map_err(err)?;
+    Ok(new_id)
+}
+
+/// Clean-shutdown counterpart of the scan (plan §2.1), in
+/// one transaction. JUDGEMENT CALL on the plan's singular
+/// "current WorkerSession": this gateway is the sole writer
+/// of its database, so every still-`active` session belongs
+/// to this process's lineage (scan worker plus any takeover
+/// workers it created) — ending only the one remembered as
+/// "current" would leave a takeover worker active and its
+/// assignment un-lost after a clean exit, breaking the plan's
+/// own convergence claim ("after shutdown, old workers are
+/// all ended, their assignments all lost"). So shutdown ends
+/// ALL active sessions (detail "clean shutdown") and loses
+/// all their active assignments (detail "worker stopped",
+/// with `assignment.lost` events each), converging exactly to
+/// the post-scan state, one step earlier. Best-effort at the
+/// call site: a failure here never blocks exiting, and a
+/// kill -9 simply skips this and lets the next scan close it.
+pub fn shutdown_cleanup(conn: &mut Connection) -> Result<(), String> {
+    let tx = conn.transaction().map_err(err)?;
+    let now = now_ms() as i64;
+    let active: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT worker_session_id FROM worker_sessions WHERE status = 'active'")
+            .map_err(err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(err)?;
+        rows
+    };
+    for worker_id in &active {
+        tx.execute(
+            "UPDATE worker_sessions SET status = 'ended', detail = 'clean shutdown', updated_at_ms = ?1 WHERE worker_session_id = ?2",
+            params![now, worker_id],
+        )
+        .map_err(err)?;
+    }
+    for worker_id in &active {
+        for row in active_assignments_for_worker_tx(&tx, worker_id)? {
+            mark_assignment_tx(&tx, &row, "lost", "worker stopped", Some("assignment.lost"))?;
+        }
+    }
+    tx.commit().map_err(err)?;
+    Ok(())
+}
+
+/// One transaction: upsert one execution row (with its
+/// `execution.created` event and derived Inbox rows) plus its
+/// creation-time workspace snapshot row. The snapshot id is
+/// chosen by the caller (the server ties it to the execution
+/// number, so no second counter can race the execution id).
+pub fn upsert_execution_with_snapshot(
+    conn: &mut Connection,
+    record: &ExecutionFileRecord,
+    snapshot: &SnapshotRow,
+) -> Result<(), String> {
+    let tx = conn.transaction().map_err(err)?;
+    upsert_execution_tx(&tx, record, "execution.created")?;
+    insert_snapshot_tx(&tx, snapshot)?;
+    tx.commit().map_err(err)?;
+    Ok(())
+}
+
+/// Takeover refusal: a stable error code the route maps to
+/// 409, versus an internal failure the route maps to 500.
+/// Nothing is written on a refusal: the whole operation is
+/// one transaction that only commits on success, so even a
+/// worker row created for an omitted id rolls back with it.
+#[derive(Debug)]
+pub enum TakeoverError {
+    Refused(&'static str),
+    Internal(String),
+}
+
+impl TakeoverError {
+    pub fn code(&self) -> String {
+        match self {
+            TakeoverError::Refused(code) => (*code).to_string(),
+            TakeoverError::Internal(_) => "takeover_failed".to_string(),
+        }
+    }
+}
+
+fn takeover_internal<T>(result: Result<T, String>) -> Result<T, TakeoverError> {
+    result.map_err(TakeoverError::Internal)
+}
+
+/// Outcome of a successful takeover: the new driving
+/// assignment, the execution row after its worker update, the
+/// plan-position checkpoint written at takeover, and any old
+/// driving assignments this takeover superseded (normally
+/// empty: validation refuses when one exists, see below).
+#[derive(Debug, Clone)]
+pub struct TakeoverResult {
+    pub assignment: AssignmentRow,
+    pub execution: ExecutionFileRecord,
+    pub checkpoint: CheckpointRow,
+    pub superseded: Vec<AssignmentRow>,
+}
+
+/// POST /assignments/takeover (plan §2.3), one transaction.
+/// Validation, in order: execution exists, execution is not
+/// terminal, the named worker (when given) exists and is
+/// active, no driving assignment exists. The last check is
+/// strict: ANY `assigned` / `active` row for the execution
+/// refuses with `assignment_active` — that is what "no double
+/// driving" means, and what makes a second takeover 409. The
+/// supersede loop after validation is therefore defensive
+/// only: it marks any driving row the check somehow missed
+/// `lost` ("superseded by takeover") rather than ever leaving
+/// two drivers, but under the strict check it finds none.
+/// Success writes: the new `active` assignment, the
+/// execution's worker update (with an `execution.reassigned`
+/// event carrying the post-state record, no Inbox side
+/// effects — takeover changes no status, so no status trigger
+/// may fire), and one `execution.plan_position` checkpoint
+/// snapshotting the Effect list (terminal keys completed, the
+/// first non-terminal key next, or null when none remains).
+/// Takeover changes no Execution status, no Conversation
+/// Session and no Effect row.
+pub fn takeover_assignment(
+    conn: &mut Connection,
+    execution_id: &str,
+    worker_session_id: Option<&str>,
+    origin_device_id: &str,
+) -> Result<TakeoverResult, TakeoverError> {
+    let tx = conn.transaction().map_err(err).map_err(TakeoverError::Internal)?;
+    let run = || -> Result<TakeoverResult, TakeoverError> {
+        let Some(mut execution) = takeover_internal(execution_row_tx(&tx, execution_id))? else {
+            return Err(TakeoverError::Refused("execution_not_found"));
+        };
+        if crate::execution_store::execution_status_group(&execution.status)
+            == Some("terminal")
+        {
+            return Err(TakeoverError::Refused("execution_terminal"));
+        }
+        let worker_id = match worker_session_id {
+            Some(id) => {
+                match takeover_internal(worker_row_tx(&tx, id))? {
+                    None => return Err(TakeoverError::Refused("worker_session_not_found")),
+                    Some(row) if row.status != "active" => {
+                        return Err(TakeoverError::Refused("worker_session_not_active"))
+                    }
+                    Some(_) => id.to_string(),
+                }
+            }
+            None => {
+                let id = takeover_internal(next_prefixed_id(
+                    &tx,
+                    "worker_sessions",
+                    "worker_session_id",
+                    "worker-",
+                ))?;
+                takeover_internal(insert_worker_session_tx(
+                    &tx,
+                    &WorkerSessionRow {
+                        worker_session_id: id.clone(),
+                        origin_device_id: origin_device_id.to_string(),
+                        status: "active".to_string(),
+                        detail: None,
+                        schema_version: 1,
+                    },
+                ))?;
+                id
+            }
+        };
+        let active = takeover_internal(active_assignments_tx(&tx, execution_id))?;
+        if !active.is_empty() {
+            return Err(TakeoverError::Refused("assignment_active"));
+        }
+        // Defensive only (see doc comment): validation above
+        // already refused on any driving row.
+        let mut superseded = Vec::new();
+        for row in &active {
+            superseded.push(takeover_internal(mark_assignment_tx(
+                &tx,
+                row,
+                "lost",
+                "superseded by takeover",
+                Some("assignment.lost"),
+            ))?);
+        }
+        let assignment = AssignmentRow {
+            assignment_id: takeover_internal(next_prefixed_id(
+                &tx,
+                "assignments",
+                "assignment_id",
+                "assignment-",
+            ))?,
+            execution_id: Some(execution_id.to_string()),
+            worker_session_id: Some(worker_id.clone()),
+            origin_device_id: origin_device_id.to_string(),
+            status: "active".to_string(),
+            detail: None,
+            lease_expires_ms: None,
+            heartbeat_ms: None,
+            schema_version: 1,
+        };
+        takeover_internal(insert_assignment_tx(&tx, &assignment))?;
+        takeover_internal(append_assignment_event(&tx, "assignment.created", &assignment))?;
+        // Worker update only: no status change, so no Inbox
+        // trigger may fire. The event payload is the updated
+        // record, keeping fold(events) == tables exact.
+        let now = now_ms() as i64;
+        takeover_internal(
+            tx.execute(
+                "UPDATE executions SET worker_session_id = ?1, updated_at_ms = ?2 WHERE execution_id = ?3",
+                params![worker_id, now, execution_id],
+            )
+            .map_err(err),
+        )?;
+        execution.worker_session_id = Some(worker_id);
+        let payload = serde_json::to_string(&execution)
+            .map_err(|e| TakeoverError::Internal(format!("sqlite: cannot encode execution: {e}")))?;
+        takeover_internal(append_event(
+            &tx,
+            "execution",
+            execution_id,
+            "execution.reassigned",
+            &payload,
+            &execution.origin_device_id,
+            now,
+            execution.schema_version as i64,
+        ))?;
+        // Plan-position checkpoint from the Effect list.
+        let effects = takeover_internal(effects_for_execution_tx(&tx, execution_id))?;
+        let mut completed_keys: Vec<String> = Vec::new();
+        let mut next_effect_key: Option<String> = None;
+        for effect in &effects {
+            let terminal = crate::effect_store::is_terminal_effect_status(&effect.status);
+            match (&effect.idempotency_key, terminal) {
+                (Some(key), true) => completed_keys.push(key.clone()),
+                (Some(key), false) if next_effect_key.is_none() => {
+                    next_effect_key = Some(key.clone());
+                }
+                _ => {}
+            }
+        }
+        let checkpoint = CheckpointRow {
+            checkpoint_id: takeover_internal(next_prefixed_id(
+                &tx,
+                "checkpoints",
+                "checkpoint_id",
+                "checkpoint-",
+            ))?,
+            execution_id: Some(execution_id.to_string()),
+            execution_seq: takeover_internal(execution_seq_tx(&tx, execution_id))?,
+            kind: "execution.plan_position".to_string(),
+            payload_json: serde_json::to_string(&serde_json::json!({
+                "next_effect_key": next_effect_key,
+                "completed_keys": completed_keys,
+            }))
+            .map_err(|e| TakeoverError::Internal(format!("sqlite: cannot encode checkpoint: {e}")))?,
+            origin_device_id: origin_device_id.to_string(),
+            schema_version: 1,
+        };
+        takeover_internal(insert_checkpoint_tx(&tx, &checkpoint))?;
+        Ok(TakeoverResult { assignment, execution, checkpoint, superseded })
+    };
+    let result = run();
+    match result {
+        Ok(outcome) => {
+            tx.commit().map_err(err).map_err(TakeoverError::Internal)?;
+            Ok(outcome)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Execution transition refusal: unknown id vs illegal edge.
+/// The unknown-word case (400) is checked by the route before
+/// calling here, from the same vocabulary function.
+#[derive(Debug)]
+pub enum ExecutionTransitionError {
+    NotFound,
+    Illegal,
+    Internal(String),
+}
+
+/// POST /executions/transition (plan §4.2), one transaction:
+/// the execution row (with an `execution.transitioned` event
+/// and the P0-D Inbox status triggers — a real status change,
+/// so review/failed rows open and close exactly as a status
+/// write always did) plus, on a terminal landing, its driving
+/// assignments → `done` (work under this assignment ended;
+/// distinct from takeover's `lost`). Non-terminal landings
+/// leave assignments untouched.
+pub fn transition_execution(
+    conn: &mut Connection,
+    execution_id: &str,
+    status: &str,
+) -> Result<ExecutionFileRecord, ExecutionTransitionError> {
+    let tx = conn.transaction().map_err(err).map_err(ExecutionTransitionError::Internal)?;
+    let run = || -> Result<ExecutionFileRecord, ExecutionTransitionError> {
+        let Some(mut record) = execution_row_tx(&tx, execution_id)
+            .map_err(ExecutionTransitionError::Internal)?
+        else {
+            return Err(ExecutionTransitionError::NotFound);
+        };
+        if !crate::execution_store::valid_execution_transition(&record.status, status) {
+            return Err(ExecutionTransitionError::Illegal);
+        }
+        record.status = status.to_string();
+        upsert_execution_tx(&tx, &record, "execution.transitioned")
+            .map_err(ExecutionTransitionError::Internal)?;
+        if crate::execution_store::execution_status_group(status) == Some("terminal") {
+            let now = now_ms() as i64;
+            for row in active_assignments_tx(&tx, execution_id)
+                .map_err(ExecutionTransitionError::Internal)?
+            {
+                tx.execute(
+                    "UPDATE assignments SET status = 'done', updated_at_ms = ?1 WHERE assignment_id = ?2",
+                    params![now, row.assignment_id],
+                )
+                .map_err(err)
+                .map_err(ExecutionTransitionError::Internal)?;
+            }
+        }
+        Ok(record)
+    };
+    match run() {
+        Ok(record) => {
+            tx.commit().map_err(err).map_err(ExecutionTransitionError::Internal)?;
+            Ok(record)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -2131,6 +3088,7 @@ mod tests {
                 worker_session_id: "worker-1".to_string(),
                 origin_device_id: "mac-local".to_string(),
                 status: "active".to_string(),
+                detail: None,
                 schema_version: 1,
             },
         )
@@ -2210,5 +3168,293 @@ mod tests {
             assert!(!keys.contains(&forbidden), "{keys:?}");
         }
         assert!(keys.contains(&"message"));
+    }
+
+    // --- P0-E unit tests (seam-level; HTTP串联见 tests/p0e_recovery.rs) ---
+
+    fn effect_with_key(id: &str, execution_id: &str, status: &str, key: &str) -> EffectFileRecord {
+        EffectFileRecord {
+            effect_id: id.to_string(),
+            execution_id: Some(execution_id.to_string()),
+            capability: "fs".to_string(),
+            operation: "write".to_string(),
+            scope: format!("{id}.txt"),
+            input_digest: Some(format!("digest-{id}")),
+            approval_id: None,
+            status: status.to_string(),
+            idempotency_key: Some(key.to_string()),
+            origin_device_id: "mac-local".to_string(),
+            schema_version: 1,
+            reconciliation: None,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn p0e_canonical_json_sorts_keys_and_snapshot_hash_is_stable() {
+        let value: serde_json::Value =
+            serde_json::from_str(r#"{"b":1,"a":{"d":2,"c":3}}"#).expect("json");
+        assert_eq!(canonical_json(&value), r#"{"a":{"c":3,"d":2},"b":1}"#);
+        let row = SnapshotRow {
+            snapshot_id: "snapshot-1".to_string(),
+            content_sha256: String::new(),
+            files_root: "/tmp/root".to_string(),
+            connector_ids_json: "[]".to_string(),
+            device_ids_json: "[]".to_string(),
+            policy_binding_ids_json: "[]".to_string(),
+            memory_scope: "default".to_string(),
+            instruction_digest: "abc".to_string(),
+            origin_device_id: "mac-local".to_string(),
+            schema_version: 1,
+        };
+        let hash = snapshot_content_sha256(&row);
+        assert_eq!(hash, snapshot_content_sha256(&row));
+        assert_eq!(hash.len(), 64);
+        let mut changed = row.clone();
+        changed.policy_binding_ids_json = "[\"network-rules:sha256:x\"]".to_string();
+        assert_ne!(hash, snapshot_content_sha256(&changed));
+    }
+
+    #[test]
+    fn p0e_migration_backfills_worker_detail_column() {
+        // A database migrated by P0-D: schema version 1, but the
+        // worker_sessions table predates the detail column.
+        let dir = std::env::temp_dir()
+            .join(format!("mock-sqlite-p0e-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("gateway.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("open raw");
+            conn.execute_batch(
+                "CREATE TABLE db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO db_meta VALUES ('db_schema_version', '1'), ('import_done', '0');
+                 CREATE TABLE worker_sessions (seq INTEGER NOT NULL, worker_session_id TEXT PRIMARY KEY, origin_device_id TEXT NOT NULL, status TEXT NOT NULL, schema_version INTEGER NOT NULL, created_ms INTEGER, updated_at_ms INTEGER);",
+            )
+            .expect("old schema");
+        }
+        let mut conn = open_db(&path).expect("reopen");
+        apply_migrations(&mut conn).expect("migrate");
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(worker_sessions)")
+            .expect("pragma");
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert!(names.contains(&"detail".to_string()), "{names:?}");
+        assert_eq!(schema_version(&conn).expect("version"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p0e_recovery_scan_ends_only_active_and_loses_their_assignments() {
+        let path = temp_db("p0e-scan");
+        let mut conn = open_db(&path).expect("open");
+        insert_worker_session(
+            &mut conn,
+            &WorkerSessionRow {
+                worker_session_id: "worker-1".to_string(),
+                origin_device_id: "mac-local".to_string(),
+                status: "active".to_string(),
+                detail: None,
+                schema_version: 1,
+            },
+        )
+        .expect("worker-1");
+        insert_worker_session(
+            &mut conn,
+            &WorkerSessionRow {
+                worker_session_id: "worker-2".to_string(),
+                origin_device_id: "mac-local".to_string(),
+                status: "ended".to_string(),
+                detail: Some("clean shutdown".to_string()),
+                schema_version: 1,
+            },
+        )
+        .expect("worker-2");
+        insert_assignment(
+            &mut conn,
+            &AssignmentRow {
+                assignment_id: "assignment-1".to_string(),
+                execution_id: Some("execution-1".to_string()),
+                worker_session_id: Some("worker-1".to_string()),
+                origin_device_id: "mac-local".to_string(),
+                status: "active".to_string(),
+                detail: None,
+                lease_expires_ms: None,
+                heartbeat_ms: None,
+                schema_version: 1,
+            },
+        )
+        .expect("assignment-1");
+        insert_assignment(
+            &mut conn,
+            &AssignmentRow {
+                assignment_id: "assignment-2".to_string(),
+                execution_id: Some("execution-2".to_string()),
+                worker_session_id: Some("worker-2".to_string()),
+                origin_device_id: "mac-local".to_string(),
+                status: "lost".to_string(),
+                detail: Some("worker stopped".to_string()),
+                lease_expires_ms: None,
+                heartbeat_ms: None,
+                schema_version: 1,
+            },
+        )
+        .expect("assignment-2");
+        let new_worker = recovery_scan(&mut conn, "mac-local").expect("scan");
+        assert_eq!(new_worker, "worker-3");
+        let workers = list_worker_sessions(&conn).expect("workers");
+        let w1 = workers.iter().find(|w| w.worker_session_id == "worker-1").unwrap();
+        assert_eq!(w1.status, "ended");
+        assert_eq!(w1.detail.as_deref(), Some("process ended"));
+        let w2 = workers.iter().find(|w| w.worker_session_id == "worker-2").unwrap();
+        assert_eq!(w2.status, "ended");
+        assert_eq!(w2.detail.as_deref(), Some("clean shutdown"));
+        let w3 = workers.iter().find(|w| w.worker_session_id == "worker-3").unwrap();
+        assert_eq!(w3.status, "active");
+        let assignments = list_assignments(&conn).expect("assignments");
+        let a1 = assignments.iter().find(|a| a.assignment_id == "assignment-1").unwrap();
+        assert_eq!(a1.status, "lost");
+        assert_eq!(a1.detail.as_deref(), Some("worker stopped"));
+        let a2 = assignments.iter().find(|a| a.assignment_id == "assignment-2").unwrap();
+        assert_eq!(a2.status, "lost");
+        assert_eq!(a2.detail.as_deref(), Some("worker stopped"));
+        // The scan's lost assignment carries an assignment.lost event.
+        let events = list_events(&conn).expect("events");
+        assert!(events.iter().any(|e| e.aggregate_kind == "assignment"
+            && e.event_type == "assignment.lost"
+            && e.aggregate_id == "assignment-1"));
+    }
+
+    #[test]
+    fn p0e_takeover_writes_checkpoint_and_refuses_cleanly() {
+        let path = temp_db("p0e-takeover");
+        let mut conn = open_db(&path).expect("open");
+        upsert_execution(&mut conn, &execution("execution-1", "running")).expect("exec");
+        upsert_effect(
+            &mut conn,
+            &effect_with_key("effect-1", "execution-1", "succeeded", "key-1"),
+        )
+        .expect("effect-1");
+        upsert_effect(
+            &mut conn,
+            &effect_with_key("effect-2", "execution-1", "planned", "key-2"),
+        )
+        .expect("effect-2");
+        // Unknown execution: refused, nothing written.
+        assert!(matches!(
+            takeover_assignment(&mut conn, "execution-9", None, "mac-local"),
+            Err(TakeoverError::Refused("execution_not_found"))
+        ));
+        assert_eq!(count_table(&conn, "worker_sessions").expect("count"), 0);
+        let outcome =
+            takeover_assignment(&mut conn, "execution-1", None, "mac-local").expect("takeover");
+        assert_eq!(outcome.assignment.status, "active");
+        assert_eq!(outcome.assignment.worker_session_id.as_deref(), Some("worker-1"));
+        assert_eq!(outcome.execution.worker_session_id.as_deref(), Some("worker-1"));
+        assert_eq!(outcome.checkpoint.kind, "execution.plan_position");
+        let payload: serde_json::Value =
+            serde_json::from_str(&outcome.checkpoint.payload_json).expect("checkpoint json");
+        assert_eq!(payload["completed_keys"], serde_json::json!(["key-1"]));
+        assert_eq!(payload["next_effect_key"], serde_json::json!("key-2"));
+        assert!(outcome.superseded.is_empty());
+        // Second takeover: the driving assignment refuses it,
+        // and the refused (omitted-worker) attempt writes no
+        // worker row either — refusal rolls the whole tx back.
+        assert!(matches!(
+            takeover_assignment(&mut conn, "execution-1", None, "mac-local"),
+            Err(TakeoverError::Refused("assignment_active"))
+        ));
+        assert_eq!(count_table(&conn, "worker_sessions").expect("count"), 1);
+        assert_eq!(count_table(&conn, "assignments").expect("count"), 1);
+        // Ended worker named explicitly: refused as not active.
+        insert_worker_session(
+            &mut conn,
+            &WorkerSessionRow {
+                worker_session_id: "worker-9".to_string(),
+                origin_device_id: "mac-local".to_string(),
+                status: "ended".to_string(),
+                detail: Some("process ended".to_string()),
+                schema_version: 1,
+            },
+        )
+        .expect("worker-9");
+        // (Need a free execution for this check: execution-1 is
+        // driven, so use a fresh one.)
+        upsert_execution(&mut conn, &execution("execution-2", "running")).expect("exec-2");
+        assert!(matches!(
+            takeover_assignment(&mut conn, "execution-2", Some("worker-9"), "mac-local"),
+            Err(TakeoverError::Refused("worker_session_not_active"))
+        ));
+        // Terminal execution: refused.
+        upsert_execution(&mut conn, &execution("execution-3", "completed")).expect("exec-3");
+        assert!(matches!(
+            takeover_assignment(&mut conn, "execution-3", None, "mac-local"),
+            Err(TakeoverError::Refused("execution_terminal"))
+        ));
+        // The reassigned event keeps fold(events) == tables.
+        assert!(fold_matches_tables(&conn).expect("fold"));
+        let events = list_events(&conn).expect("events");
+        assert!(events.iter().any(|e| e.event_type == "execution.reassigned"));
+        assert!(events.iter().any(|e| e.event_type == "assignment.created"));
+    }
+
+    #[test]
+    fn p0e_transition_moves_status_and_dones_assignments_on_terminal() {
+        let path = temp_db("p0e-transition");
+        let mut conn = open_db(&path).expect("open");
+        upsert_execution(&mut conn, &execution("execution-1", "running")).expect("exec");
+        insert_worker_session(
+            &mut conn,
+            &WorkerSessionRow {
+                worker_session_id: "worker-1".to_string(),
+                origin_device_id: "mac-local".to_string(),
+                status: "active".to_string(),
+                detail: None,
+                schema_version: 1,
+            },
+        )
+        .expect("worker");
+        insert_assignment(
+            &mut conn,
+            &AssignmentRow {
+                assignment_id: "assignment-1".to_string(),
+                execution_id: Some("execution-1".to_string()),
+                worker_session_id: Some("worker-1".to_string()),
+                origin_device_id: "mac-local".to_string(),
+                status: "active".to_string(),
+                detail: None,
+                lease_expires_ms: None,
+                heartbeat_ms: None,
+                schema_version: 1,
+            },
+        )
+        .expect("assignment");
+        assert!(matches!(
+            transition_execution(&mut conn, "execution-9", "running"),
+            Err(ExecutionTransitionError::NotFound)
+        ));
+        assert!(transition_execution(&mut conn, "execution-1", "completed").is_ok());
+        // Illegal: terminal has no outgoing edge; the row is
+        // untouched by the refused attempt.
+        assert!(matches!(
+            transition_execution(&mut conn, "execution-1", "running"),
+            Err(ExecutionTransitionError::Illegal)
+        ));
+        let record = get_execution(&conn, "execution-1").expect("get").unwrap();
+        assert_eq!(record.status, "completed");
+        let assignment = get_assignment(&conn, "assignment-1").expect("get").unwrap();
+        assert_eq!(assignment.status, "done");
+        // Non-terminal landing leaves assignments alone.
+        upsert_execution(&mut conn, &execution("execution-2", "running")).expect("exec-2");
+        let moved = transition_execution(&mut conn, "execution-2", "needs_review")
+            .expect("to review");
+        assert_eq!(moved.status, "needs_review");
+        assert!(fold_matches_tables(&conn).expect("fold"));
+        let events = list_events(&conn).expect("events");
+        assert!(events.iter().any(|e| e.event_type == "execution.transitioned"));
     }
 }
