@@ -33,6 +33,12 @@ pub struct ApprovalFileRecord {
     pub consumed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_digest: Option<String>,
+    /// Phase 2 (Q4): the device action this approval was consumed
+    /// for, set at first device use (bind-on-consume). Loop-bound
+    /// records never carry this; digest-bound records never carry
+    /// a loop binding. `None` means unbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_binding: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -114,6 +120,7 @@ mod tests {
             binding: None,
             consumed: false,
             operation_digest: None,
+            action_binding: None,
             message: None,
         }
     }

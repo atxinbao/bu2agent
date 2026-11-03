@@ -96,6 +96,9 @@ use crate::task_store::{append_task, load_tasks, next_task_number, TaskFileRecor
 use crate::execution_store::{
     append_execution, load_executions, next_execution_number, ExecutionFileRecord,
 };
+use crate::effect_store::{
+    append_effect, load_effects, next_effect_number, EffectFileRecord, NewEffect,
+};
 use crate::session_store::{
     append_session, load_sessions, next_session_number, select_context, session_number, title_from,
     SessionRecord, SessionTurn, MAX_INPUT_BYTES,
@@ -242,6 +245,10 @@ pub(crate) struct ApprovalState {
     binding: Option<ApprovalBinding>,
     consumed: bool,
     operation_digest: Option<String>,
+    /// Phase 2 (Q4): device action id this approval was consumed
+    /// for, set at first device use. Never set on loop-bound or
+    /// digest-bound records.
+    action_binding: Option<String>,
     message: Option<String>,
 }
 
@@ -257,7 +264,7 @@ impl ApprovalState {
         consumed: bool,
         operation_digest: Option<String>,
     ) -> Self {
-        ApprovalState { tool, status, binding, consumed, operation_digest, message: None }
+        ApprovalState { tool, status, binding, consumed, operation_digest, action_binding: None, message: None }
     }
 
     fn is_bound(&self) -> bool {
@@ -316,6 +323,14 @@ pub struct AppState {
     pub(crate) executions: Arc<Mutex<HashMap<String, ExecutionFileRecord>>>,
     next_execution_id: Arc<Mutex<u64>>,
     executions_path: Option<PathBuf>,
+    pub(crate) effects: Arc<Mutex<HashMap<String, EffectFileRecord>>>,
+    next_effect_id: Arc<Mutex<u64>>,
+    effects_path: Option<PathBuf>,
+    /// Device this gateway instance records as the origin of new
+    /// Execution and Effect rows (P0-A provenance). Resolved once
+    /// at startup from MOCK_ORIGIN_DEVICE_ID, default "mac-local";
+    /// never mixed into ids or idempotency keys.
+    pub(crate) origin_device_id: String,
     pub(crate) task_drafts: Arc<Mutex<HashMap<String, String>>>,
     pub(crate) task_drafts_dir: Option<PathBuf>,
     sessions: Arc<Mutex<HashMap<String, SessionRecord>>>,
@@ -384,6 +399,19 @@ impl Default for AppState {
     }
 }
 
+/// P0-A origin device id resolution (contract §9): the gateway
+/// stamps new Execution and Effect rows with the device it runs
+/// on. An explicitly set, non-empty value wins; anything else
+/// (unset or empty) falls back to "mac-local", the current
+/// machine's standing value. The fallback is a value, not a
+/// model constant: ids and idempotency keys never contain it.
+pub fn resolve_origin_device_id(value: Option<String>) -> String {
+    match value {
+        Some(v) if !v.is_empty() => v,
+        _ => "mac-local".to_string(),
+    }
+}
+
 impl AppState {
     /// 正常启动共用一次凭据解析结果；测试构造器不读取环境凭据。
     pub fn from_deepseek_config(config: DeepSeekConfig) -> Self {
@@ -426,6 +454,15 @@ impl AppState {
         if let Ok(executions_path) = std::env::var("MOCK_EXECUTIONS_PATH") {
             state = state.with_executions_path(PathBuf::from(executions_path));
         }
+        if let Ok(effects_path) = std::env::var("MOCK_EFFECTS_PATH") {
+            state = state.with_effects_path(PathBuf::from(effects_path));
+        }
+        // P0-A provenance: the origin device id is a value, never
+        // part of any id. Shell packaging keeps the default: no
+        // gateway_home wiring is needed for the default to hold.
+        state = state.with_origin_device_id(resolve_origin_device_id(
+            std::env::var("MOCK_ORIGIN_DEVICE_ID").ok(),
+        ));
         if let Ok(sessions_path) = std::env::var("MOCK_SESSIONS_PATH") {
             state = state.with_sessions_path(PathBuf::from(sessions_path));
         }
@@ -512,7 +549,7 @@ impl AppState {
                     Some(status) => {
                         approvals.insert(
                             record.tool_call_id.clone(),
-                            ApprovalState { tool: record.tool.clone(), status, binding: record.binding.clone(), consumed: record.consumed, operation_digest: record.operation_digest.clone(), message: record.message.clone() },
+                            ApprovalState { tool: record.tool.clone(), status, binding: record.binding.clone(), consumed: record.consumed, operation_digest: record.operation_digest.clone(), action_binding: record.action_binding.clone(), message: record.message.clone() },
                         );
                     }
                     None => {
@@ -541,6 +578,10 @@ impl AppState {
             executions: Arc::new(Mutex::new(HashMap::new())),
             next_execution_id: Arc::new(Mutex::new(1)),
             executions_path: None,
+            effects: Arc::new(Mutex::new(HashMap::new())),
+            next_effect_id: Arc::new(Mutex::new(1)),
+            effects_path: None,
+            origin_device_id: "mac-local".to_string(),
             task_drafts: Arc::new(Mutex::new(HashMap::new())),
             task_drafts_dir: None,
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -673,6 +714,7 @@ impl AppState {
     pub(crate) fn request_loop_approval(
         &self,
         binding: ApprovalBinding,
+        digest: String,
     ) -> Result<String, LoopError> {
         let mut next = self.next_approval_id.lock().unwrap();
         let id = format!("approval-{}", *next);
@@ -682,7 +724,11 @@ impl AppState {
             status: ApprovalStatus::Pending,
             binding: Some(binding),
             consumed: false,
-            operation_digest: None,
+            // Phase 2 (Q5): the loop approval carries the unified
+            // digest from creation, so the gate no longer depends
+            // on the binding's wire field for parameter binding.
+            operation_digest: Some(digest),
+            action_binding: None,
             message: None,
         };
         let mut approvals = self.approvals.lock().unwrap();
@@ -701,7 +747,12 @@ impl AppState {
         let record = approvals
             .get(id)
             .ok_or(LoopError(403, "approval_required"))?;
-        if record.binding.as_ref() != Some(binding)
+        // Phase 2 (Q5): the reference triple identifies the call;
+        // the digest is checked at consume/execute time, not here.
+        if record
+            .binding
+            .as_ref()
+            .is_none_or(|b| !crate::loop_engine::binding_ref_matches(b, binding))
             || record.tool != binding.tool
             || record.consumed
         {
@@ -714,19 +765,75 @@ impl AppState {
         &self,
         id: &str,
         binding: &ApprovalBinding,
+        digest: &str,
     ) -> Result<(), LoopError> {
         let mut approvals = self.approvals.lock().unwrap();
         let record = approvals
             .get_mut(id)
             .ok_or(LoopError(403, "approval_required"))?;
-        if record.binding.as_ref() != Some(binding)
+        // Phase 2 (Q5): reference triple + unified digest, both
+        // under the same lock as consumption, so a concurrent
+        // execution of one approval still serializes and only the
+        // first consumes it. The wire args_sha256 is not consulted.
+        if record
+            .binding
+            .as_ref()
+            .is_none_or(|b| !crate::loop_engine::binding_ref_matches(b, binding))
             || record.status != ApprovalStatus::Approved
             || record.consumed
+            || record.operation_digest.as_deref() != Some(digest)
         {
             return Err(LoopError(403, "approval_binding_mismatch"));
         }
         record.consumed = true;
         persist_approval(self, id, record).map_err(|_| LoopError(500, "approval_audit_failed"))
+    }
+
+    /// Phase 2 loop-call Effect: mirrors a dispatched loop tool
+    /// call into the effects store. Only the two approval-gated
+    /// tools produce effects; reads never do, and neither do gate
+    /// failures or pre-dispatch refusals (nothing was attempted).
+    /// The status word is the outcome's CallStatus in its
+    /// serialized snake_case form. The digest is the unified Q5
+    /// digest of the dispatched args.
+    fn record_loop_effect(
+        &self,
+        tool: &str,
+        args: &std::collections::BTreeMap<String, String>,
+        approval_id: &Option<String>,
+        binding: &Option<ApprovalBinding>,
+        outcome: &ToolOutcome,
+    ) {
+        let (capability, operation, scope) = match tool {
+            "fs.write" => (
+                "fs",
+                "write",
+                args.get("path").cloned().unwrap_or_default(),
+            ),
+            "reminders.set_completed" => (
+                "reminders",
+                "set_completed",
+                args.get("id").cloned().unwrap_or_default(),
+            ),
+            _ => return,
+        };
+        let execution_id =
+            binding.as_ref().and_then(|b| execution_for_loop(self, &b.loop_id));
+        let status = serde_json::to_string(&outcome.status)
+            .unwrap_or_else(|_| "\"unknown\"".to_string());
+        let status = status.trim_matches('"');
+        record_effect(
+            self,
+            NewEffect {
+                execution_id,
+                capability: capability.to_string(),
+                operation: operation.to_string(),
+                scope,
+                input_digest: Some(crate::loop_engine::args_digest(tool, args)),
+                approval_id: approval_id.clone(),
+                status: status.to_string(),
+            },
+        );
     }
 
     /// 循环与 POST /agent/tool/call 共用服务端分派。绑定凭据不能从公共端点重放。
@@ -745,14 +852,20 @@ impl AppState {
                     .as_ref()
                     .and_then(|id| approvals.get(id))
                     .is_some_and(|record| {
+                        // Phase 2 (Q5): reference triple + unified
+                        // digest, never the binding's wire field.
+                        // The digest is recomputed from the exact
+                        // args about to be dispatched.
                         record.status == ApprovalStatus::Approved
                             && record.consumed
-                            && record.binding == binding
-                            && binding.as_ref().is_some_and(|b| {
-                                b.tool == tool
-                                    && b.args_sha256
-                                        == crate::loop_engine::args_digest(&tool, &args)
-                            })
+                            && record
+                                .binding
+                                .as_ref()
+                                .is_some_and(|b| binding
+                                    .as_ref()
+                                    .is_some_and(|given| crate::loop_engine::binding_ref_matches(b, given)))
+                            && record.operation_digest.as_deref()
+                                == Some(crate::loop_engine::args_digest(&tool, &args).as_str())
                     })
             };
             if !valid {
@@ -799,7 +912,12 @@ impl AppState {
                 };
             }
             let device_backend = Arc::clone(&self.device_backend);
-            return match tokio::task::spawn_blocking(move || {
+            // Every arm below is post-dispatch: the backend was
+            // invoked and reported a terminal outcome, so each one
+            // mirrors into an Effect (including Unknown and
+            // AwaitingAuthorization, which are terminal reports,
+            // not refusals to attempt).
+            let outcome = match tokio::task::spawn_blocking(move || {
                 execute_set(&device_backend, &id, completed, Duration::from_secs(8))
             })
             .await
@@ -829,9 +947,15 @@ impl AppState {
                 },
                 Err(_) => ToolOutcome::unknown(),
             };
+            self.record_loop_effect(&tool, &args, &approval_id, &binding, &outcome);
+            return outcome;
         }
         if let Some(backend) = backend {
-            return backend.execute(tool, args).await;
+            let outcome = backend.execute(tool.clone(), args.clone()).await;
+            if tool == "fs.write" {
+                self.record_loop_effect(&tool, &args, &approval_id, &binding, &outcome);
+            }
+            return outcome;
         }
         // 真实文件分派继续限制单根；拒绝路径中的符号链接，不能用链接绕开参数校验。
         let mut checked = self.files_root.clone();
@@ -844,6 +968,38 @@ impl AppState {
         let state = self.clone();
         let write_target =
             (tool == "fs.write").then(|| (args["path"].clone(), args["text"].clone()));
+        // Post-dispatch Effect context for fs.write, cloned before
+        // args/approval_id move into the blocking task. Reads never
+        // produce an Effect, so the context exists only for writes.
+        let fs_effect = (tool == "fs.write").then(|| {
+            (
+                args.get("path").cloned().unwrap_or_default(),
+                crate::loop_engine::args_digest(&tool, &args),
+                approval_id.clone(),
+                binding.as_ref().map(|b| b.loop_id.clone()),
+            )
+        });
+        let record_fs_effect = |outcome: &ToolOutcome| {
+            if let Some((scope, digest, approval_id, loop_id)) = &fs_effect {
+                let execution_id =
+                    loop_id.as_deref().and_then(|id| execution_for_loop(self, id));
+                let status = serde_json::to_string(&outcome.status)
+                    .unwrap_or_else(|_| "\"unknown\"".to_string());
+                let status = status.trim_matches('"');
+                record_effect(
+                    self,
+                    NewEffect {
+                        execution_id,
+                        capability: "fs".to_string(),
+                        operation: "write".to_string(),
+                        scope: scope.clone(),
+                        input_digest: Some(digest.clone()),
+                        approval_id: approval_id.clone(),
+                        status: status.to_string(),
+                    },
+                );
+            }
+        };
         let response = tokio::task::spawn_blocking(move || {
             let write_path = write_target.as_ref().map(|(path, _)| state.files_root.join(path));
             let response = state.loop_fault.dispatch(write_path.as_deref(), || dispatch_agent_tool(
@@ -871,13 +1027,26 @@ impl AppState {
         .await;
         let response = match response {
             Ok(Ok(response)) => response,
-            Ok(Err(outcome)) => return outcome,
-            Err(_) => return ToolOutcome::unknown(),
+            // The write was dispatched and its verification failed:
+            // an attempted execution with an Unknown report.
+            Ok(Err(outcome)) => {
+                record_fs_effect(&outcome);
+                return outcome;
+            }
+            // The blocking task itself failed to join: dispatch was
+            // attempted, outcome unknown.
+            Err(_) => {
+                let outcome = ToolOutcome::unknown();
+                record_fs_effect(&outcome);
+                return outcome;
+            }
         };
         if !response.status().is_success() {
-            return ToolOutcome::failed(ErrorCode::ToolFailed);
+            let outcome = ToolOutcome::failed(ErrorCode::ToolFailed);
+            record_fs_effect(&outcome);
+            return outcome;
         }
-        match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+        let outcome = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
             Ok(bytes) => {
                 let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
                 let result = &value["result"];
@@ -889,7 +1058,9 @@ impl AppState {
                 )
             }
             Err(_) => ToolOutcome::unknown(),
-        }
+        };
+        record_fs_effect(&outcome);
+        outcome
     }
 
     /// Test seam: load task records from a JSONL file, so
@@ -950,6 +1121,33 @@ impl AppState {
         self.next_execution_id = Arc::new(Mutex::new(next_execution_number(&records)));
         self.executions = Arc::new(Mutex::new(executions));
         self.executions_path = Some(path);
+        self
+    }
+
+    /// Test seam + production path for effect records: load
+    /// `effects.jsonl` so a restart keeps the phase-2 convergence
+    /// records and the counter resumes. Production reads
+    /// MOCK_EFFECTS_PATH. Phase 2 only appends: no read path
+    /// switches to effects yet, and no status conversion happens
+    /// on reload (state convergence is phase 4).
+    pub fn with_effects_path(mut self, path: PathBuf) -> Self {
+        let records = load_effects(&path);
+        let mut effects = HashMap::new();
+        for record in &records {
+            effects.insert(record.effect_id.clone(), record.clone());
+        }
+        self.next_effect_id = Arc::new(Mutex::new(next_effect_number(&records)));
+        self.effects = Arc::new(Mutex::new(effects));
+        self.effects_path = Some(path);
+        self
+    }
+
+    /// Test seam for P0-A provenance: override the origin device
+    /// id this instance stamps on new Execution and Effect rows.
+    /// Production resolves it once at startup from
+    /// MOCK_ORIGIN_DEVICE_ID (see `resolve_origin_device_id`).
+    pub fn with_origin_device_id(mut self, id: String) -> Self {
+        self.origin_device_id = id;
         self
     }
 
@@ -1591,7 +1789,14 @@ async fn files_export(State(state): State<AppState>, Json(req): Json<ExportReque
     if let Err(response) = consume_bound_approval(&state, "fs.export", &req.approval_id, &digest) { return *response; }
     if !source.is_file() { return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"export source must be a file"}))).into_response(); }
     if let Some(parent) = target.parent() { if std::fs::create_dir_all(parent).is_err() { return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot create export parent"}))).into_response(); } }
-    match std::fs::copy(&source, &target) { Ok(bytes) => Json(serde_json::json!({"from":req.from,"to":req.to,"size_bytes":bytes})).into_response(), Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot export file"}))).into_response() }
+    match std::fs::copy(&source, &target) { Ok(bytes) => {
+        // Phase 2: a successful export mirrors into an Effect;
+        // the scope is the normalized source path (the digest
+        // already commits to the absolute destination).
+        let scope = crate::operation_binding::normalize_path(&req.from).unwrap_or_default();
+        record_effect(&state, NewEffect { execution_id: None, capability: "fs".to_string(), operation: "export".to_string(), scope, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+        Json(serde_json::json!({"from":req.from,"to":req.to,"size_bytes":bytes})).into_response()
+    }, Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot export file"}))).into_response() }
 }
 
 async fn files_library(State(state): State<AppState>, Json(req): Json<LibraryRequestDto>) -> impl IntoResponse {
@@ -1654,7 +1859,11 @@ async fn files_write(
         std::fs::write(&full, &data).map(|_| data.len() as u64).map_err(|_| ())
     };
     match written {
-        Ok(size) => Json(serde_json::json!({ "path": req.path, "size_bytes": size })).into_response(),
+        Ok(size) => {
+            // Phase 2: a successful write mirrors into an Effect.
+            record_effect(&state, NewEffect { execution_id: None, capability: "fs".to_string(), operation: "write".to_string(), scope: normalized, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+            Json(serde_json::json!({ "path": req.path, "size_bytes": size })).into_response()
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot write file" }))).into_response(),
     }
 }
@@ -1680,7 +1889,11 @@ async fn files_delete(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "delete refuses directories" }))).into_response();
     }
     match std::fs::remove_file(&full) {
-        Ok(()) => Json(serde_json::json!({ "deleted": true })).into_response(),
+        Ok(()) => {
+            // Phase 2: a successful delete mirrors into an Effect.
+            record_effect(&state, NewEffect { execution_id: None, capability: "fs".to_string(), operation: "delete".to_string(), scope: normalized, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+            Json(serde_json::json!({ "deleted": true })).into_response()
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "file not found" }))).into_response()
         }
@@ -1719,7 +1932,17 @@ async fn files_rename(
         }
     }
     match std::fs::rename(&from, &to) {
-        Ok(()) => Json(serde_json::json!({ "from": req.from, "to": req.to })).into_response(),
+        Ok(()) => {
+            // Phase 2: a successful rename mirrors into an Effect;
+            // the scope names both ends, normalized, in order.
+            let scope = format!(
+                "{} -> {}",
+                crate::operation_binding::normalize_path(&req.from).unwrap_or_default(),
+                crate::operation_binding::normalize_path(&req.to).unwrap_or_default()
+            );
+            record_effect(&state, NewEffect { execution_id: None, capability: "fs".to_string(), operation: "rename".to_string(), scope, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+            Json(serde_json::json!({ "from": req.from, "to": req.to })).into_response()
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot rename file" }))).into_response(),
     }
 }
@@ -1741,7 +1964,11 @@ async fn files_mkdir(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
     };
     match std::fs::create_dir_all(&full) {
-        Ok(()) => Json(serde_json::json!({ "path": normalized })).into_response(),
+        Ok(()) => {
+            // Phase 2: a successful mkdir mirrors into an Effect.
+            record_effect(&state, NewEffect { execution_id: None, capability: "fs".to_string(), operation: "mkdir".to_string(), scope: normalized.clone(), input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+            Json(serde_json::json!({ "path": normalized })).into_response()
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot create directory" }))).into_response(),
     }
 }
@@ -1973,7 +2200,7 @@ async fn approval_request(
     let mut next = state.next_approval_id.lock().expect("approval id lock");
     let id = format!("approval-{}", *next);
     *next += 1;
-    let record = ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending, binding: None, consumed: false, operation_digest: operation_digest.clone(), message: req.message.clone() };
+    let record = ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending, binding: None, consumed: false, operation_digest: operation_digest.clone(), action_binding: None, message: req.message.clone() };
     let mut approvals = state.approvals.lock().expect("approval lock");
     if let Err(detail) = persist_approval(&state, &id, &record) {
         // Bound records fail closed like loop approvals: an id whose
@@ -2176,6 +2403,7 @@ pub(crate) fn persist_approval(state: &AppState, tool_call_id: &str, approval: &
         binding: approval.binding.clone(),
         consumed: approval.consumed,
         operation_digest: approval.operation_digest.clone(),
+        action_binding: approval.action_binding.clone(),
         message: approval.message.clone(),
     };
     append_record(path, &record)
@@ -2300,6 +2528,102 @@ pub(crate) fn consume_bound_approval(
     Ok(())
 }
 
+/// Phase 2 (Q4) device approval checks, shared by the peek and
+/// the consume so both agree. Loop-bound records can never pass
+/// (a loop binding authorizes one loop call, not a device action);
+/// digest-bound records can never pass either (their binding is a
+/// parameter digest, and the device gate binds by action id, not
+/// by digest — a record carrying both would be ambiguous, and the
+/// request path never creates one). An already-bound or already-
+/// consumed record is a reuse, not a fresh authorization.
+fn device_approval_error(record: &ApprovalState, action_id: &str) -> Option<&'static str> {
+    if record.binding.is_some() || record.operation_digest.is_some() {
+        return Some("approval_binding_mismatch");
+    }
+    if record.tool != DEVICE_ACTION {
+        return Some("approval_required");
+    }
+    if record.status == ApprovalStatus::Rejected {
+        return Some("approval_rejected");
+    }
+    // Edited stays executable, as in may_execute: the edit flow
+    // leaves the record in a directly executable state, and the
+    // old status-only device gate already accepted it. Requiring
+    // exactly Approved here would newly reject Edited device
+    // approvals, a behavior regression, not a convergence.
+    if record.status != ApprovalStatus::Approved && record.status != ApprovalStatus::Edited {
+        return Some("approval_required");
+    }
+    if record.action_binding.as_ref().is_some_and(|bound| bound != action_id) || record.consumed {
+        return Some("approval_binding_mismatch");
+    }
+    None
+}
+
+/// Phase 2 (Q4) device peek: validates without burning, so a
+/// device_set that fails on the action side (unknown action, not
+/// requested) never consumes the approval, and approval errors
+/// keep their old precedence over action errors.
+fn check_device_approval(
+    state: &AppState,
+    tool_call_id: &Option<String>,
+    action_id: &str,
+) -> Result<(), Box<axum::response::Response>> {
+    let forbidden = |error: &str| {
+        Box::new(
+            (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": error }))).into_response(),
+        )
+    };
+    let Some(id) = tool_call_id else {
+        return Err(forbidden("approval_required"));
+    };
+    let approvals = state.approvals.lock().expect("approval lock");
+    let Some(record) = approvals.get(id) else {
+        return Err(forbidden("approval_required"));
+    };
+    match device_approval_error(record, action_id) {
+        Some(error) => Err(forbidden(error)),
+        None => Ok(()),
+    }
+}
+
+/// Phase 2 (Q4) device gate: bind-on-consume. The first device use
+/// of an approval binds it to that action id and consumes it, in
+/// one lock acquisition, so a second use — for the same action or
+/// another — fails with a binding mismatch. A persistence failure
+/// returns 500 without executing, and the in-memory consumed flag
+/// stays set (fail closed, as in the loop and digest paths).
+pub(crate) fn consume_device_approval(
+    state: &AppState,
+    tool_call_id: &Option<String>,
+    action_id: &str,
+) -> Result<(), Box<axum::response::Response>> {
+    let forbidden = |error: &str| {
+        Box::new(
+            (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": error }))).into_response(),
+        )
+    };
+    let Some(id) = tool_call_id else {
+        return Err(forbidden("approval_required"));
+    };
+    let mut approvals = state.approvals.lock().expect("approval lock");
+    let Some(record) = approvals.get_mut(id) else {
+        return Err(forbidden("approval_required"));
+    };
+    if let Some(error) = device_approval_error(record, action_id) {
+        return Err(forbidden(error));
+    }
+    record.action_binding = Some(action_id.to_string());
+    record.consumed = true;
+    if let Err(detail) = persist_approval(state, id, record) {
+        eprintln!("warning: device approval consumption persistence failed: {detail}");
+        return Err(Box::new(
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "approval_audit_failed" }))).into_response(),
+        ));
+    }
+    Ok(())
+}
+
 async fn agent_tool_call(
     State(state): State<AppState>,
     Json(req): Json<ToolCallDto>,
@@ -2340,7 +2664,32 @@ async fn agent_tool_call(
                     req.args.insert("path".to_string(), normalized);
                 }
             }
-            return dispatch_agent_tool(&state, req);
+            // Phase 2: a successful bound dispatch mirrors into an
+            // Effect. A failed dispatch wrote nothing, so it leaves
+            // no Effect — the same success-only rule as the /fs/*
+            // endpoints, which share this dispatcher.
+            let scope = req.args.get("path").cloned().unwrap_or_default();
+            let operation = match req.tool.as_str() {
+                "fs.write" => "write",
+                _ => "delete",
+            };
+            let approval_id = req.tool_call_id.clone();
+            let response = dispatch_agent_tool(&state, req);
+            if response.status().is_success() {
+                record_effect(
+                    &state,
+                    NewEffect {
+                        execution_id: None,
+                        capability: "fs".to_string(),
+                        operation: operation.to_string(),
+                        scope,
+                        input_digest: Some(digest),
+                        approval_id,
+                        status: "completed".to_string(),
+                    },
+                );
+            }
+            return response;
         }
         if let Err(response) = check_approval(&state, &req.tool, &req.tool_call_id) {
             return *response;
@@ -2661,6 +3010,8 @@ async fn connectors_accounts_link(
         .expect("connector accounts lock")
         .insert(account.account_id.clone(), account.clone());
     persist_connector_line(&state, &ConnectorStateLine::Account(account.clone()));
+    // Phase 2: a successful link mirrors into an Effect.
+    record_connector_effect(&state, "connectors", "link", &account.account_id);
     Json(account_view(&account)).into_response()
 }
 
@@ -2683,6 +3034,9 @@ async fn connectors_accounts_unlink(
     account.unlinked = true;
     let updated = account.clone();
     persist_connector_line(&state, &ConnectorStateLine::Account(updated.clone()));
+    // Phase 2: a successful unlink mirrors into an Effect, even
+    // when idempotent (the tombstone line was still appended).
+    record_connector_effect(&state, "connectors", "unlink", &updated.account_id);
     Json(account_view(&updated)).into_response()
 }
 
@@ -2731,6 +3085,8 @@ async fn connectors_connect(
             updated_ms: now_ms(),
         }),
     );
+    // Phase 2: a successful connect mirrors into an Effect.
+    record_connector_effect(&state, "connectors", "connect", &id);
     Json(connector_view(&state, entry)).into_response()
 }
 
@@ -2756,6 +3112,8 @@ async fn connectors_disconnect(
             updated_ms: now_ms(),
         }),
     );
+    // Phase 2: a successful disconnect mirrors into an Effect.
+    record_connector_effect(&state, "connectors", "disconnect", &id);
     Json(connector_view(&state, entry)).into_response()
 }
 
@@ -2928,6 +3286,9 @@ async fn vault_custom_register(
     };
     custom.insert(id, def.clone());
     persist_vault_line(&state, &VaultStateLine::CustomConnector(def.clone()));
+    // Phase 2: a successful custom-connector registration mirrors
+    // into an Effect.
+    record_connector_effect(&state, "custom-connectors", "register", &def.id);
     Json(custom_connector_view(&def)).into_response()
 }
 
@@ -2963,6 +3324,9 @@ async fn vault_custom_delete(
     def.deleted = true;
     let updated = def.clone();
     persist_vault_line(&state, &VaultStateLine::CustomConnector(updated.clone()));
+    // Phase 2: a successful custom-connector delete mirrors into
+    // an Effect.
+    record_connector_effect(&state, "custom-connectors", "delete", &req.id);
     Json(custom_connector_view(&updated)).into_response()
 }
 
@@ -3003,6 +3367,11 @@ async fn vault_credentials_register(
     if let Some(provider) = &provider {
         ensure_catalog_entry(&state, provider, now);
     }
+    // Phase 2: a successful credential registration mirrors into
+    // an Effect. The incidental catalog ensure above is not a
+    // second Effect: one call, one Effect. No secret material ever
+    // enters an Effect — only the handle.
+    record_connector_effect(&state, "credentials", "register", &slot.handle);
     Json(credential_view(&state, &slot)).into_response()
 }
 
@@ -3043,6 +3412,9 @@ async fn vault_credentials_delete(
     slot.deleted = true;
     let updated = slot.clone();
     persist_vault_line(&state, &VaultStateLine::Credential(updated.clone()));
+    // Phase 2: a successful credential delete (real backend
+    // erasure + tombstone) mirrors into an Effect.
+    record_connector_effect(&state, "credentials", "delete", &req.handle);
     Json(credential_view(&state, &updated)).into_response()
 }
 
@@ -3072,6 +3444,9 @@ async fn vault_credentials_capture(
     slot.updated_ms = now_ms();
     let updated = slot.clone();
     persist_vault_line(&state, &VaultStateLine::Credential(updated.clone()));
+    // Phase 2: a successful credential capture (secret rotation)
+    // mirrors into an Effect; the secret itself never does.
+    record_connector_effect(&state, "credentials", "capture", &req.handle);
     Json(credential_view(&state, &updated)).into_response()
 }
 
@@ -3170,6 +3545,11 @@ async fn vault_capture_fulfill(
     ticket.status = TicketStatus::Fulfilled;
     let updated_ticket = ticket.clone();
     persist_vault_line(&state, &VaultStateLine::Ticket(updated_ticket));
+    // Phase 2: a successful capture fulfill mirrors into an
+    // Effect for the materialized credential. The ticket request
+    // itself is not an Effect: it mints an ephemeral exchange
+    // token, and its durable outcome is this fulfill.
+    record_connector_effect(&state, "credentials", "fulfill", &ticket.handle);
     Json(credential_view(&state, &updated)).into_response()
 }
 
@@ -3235,6 +3615,8 @@ async fn vault_catalog_update(
     entry.updated_ms = now_ms();
     let updated = entry.clone();
     persist_vault_line(&state, &VaultStateLine::Catalog(updated.clone()));
+    // Phase 2: a successful catalog update mirrors into an Effect.
+    record_connector_effect(&state, "catalog", "update", &req.id);
     Json(catalog_view(&updated)).into_response()
 }
 
@@ -3257,6 +3639,8 @@ async fn vault_catalog_delete(
     entry.deleted = true;
     let updated = entry.clone();
     persist_vault_line(&state, &VaultStateLine::Catalog(updated.clone()));
+    // Phase 2: a successful catalog delete mirrors into an Effect.
+    record_connector_effect(&state, "catalog", "delete", &req.id);
     Json(catalog_view(&updated)).into_response()
 }
 
@@ -5796,11 +6180,21 @@ pub(crate) fn create_execution(
     let mut next = state.next_execution_id.lock().expect("execution id lock");
     let id = format!("execution-{}", *next);
     *next += 1;
+    // P0-A only adds provenance and reserved references: the
+    // session, worker session and snapshot fields stay None
+    // until their phases land, and the origin/schema pair is
+    // stamped from this instance. Status values and the
+    // creation paths are untouched.
     let record = ExecutionFileRecord {
         execution_id: id,
         task_id,
         loop_id,
+        session_id: None,
+        worker_session_id: None,
+        workspace_snapshot_id: None,
         status: "running".to_string(),
+        origin_device_id: state.origin_device_id.clone(),
+        schema_version: 1,
     };
     state.executions.lock().expect("execution lock").insert(record.execution_id.clone(), record.clone());
     persist_execution(state, &record);
@@ -5809,6 +6203,122 @@ pub(crate) fn create_execution(
 
 fn task_number(task_id: &str) -> u64 {
     task_id.strip_prefix("task-").and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)
+}
+
+fn effect_number(effect_id: &str) -> u64 {
+    effect_id.strip_prefix("effect-").and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)
+}
+
+pub(crate) fn persist_effect(state: &AppState, record: &EffectFileRecord) {
+    let Some(path) = &state.effects_path else { return };
+    append_effect(path, record);
+}
+
+/// Phase 2 dual-write entry: append one Effect line mirroring a
+/// durable side effect, and keep it in the in-memory map for the
+/// read-only `/effects` routes. Best-effort like every other JSONL
+/// append here: a missing path means effects are not persisted for
+/// this run, and an append failure only warns. The caller has
+/// already produced the mirrored outcome; this never changes the
+/// caller's response and never gates execution.
+pub(crate) fn record_effect(state: &AppState, effect: NewEffect) -> EffectFileRecord {
+    let mut next = state.next_effect_id.lock().expect("effect id lock");
+    let id = format!("effect-{}", *next);
+    *next += 1;
+    // P0-A only adds the idempotency key and provenance. The key
+    // is computed here, centrally, from the record's own fields:
+    // it exists exactly when the execution id and the digest are
+    // both present, so direct writes without an execution keep a
+    // null key (forcing attribution is P0-B's job). No gate reads
+    // the key yet, and no call site changes shape.
+    let idempotency_key = match (&effect.execution_id, &effect.input_digest) {
+        (Some(execution_id), Some(digest)) => Some(crate::effect_store::idempotency_key(
+            execution_id,
+            &effect.capability,
+            &effect.operation,
+            &effect.scope,
+            digest,
+        )),
+        _ => None,
+    };
+    let record = EffectFileRecord {
+        effect_id: id,
+        execution_id: effect.execution_id,
+        capability: effect.capability,
+        operation: effect.operation,
+        scope: effect.scope,
+        input_digest: effect.input_digest,
+        approval_id: effect.approval_id,
+        status: effect.status,
+        idempotency_key,
+        origin_device_id: state.origin_device_id.clone(),
+        schema_version: 1,
+    };
+    state.effects.lock().expect("effect lock").insert(record.effect_id.clone(), record.clone());
+    persist_effect(state, &record);
+    record
+}
+
+/// Phase 2 management-plane Effect helper: connector and vault
+/// writes carry no approval, so the digest commits to the
+/// operation and the affected id in the unified Q5 shape, and the
+/// status is always `completed` (these handlers only return
+/// success after the mutation persisted).
+pub(crate) fn record_connector_effect(
+    state: &AppState,
+    capability: &str,
+    operation: &str,
+    scope: &str,
+) {
+    let digest = crate::operation_binding::operation_digest(
+        &format!("{capability}.{operation}"),
+        None,
+        &std::collections::BTreeMap::from([("id".to_string(), scope.to_string())]),
+    );
+    record_effect(
+        state,
+        NewEffect {
+            execution_id: None,
+            capability: capability.to_string(),
+            operation: operation.to_string(),
+            scope: scope.to_string(),
+            input_digest: Some(digest),
+            approval_id: None,
+            status: "completed".to_string(),
+        },
+    );
+}
+
+/// Execution of the attempt a loop belongs to. Phase 1 creates
+/// exactly one Execution per loop_start, so a loop id maps to at
+/// most one record; a loop started before phase 1 (or before
+/// executions were persisted) has none, and its effects carry
+/// `None` rather than a fabricated id.
+pub(crate) fn execution_for_loop(state: &AppState, loop_id: &str) -> Option<String> {
+    state
+        .executions
+        .lock()
+        .expect("execution lock")
+        .values()
+        .find(|r| r.loop_id.as_deref() == Some(loop_id))
+        .map(|r| r.execution_id.clone())
+}
+
+/// Execution of the current attempt of a task. A task resume spawns
+/// a fresh runner attempt and a fresh Execution, so the latest
+/// (largest execution-N) record for the task is the current
+/// attempt. Whether a resume continues the same Execution is a
+/// phase 4 (Q6) decision; until then, latest-wins is the honest
+/// mapping for the attempt that just wrote.
+pub(crate) fn execution_for_task(state: &AppState, task_id: &str) -> Option<String> {
+    state
+        .executions
+        .lock()
+        .expect("execution lock")
+        .values()
+        .filter(|r| r.task_id.as_deref() == Some(task_id))
+        .max_by_key(|r| execution_number(&r.execution_id))
+        .map(|r| r.execution_id.clone())
 }
 
 async fn tasks_create(
@@ -6005,7 +6515,7 @@ async fn tasks_execute(
         return bad_request("invalid path");
     };
     if let Err(response) =
-        consume_bound_approval(&state, "fs.write", &Some(approval_id), &digest)
+        consume_bound_approval(&state, "fs.write", &Some(approval_id.clone()), &digest)
     {
         return *response;
     }
@@ -6035,6 +6545,21 @@ async fn tasks_execute(
     }
     if std::fs::write(&full, draft.as_bytes()).is_err() {
         crate::task_runner::fail(&state, &req.task_id, "产物写入失败");
+        // Phase 2: the artifact write was attempted and failed,
+        // and the task now persists as failed — that terminal
+        // outcome mirrors into a failed Effect.
+        record_effect(
+            &state,
+            NewEffect {
+                execution_id: execution_for_task(&state, &req.task_id),
+                capability: "tasks".to_string(),
+                operation: "execute".to_string(),
+                scope: req.task_id.clone(),
+                input_digest: Some(digest),
+                approval_id: Some(approval_id.clone()),
+                status: "failed".to_string(),
+            },
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "cannot write file" })),
@@ -6047,6 +6572,22 @@ async fn tasks_execute(
         current.error = None;
         let updated = current.clone();
         persist_task(&state, &updated);
+        // Phase 2: a successful task write mirrors into an Effect.
+        // The digest is the artifact write digest the approval gate
+        // consumed; the operation is the task execution, not the
+        // underlying file write.
+        record_effect(
+            &state,
+            NewEffect {
+                execution_id: execution_for_task(&state, &req.task_id),
+                capability: "tasks".to_string(),
+                operation: "execute".to_string(),
+                scope: req.task_id.clone(),
+                input_digest: Some(digest),
+                approval_id: Some(approval_id.clone()),
+                status: "completed".to_string(),
+            },
+        );
         return Json(updated).into_response();
     }
     (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" }))).into_response()
@@ -6212,6 +6753,32 @@ async fn executions_get(
     match state.executions.lock().expect("execution lock").get(&query.execution_id) {
         Some(record) => Json(record.clone()).into_response(),
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown execution" })))
+            .into_response(),
+    }
+}
+
+// Phase 2 read-only Effect routes, mirroring /executions: the old
+// read paths keep serving the old records, and these routes expose
+// the converged view alongside. No existing response changes.
+#[derive(Debug, Deserialize)]
+struct EffectGetQuery {
+    effect_id: String,
+}
+
+async fn effects_list(State(state): State<AppState>) -> Json<Vec<EffectFileRecord>> {
+    let mut records: Vec<EffectFileRecord> =
+        state.effects.lock().expect("effect lock").values().cloned().collect();
+    records.sort_by_key(|r| effect_number(&r.effect_id));
+    Json(records)
+}
+
+async fn effects_get(
+    State(state): State<AppState>,
+    Query(query): Query<EffectGetQuery>,
+) -> impl IntoResponse {
+    match state.effects.lock().expect("effect lock").get(&query.effect_id) {
+        Some(record) => Json(record.clone()).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown effect" })))
             .into_response(),
     }
 }
@@ -6631,12 +7198,17 @@ async fn device_set(
     State(state): State<AppState>,
     Json(req): Json<DeviceSetDto>,
 ) -> impl IntoResponse {
-    if let Err(response) = check_approval(&state, DEVICE_ACTION, &req.tool_call_id) {
+    // Phase 2 (Q4): peek first (approval errors keep their old
+    // precedence over action errors, nothing burned), then bind
+    // and consume only once the action is known executable — so a
+    // failed set never burns the approval, and a lost consume race
+    // still leaves the action requested for a fresh approval.
+    if let Err(response) = check_device_approval(&state, &req.tool_call_id, &req.action_id) {
         return *response;
     }
     let (reminder_id, target) = {
-        let mut actions = state.actions.lock().expect("action lock");
-        let Some(record) = actions.get_mut(&req.action_id) else {
+        let actions = state.actions.lock().expect("action lock");
+        let Some(record) = actions.get(&req.action_id) else {
             return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown action" })))
                 .into_response();
         };
@@ -6646,11 +7218,21 @@ async fn device_set(
         if let Some(response) = device_pin_error(&state, &record.reminder_id) {
             return response;
         }
+        (record.reminder_id.clone(), record.target_completed)
+    };
+    if let Err(response) = consume_device_approval(&state, &req.tool_call_id, &req.action_id) {
+        return *response;
+    }
+    {
+        let mut actions = state.actions.lock().expect("action lock");
+        let Some(record) = actions.get_mut(&req.action_id) else {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown action" })))
+                .into_response();
+        };
         record.status = "approved".to_string();
         let approved = record.clone();
         persist_action(&state, &approved);
-        (record.reminder_id.clone(), record.target_completed)
-    };
+    }
     let backend = Arc::clone(&state.device_backend);
     let outcome = tokio::task::spawn_blocking(move || {
         execute_set(&backend, &reminder_id, target, Duration::from_secs(DEVICE_TIMEOUT_SECS))
@@ -6692,6 +7274,34 @@ async fn device_set(
     }
     let updated = record.clone();
     persist_action(&state, &updated);
+    // Phase 2: the action's terminal outcome mirrors into an
+    // Effect. awaiting_authorization is terminal for this action:
+    // nothing was written, but the action record now says so, and
+    // the Effect carries that same status word. The digest is the
+    // unified Q5 digest of the executed (reminder, completed) pair
+    // — the same value a loop reminder call would carry — while
+    // the authorization itself is bound by action id (Q4), not by
+    // digest: device approvals carry no operation digest.
+    let digest = crate::operation_binding::operation_digest(
+        DEVICE_ACTION,
+        Some("set_completed"),
+        &std::collections::BTreeMap::from([
+            ("id".to_string(), updated.reminder_id.clone()),
+            ("completed".to_string(), updated.target_completed.to_string()),
+        ]),
+    );
+    record_effect(
+        &state,
+        NewEffect {
+            execution_id: None,
+            capability: "devices".to_string(),
+            operation: "set".to_string(),
+            scope: req.action_id.clone(),
+            input_digest: Some(digest),
+            approval_id: req.tool_call_id.clone(),
+            status: updated.status.clone(),
+        },
+    );
     Json(updated).into_response()
 }
 
@@ -7100,6 +7710,8 @@ pub fn app(state: AppState) -> Router {
         .route("/tasks/cancel", post(tasks_cancel))
         .route("/executions/list", get(executions_list))
         .route("/executions/get", get(executions_get))
+        .route("/effects/list", get(effects_list))
+        .route("/effects/get", get(effects_get))
         .route("/sessions/create", post(sessions_create))
         .route("/sessions/list", get(sessions_list))
         .route("/sessions/get", get(sessions_get))

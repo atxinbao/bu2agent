@@ -137,6 +137,7 @@ fn approval_record(id: &str, tool: &str, status: &str) -> ApprovalFileRecord {
         binding: None,
         consumed: false,
         operation_digest: None,
+        action_binding: None,
         message: None,
     }
 }
@@ -888,13 +889,15 @@ async fn loop_binding_consumption_snapshot() {
         assert_eq!(view["status"], "completed");
     }
 
-    // The approval record now shows the loop model: consumed,
-    // bound, no operation digest.
+    // Phase 2 (Q5): the loop model now carries the unified digest
+    // alongside the binding: consumed, bound, and the digest equals
+    // the binding's wire digest. The gate checks the reference
+    // triple plus this stored digest, never the wire field alone.
     let record = last_approval_record(&approvals_path, &approval_id);
     assert_eq!(record["consumed"], true);
     assert_eq!(record["binding"]["loop_id"], loop_id);
     assert_eq!(record["binding"]["tool"], "fs.write");
-    assert!(record["operation_digest"].is_null());
+    assert_eq!(record["operation_digest"], record["binding"]["args_sha256"]);
 
     server.abort();
     let _ = std::fs::remove_dir_all(&base);
@@ -1024,10 +1027,14 @@ async fn operation_digest_consumption_snapshot() {
 
 #[tokio::test]
 async fn device_check_only_consumption_snapshot() {
-    // Model 3: device check-only. device_set verifies the
-    // approval (no binding, tool match, approved status) but
-    // never sets consumed: the record stays approved and
-    // unconsumed after a successful set.
+    // Phase 2 (Q4) REPLACES model 3: device_set now binds the
+    // approval to the action id and consumes it at first use, so
+    // the record is approved, consumed, and bound to action-1
+    // after a successful set. This test was intentionally updated
+    // for the Q4 change; it is not a regression.
+    // Model 3 (pre-phase-2): device check-only. device_set
+    // verified the approval (no binding, tool match, approved
+    // status) but never set consumed.
     let base = temp_base("device-check");
     let files_root = base.join("files");
     std::fs::create_dir_all(&files_root).expect("create files root");
@@ -1086,7 +1093,8 @@ async fn device_check_only_consumption_snapshot() {
 
     let record = last_approval_record(&approvals_path, &approval_id);
     assert_eq!(record["status"], "approved");
-    assert_eq!(record["consumed"], false, "device set must not consume the approval");
+    assert_eq!(record["consumed"], true, "phase 2 (Q4): device set consumes the approval");
+    assert_eq!(record["action_binding"], "action-1", "phase 2 (Q4): device set binds to the action");
     assert!(record["binding"].is_null());
     assert!(record["operation_digest"].is_null());
 

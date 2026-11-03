@@ -150,14 +150,26 @@ async fn device_create_set_get_roundtrip() {
     assert_eq!(listed[0]["completed"], true);
 
     // A second set on the same action is refused: each action
-    // executes at most once.
+    // executes at most once. Phase 2 (Q4) changed the refusal
+    // reason: the first set consumed the approval, so the reuse
+    // now fails at the approval gate (403) before the action
+    // state is even consulted. The at-most-once property itself
+    // is unchanged, as the fresh-approval probe below shows.
     let (status, _body) = post(
         addr,
         "/devices/reminders/set",
         &format!(r#"{{"action_id":"action-1","tool_call_id":"{approval}"}}"#),
     )
     .await;
-    assert!(status.contains("400"), "second set must be 400: {status}");
+    assert!(status.contains("403"), "second set with a consumed approval must be 403: {status}");
+    let fresh = approve(addr, "approved").await;
+    let (status, _body) = post(
+        addr,
+        "/devices/reminders/set",
+        &format!(r#"{{"action_id":"action-1","tool_call_id":"{fresh}"}}"#),
+    )
+    .await;
+    assert!(status.contains("400"), "fresh approval on a completed action must be 400: {status}");
 
     let _ = create_action(addr, "reminder-2", false).await;
     let (status, body) = get(addr, "/devices/actions/list").await;

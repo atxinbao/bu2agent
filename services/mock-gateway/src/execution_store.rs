@@ -14,11 +14,28 @@
 //! no `kind` field yet (draft §3 leaves it undecided) and no
 //! workspace snapshot id (phase 3): exactly one of task_id /
 //! loop_id is set, identifying the source attempt.
+//!
+//! P0-A (PA contract §2.1) only adds fields: the originating
+//! conversation session, the current worker session and the locked
+//! workspace snapshot (all still None in P0-A: sessions,
+//! workers and snapshots land in later phases), plus the record
+//! provenance every new record carries: `origin_device_id` and
+//! `schema_version`. No status value, no gate and no creation
+//! path changes here. Old lines without the new fields still
+//! parse: they read as schema version 0 with origin "unknown",
+//! never backfilled.
 
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
+
+/// Origin reported for records written before P0-A added the
+/// field, and for any line that omits it. Deliberately not a
+/// device id: "unknown" means "no provenance recorded".
+fn unknown_origin() -> String {
+    "unknown".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionFileRecord {
@@ -29,10 +46,31 @@ pub struct ExecutionFileRecord {
     /// Source loop, if this execution is a loop attempt.
     #[serde(default)]
     pub loop_id: Option<String>,
+    /// Originating conversation session, when one exists. P0-A
+    /// only reserves the field; no creation path sets it yet.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Worker session currently driving this execution. P0-A
+    /// only reserves the field; WorkerSession storage is later.
+    #[serde(default)]
+    pub worker_session_id: Option<String>,
+    /// Locked workspace snapshot. P0-A only reserves the field;
+    /// snapshots land in a later phase.
+    #[serde(default)]
+    pub workspace_snapshot_id: Option<String>,
     /// One of: running, awaiting_approval, needs_review,
     /// completed, failed, cancelled. Phase 1 only ever writes
     /// "running" at creation; transitions arrive with phase 4.
     pub status: String,
+    /// Device that created this execution, resolved at gateway
+    /// startup (see `resolve_origin_device_id`); "unknown" for
+    /// pre-P0-A lines.
+    #[serde(default = "unknown_origin")]
+    pub origin_device_id: String,
+    /// Contract schema version: 1 for rows written by P0-A or
+    /// later, 0 for pre-P0-A rows read without the field.
+    #[serde(default)]
+    pub schema_version: u64,
 }
 
 /// The four Q2 status groups. Terminal outcomes share one group so
@@ -137,7 +175,12 @@ mod tests {
                 execution_id: "execution-1".to_string(),
                 task_id: Some("task-1".to_string()),
                 loop_id: None,
+                session_id: None,
+                worker_session_id: None,
+                workspace_snapshot_id: None,
                 status: "running".to_string(),
+                origin_device_id: "mac-local".to_string(),
+                schema_version: 1,
             },
         );
         append_execution(
@@ -146,7 +189,12 @@ mod tests {
                 execution_id: "execution-1".to_string(),
                 task_id: Some("task-1".to_string()),
                 loop_id: None,
+                session_id: None,
+                worker_session_id: None,
+                workspace_snapshot_id: None,
                 status: "completed".to_string(),
+                origin_device_id: "mac-local".to_string(),
+                schema_version: 1,
             },
         );
         let records = load_executions(&path);
@@ -170,6 +218,53 @@ mod tests {
         assert_eq!(records[0].loop_id.as_deref(), Some("loop-2"));
         assert_eq!(next_execution_number(&records), 4);
         assert_eq!(next_execution_number(&[]), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p0a_fields_roundtrip_and_old_lines_read_as_schema_zero() {
+        let dir = temp_dir("p0a");
+        let path = dir.join("executions.jsonl");
+        append_execution(
+            &path,
+            &ExecutionFileRecord {
+                execution_id: "execution-1".to_string(),
+                task_id: Some("task-1".to_string()),
+                loop_id: None,
+                session_id: Some("session-1".to_string()),
+                worker_session_id: None,
+                workspace_snapshot_id: None,
+                status: "running".to_string(),
+                origin_device_id: "worker-9".to_string(),
+                schema_version: 1,
+            },
+        );
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open for append");
+            writeln!(
+                f,
+                "{{\"execution_id\":\"execution-2\",\"task_id\":null,\"loop_id\":\"loop-3\",\"status\":\"running\"}}"
+            )
+            .expect("append old line");
+        }
+        let records = load_executions(&path);
+        assert_eq!(records.len(), 2);
+        let new_row = &records[0];
+        assert_eq!(new_row.session_id.as_deref(), Some("session-1"));
+        assert_eq!(new_row.worker_session_id, None);
+        assert_eq!(new_row.workspace_snapshot_id, None);
+        assert_eq!(new_row.origin_device_id, "worker-9");
+        assert_eq!(new_row.schema_version, 1);
+        let old_row = &records[1];
+        assert_eq!(old_row.session_id, None);
+        assert_eq!(old_row.worker_session_id, None);
+        assert_eq!(old_row.workspace_snapshot_id, None);
+        assert_eq!(old_row.origin_device_id, "unknown");
+        assert_eq!(old_row.schema_version, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -11,10 +11,12 @@
 //! execution can never drift apart. A client-supplied hash is never
 //! trusted: the server hashes the bytes it actually received.
 //!
-//! Path rules mirror the loop engine's normalization (rooted, parent,
-//! backslash and prefix paths are rejected; normal components are
-//! rejoined with `/`). The loop module is deliberately untouched;
-//! parity tests here guard the shared rules.
+//! Path rules are the single normalization both approval families
+//! share (rooted, parent, backslash and prefix paths are rejected;
+//! normal components are rejoined with `/`). Phase 2 (Q5) merged
+//! the loop engine's copy into this function: the loop module now
+//! delegates here, keeping only its fs.list empty-path allowance.
+//! Parity tests in both modules guard the shared rules.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
@@ -52,6 +54,29 @@ pub fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
 
+/// Q5 unified digest: every approval-bound operation commits to a
+/// (tool, mode, params) triple, serialized as one JSON tuple and
+/// hashed. `mode` is `Some` for operations whose mode changes the
+/// effect (file overwrite vs append, reminder set_completed) and
+/// `None` for operations with a single mode (delete, mkdir, rename,
+/// export), whose historical shape is the bare (tool, params) pair.
+/// All digest functions below delegate here, and the loop engine's
+/// `args_digest` is the same function over loop-normalized args, so
+/// the two approval families can never drift apart again. A digest
+/// is only meaningful next to the tool it was computed for: callers
+/// always check tool + digest together.
+pub fn operation_digest(
+    tool: &str,
+    mode: Option<&str>,
+    params: &BTreeMap<String, String>,
+) -> String {
+    let payload = match mode {
+        Some(mode) => serde_json::to_string(&(tool, mode, params)).expect("string map"),
+        None => serde_json::to_string(&(tool, params)).expect("string map"),
+    };
+    sha256_hex(payload.as_bytes())
+}
+
 /// Digest for a file write, computed from the normalized path, the
 /// SHA-256 of the decoded content bytes, and the write mode. The
 /// mode is part of the digest so an overwrite approval can never be
@@ -64,11 +89,7 @@ pub fn write_digest(path_raw: &str, content: &[u8], append: bool) -> Option<Stri
         ("content_sha256".to_string(), sha256_hex(content)),
         ("path".to_string(), path),
     ]);
-    Some(sha256_hex(
-        serde_json::to_string(&("fs.write", mode, params))
-            .expect("string map")
-            .as_bytes(),
-    ))
+    Some(operation_digest("fs.write", Some(mode), &params))
 }
 
 /// Digest for a file delete, computed from the normalized path.
@@ -76,22 +97,14 @@ pub fn write_digest(path_raw: &str, content: &[u8], append: bool) -> Option<Stri
 pub fn delete_digest(path_raw: &str) -> Option<String> {
     let path = normalize_path(path_raw)?;
     let params = BTreeMap::from([("path".to_string(), path)]);
-    Some(sha256_hex(
-        serde_json::to_string(&("fs.delete", params))
-            .expect("string map")
-            .as_bytes(),
-    ))
+    Some(operation_digest("fs.delete", None, &params))
 }
 
 /// Digest for an idempotent directory creation bound to one path.
 pub fn mkdir_digest(path_raw: &str) -> Option<String> {
     let path = normalize_path(path_raw)?;
     let params = BTreeMap::from([("path".to_string(), path)]);
-    Some(sha256_hex(
-        serde_json::to_string(&("fs.mkdir", params))
-            .expect("string map")
-            .as_bytes(),
-    ))
+    Some(operation_digest("fs.mkdir", None, &params))
 }
 
 /// Digest for moving an entry between two normalized paths.
@@ -99,11 +112,7 @@ pub fn rename_digest(from_raw: &str, to_raw: &str) -> Option<String> {
     let from = normalize_path(from_raw)?;
     let to = normalize_path(to_raw)?;
     let params = BTreeMap::from([("from".to_string(), from), ("to".to_string(), to)]);
-    Some(sha256_hex(
-        serde_json::to_string(&("fs.rename", params))
-            .expect("string map")
-            .as_bytes(),
-    ))
+    Some(operation_digest("fs.rename", None, &params))
 }
 
 /// Digest for exporting a root file to one explicit absolute destination.
@@ -117,9 +126,7 @@ pub fn export_digest(from_raw: &str, to_raw: &str) -> Option<String> {
         ("from".to_string(), from),
         ("to".to_string(), to.to_string_lossy().into_owned()),
     ]);
-    Some(sha256_hex(
-        serde_json::to_string(&("fs.export", params)).expect("string map").as_bytes(),
-    ))
+    Some(operation_digest("fs.export", None, &params))
 }
 
 #[cfg(test)]

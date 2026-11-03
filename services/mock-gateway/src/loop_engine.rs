@@ -88,7 +88,21 @@ pub struct ApprovalBinding {
     pub loop_id: String,
     pub call_id: usize,
     pub tool: String,
+    /// Phase 2 (Q5): kept on the wire for client compatibility
+    /// (the desktop loop view requires this field), but no longer
+    /// a security input: the gate checks the (loop_id, call_id,
+    /// tool) reference triple plus the unified operation digest
+    /// stored on the approval record. The value carried here is
+    /// that same unified digest.
     pub args_sha256: String,
+}
+
+/// Reference part of a loop binding: the (loop_id, call_id, tool)
+/// triple that identifies which call an approval authorizes. The
+/// parameters are bound separately by the operation digest, so a
+/// binding comparison must never again depend on `args_sha256`.
+pub fn binding_ref_matches(a: &ApprovalBinding, b: &ApprovalBinding) -> bool {
+    a.loop_id == b.loop_id && a.call_id == b.call_id && a.tool == b.tool
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -521,27 +535,20 @@ pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, E
         None if tool == "fs.list" => "",
         _ => return Err(ErrorCode::InvalidArguments),
     };
-    // Windows 的 /path 有根但没有盘符，is_absolute 不会拒绝它。
-    // 必须在规范化丢弃 RootDir 前拒绝所有带根路径。
-    if raw.contains(['\0', '\\'])
-        || Path::new(raw).has_root()
-        || Path::new(raw)
+    // Phase 2 (Q5): path normalization lives in operation_binding
+    // now; the loop keeps only its fs.list root allowance (an empty
+    // or dot-only path addresses the file root). Anything the shared
+    // normalizer rejects is still rejected here, including paths
+    // over 4096 bytes, which the shared function bounds.
+    let path = if tool == "fs.list"
+        && Path::new(raw)
             .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+            .all(|c| matches!(c, Component::CurDir))
     {
-        return Err(ErrorCode::InvalidArguments);
-    }
-    let path = Path::new(raw)
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/");
-    if path.len() > 4096 || (path.is_empty() && tool != "fs.list") {
-        return Err(ErrorCode::InvalidArguments);
-    }
+        String::new()
+    } else {
+        crate::operation_binding::normalize_path(raw).ok_or(ErrorCode::InvalidArguments)?
+    };
     let mut out = BTreeMap::from([("path".into(), path)]);
     if tool == "fs.write" {
         let text = object
@@ -557,9 +564,32 @@ pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, E
 }
 
 pub fn args_digest(tool: &str, args: &BTreeMap<String, String>) -> String {
-    // 每种写入语义使用独立标签，提醒事项授权不能复用文件写授权。
-    let mode = if tool == "reminders.set_completed" { "set_completed" } else { "overwrite" };
-    digest(&serde_json::to_string(&(tool, mode, args)).expect("string map")).sha256
+    // Phase 2 (Q5): the loop digest is the unified operation digest.
+    // The one loop-specific rule that survives is the fs.write text
+    // indirection: a loop write commits to the SHA-256 of its text,
+    // never the text itself, exactly as the direct write digest
+    // commits to the SHA-256 of the decoded bytes. Same text, same
+    // normalized path, same mode => same digest on both paths.
+    // Every write semantic keeps its own mode label, so a reminder
+    // authorization can never authorize a file write (or reverse).
+    if tool == "fs.write" {
+        let params = BTreeMap::from([
+            (
+                "content_sha256".to_string(),
+                crate::operation_binding::sha256_hex(
+                    args.get("text").map(String::as_str).unwrap_or_default().as_bytes(),
+                ),
+            ),
+            ("path".to_string(), args.get("path").cloned().unwrap_or_default()),
+        ]);
+        return crate::operation_binding::operation_digest("fs.write", Some("overwrite"), &params);
+    }
+    let mode = if tool == "reminders.set_completed" {
+        "set_completed"
+    } else {
+        "overwrite"
+    };
+    crate::operation_binding::operation_digest(tool, Some(mode), args)
 }
 
 impl LoopEngine {
@@ -875,7 +905,9 @@ impl LoopEngine {
                             tool: call.tool.clone(),
                             args_sha256: call.args_sha256.clone(),
                         };
-                        call.approval_id = Some(app.request_loop_approval(binding.clone())?);
+                        call.approval_id = Some(
+                            app.request_loop_approval(binding.clone(), call.args_sha256.clone())?,
+                        );
                         call.binding = Some(binding);
                         call.status = CallStatus::AwaitingApproval;
                         live.record.status = LoopStatus::AwaitingApproval;
@@ -887,7 +919,7 @@ impl LoopEngine {
                 let args = live.arguments[index].clone().expect("validated arguments");
                 // 消费批准、预留执行与取消共享循环锁；预留是步骤开始的线性化点。
                 if let (Some(id), Some(binding)) = (&call.approval_id, &call.binding) {
-                    app.consume_loop_approval(id, binding)?;
+                    app.consume_loop_approval(id, binding, &call.args_sha256)?;
                 }
                 call.status = CallStatus::Running;
                 call.submitted = true;
