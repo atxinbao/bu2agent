@@ -126,6 +126,9 @@ fn action_record(id: &str, status: &str) -> DeviceActionRecord {
         target_completed: true,
         status: status.to_string(),
         detail: None,
+        // P0-B adapter field; snapshot fixtures model pre-P0-B
+        // rows, which carry no execution id.
+        execution_id: None,
     }
 }
 

@@ -281,7 +281,9 @@ async fn origin_override_stamps_execution_and_effect_rows() {
     assert!(head.contains("200"), "run: {head}");
     assert_eq!(h.executions().await[0]["origin_device_id"], "worker-9");
 
-    // Direct write: no execution, so no key, but provenance stamps.
+    // P0-B: a direct write is its own attempt, so it now carries
+    // a minimal Execution and a non-null key; provenance stamps
+    // are unchanged.
     let (head, body) = h
         .post(
             "/approval/request",
@@ -303,8 +305,9 @@ async fn origin_override_stamps_execution_and_effect_rows() {
     let effect = &effects[0];
     assert_eq!(effect["capability"], "fs");
     assert_eq!(effect["operation"], "write");
-    assert!(effect["execution_id"].is_null());
-    assert!(effect["idempotency_key"].is_null());
+    let execution_id = effect["execution_id"].as_str().expect("minimal execution");
+    assert!(execution_id.starts_with("execution-"));
+    assert!(effect["idempotency_key"].is_string());
     assert_eq!(effect["origin_device_id"], "worker-9");
     assert_eq!(effect["schema_version"], 1);
     model.abort();

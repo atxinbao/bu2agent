@@ -25,6 +25,11 @@ pub struct DeviceActionRecord {
     pub target_completed: bool,
     pub status: String,
     pub detail: Option<String>,
+    /// P0-B adapter: the Execution this action attempt belongs to,
+    /// created at actions_create. None for pre-P0-B rows, which
+    /// parse without the field and stay unattributed.
+    #[serde(default)]
+    pub execution_id: Option<String>,
 }
 
 pub fn valid_action_status(status: &str) -> bool {
@@ -121,6 +126,7 @@ mod tests {
             target_completed: true,
             status: status.to_string(),
             detail: None,
+            execution_id: None,
         }
     }
 

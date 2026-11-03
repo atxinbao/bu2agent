@@ -567,7 +567,12 @@ async fn digest_gate_rejects_mismatch_without_burning_then_single_use() {
     assert_eq!(effects.len(), 1);
     let effect = find_effect(&effects, "fs", "write", "a.txt");
     assert_eq!(effect["effect_id"], "effect-1");
-    assert!(effect["execution_id"].is_null(), "direct writes have no attempt");
+    // P0-B: a direct write is its own attempt, so it now carries
+    // a minimal Execution and a non-null key; the phase-2 null
+    // attribution was the gap this phase closes.
+    let execution_id = effect["execution_id"].as_str().expect("minimal execution");
+    assert!(execution_id.starts_with("execution-"));
+    assert!(effect["idempotency_key"].is_string());
     assert_eq!(effect["approval_id"], approval);
     assert_eq!(effect["status"], "completed");
     assert_eq!(
@@ -615,10 +620,15 @@ async fn device_bind_consume_and_reuse_fails() {
 
     let effects = h.effects().await;
     assert_eq!(effects.len(), 1);
-    let effect = find_effect(&effects, "devices", "set", "action-1");
+    // P0-B (contract §3): new device rows use the contract triple
+    // (device, reminders.set_completed, reminder_id), not the
+    // phase-2 (devices, set, action_id); and the Effect belongs
+    // to the Execution created at actions_create.
+    let effect = find_effect(&effects, "device", "reminders.set_completed", "reminder-1");
     assert_eq!(effect["approval_id"], approval);
     assert_eq!(effect["status"], "completed");
-    assert!(effect["execution_id"].is_null(), "device actions have no attempt");
+    assert_eq!(effect["execution_id"], created["execution_id"]);
+    assert!(effect["idempotency_key"].is_string(), "device effect carries a key");
 
     // Reuse for a second action: 403 binding mismatch, and the
     // second action stays requested (no Effect, no consumption).

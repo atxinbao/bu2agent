@@ -1794,7 +1794,7 @@ async fn files_export(State(state): State<AppState>, Json(req): Json<ExportReque
         // the scope is the normalized source path (the digest
         // already commits to the absolute destination).
         let scope = crate::operation_binding::normalize_path(&req.from).unwrap_or_default();
-        record_effect(&state, NewEffect { execution_id: None, capability: "fs".to_string(), operation: "export".to_string(), scope, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+        record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "export".to_string(), scope, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
         Json(serde_json::json!({"from":req.from,"to":req.to,"size_bytes":bytes})).into_response()
     }, Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot export file"}))).into_response() }
 }
@@ -1861,7 +1861,7 @@ async fn files_write(
     match written {
         Ok(size) => {
             // Phase 2: a successful write mirrors into an Effect.
-            record_effect(&state, NewEffect { execution_id: None, capability: "fs".to_string(), operation: "write".to_string(), scope: normalized, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+            record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "write".to_string(), scope: normalized, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
             Json(serde_json::json!({ "path": req.path, "size_bytes": size })).into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot write file" }))).into_response(),
@@ -1891,7 +1891,7 @@ async fn files_delete(
     match std::fs::remove_file(&full) {
         Ok(()) => {
             // Phase 2: a successful delete mirrors into an Effect.
-            record_effect(&state, NewEffect { execution_id: None, capability: "fs".to_string(), operation: "delete".to_string(), scope: normalized, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+            record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "delete".to_string(), scope: normalized, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
             Json(serde_json::json!({ "deleted": true })).into_response()
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1940,7 +1940,7 @@ async fn files_rename(
                 crate::operation_binding::normalize_path(&req.from).unwrap_or_default(),
                 crate::operation_binding::normalize_path(&req.to).unwrap_or_default()
             );
-            record_effect(&state, NewEffect { execution_id: None, capability: "fs".to_string(), operation: "rename".to_string(), scope, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+            record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "rename".to_string(), scope, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
             Json(serde_json::json!({ "from": req.from, "to": req.to })).into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot rename file" }))).into_response(),
@@ -1966,7 +1966,7 @@ async fn files_mkdir(
     match std::fs::create_dir_all(&full) {
         Ok(()) => {
             // Phase 2: a successful mkdir mirrors into an Effect.
-            record_effect(&state, NewEffect { execution_id: None, capability: "fs".to_string(), operation: "mkdir".to_string(), scope: normalized.clone(), input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+            record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "mkdir".to_string(), scope: normalized.clone(), input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
             Json(serde_json::json!({ "path": normalized })).into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot create directory" }))).into_response(),
@@ -2679,7 +2679,9 @@ async fn agent_tool_call(
                 record_effect(
                     &state,
                     NewEffect {
-                        execution_id: None,
+                        // P0-B: a bound tool-call write is its own
+                        // attempt, so it gets a minimal Execution.
+                        execution_id: Some(adapter_execution(&state)),
                         capability: "fs".to_string(),
                         operation: operation.to_string(),
                         scope,
@@ -6278,7 +6280,9 @@ pub(crate) fn record_connector_effect(
     record_effect(
         state,
         NewEffect {
-            execution_id: None,
+            // P0-B: a management-plane write is its own attempt,
+            // so it gets a minimal Execution and a non-null key.
+            execution_id: Some(adapter_execution(state)),
             capability: capability.to_string(),
             operation: operation.to_string(),
             scope: scope.to_string(),
@@ -6319,6 +6323,19 @@ pub(crate) fn execution_for_task(state: &AppState, task_id: &str) -> Option<Stri
         .filter(|r| r.task_id.as_deref() == Some(task_id))
         .max_by_key(|r| execution_number(&r.execution_id))
         .map(|r| r.execution_id.clone())
+}
+
+/// P0-B adapter: a minimal Execution for a write with no task or
+/// loop attempt of its own (direct REST writes, connector/vault
+/// management writes). One per write: the write IS the attempt.
+/// The status stays "running": the adapter must not invent the
+/// phase 4 transitions, and a failed write never reaches this
+/// call because every call site records its Effect only on
+/// success. Task, loop and device attempts never use this: they
+/// resolve their own Execution (execution_for_task,
+/// execution_for_loop, or the action record's execution id).
+pub(crate) fn adapter_execution(state: &AppState) -> String {
+    create_execution(state, None, None).execution_id
 }
 
 async fn tasks_create(
@@ -7180,6 +7197,11 @@ async fn actions_create(
     let mut next = state.next_action_id.lock().expect("action id lock");
     let id = format!("action-{}", *next);
     *next += 1;
+    // P0-B adapter: the attempt starts at creation, so the
+    // Execution is created here and carried on the action record;
+    // device_set attaches its Effect to it. The pin check above
+    // already passed, so a rejected creation leaves no orphan.
+    let execution_id = create_execution(&state, None, None).execution_id;
     let record = DeviceActionRecord {
         action_id: id,
         device: DEVICE_ID.to_string(),
@@ -7188,6 +7210,7 @@ async fn actions_create(
         target_completed: req.target_completed,
         status: "requested".to_string(),
         detail: None,
+        execution_id: Some(execution_id),
     };
     state.actions.lock().expect("action lock").insert(record.action_id.clone(), record.clone());
     persist_action(&state, &record);
@@ -7293,10 +7316,19 @@ async fn device_set(
     record_effect(
         &state,
         NewEffect {
-            execution_id: None,
-            capability: "devices".to_string(),
-            operation: "set".to_string(),
-            scope: req.action_id.clone(),
+            // P0-B: the Effect belongs to the action's Execution
+            // (created at actions_create and carried on the
+            // record). Pre-P0-B actions have none and stay
+            // unattributed rather than fabricated.
+            execution_id: updated.execution_id.clone(),
+            // P0-B (contract §3): new device rows use the
+            // contract triple, not the phase-2 (devices, set,
+            // action_id). History rows are untouched. Only the
+            // labels change here; the digest computation above
+            // is identical, so no gate or consumption moves.
+            capability: "device".to_string(),
+            operation: "reminders.set_completed".to_string(),
+            scope: updated.reminder_id.clone(),
             input_digest: Some(digest),
             approval_id: req.tool_call_id.clone(),
             status: updated.status.clone(),
