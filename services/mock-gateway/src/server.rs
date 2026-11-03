@@ -98,6 +98,7 @@ use crate::execution_store::{
 };
 use crate::effect_store::{
     append_effect, load_effects, next_effect_number, EffectFileRecord, NewEffect,
+    Reconciliation,
 };
 use crate::session_store::{
     append_session, load_sessions, next_session_number, select_context, session_number, title_from,
@@ -249,6 +250,15 @@ pub(crate) struct ApprovalState {
     /// for, set at first device use. Never set on loop-bound or
     /// digest-bound records.
     action_binding: Option<String>,
+    /// P0-C (contract §5): the Effect this approval authorizes,
+    /// set when the Effect is planned (loop proposal, device
+    /// action creation, digest-bound approval request) or at
+    /// first consume for approvals planned elsewhere (task
+    /// execute). The binding is `effect_id + input_digest`:
+    /// the gate checks both, never the execution device and
+    /// never the action record alone. None for legacy approvals
+    /// issued before P0-C, which keep their old gate.
+    effect_binding: Option<String>,
     message: Option<String>,
 }
 
@@ -264,11 +274,11 @@ impl ApprovalState {
         consumed: bool,
         operation_digest: Option<String>,
     ) -> Self {
-        ApprovalState { tool, status, binding, consumed, operation_digest, action_binding: None, message: None }
+        ApprovalState { tool, status, binding, consumed, operation_digest, action_binding: None, effect_binding: None, message: None }
     }
 
     fn is_bound(&self) -> bool {
-        self.binding.is_some() || self.operation_digest.is_some()
+        self.binding.is_some() || self.operation_digest.is_some() || self.effect_binding.is_some()
     }
 }
 
@@ -549,7 +559,7 @@ impl AppState {
                     Some(status) => {
                         approvals.insert(
                             record.tool_call_id.clone(),
-                            ApprovalState { tool: record.tool.clone(), status, binding: record.binding.clone(), consumed: record.consumed, operation_digest: record.operation_digest.clone(), action_binding: record.action_binding.clone(), message: record.message.clone() },
+                            ApprovalState { tool: record.tool.clone(), status, binding: record.binding.clone(), consumed: record.consumed, operation_digest: record.operation_digest.clone(), action_binding: record.action_binding.clone(), effect_binding: record.effect_binding.clone(), message: record.message.clone() },
                         );
                     }
                     None => {
@@ -729,6 +739,7 @@ impl AppState {
             // on the binding's wire field for parameter binding.
             operation_digest: Some(digest),
             action_binding: None,
+            effect_binding: None,
             message: None,
         };
         let mut approvals = self.approvals.lock().unwrap();
@@ -785,17 +796,63 @@ impl AppState {
         {
             return Err(LoopError(403, "approval_binding_mismatch"));
         }
+        // P0-C (contract §5): when the approval is bound to an
+        // Effect, the Effect must exist, carry the same digest,
+        // and sit at `planned` (or already `authorized`, which
+        // a retried consume after a crash may meet). The check
+        // runs before consumption, so a mismatched Effect never
+        // burns the approval; legacy approvals without an
+        // effect_binding keep the old gate above, unchanged.
+        let effect_id = record.effect_binding.clone();
+        if let Some(effect_id) = &effect_id {
+            let effect = effect_by_id(self, effect_id);
+            match effect {
+                Some(effect)
+                    if effect.input_digest.as_deref() == Some(digest)
+                        && (effect.status == "planned" || effect.status == "authorized") => {}
+                _ => return Err(LoopError(403, "approval_binding_mismatch")),
+            }
+        }
         record.consumed = true;
-        persist_approval(self, id, record).map_err(|_| LoopError(500, "approval_audit_failed"))
+        persist_approval(self, id, record).map_err(|_| LoopError(500, "approval_audit_failed"))?;
+        // Authorization lands the Effect at `authorized`. The
+        // persist above already failed closed on error, so this
+        // transition only runs for a consumed approval; an
+        // already-authorized Effect is left alone.
+        if let Some(effect_id) = &effect_id {
+            if effect_by_id(self, effect_id).is_some_and(|e| e.status == "planned") {
+                let _ = transition_effect(self, effect_id, "authorized", None, None);
+            }
+        }
+        Ok(())
     }
 
-    /// Phase 2 loop-call Effect: mirrors a dispatched loop tool
-    /// call into the effects store. Only the two approval-gated
-    /// tools produce effects; reads never do, and neither do gate
-    /// failures or pre-dispatch refusals (nothing was attempted).
-    /// The status word is the outcome's CallStatus in its
-    /// serialized snake_case form. The digest is the unified Q5
-    /// digest of the dispatched args.
+    /// P0-C: drive a bound loop Effect to its terminal state.
+    /// Returns true when a bound Effect was found and driven
+    /// (an `authorized` Effect takes the compressed
+    /// `authorized -> started -> terminal` chain). False means
+    /// the caller must fall back to recording a terminal row.
+    fn transition_bound_loop_effect(&self, approval_id: &str, terminal: &str) -> bool {
+        let Some(effect) = effect_for_approval(self, approval_id, None) else {
+            return false;
+        };
+        if effect.status == "authorized" {
+            let _ = transition_effect(self, &effect.effect_id, "started", None, None);
+        }
+        transition_effect(self, &effect.effect_id, terminal, None, None).is_ok()
+    }
+
+    /// P0-C loop-call Effect: drives the planned Effect created
+    /// at proposal time through its terminal transition. Only
+    /// the two approval-gated tools produce effects; reads never
+    /// do, and neither do gate failures or pre-dispatch refusals
+    /// (nothing was attempted). The outcome's CallStatus maps
+    /// by contract §4: `succeeded`/`failed`/`unknown` are already
+    /// lifecycle words; `Running` never reaches here post-
+    /// dispatch. When no planned Effect exists (a legacy approval
+    /// from before P0-C, or a dispatch without a proposal-time
+    /// plan), the old behaviour applies: one terminal row is
+    /// recorded directly, in the new word.
     fn record_loop_effect(
         &self,
         tool: &str,
@@ -817,11 +874,18 @@ impl AppState {
             ),
             _ => return,
         };
-        let execution_id =
-            binding.as_ref().and_then(|b| execution_for_loop(self, &b.loop_id));
         let status = serde_json::to_string(&outcome.status)
             .unwrap_or_else(|_| "\"unknown\"".to_string());
         let status = status.trim_matches('"');
+        let terminal = crate::effect_store::map_legacy_status_to_new(status)
+            .unwrap_or("failed");
+        if let Some(approval_id) = approval_id {
+            if self.transition_bound_loop_effect(approval_id, terminal) {
+                return;
+            }
+        }
+        let execution_id =
+            binding.as_ref().and_then(|b| execution_for_loop(self, &b.loop_id));
         record_effect(
             self,
             NewEffect {
@@ -831,7 +895,7 @@ impl AppState {
                 scope,
                 input_digest: Some(crate::loop_engine::args_digest(tool, args)),
                 approval_id: approval_id.clone(),
-                status: status.to_string(),
+                status: terminal.to_string(),
             },
         );
     }
@@ -870,6 +934,122 @@ impl AppState {
             };
             if !valid {
                 return ToolOutcome::failed(ErrorCode::InvalidArguments);
+            }
+            // P0-C: the bound Effect gates dispatch too. A
+            // terminal Effect means this write already happened:
+            // replay its outcome, never dispatch twice. An
+            // `unknown` or `reconciling` Effect means the outcome
+            // is unsettled: report unknown, never dispatch twice.
+            // A `started` Effect means a dispatch is already in
+            // flight: refuse. Otherwise drive `authorized ->
+            // started` now; the outcome transition happens in
+            // record_loop_effect after dispatch.
+            let digest = crate::loop_engine::args_digest(&tool, &args);
+            if let Some(approval_id) = &approval_id {
+                if let Some(effect) = effect_for_approval(self, approval_id, Some(&digest)) {
+                    match effect.status.as_str() {
+                        "succeeded" => {
+                            return ToolOutcome::success(
+                                "replayed from existing effect".to_string(),
+                            );
+                        }
+                        "failed" => {
+                            return ToolOutcome::failed(ErrorCode::ToolFailed);
+                        }
+                        "reconciled" => {
+                            return match effect
+                                .reconciliation
+                                .as_ref()
+                                .map(|r| r.result.as_str())
+                            {
+                                Some("completed") => ToolOutcome::success(
+                                    "replayed from reconciled effect".to_string(),
+                                ),
+                                Some("failed") => {
+                                    ToolOutcome::failed(ErrorCode::ToolFailed)
+                                }
+                                _ => ToolOutcome::unknown(),
+                            };
+                        }
+                        "unknown" | "reconciling" => return ToolOutcome::unknown(),
+                        "started" => {
+                            return ToolOutcome::failed(ErrorCode::InvalidArguments);
+                        }
+                        "authorized" => {
+                            let _ = transition_effect(
+                                self,
+                                &effect.effect_id,
+                                "started",
+                                None,
+                                None,
+                            );
+                        }
+                        "planned" => {
+                            let _ = transition_effect_chain(
+                                self,
+                                &effect.effect_id,
+                                &["authorized", "started"],
+                            );
+                        }
+                        _ => {
+                            return ToolOutcome::failed(ErrorCode::InvalidArguments);
+                        }
+                    }
+                }
+            }
+            // Defensive idempotency check for a *different*
+            // Effect with the same key in this execution (the
+            // bound Effect itself is handled above).
+            if let (Some(binding), Some(approval_id)) = (&binding, &approval_id) {
+                let (capability, operation, scope) = match tool.as_str() {
+                    "fs.write" => (
+                        "fs",
+                        "write",
+                        args.get("path").cloned().unwrap_or_default(),
+                    ),
+                    "reminders.set_completed" => (
+                        "reminders",
+                        "set_completed",
+                        args.get("id").cloned().unwrap_or_default(),
+                    ),
+                    _ => return ToolOutcome::failed(ErrorCode::InvalidArguments),
+                };
+                let bound_id = effect_for_approval(self, approval_id, Some(&digest))
+                    .map(|e| e.effect_id);
+                match check_idempotency(
+                    self,
+                    execution_for_loop(self, &binding.loop_id).as_deref(),
+                    capability,
+                    operation,
+                    &scope,
+                    Some(&digest),
+                    bound_id.as_deref(),
+                ) {
+                    IdempotencyDecision::Proceed => {}
+                    IdempotencyDecision::Blocked(_) => return ToolOutcome::unknown(),
+                    IdempotencyDecision::Replay(other) => {
+                        return match other.status.as_str() {
+                            "succeeded" => ToolOutcome::success(
+                                "replayed from existing effect".to_string(),
+                            ),
+                            "failed" => ToolOutcome::failed(ErrorCode::ToolFailed),
+                            "reconciled" => match other
+                                .reconciliation
+                                .as_ref()
+                                .map(|r| r.result.as_str())
+                            {
+                                Some("completed") => ToolOutcome::success(
+                                    "replayed from reconciled effect".to_string(),
+                                ),
+                                Some("failed") => {
+                                    ToolOutcome::failed(ErrorCode::ToolFailed)
+                                }
+                                _ => ToolOutcome::unknown(),
+                            },
+                            _ => ToolOutcome::unknown(),
+                        };
+                    }
+                }
             }
         }
         if tool == "reminders.list" {
@@ -981,11 +1161,21 @@ impl AppState {
         });
         let record_fs_effect = |outcome: &ToolOutcome| {
             if let Some((scope, digest, approval_id, loop_id)) = &fs_effect {
-                let execution_id =
-                    loop_id.as_deref().and_then(|id| execution_for_loop(self, id));
                 let status = serde_json::to_string(&outcome.status)
                     .unwrap_or_else(|_| "\"unknown\"".to_string());
                 let status = status.trim_matches('"');
+                let terminal = crate::effect_store::map_legacy_status_to_new(status)
+                    .unwrap_or("failed");
+                // P0-C: drive the bound planned Effect when one
+                // exists; otherwise fall back to the old
+                // terminal-row recording (legacy approval).
+                if let Some(approval_id) = approval_id {
+                    if self.transition_bound_loop_effect(approval_id, terminal) {
+                        return;
+                    }
+                }
+                let execution_id =
+                    loop_id.as_deref().and_then(|id| execution_for_loop(self, id));
                 record_effect(
                     self,
                     NewEffect {
@@ -995,7 +1185,7 @@ impl AppState {
                         scope: scope.clone(),
                         input_digest: Some(digest.clone()),
                         approval_id: approval_id.clone(),
-                        status: status.to_string(),
+                        status: terminal.to_string(),
                     },
                 );
             }
@@ -1786,17 +1976,34 @@ async fn files_export(State(state): State<AppState>, Json(req): Json<ExportReque
     };
     if !target_abs.is_absolute() || target_abs.starts_with(&root) { return bad_request("export target must be outside file root"); }
     if target.exists() { return (StatusCode::CONFLICT, Json(serde_json::json!({"error":"export target already exists"}))).into_response(); }
-    if let Err(response) = consume_bound_approval(&state, "fs.export", &req.approval_id, &digest) { return *response; }
-    if !source.is_file() { return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"export source must be a file"}))).into_response(); }
-    if let Some(parent) = target.parent() { if std::fs::create_dir_all(parent).is_err() { return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot create export parent"}))).into_response(); } }
+    // P0-C: bound Effect gates the export (see files_write).
+    let bound_effect = match bound_write_gate(&state, &req.approval_id, &digest) {
+        Ok(WriteGate::Proceed(effect)) => effect,
+        Ok(WriteGate::Replay(effect)) => {
+            let size = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+            return Json(serde_json::json!({"from":req.from,"to":req.to,"size_bytes":size,"effect_id":effect.effect_id,"replayed":true})).into_response();
+        }
+        Err(response) => return *response,
+    };
+    if let Some(effect) = &bound_effect {
+        if let Err(response) = consume_bound_approval_for_effect(&state, "fs.export", &req.approval_id, &digest, Some(&effect.effect_id)) { return *response; }
+        if let Err(response) = start_bound_effect(&state, effect) { return *response; }
+    } else if let Err(response) = consume_bound_approval(&state, "fs.export", &req.approval_id, &digest) { return *response; }
+    if !source.is_file() { if let Some(effect) = &bound_effect { let _ = transition_effect(&state, &effect.effect_id, "failed", None, None); } return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"export source must be a file"}))).into_response(); }
+    if let Some(parent) = target.parent() { if std::fs::create_dir_all(parent).is_err() { if let Some(effect) = &bound_effect { let _ = transition_effect(&state, &effect.effect_id, "failed", None, None); } return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot create export parent"}))).into_response(); } }
     match std::fs::copy(&source, &target) { Ok(bytes) => {
-        // Phase 2: a successful export mirrors into an Effect;
-        // the scope is the normalized source path (the digest
-        // already commits to the absolute destination).
-        let scope = crate::operation_binding::normalize_path(&req.from).unwrap_or_default();
-        record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "export".to_string(), scope, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+        // P0-C: drive the bound Effect; the scope is the
+        // normalized source path (the digest already commits
+        // to the absolute destination). Legacy approvals record
+        // one terminal row.
+        if let Some(effect) = &bound_effect {
+            let _ = transition_effect(&state, &effect.effect_id, "succeeded", None, None);
+        } else {
+            let scope = crate::operation_binding::normalize_path(&req.from).unwrap_or_default();
+            record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "export".to_string(), scope, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "succeeded".to_string() });
+        }
         Json(serde_json::json!({"from":req.from,"to":req.to,"size_bytes":bytes})).into_response()
-    }, Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot export file"}))).into_response() }
+    }, Err(_) => { if let Some(effect) = &bound_effect { let _ = transition_effect(&state, &effect.effect_id, "failed", None, None); } (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot export file"}))).into_response() } }
 }
 
 async fn files_library(State(state): State<AppState>, Json(req): Json<LibraryRequestDto>) -> impl IntoResponse {
@@ -1830,7 +2037,32 @@ async fn files_write(
     let Some(digest) = crate::operation_binding::write_digest(&req.path, &data, req.append.unwrap_or(false)) else {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
     };
-    if let Err(response) = consume_bound_approval(&state, "fs.write", &req.approval_id, &digest) {
+    // P0-C: the bound Effect (planned at approval request)
+    // gates the write: replay returns the prior Effect without
+    // writing, an unsettled Effect refuses, a planned one is
+    // consumed bound to it and driven forward.
+    let bound_effect = match bound_write_gate(&state, &req.approval_id, &digest) {
+        Ok(WriteGate::Proceed(effect)) => effect,
+        Ok(WriteGate::Replay(effect)) => {
+            let size = std::fs::metadata(
+                state.files_root.join(
+                    crate::operation_binding::normalize_path(&req.path).unwrap_or_default(),
+                ),
+            )
+            .map(|m| m.len())
+            .unwrap_or(0);
+            return Json(serde_json::json!({ "path": req.path, "size_bytes": size, "effect_id": effect.effect_id, "replayed": true })).into_response();
+        }
+        Err(response) => return *response,
+    };
+    if let Some(effect) = &bound_effect {
+        if let Err(response) = consume_bound_approval_for_effect(&state, "fs.write", &req.approval_id, &digest, Some(&effect.effect_id)) {
+            return *response;
+        }
+        if let Err(response) = start_bound_effect(&state, effect) {
+            return *response;
+        }
+    } else if let Err(response) = consume_bound_approval(&state, "fs.write", &req.approval_id, &digest) {
         return *response;
     }
     let Some(normalized) = crate::operation_binding::normalize_path(&req.path) else {
@@ -1841,6 +2073,9 @@ async fn files_write(
     };
     if let Some(parent) = full.parent() {
         if std::fs::create_dir_all(parent).is_err() {
+            if let Some(effect) = &bound_effect {
+                let _ = transition_effect(&state, &effect.effect_id, "failed", None, None);
+            }
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot create parent directory" }))).into_response();
         }
     }
@@ -1860,11 +2095,23 @@ async fn files_write(
     };
     match written {
         Ok(size) => {
-            // Phase 2: a successful write mirrors into an Effect.
-            record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "write".to_string(), scope: normalized, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+            // P0-C: drive the bound Effect to its terminal
+            // state; legacy approvals record one terminal row.
+            if let Some(effect) = &bound_effect {
+                let _ = transition_effect(&state, &effect.effect_id, "succeeded", None, None);
+            } else {
+                record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "write".to_string(), scope: normalized, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "succeeded".to_string() });
+            }
             Json(serde_json::json!({ "path": req.path, "size_bytes": size })).into_response()
         }
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot write file" }))).into_response(),
+        Err(_) => {
+            if let Some(effect) = &bound_effect {
+                let _ = transition_effect(&state, &effect.effect_id, "failed", None, None);
+            } else {
+                record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "write".to_string(), scope: normalized, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "failed".to_string() });
+            }
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot write file" }))).into_response()
+        }
     }
 }
 
@@ -1876,7 +2123,22 @@ async fn files_delete(
     let Some(digest) = crate::operation_binding::delete_digest(&req.path) else {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
     };
-    if let Err(response) = consume_bound_approval(&state, "fs.delete", &req.approval_id, &digest) {
+    // P0-C: bound Effect gates the delete (see files_write).
+    let bound_effect = match bound_write_gate(&state, &req.approval_id, &digest) {
+        Ok(WriteGate::Proceed(effect)) => effect,
+        Ok(WriteGate::Replay(effect)) => {
+            return Json(serde_json::json!({ "deleted": true, "effect_id": effect.effect_id, "replayed": true })).into_response();
+        }
+        Err(response) => return *response,
+    };
+    if let Some(effect) = &bound_effect {
+        if let Err(response) = consume_bound_approval_for_effect(&state, "fs.delete", &req.approval_id, &digest, Some(&effect.effect_id)) {
+            return *response;
+        }
+        if let Err(response) = start_bound_effect(&state, effect) {
+            return *response;
+        }
+    } else if let Err(response) = consume_bound_approval(&state, "fs.delete", &req.approval_id, &digest) {
         return *response;
     }
     let Some(normalized) = crate::operation_binding::normalize_path(&req.path) else {
@@ -1886,18 +2148,36 @@ async fn files_delete(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
     };
     if full.is_dir() {
+        if let Some(effect) = &bound_effect {
+            let _ = transition_effect(&state, &effect.effect_id, "failed", None, None);
+        }
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "delete refuses directories" }))).into_response();
     }
     match std::fs::remove_file(&full) {
         Ok(()) => {
-            // Phase 2: a successful delete mirrors into an Effect.
-            record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "delete".to_string(), scope: normalized, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+            if let Some(effect) = &bound_effect {
+                let _ = transition_effect(&state, &effect.effect_id, "succeeded", None, None);
+            } else {
+                record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "delete".to_string(), scope: normalized, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "succeeded".to_string() });
+            }
             Json(serde_json::json!({ "deleted": true })).into_response()
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(effect) = &bound_effect {
+                let _ = transition_effect(&state, &effect.effect_id, "failed", None, None);
+            } else {
+                record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "delete".to_string(), scope: normalized, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "failed".to_string() });
+            }
             (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "file not found" }))).into_response()
         }
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot delete file" }))).into_response(),
+        Err(_) => {
+            if let Some(effect) = &bound_effect {
+                let _ = transition_effect(&state, &effect.effect_id, "failed", None, None);
+            } else {
+                record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "delete".to_string(), scope: normalized, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "failed".to_string() });
+            }
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot delete file" }))).into_response()
+        }
     }
 }
 
@@ -1920,30 +2200,68 @@ async fn files_rename(
     if to.exists() {
         return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "rename target already exists" }))).into_response();
     }
-    if let Err(response) = consume_bound_approval(&state, "fs.rename", &req.approval_id, &digest) {
+    // P0-C: bound Effect gates the rename (see files_write).
+    let bound_effect = match bound_write_gate(&state, &req.approval_id, &digest) {
+        Ok(WriteGate::Proceed(effect)) => effect,
+        Ok(WriteGate::Replay(effect)) => {
+            return Json(serde_json::json!({ "from": req.from, "to": req.to, "effect_id": effect.effect_id, "replayed": true })).into_response();
+        }
+        Err(response) => return *response,
+    };
+    if let Some(effect) = &bound_effect {
+        if let Err(response) = consume_bound_approval_for_effect(&state, "fs.rename", &req.approval_id, &digest, Some(&effect.effect_id)) {
+            return *response;
+        }
+        if let Err(response) = start_bound_effect(&state, effect) {
+            return *response;
+        }
+    } else if let Err(response) = consume_bound_approval(&state, "fs.rename", &req.approval_id, &digest) {
         return *response;
     }
     if !from.exists() {
+        if let Some(effect) = &bound_effect {
+            let _ = transition_effect(&state, &effect.effect_id, "failed", None, None);
+        }
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "source file not found" }))).into_response();
     }
     if let Some(parent) = to.parent() {
         if std::fs::create_dir_all(parent).is_err() {
+            if let Some(effect) = &bound_effect {
+                let _ = transition_effect(&state, &effect.effect_id, "failed", None, None);
+            }
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot create parent directory" }))).into_response();
         }
     }
     match std::fs::rename(&from, &to) {
         Ok(()) => {
-            // Phase 2: a successful rename mirrors into an Effect;
-            // the scope names both ends, normalized, in order.
-            let scope = format!(
-                "{} -> {}",
-                crate::operation_binding::normalize_path(&req.from).unwrap_or_default(),
-                crate::operation_binding::normalize_path(&req.to).unwrap_or_default()
-            );
-            record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "rename".to_string(), scope, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+            // P0-C: drive the bound Effect; the scope names both
+            // ends, normalized, in order. Legacy approvals record
+            // one terminal row.
+            if let Some(effect) = &bound_effect {
+                let _ = transition_effect(&state, &effect.effect_id, "succeeded", None, None);
+            } else {
+                let scope = format!(
+                    "{} -> {}",
+                    crate::operation_binding::normalize_path(&req.from).unwrap_or_default(),
+                    crate::operation_binding::normalize_path(&req.to).unwrap_or_default()
+                );
+                record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "rename".to_string(), scope, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "succeeded".to_string() });
+            }
             Json(serde_json::json!({ "from": req.from, "to": req.to })).into_response()
         }
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot rename file" }))).into_response(),
+        Err(_) => {
+            if let Some(effect) = &bound_effect {
+                let _ = transition_effect(&state, &effect.effect_id, "failed", None, None);
+            } else {
+                let scope = format!(
+                    "{} -> {}",
+                    crate::operation_binding::normalize_path(&req.from).unwrap_or_default(),
+                    crate::operation_binding::normalize_path(&req.to).unwrap_or_default()
+                );
+                record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "rename".to_string(), scope, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "failed".to_string() });
+            }
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot rename file" }))).into_response()
+        }
     }
 }
 
@@ -1954,7 +2272,22 @@ async fn files_mkdir(
     let Some(digest) = crate::operation_binding::mkdir_digest(&req.path) else {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path escapes file root" }))).into_response();
     };
-    if let Err(response) = consume_bound_approval(&state, "fs.mkdir", &req.approval_id, &digest) {
+    // P0-C: bound Effect gates the mkdir (see files_write).
+    let bound_effect = match bound_write_gate(&state, &req.approval_id, &digest) {
+        Ok(WriteGate::Proceed(effect)) => effect,
+        Ok(WriteGate::Replay(effect)) => {
+            return Json(serde_json::json!({ "path": req.path, "effect_id": effect.effect_id, "replayed": true })).into_response();
+        }
+        Err(response) => return *response,
+    };
+    if let Some(effect) = &bound_effect {
+        if let Err(response) = consume_bound_approval_for_effect(&state, "fs.mkdir", &req.approval_id, &digest, Some(&effect.effect_id)) {
+            return *response;
+        }
+        if let Err(response) = start_bound_effect(&state, effect) {
+            return *response;
+        }
+    } else if let Err(response) = consume_bound_approval(&state, "fs.mkdir", &req.approval_id, &digest) {
         return *response;
     }
     let Some(normalized) = crate::operation_binding::normalize_path(&req.path) else {
@@ -1965,11 +2298,21 @@ async fn files_mkdir(
     };
     match std::fs::create_dir_all(&full) {
         Ok(()) => {
-            // Phase 2: a successful mkdir mirrors into an Effect.
-            record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "mkdir".to_string(), scope: normalized.clone(), input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "completed".to_string() });
+            if let Some(effect) = &bound_effect {
+                let _ = transition_effect(&state, &effect.effect_id, "succeeded", None, None);
+            } else {
+                record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "mkdir".to_string(), scope: normalized.clone(), input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "succeeded".to_string() });
+            }
             Json(serde_json::json!({ "path": normalized })).into_response()
         }
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot create directory" }))).into_response(),
+        Err(_) => {
+            if let Some(effect) = &bound_effect {
+                let _ = transition_effect(&state, &effect.effect_id, "failed", None, None);
+            } else {
+                record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "mkdir".to_string(), scope: normalized.clone(), input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "failed".to_string() });
+            }
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "cannot create directory" }))).into_response()
+        }
     }
 }
 
@@ -2200,7 +2543,7 @@ async fn approval_request(
     let mut next = state.next_approval_id.lock().expect("approval id lock");
     let id = format!("approval-{}", *next);
     *next += 1;
-    let record = ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending, binding: None, consumed: false, operation_digest: operation_digest.clone(), action_binding: None, message: req.message.clone() };
+    let record = ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending, binding: None, consumed: false, operation_digest: operation_digest.clone(), action_binding: None, effect_binding: None, message: req.message.clone() };
     let mut approvals = state.approvals.lock().expect("approval lock");
     if let Err(detail) = persist_approval(&state, &id, &record) {
         // Bound records fail closed like loop approvals: an id whose
@@ -2211,6 +2554,82 @@ async fn approval_request(
         eprintln!("warning: approval persistence failed: {detail}");
     }
     approvals.insert(id.clone(), record);
+    // The insert guard must be released before the planned
+    // Effect below takes the approvals lock again for the
+    // binding: std Mutexes are not reentrant, and holding
+    // this guard across the second lock would deadlock.
+    drop(approvals);
+    // P0-C: a digest-bound approval request IS the plan for
+    // its write, so the Effect is created here as `planned`
+    // and the approval is bound to it (`effect_id +
+    // input_digest`). The write handler later drives it
+    // `planned -> authorized -> started -> terminal` instead
+    // of recording a fresh row. A rejected or never-used
+    // approval leaves its planned row planned: that is the
+    // honest record (planned, never authorized), not a missing
+    // Effect. Binding persistence is best-effort here because
+    // the approval is already issued; the write handler can
+    // still resolve the planned row through `approval_id` as
+    // a fallback, so a lost binding line cannot authorize a
+    // different write (the digest check still applies).
+    if let Some(digest) = &operation_digest {
+        let planned = match req.tool.as_str() {
+            "fs.write" => req.path.as_deref().and_then(|p| {
+                crate::operation_binding::normalize_path(p)
+                    .map(|scope| ("fs", "write", scope))
+            }),
+            "fs.delete" => req.path.as_deref().and_then(|p| {
+                crate::operation_binding::normalize_path(p)
+                    .map(|scope| ("fs", "delete", scope))
+            }),
+            "fs.rename" => match (req.path.as_deref(), req.to_path.as_deref()) {
+                (Some(from), Some(to)) => {
+                    match (
+                        crate::operation_binding::normalize_path(from),
+                        crate::operation_binding::normalize_path(to),
+                    ) {
+                        (Some(from), Some(to)) => {
+                            Some(("fs", "rename", format!("{from} -> {to}")))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            "fs.mkdir" => req.path.as_deref().and_then(|p| {
+                crate::operation_binding::normalize_path(p)
+                    .map(|scope| ("fs", "mkdir", scope))
+            }),
+            "fs.export" => req.path.as_deref().and_then(|p| {
+                crate::operation_binding::normalize_path(p)
+                    .map(|scope| ("fs", "export", scope))
+            }),
+            _ => None,
+        };
+        if let Some((capability, operation, scope)) = planned {
+            let effect = record_effect(
+                &state,
+                NewEffect {
+                    execution_id: Some(adapter_execution(&state)),
+                    capability: capability.to_string(),
+                    operation: operation.to_string(),
+                    scope,
+                    input_digest: Some(digest.clone()),
+                    approval_id: Some(id.clone()),
+                    status: "planned".to_string(),
+                },
+            );
+            let mut approvals = state.approvals.lock().expect("approval lock");
+            if let Some(approval) = approvals.get_mut(&id) {
+                approval.effect_binding = Some(effect.effect_id.clone());
+                let bound = approval.clone();
+                drop(approvals);
+                if let Err(detail) = persist_approval(&state, &id, &bound) {
+                    eprintln!("warning: approval effect binding persistence failed: {detail}");
+                }
+            }
+        }
+    }
     Json(ApprovalRequestResponse {
         tool_call_id: Some(id),
         requires_approval: true,
@@ -2267,6 +2686,7 @@ struct ApprovalView {
     bound: bool,
     binding: Option<ApprovalBinding>,
     operation_digest: Option<String>,
+    effect_binding: Option<String>,
     message: Option<String>,
 }
 
@@ -2284,6 +2704,7 @@ fn approval_view(approval_id: &str, record: &ApprovalState) -> ApprovalView {
         bound: record.is_bound(),
         binding: record.binding.clone(),
         operation_digest: record.operation_digest.clone(),
+        effect_binding: record.effect_binding.clone(),
         message: record.message.clone(),
     }
 }
@@ -2295,9 +2716,12 @@ fn approval_view_from_file(record: &ApprovalFileRecord) -> ApprovalView {
         tool: record.tool.clone(),
         status: record.status.clone(),
         consumed: record.consumed,
-        bound: record.binding.is_some() || record.operation_digest.is_some(),
+        bound: record.binding.is_some()
+            || record.operation_digest.is_some()
+            || record.effect_binding.is_some(),
         binding: record.binding.clone(),
         operation_digest: record.operation_digest.clone(),
+        effect_binding: record.effect_binding.clone(),
         message: record.message.clone(),
     }
 }
@@ -2404,6 +2828,7 @@ pub(crate) fn persist_approval(state: &AppState, tool_call_id: &str, approval: &
         consumed: approval.consumed,
         operation_digest: approval.operation_digest.clone(),
         action_binding: approval.action_binding.clone(),
+        effect_binding: approval.effect_binding.clone(),
         message: approval.message.clone(),
     };
     append_record(path, &record)
@@ -2491,9 +2916,41 @@ pub(crate) fn consume_bound_approval(
     tool_call_id: &Option<String>,
     digest: &str,
 ) -> Result<(), Box<axum::response::Response>> {
+    consume_bound_approval_for_effect(state, tool, tool_call_id, digest, None)
+}
+
+/// P0-C digest gate bound to an Effect (contract §5). Lookup,
+/// tool match, status, digest match, Effect match and
+/// consumption happen under a single approvals-lock acquisition
+/// (the Effect itself is read under the effects lock, in the
+/// approvals-before-effects order), so concurrent executions of
+/// one approval serialize and only the first consumes it. When
+/// `effect_id` is given, the approval must either already be
+/// bound to that Effect or be unbound (in which case it is bound
+/// here, at first consume, for approvals planned elsewhere such
+/// as task execute); a binding to a different Effect is a
+/// mismatch, and the bound Effect must carry the same digest
+/// and sit at `planned` (or already `authorized`). Consumption
+/// moves the Effect to `authorized`. A persistence failure
+/// returns 500 without executing, and the in-memory consumed
+/// flag stays set (fail closed, as in the loop path). With
+/// `effect_id` None this is the legacy gate, unchanged: it
+/// binds by digest only and moves no Effect.
+pub(crate) fn consume_bound_approval_for_effect(
+    state: &AppState,
+    tool: &str,
+    tool_call_id: &Option<String>,
+    digest: &str,
+    effect_id: Option<&str>,
+) -> Result<(), Box<axum::response::Response>> {
     let forbidden = |error: &str| {
         Box::new(
             (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": error }))).into_response(),
+        )
+    };
+    let internal = |error: &str| {
+        Box::new(
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": error }))).into_response(),
         )
     };
     let Some(id) = tool_call_id else {
@@ -2518,12 +2975,36 @@ pub(crate) fn consume_bound_approval(
     if record.consumed || record.operation_digest.as_deref() != Some(digest) {
         return Err(forbidden("approval_binding_mismatch"));
     }
+    if let Some(effect_id) = effect_id {
+        if let Some(bound) = &record.effect_binding {
+            if bound != effect_id {
+                return Err(forbidden("approval_binding_mismatch"));
+            }
+        }
+        // Effect existence/digest/state, checked before the
+        // approval is burned so a mismatched Effect never
+        // consumes it.
+        match effect_by_id(state, effect_id) {
+            Some(effect)
+                if effect.input_digest.as_deref() == Some(digest)
+                    && (effect.status == "planned" || effect.status == "authorized") => {}
+            _ => return Err(forbidden("approval_binding_mismatch")),
+        }
+        record.effect_binding = Some(effect_id.to_string());
+    }
     record.consumed = true;
     if let Err(detail) = persist_approval(state, id, record) {
         eprintln!("warning: bound approval consumption persistence failed: {detail}");
         return Err(Box::new(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "approval_audit_failed" }))).into_response(),
         ));
+    }
+    if let Some(effect_id) = effect_id {
+        if effect_by_id(state, effect_id).is_some_and(|e| e.status == "planned")
+            && transition_effect(state, effect_id, "authorized", None, None).is_err()
+        {
+            return Err(internal("effect_transition_failed"));
+        }
     }
     Ok(())
 }
@@ -2593,10 +3074,27 @@ fn check_device_approval(
 /// another — fails with a binding mismatch. A persistence failure
 /// returns 500 without executing, and the in-memory consumed flag
 /// stays set (fail closed, as in the loop and digest paths).
-pub(crate) fn consume_device_approval(
+/// P0-C device gate: the approval authorizes an Effect
+/// (`effect_id + input_digest`), not the action record. When
+/// `effect_id` is given, the approval must either already be
+/// bound to that Effect or be unbound (bound here, at first
+/// consume); a binding to a different Effect, or an Effect
+/// carrying a different digest, is a mismatch, checked before
+/// the approval is burned. Consumption moves the Effect to
+/// `authorized`. `Approved | Edited` both execute, as in
+/// `may_execute`. The legacy `action_binding` is still recorded
+/// alongside, so phase-2 readers keep working. With
+/// `effect_id` None (a pre-P0-C action with no planned Effect)
+/// this is the legacy gate, unchanged. A persistence failure
+/// returns 500 without executing, and the in-memory consumed
+/// flag stays set (fail closed, as in the loop and digest
+/// paths).
+pub(crate) fn consume_device_approval_for_effect(
     state: &AppState,
     tool_call_id: &Option<String>,
     action_id: &str,
+    effect_id: Option<&str>,
+    digest: Option<&str>,
 ) -> Result<(), Box<axum::response::Response>> {
     let forbidden = |error: &str| {
         Box::new(
@@ -2613,6 +3111,20 @@ pub(crate) fn consume_device_approval(
     if let Some(error) = device_approval_error(record, action_id) {
         return Err(forbidden(error));
     }
+    if let Some(effect_id) = effect_id {
+        if let Some(bound) = &record.effect_binding {
+            if bound != effect_id {
+                return Err(forbidden("approval_binding_mismatch"));
+            }
+        }
+        match effect_by_id(state, effect_id) {
+            Some(effect)
+                if digest.is_none_or(|d| effect.input_digest.as_deref() == Some(d))
+                    && (effect.status == "planned" || effect.status == "authorized") => {}
+            _ => return Err(forbidden("approval_binding_mismatch")),
+        }
+        record.effect_binding = Some(effect_id.to_string());
+    }
     record.action_binding = Some(action_id.to_string());
     record.consumed = true;
     if let Err(detail) = persist_approval(state, id, record) {
@@ -2621,7 +3133,144 @@ pub(crate) fn consume_device_approval(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "approval_audit_failed" }))).into_response(),
         ));
     }
+    if let Some(effect_id) = effect_id {
+        if effect_by_id(state, effect_id).is_some_and(|e| e.status == "planned")
+            && transition_effect(state, effect_id, "authorized", None, None).is_err()
+        {
+            return Err(Box::new(
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "effect_transition_failed" }))).into_response(),
+            ));
+        }
+    }
     Ok(())
+}
+
+/// P0-C shared gate for approval-bound writes (files, agent
+/// tool calls, task execute). Resolves the Effect the approval
+/// authorizes and decides, before any consumption or write:
+/// - `Proceed(Some(effect))`: the Effect is `planned` or
+///   `authorized`; the caller consumes the approval bound to
+///   it and drives it forward.
+/// - `Proceed(None)`: no planned Effect exists (a legacy
+///   approval); the caller uses the legacy gate and records a
+///   terminal row directly.
+/// - `Replay(effect)`: the write already reached a terminal
+///   Effect (its own, or another Effect with the same
+///   idempotency key): return the prior Effect, write nothing,
+///   consume nothing.
+///
+/// An unsettled Effect (`unknown`, `reconciling`, in flight,
+/// or a legacy row that cannot be driven) refuses with a 409
+/// error response instead of a gate value: write nothing,
+/// consume nothing.
+/// A digest mismatch against a bound Effect is a 403, never a
+/// fallback to the legacy gate: a bound approval can never
+/// authorize different parameters.
+pub(crate) enum WriteGate {
+    Proceed(Option<EffectFileRecord>),
+    Replay(EffectFileRecord),
+}
+
+pub(crate) fn bound_write_gate(
+    state: &AppState,
+    tool_call_id: &Option<String>,
+    digest: &str,
+) -> Result<WriteGate, Box<axum::response::Response>> {
+    let forbidden = |error: &str| {
+        Box::new(
+            (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": error }))).into_response(),
+        )
+    };
+    let conflict = |error: &'static str, effect: &EffectFileRecord| {
+        Box::new(
+            (StatusCode::CONFLICT, Json(serde_json::json!({ "error": error, "effect_id": effect.effect_id, "status": effect.status }))).into_response(),
+        )
+    };
+    let Some(id) = tool_call_id else {
+        return Ok(WriteGate::Proceed(None));
+    };
+    let bound_id = {
+        let approvals = state.approvals.lock().expect("approval lock");
+        approvals.get(id).and_then(|r| r.effect_binding.clone())
+    };
+    match effect_for_approval(state, id, Some(digest)) {
+        Some(effect) => match effect.status.as_str() {
+            "planned" | "authorized" => {
+                match check_idempotency(
+                    state,
+                    effect.execution_id.as_deref(),
+                    &effect.capability,
+                    &effect.operation,
+                    &effect.scope,
+                    effect.input_digest.as_deref(),
+                    Some(&effect.effect_id),
+                ) {
+                    IdempotencyDecision::Proceed => Ok(WriteGate::Proceed(Some(effect))),
+                    IdempotencyDecision::Replay(other) => Ok(WriteGate::Replay(other)),
+                    IdempotencyDecision::Blocked(other) => {
+                        Err(conflict("effect_idempotency_blocked", &other))
+                    }
+                }
+            }
+            "succeeded" | "failed" | "reconciled" => Ok(WriteGate::Replay(effect)),
+            "unknown" => Err(conflict("effect_unknown", &effect)),
+            "reconciling" => Err(conflict("effect_reconciling", &effect)),
+            "started" => Err(conflict("effect_in_flight", &effect)),
+            _ => Err(conflict("effect_legacy", &effect)),
+        },
+        None => {
+            if let Some(bound_id) = bound_id {
+                // Bound to an Effect that exists but carries a
+                // different digest: tampering, fail closed, never
+                // fall back to the digest-only gate.
+                if effect_by_id(state, &bound_id).is_some() {
+                    return Err(forbidden("approval_binding_mismatch"));
+                }
+                // Bound to an Effect that is missing entirely:
+                // the Effects store was not persisted across a
+                // restart (approvals persist independently), so
+                // the planned row did not survive. Fall back to
+                // the legacy digest gate, which still checks
+                // tool, status, digest and single use: the
+                // restart guarantee (an approved, unconsumed
+                // approval executes exactly once after reload)
+                // outranks attribution to a lost row, and the
+                // caller records a fresh terminal row.
+                return Ok(WriteGate::Proceed(None));
+            }
+            Ok(WriteGate::Proceed(None))
+        }
+    }
+}
+
+/// Drive a bound Effect from `authorized` to `started` after
+/// consumption. Returns an error response on failure (the
+/// approval is already consumed at this point: fail closed,
+/// write nothing, and let the operator see the stuck Effect).
+fn start_bound_effect(
+    state: &AppState,
+    effect: &EffectFileRecord,
+) -> Result<(), Box<axum::response::Response>> {
+    let current = effect_by_id(state, &effect.effect_id);
+    match current.as_ref().map(|e| e.status.as_str()) {
+        Some("authorized") => transition_effect(state, &effect.effect_id, "started", None, None)
+            .map(|_| ())
+            .map_err(|_| {
+                Box::new(
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "effect_transition_failed" }))).into_response(),
+                )
+            }),
+        Some("planned") => transition_effect_chain(state, &effect.effect_id, &["authorized", "started"])
+            .map(|_| ())
+            .map_err(|_| {
+                Box::new(
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "effect_transition_failed" }))).into_response(),
+                )
+            }),
+        _ => Err(Box::new(
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "effect_transition_failed" }))).into_response(),
+        )),
+    }
 }
 
 async fn agent_tool_call(
@@ -2653,7 +3302,43 @@ async fn agent_tool_call(
             _ => None,
         };
         if let Some(digest) = bound {
-            if let Err(response) = consume_bound_approval(&state, &req.tool, &req.tool_call_id, &digest) {
+            // P0-C: resolve the bound Effect before consuming.
+            // A terminal Effect replays without dispatching; an
+            // unsettled one refuses; a planned/authorized one is
+            // consumed bound to it and driven forward. Legacy
+            // approvals with no planned row keep the old gate
+            // and terminal-row recording.
+            let gate = match bound_write_gate(&state, &req.tool_call_id, &digest) {
+                Ok(gate) => gate,
+                Err(response) => return *response,
+            };
+            let bound_effect = match gate {
+                WriteGate::Replay(effect) => {
+                    return Json(serde_json::json!({
+                        "result": "replayed",
+                        "effect_id": effect.effect_id,
+                        "replayed": true,
+                    }))
+                    .into_response();
+                }
+                WriteGate::Proceed(effect) => effect,
+            };
+            if let Some(effect) = &bound_effect {
+                if let Err(response) = consume_bound_approval_for_effect(
+                    &state,
+                    &req.tool,
+                    &req.tool_call_id,
+                    &digest,
+                    Some(&effect.effect_id),
+                ) {
+                    return *response;
+                }
+                if let Err(response) = start_bound_effect(&state, effect) {
+                    return *response;
+                }
+            } else if let Err(response) =
+                consume_bound_approval(&state, &req.tool, &req.tool_call_id, &digest)
+            {
                 return *response;
             }
             // Dispatch the normalized path so the executed path is
@@ -2664,10 +3349,6 @@ async fn agent_tool_call(
                     req.args.insert("path".to_string(), normalized);
                 }
             }
-            // Phase 2: a successful bound dispatch mirrors into an
-            // Effect. A failed dispatch wrote nothing, so it leaves
-            // no Effect — the same success-only rule as the /fs/*
-            // endpoints, which share this dispatcher.
             let scope = req.args.get("path").cloned().unwrap_or_default();
             let operation = match req.tool.as_str() {
                 "fs.write" => "write",
@@ -2675,19 +3356,27 @@ async fn agent_tool_call(
             };
             let approval_id = req.tool_call_id.clone();
             let response = dispatch_agent_tool(&state, req);
-            if response.status().is_success() {
+            let succeeded = response.status().is_success();
+            if let Some(effect) = &bound_effect {
+                let _ = transition_effect(
+                    &state,
+                    &effect.effect_id,
+                    if succeeded { "succeeded" } else { "failed" },
+                    None,
+                    None,
+                );
+            } else if succeeded {
+                // Legacy fallback: one terminal row, new word.
                 record_effect(
                     &state,
                     NewEffect {
-                        // P0-B: a bound tool-call write is its own
-                        // attempt, so it gets a minimal Execution.
                         execution_id: Some(adapter_execution(&state)),
                         capability: "fs".to_string(),
                         operation: operation.to_string(),
                         scope,
                         input_digest: Some(digest),
                         approval_id,
-                        status: "completed".to_string(),
+                        status: "succeeded".to_string(),
                     },
                 );
             }
@@ -6255,10 +6944,354 @@ pub(crate) fn record_effect(state: &AppState, effect: NewEffect) -> EffectFileRe
         idempotency_key,
         origin_device_id: state.origin_device_id.clone(),
         schema_version: 1,
+        reconciliation: None,
+        detail: None,
     };
     state.effects.lock().expect("effect lock").insert(record.effect_id.clone(), record.clone());
     persist_effect(state, &record);
     record
+}
+
+/// P0-C lifecycle driver: append one transition line for an
+/// existing Effect and keep the in-memory map on the last line.
+/// Returns the new row, or an HTTP status: 404 for an unknown
+/// effect, 409 for a refused transition (including a legacy row
+/// whose old status word is not in the lifecycle vocabulary:
+/// history rows are never translated, so they cannot be driven
+/// forward). A transition never rewrites history: the old line
+/// stays in the JSONL file, last line wins. Persist appends are
+/// best-effort like every other store here (memory is
+/// authoritative for the run); a failed append only warns.
+pub(crate) fn transition_effect(
+    state: &AppState,
+    effect_id: &str,
+    to: &str,
+    reconciliation: Option<Reconciliation>,
+    detail: Option<String>,
+) -> Result<EffectFileRecord, u16> {
+    if !crate::effect_store::is_new_effect_status(to) {
+        return Err(400);
+    }
+    let mut effects = state.effects.lock().expect("effect lock");
+    let Some(current) = effects.get(effect_id).cloned() else {
+        return Err(404);
+    };
+    if !crate::effect_store::valid_effect_transition(&current.status, to) {
+        return Err(409);
+    }
+    let mut next = current.clone();
+    next.status = to.to_string();
+    if reconciliation.is_some() {
+        next.reconciliation = reconciliation;
+    }
+    if detail.is_some() {
+        next.detail = detail;
+    }
+    effects.insert(next.effect_id.clone(), next.clone());
+    drop(effects);
+    persist_effect(state, &next);
+    Ok(next)
+}
+
+/// Drive an Effect through a compressed chain (contract §4:
+/// process states may be compressed, order never changes). Used
+/// by flows with no waiting step between states, e.g. connector
+/// writes. Stops at the first refused transition and reports it.
+pub(crate) fn transition_effect_chain(
+    state: &AppState,
+    effect_id: &str,
+    steps: &[&str],
+) -> Result<EffectFileRecord, u16> {
+    let mut last = state
+        .effects
+        .lock()
+        .expect("effect lock")
+        .get(effect_id)
+        .cloned()
+        .ok_or(404u16)?;
+    for step in steps {
+        last = transition_effect(state, effect_id, step, None, None)?;
+    }
+    Ok(last)
+}
+
+/// P0-C attribution update, not a transition: stamp the
+/// authorizing approval onto an Effect whose approval was
+/// unknown at plan time (device actions are planned at creation,
+/// before any approval exists). Appends a same-status line so
+/// the JSONL history stays last-line-wins; it never changes the
+/// status and never gates anything.
+pub(crate) fn stamp_effect_approval(
+    state: &AppState,
+    effect_id: &str,
+    approval_id: &str,
+) {
+    let mut effects = state.effects.lock().expect("effect lock");
+    let Some(mut record) = effects.get(effect_id).cloned() else {
+        return;
+    };
+    record.approval_id = Some(approval_id.to_string());
+    effects.insert(record.effect_id.clone(), record.clone());
+    drop(effects);
+    persist_effect(state, &record);
+}
+
+pub(crate) fn effect_by_id(state: &AppState, effect_id: &str) -> Option<EffectFileRecord> {
+    state
+        .effects
+        .lock()
+        .expect("effect lock")
+        .get(effect_id)
+        .cloned()
+}
+
+/// The Effect an approval authorizes, resolved through the
+/// P0-C binding first and, for approvals issued before P0-C
+/// (whose planned row survives in the effects file even though
+/// the approval row carries no binding), through the planned
+/// row's `approval_id` as a fallback. The digest must match
+/// when one is given: a bound Effect for different parameters
+/// is a mismatch, never a candidate.
+pub(crate) fn effect_for_approval(
+    state: &AppState,
+    approval_id: &str,
+    digest: Option<&str>,
+) -> Option<EffectFileRecord> {
+    // Lock order discipline: never hold the effects lock while
+    // taking the approvals lock (consume paths take approvals
+    // first, then effects). Snapshot effects, release, then read
+    // the approval binding.
+    let mut records: Vec<EffectFileRecord> = {
+        let effects = state.effects.lock().expect("effect lock");
+        effects.values().cloned().collect()
+    };
+    records.sort_by_key(|r| effect_number(&r.effect_id));
+    // Prefer the approval's own binding when it resolves.
+    let bound = {
+        let approvals = state.approvals.lock().expect("approval lock");
+        approvals
+            .get(approval_id)
+            .and_then(|r| r.effect_binding.clone())
+    };
+    if let Some(bound) = bound {
+        if let Some(record) = records.iter().find(|r| r.effect_id == bound).cloned() {
+            if digest.is_none_or(|d| record.input_digest.as_deref() == Some(d)) {
+                return Some(record);
+            }
+            return None;
+        }
+    }
+    records.into_iter().find(|r| {
+        r.approval_id.as_deref() == Some(approval_id)
+            && digest.is_none_or(|d| r.input_digest.as_deref() == Some(d))
+    })
+}
+
+/// P0-C idempotency enforcement (contract §3): before executing
+/// a write carrying an Effect, look for a *different* Effect
+/// with the same key. A terminal one means the write already
+/// happened: replay it, never re-execute. An `unknown`,
+/// `reconciling` or in-flight (`planned`/`authorized`/`started`)
+/// one means the outcome is not settled: refuse, never
+/// re-execute. No key (legacy unattributed write) means the old
+/// behaviour: proceed. Lock order is approvals-before-effects
+/// wherever both are needed; this helper takes only the effects
+/// lock and never touches approvals.
+pub(crate) enum IdempotencyDecision {
+    Proceed,
+    Replay(EffectFileRecord),
+    Blocked(EffectFileRecord),
+}
+
+pub(crate) fn check_idempotency(
+    state: &AppState,
+    execution_id: Option<&str>,
+    capability: &str,
+    operation: &str,
+    scope: &str,
+    digest: Option<&str>,
+    exclude_effect_id: Option<&str>,
+) -> IdempotencyDecision {
+    let (Some(execution_id), Some(digest)) = (execution_id, digest) else {
+        return IdempotencyDecision::Proceed;
+    };
+    let key = crate::effect_store::idempotency_key(
+        execution_id,
+        capability,
+        operation,
+        scope,
+        digest,
+    );
+    let effects = state.effects.lock().expect("effect lock");
+    let mut records: Vec<EffectFileRecord> = effects
+        .values()
+        .filter(|r| {
+            r.idempotency_key.as_deref() == Some(key.as_str())
+                && exclude_effect_id.is_none_or(|id| r.effect_id != id)
+        })
+        .cloned()
+        .collect();
+    records.sort_by_key(|r| effect_number(&r.effect_id));
+    match records.into_iter().next() {
+        None => IdempotencyDecision::Proceed,
+        Some(record) if crate::effect_store::is_terminal_effect_status(&record.status) => {
+            IdempotencyDecision::Replay(record)
+        }
+        Some(record) => IdempotencyDecision::Blocked(record),
+    }
+}
+
+/// P0-C loop planning: a proposed gated call gets its planned
+/// Effect at proposal time (the engine calls this right after
+/// `request_loop_approval`), and the approval is bound to it.
+/// The `(loop_id, call_id, tool)` triple stays a source
+/// reference on the approval record; the gate checks
+/// `effect_id + input_digest`. Non-gated tools never reach here.
+/// Best-effort on the binding persist: the in-memory binding is
+/// authoritative for the run, and a loop that restarts becomes
+/// `Interrupted` anyway, so a lost binding cannot authorize a
+/// later call.
+pub(crate) fn plan_loop_effect(
+    state: &AppState,
+    approval_id: &str,
+    binding: &ApprovalBinding,
+    args: &std::collections::BTreeMap<String, String>,
+) -> Option<EffectFileRecord> {
+    let (capability, operation, scope) = match binding.tool.as_str() {
+        "fs.write" => (
+            "fs",
+            "write",
+            args.get("path").cloned().unwrap_or_default(),
+        ),
+        "reminders.set_completed" => (
+            "reminders",
+            "set_completed",
+            args.get("id").cloned().unwrap_or_default(),
+        ),
+        _ => return None,
+    };
+    let record = record_effect(
+        state,
+        NewEffect {
+            execution_id: execution_for_loop(state, &binding.loop_id),
+            capability: capability.to_string(),
+            operation: operation.to_string(),
+            scope,
+            input_digest: Some(crate::loop_engine::args_digest(&binding.tool, args)),
+            approval_id: Some(approval_id.to_string()),
+            status: "planned".to_string(),
+        },
+    );
+    let mut approvals = state.approvals.lock().expect("approval lock");
+    if let Some(approval) = approvals.get_mut(approval_id) {
+        approval.effect_binding = Some(record.effect_id.clone());
+        let bound = approval.clone();
+        drop(approvals);
+        if let Err(detail) = persist_approval(state, approval_id, &bound) {
+            eprintln!("warning: loop effect binding persistence failed: {detail}");
+        }
+    }
+    Some(record)
+}
+
+/// P0-C device planning digest: the unified Q5 digest of the
+/// executed (reminder, completed) pair, shared by actions_create
+/// (planned row) and device_set (gate check). Identical to the
+/// phase-2 digest, so no gate or consumption moves.
+pub(crate) fn device_effect_digest(reminder_id: &str, target_completed: bool) -> String {
+    crate::operation_binding::operation_digest(
+        DEVICE_ACTION,
+        Some("set_completed"),
+        &std::collections::BTreeMap::from([
+            ("id".to_string(), reminder_id.to_string()),
+            ("completed".to_string(), target_completed.to_string()),
+        ]),
+    )
+}
+
+/// P0-C reconciliation driver, shared by `/effects/reconcile`
+/// and `actions_refresh`. The caller guarantees the Effect is
+/// `unknown` and hands over its device action. Returns the new
+/// Effect row, or an error string: `effect_no_readback` when
+/// no device action backs the Effect (fs/task/connector/loop
+/// Effects have no readback method and are left `unknown` by
+/// design, never invented), `effect_action_mismatch` when the
+/// backing action is no longer `unknown`.
+/// Hard constraint, mirroring the device rule: a failed or
+/// inconclusive re-check never writes `unknown` as `failed`.
+/// Only a conclusive proof lands on `reconciled`: a state match
+/// (`completed`) or a missing target (`failed`, because a write
+/// cannot land on a reminder that no longer exists). Anything
+/// else (query error, unchanged state) returns the Effect to
+/// `unknown` via `reconciling -> unknown`.
+pub(crate) fn reconcile_device_effect(
+    state: &AppState,
+    effect: &EffectFileRecord,
+    action: &crate::device_store::DeviceActionRecord,
+) -> Result<EffectFileRecord, String> {
+    if effect.status != "unknown" {
+        return Err("effect_not_unknown".to_string());
+    }
+    if action.status != "unknown" {
+        return Err("effect_action_mismatch".to_string());
+    }
+    transition_effect(state, &effect.effect_id, "reconciling", None, None)
+        .map_err(|_| "effect_transition_failed".to_string())?;
+    let outcome =
+        resolve_unknown(&state.device_backend, &action.reminder_id, action.target_completed);
+    reconcile_device_effect_with_outcome(state, effect, outcome)
+}
+
+/// Same reconciliation driver, but with a re-check outcome the
+/// caller already computed (so `actions_refresh` resolves once
+/// and drives both the action and its Effect from that single
+/// observation, never from two queries that could disagree).
+pub(crate) fn reconcile_device_effect_with_outcome(
+    state: &AppState,
+    effect: &EffectFileRecord,
+    outcome: ResolveOutcome,
+) -> Result<EffectFileRecord, String> {
+    match outcome {
+        ResolveOutcome::Completed(_) => {
+            let reconciliation = Reconciliation {
+                result: "completed".to_string(),
+                checked_ms: crate::effect_store::now_ms(),
+                detail: None,
+            };
+            transition_effect(
+                state,
+                &effect.effect_id,
+                "reconciled",
+                Some(reconciliation),
+                None,
+            )
+            .map_err(|_| "effect_transition_failed".to_string())
+        }
+        ResolveOutcome::Failed(e) => {
+            let reconciliation = Reconciliation {
+                result: "failed".to_string(),
+                checked_ms: crate::effect_store::now_ms(),
+                detail: Some(e.to_string()),
+            };
+            transition_effect(
+                state,
+                &effect.effect_id,
+                "reconciled",
+                Some(reconciliation),
+                None,
+            )
+            .map_err(|_| "effect_transition_failed".to_string())
+        }
+        ResolveOutcome::StillUnknown(maybe_err) => {
+            // Inconclusive: back to unknown, no reconciliation
+            // conclusion attached (a stale conclusion must never
+            // masquerade as a verdict). The detail, if any, is
+            // carried on the action record by the caller.
+            let _ = maybe_err;
+            transition_effect(state, &effect.effect_id, "unknown", None, None)
+                .map_err(|_| "effect_transition_failed".to_string())
+        }
+    }
 }
 
 /// Phase 2 management-plane Effect helper: connector and vault
@@ -6277,7 +7310,14 @@ pub(crate) fn record_connector_effect(
         None,
         &std::collections::BTreeMap::from([("id".to_string(), scope.to_string())]),
     );
-    record_effect(
+    // P0-C: management-plane writes have no separate plan or
+    // approval step, so the lifecycle chain is compressed in
+    // this helper (contract §4: process states may be
+    // compressed, order never changes): planned at the write
+    // request, authorized by the request itself, started, then
+    // succeeded. The single in-memory row ends at `succeeded`;
+    // the JSONL history holds the chain, last line wins.
+    let record = record_effect(
         state,
         NewEffect {
             // P0-B: a management-plane write is its own attempt,
@@ -6288,8 +7328,13 @@ pub(crate) fn record_connector_effect(
             scope: scope.to_string(),
             input_digest: Some(digest),
             approval_id: None,
-            status: "completed".to_string(),
+            status: "planned".to_string(),
         },
+    );
+    let _ = transition_effect_chain(
+        state,
+        &record.effect_id,
+        &["authorized", "started", "succeeded"],
     );
 }
 
@@ -6531,9 +7576,57 @@ async fn tasks_execute(
     else {
         return bad_request("invalid path");
     };
-    if let Err(response) =
-        consume_bound_approval(&state, "fs.write", &Some(approval_id.clone()), &digest)
-    {
+    // P0-C: the task write is planned here (the execute request
+    // is its first execution step; the task approval itself was
+    // created by the runner, not by /approval/request, so no
+    // planned row exists yet). A terminal Effect for the same
+    // key replays the task record without writing; an unsettled
+    // one refuses. Otherwise the approval is consumed bound to
+    // the planned Effect and the Effect is driven forward.
+    let task_execution = execution_for_task(&state, &req.task_id);
+    match check_idempotency(
+        &state,
+        task_execution.as_deref(),
+        "tasks",
+        "execute",
+        &req.task_id,
+        Some(&digest),
+        None,
+    ) {
+        IdempotencyDecision::Replay(_) => {
+            return Json(record).into_response();
+        }
+        IdempotencyDecision::Blocked(other) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
+            )
+                .into_response();
+        }
+        IdempotencyDecision::Proceed => {}
+    }
+    let task_effect = record_effect(
+        &state,
+        NewEffect {
+            execution_id: task_execution,
+            capability: "tasks".to_string(),
+            operation: "execute".to_string(),
+            scope: req.task_id.clone(),
+            input_digest: Some(digest.clone()),
+            approval_id: Some(approval_id.clone()),
+            status: "planned".to_string(),
+        },
+    );
+    if let Err(response) = consume_bound_approval_for_effect(
+        &state,
+        "fs.write",
+        &Some(approval_id.clone()),
+        &digest,
+        Some(&task_effect.effect_id),
+    ) {
+        return *response;
+    }
+    if let Err(response) = start_bound_effect(&state, &task_effect) {
         return *response;
     }
     // Same tail as files_write (overwrite): normalized path,
@@ -6553,6 +7646,7 @@ async fn tasks_execute(
     };
     if let Some(parent) = full.parent() {
         if std::fs::create_dir_all(parent).is_err() {
+            let _ = transition_effect(&state, &task_effect.effect_id, "failed", None, None);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "cannot create parent directory" })),
@@ -6562,21 +7656,10 @@ async fn tasks_execute(
     }
     if std::fs::write(&full, draft.as_bytes()).is_err() {
         crate::task_runner::fail(&state, &req.task_id, "产物写入失败");
-        // Phase 2: the artifact write was attempted and failed,
-        // and the task now persists as failed — that terminal
-        // outcome mirrors into a failed Effect.
-        record_effect(
-            &state,
-            NewEffect {
-                execution_id: execution_for_task(&state, &req.task_id),
-                capability: "tasks".to_string(),
-                operation: "execute".to_string(),
-                scope: req.task_id.clone(),
-                input_digest: Some(digest),
-                approval_id: Some(approval_id.clone()),
-                status: "failed".to_string(),
-            },
-        );
+        // P0-C: the artifact write was attempted and failed,
+        // and the task now persists as failed — the planned
+        // Effect drives to `failed`.
+        let _ = transition_effect(&state, &task_effect.effect_id, "failed", None, None);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "cannot write file" })),
@@ -6589,22 +7672,12 @@ async fn tasks_execute(
         current.error = None;
         let updated = current.clone();
         persist_task(&state, &updated);
-        // Phase 2: a successful task write mirrors into an Effect.
-        // The digest is the artifact write digest the approval gate
-        // consumed; the operation is the task execution, not the
-        // underlying file write.
-        record_effect(
-            &state,
-            NewEffect {
-                execution_id: execution_for_task(&state, &req.task_id),
-                capability: "tasks".to_string(),
-                operation: "execute".to_string(),
-                scope: req.task_id.clone(),
-                input_digest: Some(digest),
-                approval_id: Some(approval_id.clone()),
-                status: "completed".to_string(),
-            },
-        );
+        // P0-C: a successful task write drives the planned
+        // Effect to `succeeded`. The digest is the artifact
+        // write digest the approval gate consumed; the
+        // operation is the task execution, not the underlying
+        // file write.
+        let _ = transition_effect(&state, &task_effect.effect_id, "succeeded", None, None);
         return Json(updated).into_response();
     }
     (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" }))).into_response()
@@ -6796,6 +7869,138 @@ async fn effects_get(
     match state.effects.lock().expect("effect lock").get(&query.effect_id) {
         Some(record) => Json(record.clone()).into_response(),
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown effect" })))
+            .into_response(),
+    }
+}
+
+// --- P0-C Effect lifecycle routes (gateway only, no client) ---
+
+#[derive(Debug, Deserialize)]
+struct EffectTransitionDto {
+    effect_id: String,
+    status: String,
+    reconciliation_result: Option<String>,
+    reconciliation_detail: Option<String>,
+}
+
+/// P0-C: drive one Effect along its lifecycle. Only contract
+/// transitions are accepted (400 for a word outside the
+/// vocabulary, 409 for an illegal edge or a legacy row, 404
+/// for an unknown id). Driving to `reconciled` requires a
+/// reconciliation result: a reconciled row without a conclusion
+/// is refused.
+async fn effects_transition(
+    State(state): State<AppState>,
+    Json(req): Json<EffectTransitionDto>,
+) -> impl IntoResponse {
+    if !crate::effect_store::is_new_effect_status(&req.status) {
+        return bad_request("unknown effect status");
+    }
+    if req.status == "reconciled" && req.reconciliation_result.is_none() {
+        return bad_request("reconciled requires reconciliation_result");
+    }
+    let reconciliation = req.reconciliation_result.map(|result| Reconciliation {
+        result,
+        checked_ms: crate::effect_store::now_ms(),
+        detail: req.reconciliation_detail.clone(),
+    });
+    match transition_effect(&state, &req.effect_id, &req.status, reconciliation, None) {
+        Ok(record) => Json(record).into_response(),
+        Err(404) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown effect" })))
+            .into_response(),
+        Err(400) => bad_request("unknown effect status"),
+        Err(_) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "effect_transition_refused" })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EffectReconcileDto {
+    effect_id: String,
+}
+
+/// P0-C: re-check an `unknown` Effect. Only device Effects have
+/// a readback method (their backing action re-queries the
+/// reminder backend); every other Effect type answers 409
+/// `effect_no_readback` and stays `unknown` — no re-check
+/// method is invented for it. A conclusive re-check lands on
+/// `reconciled` with its conclusion; an inconclusive one
+/// returns the Effect to `unknown`. The backing action record
+/// is updated to match, when one exists.
+async fn effects_reconcile(
+    State(state): State<AppState>,
+    Json(req): Json<EffectReconcileDto>,
+) -> impl IntoResponse {
+    let Some(effect) = effect_by_id(&state, &req.effect_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown effect" })))
+            .into_response();
+    };
+    if effect.status != "unknown" {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "effect_not_unknown", "status": effect.status })),
+        )
+            .into_response();
+    }
+    // Backing device action: by the P0-C effect id, or (for
+    // pre-P0-C device Effects) by the shared execution id.
+    let action = {
+        let actions = state.actions.lock().expect("action lock");
+        actions
+            .values()
+            .find(|a| {
+                a.effect_id.as_deref() == Some(&effect.effect_id)
+                    || (effect.execution_id.is_some()
+                        && a.execution_id == effect.execution_id)
+            })
+            .cloned()
+    };
+    let Some(action) = action else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "effect_no_readback", "effect_id": effect.effect_id })),
+        )
+            .into_response();
+    };
+    if action.status != "unknown" {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "effect_action_mismatch", "action_status": action.status })),
+        )
+            .into_response();
+    }
+    match reconcile_device_effect(&state, &effect, &action) {
+        Ok(record) => {
+            // Mirror the verdict onto the action record, as
+            // actions_refresh does.
+            let mut actions = state.actions.lock().expect("action lock");
+            if let Some(current) = actions.get_mut(&action.action_id) {
+                match record.reconciliation.as_ref().map(|r| r.result.as_str()) {
+                    Some("completed") => {
+                        current.status = "completed".to_string();
+                        current.detail = None;
+                    }
+                    Some("failed") => {
+                        current.status = "failed".to_string();
+                        current.detail = record
+                            .reconciliation
+                            .as_ref()
+                            .and_then(|r| r.detail.clone());
+                    }
+                    _ => {}
+                }
+                let updated = current.clone();
+                persist_action(&state, &updated);
+            }
+            Json(record).into_response()
+        }
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": error })),
+        )
             .into_response(),
     }
 }
@@ -7202,6 +8407,24 @@ async fn actions_create(
     // device_set attaches its Effect to it. The pin check above
     // already passed, so a rejected creation leaves no orphan.
     let execution_id = create_execution(&state, None, None).execution_id;
+    // P0-C: the action is planned here. Its Effect is created
+    // as `planned` (contract triple, Q5 digest) and carried on
+    // the action record; device_set drives it forward instead
+    // of recording a fresh row. A never-executed action leaves
+    // its planned row planned: recorded, never authorized.
+    let digest = device_effect_digest(&req.reminder_id, req.target_completed);
+    let planned = record_effect(
+        &state,
+        NewEffect {
+            execution_id: Some(execution_id.clone()),
+            capability: "device".to_string(),
+            operation: "reminders.set_completed".to_string(),
+            scope: req.reminder_id.clone(),
+            input_digest: Some(digest),
+            approval_id: None,
+            status: "planned".to_string(),
+        },
+    );
     let record = DeviceActionRecord {
         action_id: id,
         device: DEVICE_ID.to_string(),
@@ -7211,6 +8434,7 @@ async fn actions_create(
         status: "requested".to_string(),
         detail: None,
         execution_id: Some(execution_id),
+        effect_id: Some(planned.effect_id),
     };
     state.actions.lock().expect("action lock").insert(record.action_id.clone(), record.clone());
     persist_action(&state, &record);
@@ -7229,7 +8453,7 @@ async fn device_set(
     if let Err(response) = check_device_approval(&state, &req.tool_call_id, &req.action_id) {
         return *response;
     }
-    let (reminder_id, target) = {
+    let (reminder_id, target, action_execution, action_effect) = {
         let actions = state.actions.lock().expect("action lock");
         let Some(record) = actions.get(&req.action_id) else {
             return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown action" })))
@@ -7241,10 +8465,87 @@ async fn device_set(
         if let Some(response) = device_pin_error(&state, &record.reminder_id) {
             return response;
         }
-        (record.reminder_id.clone(), record.target_completed)
+        (
+            record.reminder_id.clone(),
+            record.target_completed,
+            record.execution_id.clone(),
+            record.effect_id.clone(),
+        )
     };
-    if let Err(response) = consume_device_approval(&state, &req.tool_call_id, &req.action_id) {
+    // P0-C: the action's own Effect gates the set. A terminal
+    // Effect with a still-requested action is an inconsistent
+    // state (e.g. operator-driven): fail closed, never execute.
+    // An unsettled Effect refuses likewise. A different Effect
+    // with the same idempotency key replays/blocks through the
+    // same rule. Legacy actions without a planned Effect use
+    // the key check alone. A planned Effect that is missing
+    // entirely (the Effects store was not persisted across a
+    // restart while actions were) falls back to the legacy
+    // gate, like the file gate: the action binding and
+    // single-use consumption still apply, and a fresh terminal
+    // row is recorded below.
+    let digest = device_effect_digest(&reminder_id, target);
+    let mut action_effect_for_gate = action_effect.clone();
+    if let Some(effect_id) = &action_effect {
+        match effect_by_id(&state, effect_id).map(|e| e.status) {
+            Some(status) if crate::effect_store::is_terminal_effect_status(&status) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "effect_terminal", "effect_id": effect_id, "status": status })),
+                )
+                    .into_response();
+            }
+            Some(status) if status != "planned" && status != "authorized" => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "effect_not_ready", "effect_id": effect_id, "status": status })),
+                )
+                    .into_response();
+            }
+            None => {
+                action_effect_for_gate = None;
+            }
+            _ => {}
+        }
+    }
+    match check_idempotency(
+        &state,
+        action_execution.as_deref(),
+        "device",
+        "reminders.set_completed",
+        &reminder_id,
+        Some(&digest),
+        action_effect_for_gate.as_deref(),
+    ) {
+        IdempotencyDecision::Proceed => {}
+        IdempotencyDecision::Replay(other) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "effect_idempotency_replay", "effect_id": other.effect_id, "status": other.status })),
+            )
+                .into_response();
+        }
+        IdempotencyDecision::Blocked(other) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
+            )
+                .into_response();
+        }
+    }
+    if let Err(response) = consume_device_approval_for_effect(
+        &state,
+        &req.tool_call_id,
+        &req.action_id,
+        action_effect_for_gate.as_deref(),
+        Some(&digest),
+    ) {
         return *response;
+    }
+    // The planned device Effect was created before its approval
+    // existed; stamp the authorizing approval onto it now.
+    if let (Some(effect_id), Some(approval_id)) = (&action_effect_for_gate, &req.tool_call_id) {
+        stamp_effect_approval(&state, effect_id, approval_id);
     }
     {
         let mut actions = state.actions.lock().expect("action lock");
@@ -7297,43 +8598,53 @@ async fn device_set(
     }
     let updated = record.clone();
     persist_action(&state, &updated);
-    // Phase 2: the action's terminal outcome mirrors into an
-    // Effect. awaiting_authorization is terminal for this action:
-    // nothing was written, but the action record now says so, and
-    // the Effect carries that same status word. The digest is the
-    // unified Q5 digest of the executed (reminder, completed) pair
-    // — the same value a loop reminder call would carry — while
-    // the authorization itself is bound by action id (Q4), not by
-    // digest: device approvals carry no operation digest.
-    let digest = crate::operation_binding::operation_digest(
-        DEVICE_ACTION,
-        Some("set_completed"),
-        &std::collections::BTreeMap::from([
-            ("id".to_string(), updated.reminder_id.clone()),
-            ("completed".to_string(), updated.target_completed.to_string()),
-        ]),
-    );
-    record_effect(
-        &state,
-        NewEffect {
-            // P0-B: the Effect belongs to the action's Execution
-            // (created at actions_create and carried on the
-            // record). Pre-P0-B actions have none and stay
-            // unattributed rather than fabricated.
-            execution_id: updated.execution_id.clone(),
-            // P0-B (contract §3): new device rows use the
-            // contract triple, not the phase-2 (devices, set,
-            // action_id). History rows are untouched. Only the
-            // labels change here; the digest computation above
-            // is identical, so no gate or consumption moves.
-            capability: "device".to_string(),
-            operation: "reminders.set_completed".to_string(),
-            scope: updated.reminder_id.clone(),
-            input_digest: Some(digest),
-            approval_id: req.tool_call_id.clone(),
-            status: updated.status.clone(),
-        },
-    );
+    // P0-C: drive the action's planned Effect to its terminal
+    // state (contract §4 mapping: completed -> succeeded,
+    // failed -> failed, unknown -> unknown). awaiting_
+    // authorization is terminal for the action but means
+    // nothing was attempted: the Effect stays `authorized`
+    // (approval passed, execution never started) rather than
+    // taking a backwards transition to `planned` — the §4
+    // `awaiting_authorization -> planned` row describes
+    // single-row conversion, not a lifecycle transition, and
+    // the action record itself carries the waiting detail.
+    // Legacy actions without a planned Effect record one
+    // terminal row, in the new word.
+    let terminal = match updated.status.as_str() {
+        "completed" => Some("succeeded"),
+        "failed" => Some("failed"),
+        "unknown" => Some("unknown"),
+        _ => None,
+    };
+    if let Some(terminal) = terminal {
+        // Drive the planned Effect when it exists in this run;
+        // a fallback run (planned row lost across restart, or a
+        // legacy action with no planned row) records a fresh
+        // terminal row instead.
+        let drive = updated
+            .effect_id
+            .as_deref()
+            .filter(|id| effect_by_id(&state, id).is_some());
+        match drive {
+            Some(effect_id) => {
+                let _ = transition_effect_chain(&state, effect_id, &["started", terminal]);
+            }
+            None => {
+                record_effect(
+                    &state,
+                    NewEffect {
+                        execution_id: updated.execution_id.clone(),
+                        capability: "device".to_string(),
+                        operation: "reminders.set_completed".to_string(),
+                        scope: updated.reminder_id.clone(),
+                        input_digest: Some(digest.clone()),
+                        approval_id: req.tool_call_id.clone(),
+                        status: terminal.to_string(),
+                    },
+                );
+            }
+        }
+    }
     Json(updated).into_response()
 }
 
@@ -7389,6 +8700,19 @@ async fn actions_refresh(
     if current.status != "unknown" {
         return Json(current).into_response();
     }
+    // P0-C: when the action has an `unknown` Effect, the same
+    // single re-check observation drives both the action and
+    // its Effect (unknown -> reconciling -> reconciled, or back
+    // to unknown on an inconclusive re-check). Legacy actions
+    // without an Effect keep the old action-only behaviour.
+    let effect = current
+        .effect_id
+        .as_deref()
+        .and_then(|id| effect_by_id(&state, id))
+        .filter(|e| e.status == "unknown");
+    if let Some(effect) = &effect {
+        let _ = transition_effect(&state, &effect.effect_id, "reconciling", None, None);
+    }
     let outcome =
         resolve_unknown(&state.device_backend, &current.reminder_id, current.target_completed);
     let mut actions = state.actions.lock().expect("action lock");
@@ -7396,7 +8720,7 @@ async fn actions_refresh(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown action" })))
             .into_response();
     };
-    match outcome {
+    match &outcome {
         ResolveOutcome::Completed(_) => {
             record.status = "completed".to_string();
             record.detail = None;
@@ -7414,6 +8738,14 @@ async fn actions_refresh(
     }
     let updated = record.clone();
     persist_action(&state, &updated);
+    drop(actions);
+    if let Some(effect) = &effect {
+        // The action above already reflects this outcome; the
+        // Effect transition must agree with it, and a failed
+        // re-check never writes unknown as failed (see the
+        // helper's hard constraint).
+        let _ = reconcile_device_effect_with_outcome(&state, effect, outcome);
+    }
     Json(updated).into_response()
 }
 
@@ -7744,6 +9076,8 @@ pub fn app(state: AppState) -> Router {
         .route("/executions/get", get(executions_get))
         .route("/effects/list", get(effects_list))
         .route("/effects/get", get(effects_get))
+        .route("/effects/transition", post(effects_transition))
+        .route("/effects/reconcile", post(effects_reconcile))
         .route("/sessions/create", post(sessions_create))
         .route("/sessions/list", get(sessions_list))
         .route("/sessions/get", get(sessions_get))

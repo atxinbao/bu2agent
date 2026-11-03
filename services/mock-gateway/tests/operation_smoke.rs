@@ -100,9 +100,17 @@ async fn bound_write_roundtrip() {
     assert!(status.contains("200"), "read status: {status} body: {body}");
     assert!(body.contains(&b64(b"hello")), "read body: {body}");
 
-    // The same approval is spent: a second execution is a 403.
-    let (status, _body) = post(addr, "/files/write", &format!("{{\"path\":\"report.md\",\"content_base64\":\"{}\",\"approval_id\":\"{id}\"}}", b64(b"hello"))).await;
-    assert!(status.contains("403"), "second write must be 403: {status}");
+    // P0-C idempotency (contract §3, task item 4): the same
+    // approval and parameters replay the terminal Effect
+    // instead of executing again — 200 with replayed=true,
+    // not a second write. (A *different* write with the spent
+    // approval is still 403.)
+    let (status, body) = post(addr, "/files/write", &format!("{{\"path\":\"report.md\",\"content_base64\":\"{}\",\"approval_id\":\"{id}\"}}", b64(b"hello"))).await;
+    assert!(status.contains("200"), "second write must replay: {status} body: {body}");
+    assert!(value(&body)["replayed"] == true, "replay flag: {body}");
+    let (status, body) = get(addr, "/files/read?path=report.md").await;
+    assert!(status.contains("200"), "read status: {status} body: {body}");
+    assert!(body.contains(&b64(b"hello")), "read body: {body}");
 
     server.abort();
     let _ = std::fs::remove_dir_all(&files_root);
@@ -224,14 +232,30 @@ async fn concurrent_consume_allows_exactly_one() {
         post(addr, "/files/write", &body),
         post(addr, "/files/write", &body),
     );
-    // Exactly one execution succeeds; the order between the two
-    // concurrent requests is not specified, so assert the pair
-    // without sorting (status lines sort "200" before "403").
-    let statuses = [first.0, second.0];
-    assert!(
-        statuses.iter().any(|s| s.contains("200")) && statuses.iter().any(|s| s.contains("403")),
-        "one execution must be 200 and the other 403: {statuses:?}"
-    );
+    // P0-C: exactly one execution happens; the order between
+    // the two concurrent requests is not specified. The loser
+    // either meets the Effect in flight (409) or after
+    // completion (200 with replayed=true) — in neither case
+    // does it write a second time, and exactly one Effect
+    // exists for the write.
+    let mut real = 0;
+    let mut replayed_or_refused = 0;
+    for (status, body) in [first, second] {
+        if status.contains("200") && value(&body)["replayed"] == true {
+            replayed_or_refused += 1;
+        } else if status.contains("200") {
+            real += 1;
+        } else if status.contains("403") || status.contains("409") {
+            replayed_or_refused += 1;
+        } else {
+            panic!("unexpected concurrent outcome: {status} {body}");
+        }
+    }
+    assert_eq!(real, 1, "exactly one real execution");
+    assert_eq!(replayed_or_refused, 1, "the loser must not execute again");
+    let (status, body) = get(addr, "/effects/list").await;
+    assert!(status.contains("200"), "effects status: {status}");
+    assert_eq!(value(&body).as_array().expect("effects array").len(), 1);
 
     server.abort();
     let _ = std::fs::remove_dir_all(&files_root);

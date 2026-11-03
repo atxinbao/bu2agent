@@ -898,6 +898,15 @@ impl LoopEngine {
                             self.save(live)?;
                             return Ok(live.view());
                         }
+                        // P0-C: the proposed call is planned
+                        // here. The arguments are validated and
+                        // stored alongside the call, so the
+                        // planned Effect can be built now and
+                        // the approval bound to it; the engine
+                        // itself is not rewritten, only this
+                        // planning call is added.
+                        let planned_args =
+                            live.arguments[index].clone().expect("validated arguments");
                         let call = &mut live.record.calls[index];
                         let binding = ApprovalBinding {
                             loop_id: live.record.loop_id.clone(),
@@ -905,9 +914,15 @@ impl LoopEngine {
                             tool: call.tool.clone(),
                             args_sha256: call.args_sha256.clone(),
                         };
-                        call.approval_id = Some(
-                            app.request_loop_approval(binding.clone(), call.args_sha256.clone())?,
+                        let approval_id = app
+                            .request_loop_approval(binding.clone(), call.args_sha256.clone())?;
+                        crate::server::plan_loop_effect(
+                            &app,
+                            &approval_id,
+                            &binding,
+                            &planned_args,
                         );
+                        call.approval_id = Some(approval_id);
                         call.binding = Some(binding);
                         call.status = CallStatus::AwaitingApproval;
                         live.record.status = LoopStatus::AwaitingApproval;

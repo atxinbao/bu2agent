@@ -129,6 +129,8 @@ fn action_record(id: &str, status: &str) -> DeviceActionRecord {
         // P0-B adapter field; snapshot fixtures model pre-P0-B
         // rows, which carry no execution id.
         execution_id: None,
+        // P0-C field; pre-P0-C rows carry no planned Effect.
+        effect_id: None,
     }
 }
 
@@ -141,6 +143,9 @@ fn approval_record(id: &str, tool: &str, status: &str) -> ApprovalFileRecord {
         consumed: false,
         operation_digest: None,
         action_binding: None,
+        // P0-C field; snapshot fixtures model pre-P0-C rows,
+        // which carry no Effect binding.
+        effect_binding: None,
         message: None,
     }
 }
@@ -974,8 +979,12 @@ async fn operation_digest_consumption_snapshot() {
     assert_eq!(record["consumed"], true);
     assert!(record["binding"].is_null(), "digest approvals carry no binding");
     assert!(!record["operation_digest"].as_str().expect("digest").is_empty());
-    // Second execution with the same approval is refused.
-    let (status, _body) = post(
+    // P0-C idempotency (contract §3, task item 4): a second
+    // execution with the same approval replays the terminal
+    // Effect instead of executing again — 200 with
+    // replayed=true, file content unchanged. (A *different*
+    // write with the spent approval is still 403.)
+    let (status, body) = post(
         addr,
         "/files/write",
         &format!(
@@ -984,7 +993,9 @@ async fn operation_digest_consumption_snapshot() {
         ),
     )
     .await;
-    assert!(status.contains("403"), "second write must be 403: {status}");
+    assert!(status.contains("200"), "second write must replay: {status} {body}");
+    assert!(body.contains("\"replayed\":true"), "replay flag: {body}");
+    assert_eq!(std::fs::read(files_root.join("a.txt")).expect("read written"), b"hello");
 
     // Mismatch path: changed content, then changed path, both
     // refused without consuming; the exact write still works.

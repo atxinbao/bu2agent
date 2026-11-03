@@ -30,6 +30,12 @@ pub struct DeviceActionRecord {
     /// parse without the field and stay unattributed.
     #[serde(default)]
     pub execution_id: Option<String>,
+    /// P0-C: the planned Effect created at actions_create for
+    /// this action. None for pre-P0-C rows, which parse without
+    /// the field; their Effects (if any) are looked up by
+    /// execution id instead of fabricated here.
+    #[serde(default)]
+    pub effect_id: Option<String>,
 }
 
 pub fn valid_action_status(status: &str) -> bool {
@@ -127,6 +133,8 @@ mod tests {
             status: status.to_string(),
             detail: None,
             execution_id: None,
+            // P0-C field; fixtures model pre-P0-C rows.
+            effect_id: None,
         }
     }
 

@@ -189,7 +189,10 @@ async fn approvals_query_edit_and_history_flow() {
     assert!(status.contains("200"), "history status: {status} body: {body}");
     let history = json(&body);
     let events = history.as_array().expect("history array");
-    assert_eq!(events.len(), 4, "history events: {history}");
+    // P0-C (contract §5): the digest-bound fs approval adds
+    // one extra history event carrying its effect_binding, so
+    // 5 events, not 4; the last two both describe approval-3.
+    assert_eq!(events.len(), 5, "history events: {history}");
     assert_eq!(events[0]["approval_id"], "approval-1");
     assert_eq!(events[0]["status"], "pending");
     assert_eq!(events[0]["message"], "first draft");
@@ -201,6 +204,8 @@ async fn approvals_query_edit_and_history_flow() {
     assert_eq!(events[3]["approval_id"], "approval-3");
     assert_eq!(events[3]["status"], "pending");
     assert_eq!(events[3]["bound"], true);
+    assert_eq!(events[4]["approval_id"], "approval-3");
+    assert_eq!(events[4]["effect_binding"], "effect-1");
 
     // The current list shows only the latest state per id.
     let (status, body) = get(addr, "/approvals").await;
@@ -233,7 +238,8 @@ async fn approvals_query_edit_and_history_flow() {
 
     let (status, body) = get(addr, "/approvals/history").await;
     assert!(status.contains("200"), "reloaded history status: {status}");
-    assert_eq!(json(&body).as_array().expect("history array").len(), 4);
+    // P0-C: the extra effect_binding event survives reload.
+    assert_eq!(json(&body).as_array().expect("history array").len(), 5);
 
     server.abort();
     let _ = std::fs::remove_dir_all(&files_root);

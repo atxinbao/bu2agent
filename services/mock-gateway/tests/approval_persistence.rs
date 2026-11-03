@@ -136,8 +136,18 @@ async fn approval_survives_server_restart() {
     server3.abort();
     let text = std::fs::read_to_string(&approvals_path).expect("read approvals file");
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 4, "approvals file lines: {text}");
-    assert!(lines[2].contains("\"consumed\":true"), "consumed line: {}", lines[2]);
-    assert!(lines[3].contains("approval-2"), "last line: {}", lines[3]);
+    // P0-C (contract §5): each digest-bound approval request
+    // persists one extra line carrying its effect_binding
+    // (pending, then pending+effect_binding), so two requests
+    // leave 6 lines, not 4. Note the last line binds
+    // approval-2 to "effect-1": this harness configures no
+    // effects file, so the effect counter restarts each run
+    // and server3's fresh planned Effect reuses effect-1;
+    // with effects persistence configured, the counter
+    // resumes and the second binding would be effect-2.
+    assert_eq!(lines.len(), 6, "approvals file lines: {text}");
+    assert!(lines[3].contains("\"consumed\":true"), "consumed line: {}", lines[3]);
+    assert!(lines[5].contains("approval-2"), "last line: {}", lines[5]);
+    assert!(lines[5].contains("effect_binding"), "last line: {}", lines[5]);
     let _ = std::fs::remove_dir_all(&files_root);
 }

@@ -39,6 +39,12 @@ pub struct ApprovalFileRecord {
     /// a loop binding. `None` means unbound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_binding: Option<String>,
+    /// P0-C (contract §5): the Effect this approval authorizes.
+    /// Set at plan time for loop and digest-bound approvals, at
+    /// first consume for device and task approvals. `None` means
+    /// a legacy approval that keeps its old gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_binding: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -121,6 +127,7 @@ mod tests {
             consumed: false,
             operation_digest: None,
             action_binding: None,
+            effect_binding: None,
             message: None,
         }
     }

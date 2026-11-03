@@ -59,6 +59,21 @@
 //! yet (enforcement is P0-C); no status word changes here.
 //! Old lines without the new fields still parse: schema version
 //! 0, origin "unknown", null key, never backfilled.
+//!
+//! P0-C (PA contract §4/§5) enforces the lifecycle on new rows:
+//! `planned -> authorized -> started -> succeeded | failed |
+//! unknown -> reconciling -> reconciled`. Transitions are checked
+//! by `valid_effect_transition`; anything else is refused and
+//! leaves the row unchanged. `reconciling -> unknown` is allowed:
+//! an inconclusive re-check must return the Effect to `unknown`
+//! (it may be re-checked later), never to `failed`. A re-check
+//! that conclusively proves the outcome lands on `reconciled`
+//! with its conclusion in `reconciliation`; the old `unknown`
+//! line stays in the JSONL history, last line wins. Old rows keep
+//! their old status word verbatim on read (never translated or
+//! rewritten); `map_legacy_status_to_new` is only for deriving
+//! the new word of a freshly recorded outcome. `NeedsReview`
+//! never enters this vocabulary: it is an Execution-layer state.
 
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
@@ -70,6 +85,31 @@ use std::path::Path;
 /// device id: "unknown" means "no provenance recorded".
 fn unknown_origin() -> String {
     "unknown".to_string()
+}
+
+/// P0-C reconciliation conclusion, written when an `unknown`
+/// Effect is re-checked to a conclusive outcome. `result` is
+/// `completed` (the re-check proved the write landed) or `failed`
+/// (the re-check conclusively proved it cannot land, e.g. the
+/// target reminder no longer exists). An inconclusive re-check
+/// never produces one of these: it returns the Effect to
+/// `unknown` with no `reconciliation` attached.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Reconciliation {
+    pub result: String,
+    pub checked_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Wall-clock milliseconds since the Unix epoch, for
+/// reconciliation timestamps. Best-effort: 0 when the clock is
+/// unavailable (never a reason to refuse a re-check).
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -111,6 +151,81 @@ pub struct EffectFileRecord {
     /// later, 0 for pre-P0-A rows read without the field.
     #[serde(default)]
     pub schema_version: u64,
+    /// P0-C reconciliation conclusion, present only on
+    /// `reconciled` rows. Absent (null) on every other status,
+    /// including `unknown` rows that survived an inconclusive
+    /// re-check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation: Option<Reconciliation>,
+    /// Optional free-text marker, e.g. the system-authorization
+    /// note carried by an Effect whose device action is awaiting
+    /// authorization. Never a status word and never a gate input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// P0-C lifecycle vocabulary (contract §4). `NeedsReview` is
+/// deliberately absent: it belongs to the Execution layer.
+pub fn new_effect_statuses() -> [&'static str; 8] {
+    [
+        "planned",
+        "authorized",
+        "started",
+        "succeeded",
+        "failed",
+        "unknown",
+        "reconciling",
+        "reconciled",
+    ]
+}
+
+pub fn is_new_effect_status(status: &str) -> bool {
+    new_effect_statuses().contains(&status)
+}
+
+/// Terminal lifecycle states: no further transition is allowed
+/// from any of these.
+pub fn is_terminal_effect_status(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed" | "reconciled")
+}
+
+/// P0-C transition enforcement (contract §4). Only the lifecycle
+/// edges are allowed. In particular: `planned` may never jump to
+/// `started`/`succeeded`/`failed`; a terminal state never moves
+/// again; `unknown` may never jump straight to `succeeded`,
+/// `failed` or `reconciled` (it must pass through `reconciling`);
+/// and `reconciling` returns to `unknown` on an inconclusive
+/// re-check, so a failed re-check never writes `unknown` as
+/// `failed`.
+pub fn valid_effect_transition(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("planned", "authorized")
+            | ("authorized", "started")
+            | ("started", "succeeded")
+            | ("started", "failed")
+            | ("started", "unknown")
+            | ("unknown", "reconciling")
+            | ("reconciling", "reconciled")
+            | ("reconciling", "unknown")
+    )
+}
+
+/// Contract §4 old-word mapping, for deriving the new word of a
+/// freshly recorded outcome only. History rows are never passed
+/// through this function on read: they keep their old word.
+pub fn map_legacy_status_to_new(old: &str) -> Option<&'static str> {
+    match old {
+        "proposed" | "awaiting_approval" | "requested" | "awaiting_authorization" => {
+            Some("planned")
+        }
+        "approved" => Some("authorized"),
+        "running" => Some("started"),
+        "completed" | "succeeded" => Some("succeeded"),
+        "failed" | "rejected" => Some("failed"),
+        "unknown" => Some("unknown"),
+        _ => None,
+    }
 }
 
 /// P0-A idempotency key (contract §3): the execution id plus the
@@ -225,6 +340,8 @@ mod tests {
             ),
             origin_device_id: "mac-local".to_string(),
             schema_version: 1,
+            reconciliation: None,
+            detail: None,
         }
     }
 
@@ -273,7 +390,73 @@ mod tests {
         assert_eq!(loaded[0].idempotency_key, None);
         assert_eq!(loaded[0].origin_device_id, "unknown");
         assert_eq!(loaded[0].schema_version, 0);
+        // P0-C: history rows keep their old word verbatim and
+        // carry no reconciliation or detail.
+        assert_eq!(loaded[0].status, "completed");
+        assert_eq!(loaded[0].reconciliation, None);
+        assert_eq!(loaded[0].detail, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lifecycle_allows_only_the_contract_edges() {
+        // Full positive chain.
+        for (from, to) in [
+            ("planned", "authorized"),
+            ("authorized", "started"),
+            ("started", "succeeded"),
+            ("started", "failed"),
+            ("started", "unknown"),
+            ("unknown", "reconciling"),
+            ("reconciling", "reconciled"),
+            // Inconclusive re-check returns to unknown (P0-C
+            // choice, nailed by the hard constraint that a failed
+            // re-check never writes unknown as failed).
+            ("reconciling", "unknown"),
+        ] {
+            assert!(valid_effect_transition(from, to), "{from} -> {to}");
+        }
+        // Illegal jumps and terminal re-transitions are refused.
+        for (from, to) in [
+            ("planned", "started"),
+            ("planned", "succeeded"),
+            ("planned", "failed"),
+            ("authorized", "succeeded"),
+            ("unknown", "succeeded"),
+            ("unknown", "failed"),
+            ("unknown", "reconciled"),
+            ("succeeded", "planned"),
+            ("failed", "reconciling"),
+            ("reconciled", "unknown"),
+            ("planned", "planned"),
+            ("started", "planned"),
+            ("started", "authorized"),
+            ("authorized", "planned"),
+        ] {
+            assert!(!valid_effect_transition(from, to), "{from} -> {to}");
+        }
+        // NeedsReview never enters the Effect vocabulary.
+        assert!(!is_new_effect_status("needs_review"));
+        assert!(is_terminal_effect_status("succeeded"));
+        assert!(is_terminal_effect_status("failed"));
+        assert!(is_terminal_effect_status("reconciled"));
+        assert!(!is_terminal_effect_status("unknown"));
+        assert!(!is_terminal_effect_status("reconciling"));
+    }
+
+    #[test]
+    fn legacy_mapping_covers_the_contract_table() {
+        assert_eq!(map_legacy_status_to_new("proposed"), Some("planned"));
+        assert_eq!(map_legacy_status_to_new("awaiting_approval"), Some("planned"));
+        assert_eq!(map_legacy_status_to_new("requested"), Some("planned"));
+        assert_eq!(map_legacy_status_to_new("approved"), Some("authorized"));
+        assert_eq!(map_legacy_status_to_new("running"), Some("started"));
+        assert_eq!(map_legacy_status_to_new("completed"), Some("succeeded"));
+        assert_eq!(map_legacy_status_to_new("failed"), Some("failed"));
+        assert_eq!(map_legacy_status_to_new("rejected"), Some("failed"));
+        assert_eq!(map_legacy_status_to_new("unknown"), Some("unknown"));
+        assert_eq!(map_legacy_status_to_new("awaiting_authorization"), Some("planned"));
+        assert_eq!(map_legacy_status_to_new("bogus"), None);
     }
 
     #[test]

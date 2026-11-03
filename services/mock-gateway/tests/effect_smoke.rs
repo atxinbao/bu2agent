@@ -541,7 +541,12 @@ async fn digest_gate_rejects_mismatch_without_burning_then_single_use() {
         .await;
     assert_eq!(status, 403);
     assert_eq!(h.last_approval(&approval)["consumed"], false);
-    assert!(h.effects().await.is_empty(), "a rejected write leaves no Effect");
+    // P0-C (contract §4): the approval request already planned
+    // the write, so one `planned` Effect remains; what a
+    // rejected write leaves is no *terminal* Effect.
+    let effects = h.effects().await;
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0]["status"], "planned");
 
     // Exact content: 200, and the old response shape is unchanged.
     let (status, body) = h
@@ -555,14 +560,20 @@ async fn digest_gate_rejects_mismatch_without_burning_then_single_use() {
     assert_eq!(body["size_bytes"], 5);
     assert_eq!(h.last_approval(&approval)["consumed"], true);
 
-    // Reuse: 403, and still exactly one Effect.
-    let (status, _) = h
+    // Reuse: P0-C idempotency (contract §3, task item 4)
+    // replaces the old bare 403 with a replay: the terminal
+    // Effect is returned, nothing is written a second time,
+    // and still exactly one Effect exists. (A *different*
+    // write with a consumed approval is still 403, as the
+    // persistence and device tests prove.)
+    let (status, body) = h
         .post(
             "/files/write",
             json!({"path": "a.txt", "content_base64": "aGVsbG8=", "approval_id": approval}),
         )
         .await;
-    assert_eq!(status, 403);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["replayed"], true);
     let effects = h.effects().await;
     assert_eq!(effects.len(), 1);
     let effect = find_effect(&effects, "fs", "write", "a.txt");
@@ -574,17 +585,24 @@ async fn digest_gate_rejects_mismatch_without_burning_then_single_use() {
     assert!(execution_id.starts_with("execution-"));
     assert!(effect["idempotency_key"].is_string());
     assert_eq!(effect["approval_id"], approval);
-    assert_eq!(effect["status"], "completed");
+    // P0-C (contract §4): new rows use the lifecycle word
+    // `succeeded`, not the old device/file word `completed`.
+    assert_eq!(effect["status"], "succeeded");
     assert_eq!(
         effect["input_digest"],
         h.last_approval(&approval)["operation_digest"],
         "the Effect carries the digest the gate consumed"
     );
-    // Dual-write consistency: the JSONL file holds the same line.
+    // Dual-write consistency: the JSONL file holds the
+    // lifecycle chain for the one Effect (planned at approval
+    // request, authorized at consume, started, succeeded),
+    // last line wins.
     let lines = h.effects_file_lines();
-    assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0]["effect_id"], "effect-1");
-    assert_eq!(lines[0]["scope"], "a.txt");
+    assert_eq!(lines.len(), 4);
+    assert!(lines.iter().all(|l| l["effect_id"] == "effect-1"));
+    assert_eq!(lines[0]["status"], "planned");
+    assert_eq!(lines[3]["status"], "succeeded");
+    assert_eq!(lines[3]["scope"], "a.txt");
 }
 
 // ---------------------------------------------------------------- device gate
@@ -626,12 +644,15 @@ async fn device_bind_consume_and_reuse_fails() {
     // to the Execution created at actions_create.
     let effect = find_effect(&effects, "device", "reminders.set_completed", "reminder-1");
     assert_eq!(effect["approval_id"], approval);
-    assert_eq!(effect["status"], "completed");
+    // P0-C (contract §4): new device rows use `succeeded`.
+    assert_eq!(effect["status"], "succeeded");
     assert_eq!(effect["execution_id"], created["execution_id"]);
     assert!(effect["idempotency_key"].is_string(), "device effect carries a key");
 
     // Reuse for a second action: 403 binding mismatch, and the
-    // second action stays requested (no Effect, no consumption).
+    // second action stays requested (no terminal Effect, no
+    // consumption; P0-C: its planned Effect from creation does
+    // exist, asserted below).
     let (_, created2) = h
         .post(
             "/devices/actions/create",
@@ -646,7 +667,14 @@ async fn device_bind_consume_and_reuse_fails() {
         )
         .await;
     assert_eq!(status, 403);
-    assert_eq!(h.effects().await.len(), 1);
+    // P0-C: the second action was planned at creation, so its
+    // `planned` Effect exists even though the set was refused;
+    // the first action's terminal Effect is still the only
+    // non-planned one.
+    let effects = h.effects().await;
+    assert_eq!(effects.len(), 2);
+    let second = find_effect(&effects, "device", "reminders.set_completed", "reminder-2");
+    assert_eq!(second["status"], "planned");
 
     // A loop-bound approval cannot authorize a device set either.
     // (Checked on the loop server itself: the approval must exist
@@ -869,7 +897,8 @@ async fn file_task_connector_effects_and_read_paths() {
     let task_effect = find_effect(&all_effects, "tasks", "execute", &task_id);
     assert_eq!(task_effect["execution_id"], exec["execution_id"]);
     assert_eq!(task_effect["approval_id"], task_approval);
-    assert_eq!(task_effect["status"], "completed");
+    // P0-C (contract §4): new rows use `succeeded`.
+    assert_eq!(task_effect["status"], "succeeded");
 
     // ---- connectors and vault: one call, one Effect each.
     let (_, linked) = h
@@ -928,29 +957,30 @@ async fn file_task_connector_effects_and_read_paths() {
     assert_eq!(status, 200);
 
     let effects = h.effects().await;
+    // P0-C (contract §4): new rows use `succeeded`.
     assert_eq!(
         find_effect(&effects, "connectors", "link", &account_id)["status"],
-        "completed"
+        "succeeded"
     );
     assert_eq!(
         find_effect(&effects, "custom-connectors", "register", "custom-1")["status"],
-        "completed"
+        "succeeded"
     );
     assert_eq!(
         find_effect(&effects, "credentials", "register", "h1")["status"],
-        "completed"
+        "succeeded"
     );
     assert_eq!(
         find_effect(&effects, "credentials", "fulfill", "h1")["status"],
-        "completed"
+        "succeeded"
     );
     assert_eq!(
         find_effect(&effects, "catalog", "update", "prov")["status"],
-        "completed"
+        "succeeded"
     );
     assert_eq!(
         find_effect(&effects, "catalog", "delete", "prov")["status"],
-        "completed"
+        "succeeded"
     );
 
     // The read-only Effect routes: get works, unknown 404s.
@@ -1001,5 +1031,7 @@ async fn effects_survive_restart_with_counter() {
     let effects = h.effects().await;
     assert_eq!(effects.len(), 2);
     assert_eq!(effects[1]["effect_id"], "effect-2");
-    assert_eq!(h.effects_file_lines().len(), 2);
+    // P0-C: each fs write leaves a 4-line lifecycle chain
+    // (planned, authorized, started, succeeded) in the file.
+    assert_eq!(h.effects_file_lines().len(), 8);
 }

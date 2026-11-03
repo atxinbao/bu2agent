@@ -344,7 +344,8 @@ async fn task_execute_effect_carries_idempotency_key() {
         .expect("task execute effect");
     assert_eq!(effect["execution_id"], execution_id);
     assert_eq!(effect["approval_id"], task_approval);
-    assert_eq!(effect["status"], "completed");
+    // P0-C (contract §4): new rows use `succeeded`.
+    assert_eq!(effect["status"], "succeeded");
     let digest = effect["input_digest"].as_str().unwrap();
     assert_eq!(
         effect["idempotency_key"],
