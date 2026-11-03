@@ -857,6 +857,7 @@ fn spawn_gateway(bin: &str, dir: &std::path::Path, port: u16) -> std::process::C
         .expect("spawn gateway")
 }
 
+#[cfg(unix)]
 fn wait_child(mut child: std::process::Child, secs: u64) -> std::process::ExitStatus {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -869,6 +870,10 @@ fn wait_child(mut child: std::process::Child, secs: u64) -> std::process::ExitSt
     }
 }
 
+// Unix 的 kill -INT 只用于验证 POSIX 下的优雅退出；Windows 没有等价的
+// `kill` 命令，强杀也不会触发同一条 graceful-shutdown 路径，因此该测试
+// 在 Windows 跳过，避免把平台信号差异误报成恢复逻辑失败。
+#[cfg(unix)]
 #[tokio::test]
 async fn p0e_binary_clean_shutdown_ends_workers_and_loses_assignments() {
     let bin = std::env::var("CARGO_BIN_EXE_mock-gateway").expect("mock-gateway test binary");
