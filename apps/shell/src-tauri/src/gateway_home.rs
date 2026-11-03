@@ -59,6 +59,9 @@ pub struct GatewayPaths {
     pub voice_state_path: PathBuf,
     pub executions_path: PathBuf,
     pub effects_path: PathBuf,
+    /// P0-D: the unified-plane SQLite database, next to the
+    /// JSONL records (WAL sidecars travel with it).
+    pub sqlite_path: PathBuf,
 }
 
 pub fn gateway_paths(working_dir: &Path) -> GatewayPaths {
@@ -84,6 +87,7 @@ pub fn gateway_paths(working_dir: &Path) -> GatewayPaths {
         voice_state_path: data.join("voice.jsonl"),
         executions_path: data.join("executions.jsonl"),
         effects_path: data.join("effects.jsonl"),
+        sqlite_path: data.join("gateway.sqlite3"),
     }
 }
 
@@ -120,6 +124,7 @@ pub fn gateway_env(paths: &GatewayPaths, addr: &str) -> Vec<(String, String)> {
     push("MOCK_VOICE_STATE_PATH", &paths.voice_state_path.to_string_lossy());
     push("MOCK_EXECUTIONS_PATH", &paths.executions_path.to_string_lossy());
     push("MOCK_EFFECTS_PATH", &paths.effects_path.to_string_lossy());
+    push("MOCK_SQLITE_PATH", &paths.sqlite_path.to_string_lossy());
     // The daily app uses the real EventKit backend on macOS; a developer
     // override (already set) still wins via the gap-fill rule above.
     #[cfg(target_os = "macos")]

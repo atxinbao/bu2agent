@@ -100,6 +100,8 @@ use crate::effect_store::{
     append_effect, load_effects, next_effect_number, EffectFileRecord, NewEffect,
     Reconciliation,
 };
+use crate::sqlite_store::{self, StateBackend};
+use rusqlite::Connection;
 use crate::session_store::{
     append_session, load_sessions, next_session_number, select_context, session_number, title_from,
     SessionRecord, SessionTurn, MAX_INPUT_BYTES,
@@ -336,6 +338,17 @@ pub struct AppState {
     pub(crate) effects: Arc<Mutex<HashMap<String, EffectFileRecord>>>,
     next_effect_id: Arc<Mutex<u64>>,
     effects_path: Option<PathBuf>,
+    /// P0-D SQLite connection, when configured. `None` means
+    /// pure JSONL behaviour. The in-memory maps above stay as a
+    /// write-through cache in SQLite mode (every persist updates
+    /// both); the migrated-domain list / get / history routes
+    /// read SQLite, and a restart reloads the maps from SQLite,
+    /// so SQLite is the authority and JSONL appends stop.
+    pub(crate) sqlite: Option<Arc<Mutex<Connection>>>,
+    sqlite_path: Option<PathBuf>,
+    sqlite_backend: Arc<Mutex<StateBackend>>,
+    sqlite_shadow_failures: Arc<Mutex<u64>>,
+    sqlite_broken: Arc<Mutex<bool>>,
     /// Device this gateway instance records as the origin of new
     /// Execution and Effect rows (P0-A provenance). Resolved once
     /// at startup from MOCK_ORIGIN_DEVICE_ID, default "mac-local";
@@ -467,6 +480,29 @@ impl AppState {
         if let Ok(effects_path) = std::env::var("MOCK_EFFECTS_PATH") {
             state = state.with_effects_path(PathBuf::from(effects_path));
         }
+        // P0-D: MOCK_SQLITE_PATH opens the unified-plane SQLite
+        // database; when it opens in shadow mode the explicit
+        // D4 switch (import + read-path switch) runs here, so a
+        // production gateway with a SQLite path is SQLite-
+        // authoritative. MOCK_STATE_BACKEND=jsonl is the loud
+        // emergency diagnostic override: it skips SQLite
+        // entirely and keeps the JSONL read path.
+        if sqlite_store::backend_override_from_env(std::env::var("MOCK_STATE_BACKEND").ok().as_deref()) {
+            eprintln!("P0-D WARNING: MOCK_STATE_BACKEND=jsonl override active: SQLite is disabled, JSONL read path in use for diagnosis only (non-steady-state, never a silent fallback)");
+        } else if let Ok(sqlite_path) = std::env::var("MOCK_SQLITE_PATH") {
+            state = state.with_sqlite_path(PathBuf::from(sqlite_path));
+            if state.sqlite_backend_name() == "shadow" {
+                match state.sqlite_import_and_switch() {
+                    Ok(report) => eprintln!(
+                        "P0-D: SQLite read path active (imported {} executions, {} effects, {} approvals)",
+                        report.executions, report.effects, report.approvals
+                    ),
+                    Err(detail) => eprintln!(
+                        "warning: P0-D SQLite import/switch failed ({detail}); staying on the JSONL read path in shadow mode"
+                    ),
+                }
+            }
+        }
         // P0-A provenance: the origin device id is a value, never
         // part of any id. Shell packaging keeps the default: no
         // gateway_home wiring is needed for the default to hold.
@@ -591,6 +627,11 @@ impl AppState {
             effects: Arc::new(Mutex::new(HashMap::new())),
             next_effect_id: Arc::new(Mutex::new(1)),
             effects_path: None,
+            sqlite: None,
+            sqlite_path: None,
+            sqlite_backend: Arc::new(Mutex::new(StateBackend::Jsonl)),
+            sqlite_shadow_failures: Arc::new(Mutex::new(0)),
+            sqlite_broken: Arc::new(Mutex::new(false)),
             origin_device_id: "mac-local".to_string(),
             task_drafts: Arc::new(Mutex::new(HashMap::new())),
             task_drafts_dir: None,
@@ -1027,6 +1068,9 @@ impl AppState {
                 ) {
                     IdempotencyDecision::Proceed => {}
                     IdempotencyDecision::Blocked(_) => return ToolOutcome::unknown(),
+                    // P0-D: broken migrated-domain store refuses
+                    // the loop write rather than guessing.
+                    IdempotencyDecision::Unavailable => return ToolOutcome::unknown(),
                     IdempotencyDecision::Replay(other) => {
                         return match other.status.as_str() {
                             "succeeded" => ToolOutcome::success(
@@ -1330,6 +1374,206 @@ impl AppState {
         self.effects = Arc::new(Mutex::new(effects));
         self.effects_path = Some(path);
         self
+    }
+
+    /// P0-D D1/D2 seam: open the SQLite database at `path`
+    /// (schema v1, WAL + FULL). The backend starts in shadow
+    /// mode unless the database already has `import_done = 1`,
+    /// in which case this is a restart: the maps are reloaded
+    /// from SQLite (never from JSONL) and the counters take the
+    /// max of the JSONL-loaded and SQLite values, and the
+    /// backend is SQLite immediately. An open failure marks
+    /// the state broken (fail-closed at the migrated-domain
+    /// surface) instead of silently falling back to JSONL.
+    /// Call `sqlite_import_and_switch` for the explicit D4 switch.
+    pub fn with_sqlite_path(mut self, path: PathBuf) -> Self {
+        match sqlite_store::open_db(&path) {
+            Ok(conn) => {
+                let done = sqlite_store::import_done(&conn).unwrap_or(false);
+                let mut backend = StateBackend::Shadow;
+                if done {
+                    backend = StateBackend::Sqlite;
+                    if let Ok(rows) = sqlite_store::list_executions(&conn) {
+                        let mut map = HashMap::new();
+                        for row in &rows {
+                            map.insert(row.execution_id.clone(), row.clone());
+                        }
+                        self.executions = Arc::new(Mutex::new(map));
+                    }
+                    if let Ok(rows) = sqlite_store::list_effects(&conn) {
+                        let mut map = HashMap::new();
+                        for row in &rows {
+                            map.insert(row.effect_id.clone(), row.clone());
+                        }
+                        self.effects = Arc::new(Mutex::new(map));
+                    }
+                    if let Ok(rows) = sqlite_store::list_approvals(&conn) {
+                        let mut map = HashMap::new();
+                        for row in &rows {
+                            match parse_approval_status(&row.status) {
+                                Some(status) => {
+                                    map.insert(
+                                        row.tool_call_id.clone(),
+                                        ApprovalState {
+                                            tool: row.tool.clone(),
+                                            status,
+                                            binding: row.binding.clone(),
+                                            consumed: row.consumed,
+                                            operation_digest: row.operation_digest.clone(),
+                                            action_binding: row.action_binding.clone(),
+                                            effect_binding: row.effect_binding.clone(),
+                                            message: row.message.clone(),
+                                        },
+                                    );
+                                }
+                                None => eprintln!(
+                                    "warning: skipping SQLite approval record with unknown status {}",
+                                    row.status
+                                ),
+                            }
+                        }
+                        self.approvals = Arc::new(Mutex::new(map));
+                    }
+                    if let Ok((next_exec, next_effect, next_appr)) =
+                        sqlite_store::next_numbers(&conn)
+                    {
+                        let mut current = self.next_execution_id.lock().expect("execution id lock");
+                        *current = (*current).max(next_exec);
+                        drop(current);
+                        let mut current = self.next_effect_id.lock().expect("effect id lock");
+                        *current = (*current).max(next_effect);
+                        drop(current);
+                        let mut current = self.next_approval_id.lock().expect("approval id lock");
+                        *current = (*current).max(next_appr);
+                    }
+                }
+                self.sqlite = Some(Arc::new(Mutex::new(conn)));
+                self.sqlite_path = Some(path);
+                self.sqlite_backend = Arc::new(Mutex::new(backend));
+            }
+            Err(detail) => {
+                eprintln!("warning: P0-D SQLite open failed ({detail}); migrated-domain surface is fail-closed, no JSONL fallback");
+                *self.sqlite_broken.lock().expect("sqlite broken lock") = true;
+                self.sqlite_backend = Arc::new(Mutex::new(StateBackend::Sqlite));
+            }
+        }
+        self
+    }
+
+    /// Current SQLite backend name: "jsonl" | "shadow" | "sqlite".
+    pub fn sqlite_backend_name(&self) -> &'static str {
+        self.sqlite_backend.lock().expect("sqlite backend lock").name()
+    }
+
+    /// Shadow-mode SQLite write failures so far (D2 counter,
+    /// visible to tests; production exposes no route for it).
+    pub fn sqlite_shadow_failures(&self) -> u64 {
+        *self.sqlite_shadow_failures.lock().expect("shadow failures lock")
+    }
+
+    /// Whether the SQLite state is known-broken (open failure or
+    /// a SQLite-mode persist failure). Migrated-domain routes
+    /// answer 5xx while this is set; chat and sessions are
+    /// unaffected (they never migrated).
+    pub fn sqlite_is_broken(&self) -> bool {
+        *self.sqlite_broken.lock().expect("sqlite broken lock")
+    }
+
+    pub(crate) fn sqlite_mode(&self) -> StateBackend {
+        *self.sqlite_backend.lock().expect("sqlite backend lock")
+    }
+
+    /// P0-D D4 explicit switch point: import folded JSONL state
+    /// (D3, single transaction, re-runnable) and then switch
+    /// the migrated-domain read path to SQLite. After this
+    /// returns Ok, JSONL appends for the migrated domains stop
+    /// and the JSONL files become generated audit exports
+    /// (rewritten best-effort on later writes). The JSONL files
+    /// themselves are never deleted. An import failure leaves
+    /// the backend in shadow mode (JSONL authoritative).
+    pub fn sqlite_import_and_switch(&self) -> Result<sqlite_store::ImportReport, String> {
+        let Some(sqlite) = &self.sqlite else {
+            return Err("sqlite not configured".to_string());
+        };
+        let mut guard = sqlite.lock().expect("sqlite lock");
+        let conn = &mut *guard;
+        let executions = match &self.executions_path {
+            Some(path) => sqlite_store::fold_executions(&load_executions(path)),
+            None => Vec::new(),
+        };
+        let effects = match &self.effects_path {
+            Some(path) => sqlite_store::fold_effects(&load_effects(path)),
+            None => Vec::new(),
+        };
+        let approvals = match &self.approvals_path {
+            Some(path) => sqlite_store::fold_approvals(&crate::approval_store::load_records(path)),
+            None => Vec::new(),
+        };
+        let report = sqlite_store::import_folded(
+            conn,
+            &executions,
+            &effects,
+            &approvals,
+            sqlite_store::now_ms(),
+        )?;
+        // Reload the write-through cache from SQLite while the
+        // connection is still in hand, then release it before
+        // touching any map lock (persist call sites take the
+        // SQLite lock while holding a map lock; reversing the
+        // order here would risk deadlock under concurrency).
+        let exec_rows = sqlite_store::list_executions(conn);
+        let effect_rows = sqlite_store::list_effects(conn);
+        let approval_rows = sqlite_store::list_approvals(conn);
+        let numbers = sqlite_store::next_numbers(conn);
+        drop(guard);
+        if let Ok(rows) = exec_rows {
+            let mut map = HashMap::new();
+            for row in &rows {
+                map.insert(row.execution_id.clone(), row.clone());
+            }
+            *self.executions.lock().expect("execution lock") = map;
+        }
+        if let Ok(rows) = effect_rows {
+            let mut map = HashMap::new();
+            for row in &rows {
+                map.insert(row.effect_id.clone(), row.clone());
+            }
+            *self.effects.lock().expect("effect lock") = map;
+        }
+        if let Ok(rows) = approval_rows {
+            let mut map = HashMap::new();
+            for row in &rows {
+                if let Some(status) = parse_approval_status(&row.status) {
+                    map.insert(
+                        row.tool_call_id.clone(),
+                        ApprovalState {
+                            tool: row.tool.clone(),
+                            status,
+                            binding: row.binding.clone(),
+                            consumed: row.consumed,
+                            operation_digest: row.operation_digest.clone(),
+                            action_binding: row.action_binding.clone(),
+                            effect_binding: row.effect_binding.clone(),
+                            message: row.message.clone(),
+                        },
+                    );
+                }
+            }
+            *self.approvals.lock().expect("approval lock") = map;
+        }
+        if let Ok((next_exec, next_effect, next_appr)) = numbers {
+            let mut current = self.next_execution_id.lock().expect("execution id lock");
+            *current = (*current).max(next_exec);
+            drop(current);
+            let mut current = self.next_effect_id.lock().expect("effect id lock");
+            *current = (*current).max(next_effect);
+            drop(current);
+            let mut current = self.next_approval_id.lock().expect("approval id lock");
+            *current = (*current).max(next_appr);
+        }
+        *self.sqlite_backend.lock().expect("sqlite backend lock") = StateBackend::Sqlite;
+        *self.sqlite_broken.lock().expect("sqlite broken lock") = false;
+        Ok(report)
     }
 
     /// Test seam for P0-A provenance: override the origin device
@@ -2734,29 +2978,99 @@ fn approval_editable(record: &ApprovalState) -> bool {
     record.status == ApprovalStatus::Pending && !record.consumed && !record.is_bound()
 }
 
-async fn approvals_list(State(state): State<AppState>) -> Json<Vec<ApprovalView>> {
+/// Approval views from the in-memory map (JSONL / shadow mode,
+/// and the gate paths that mutate under the approvals lock).
+fn approval_views_from_map(state: &AppState) -> Vec<ApprovalView> {
     let approvals = state.approvals.lock().expect("approval lock");
     let mut views: Vec<ApprovalView> =
         approvals.iter().map(|(id, record)| approval_view(id, record)).collect();
     views.sort_by_key(|view| approval_number(&view.approval_id));
-    Json(views)
+    views
 }
 
-async fn approvals_history(State(state): State<AppState>) -> Json<Vec<ApprovalView>> {
+async fn approvals_list(State(state): State<AppState>) -> impl IntoResponse {
+    // P0-D: SQLite mode reads SQLite; a broken database fails
+    // closed (5xx) instead of serving a stale map.
+    if state.sqlite_mode() == StateBackend::Sqlite {
+        if state.sqlite_is_broken() {
+            return sqlite_error_response();
+        }
+        let Some(sqlite) = &state.sqlite else {
+            return sqlite_error_response();
+        };
+        let conn = sqlite.lock().expect("sqlite lock");
+        return match sqlite_store::list_approvals(&conn) {
+            Ok(rows) => {
+                let mut views: Vec<ApprovalView> =
+                    rows.iter().map(approval_view_from_file).collect();
+                views.sort_by_key(|view| approval_number(&view.approval_id));
+                Json(views).into_response()
+            }
+            Err(_) => sqlite_error_response(),
+        };
+    }
+    Json(approval_views_from_map(&state)).into_response()
+}
+
+async fn approvals_history(State(state): State<AppState>) -> impl IntoResponse {
+    // P0-D: in SQLite mode history is the approval event log in
+    // global order (each payload is a full approval row), not
+    // the generated export file (which holds one snapshot row
+    // per approval). A broken database fails closed.
+    if state.sqlite_mode() == StateBackend::Sqlite {
+        if state.sqlite_is_broken() {
+            return sqlite_error_response();
+        }
+        let Some(sqlite) = &state.sqlite else {
+            return sqlite_error_response();
+        };
+        let conn = sqlite.lock().expect("sqlite lock");
+        return match sqlite_store::list_events(&conn) {
+            Ok(events) => {
+                let mut views = Vec::new();
+                for event in events {
+                    if event.aggregate_kind != "approval" {
+                        continue;
+                    }
+                    if let Ok(record) =
+                        serde_json::from_str::<ApprovalFileRecord>(&event.payload_json)
+                    {
+                        views.push(approval_view_from_file(&record));
+                    }
+                }
+                Json(views).into_response()
+            }
+            Err(_) => sqlite_error_response(),
+        };
+    }
     if let Some(path) = &state.approvals_path {
         let views: Vec<ApprovalView> =
             load_records(path).iter().map(approval_view_from_file).collect();
-        return Json(views);
+        return Json(views).into_response();
     }
     // No persistence configured: history degrades to the current
     // state, one entry per approval.
-    approvals_list(State(state)).await
+    Json(approval_views_from_map(&state)).into_response()
 }
 
 async fn approvals_get(
     State(state): State<AppState>,
     axum::extract::Path(approval_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if state.sqlite_mode() == StateBackend::Sqlite {
+        if state.sqlite_is_broken() {
+            return sqlite_error_response();
+        }
+        let Some(sqlite) = &state.sqlite else {
+            return sqlite_error_response();
+        };
+        let conn = sqlite.lock().expect("sqlite lock");
+        return match sqlite_store::get_approval(&conn, &approval_id) {
+            Ok(Some(record)) => Json(approval_view_from_file(&record)).into_response(),
+            Ok(None) => unknown_approval(),
+            Err(_) => sqlite_error_response(),
+        };
+    }
     let approvals = state.approvals.lock().expect("approval lock");
     match approvals.get(&approval_id) {
         Some(record) => Json(approval_view(&approval_id, record)).into_response(),
@@ -2818,8 +3132,12 @@ async fn approval_edit_message(
 /// Append one approval record to the persistence file, when
 /// configured. Best-effort: a failure is logged to stderr and
 /// the in-memory record (authoritative for this run) is kept.
+/// P0-D: in shadow mode the SQLite upsert is best-effort too
+/// (warn + count, never changes the Result); in SQLite mode
+/// the SQLite upsert IS the persist (JSONL becomes the audit
+/// export) and a failure returns Err, so the existing call
+/// sites fail closed exactly as they did for a JSONL failure.
 pub(crate) fn persist_approval(state: &AppState, tool_call_id: &str, approval: &ApprovalState) -> Result<(), String> {
-    let Some(path) = &state.approvals_path else { return Ok(()) };
     let record = ApprovalFileRecord {
         tool_call_id: tool_call_id.to_string(),
         tool: approval.tool.clone(),
@@ -2831,7 +3149,46 @@ pub(crate) fn persist_approval(state: &AppState, tool_call_id: &str, approval: &
         effect_binding: approval.effect_binding.clone(),
         message: approval.message.clone(),
     };
-    append_record(path, &record)
+    match state.sqlite_mode() {
+        StateBackend::Sqlite => {
+            let Some(sqlite) = &state.sqlite else {
+                *state.sqlite_broken.lock().expect("sqlite broken lock") = true;
+                return Err("sqlite unavailable".to_string());
+            };
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            match sqlite_store::upsert_approval(&mut conn, &record) {
+                Ok(()) => {
+                    if let Some(path) = &state.approvals_path {
+                        if let Err(detail) = sqlite_store::export_approvals(&conn, path) {
+                            eprintln!("warning: P0-D approvals audit export failed: {detail}");
+                        }
+                    }
+                    Ok(())
+                }
+                Err(detail) => {
+                    *state.sqlite_broken.lock().expect("sqlite broken lock") = true;
+                    Err(detail)
+                }
+            }
+        }
+        StateBackend::Shadow => {
+            if let Some(path) = &state.approvals_path {
+                append_record(path, &record)?;
+            }
+            if let Some(sqlite) = &state.sqlite {
+                let mut conn = sqlite.lock().expect("sqlite lock");
+                if let Err(detail) = sqlite_store::upsert_approval(&mut conn, &record) {
+                    *state.sqlite_shadow_failures.lock().expect("shadow failures lock") += 1;
+                    eprintln!("warning: P0-D shadow approval write failed: {detail}");
+                }
+            }
+            Ok(())
+        }
+        StateBackend::Jsonl => {
+            let Some(path) = &state.approvals_path else { return Ok(()) };
+            append_record(path, &record)
+        }
+    }
 }
 
 /// Task-runner read of an approval's status. ApprovalState fields
@@ -3210,6 +3567,15 @@ pub(crate) fn bound_write_gate(
                     IdempotencyDecision::Blocked(other) => {
                         Err(conflict("effect_idempotency_blocked", &other))
                     }
+                    // P0-D: broken migrated-domain store fails
+                    // the bound write closed (5xx, not a guess).
+                    IdempotencyDecision::Unavailable => Err(Box::new(
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({ "error": "sqlite_unavailable" })),
+                        )
+                            .into_response(),
+                    )),
                 }
             }
             "succeeded" | "failed" | "reconciled" => Ok(WriteGate::Replay(effect)),
@@ -6845,9 +7211,107 @@ pub(crate) fn persist_task(state: &AppState, record: &TaskFileRecord) {
     append_task(path, record);
 }
 
+/// Migrated-domain read snapshots. In SQLite mode these read
+/// SQLite (the authority); in shadow / JSONL mode they read
+/// the in-memory maps. `None` means SQLite mode with no usable
+/// connection (broken): callers must fail closed, never fall
+/// back to the maps or to JSONL.
+fn executions_snapshot(state: &AppState) -> Option<Vec<ExecutionFileRecord>> {
+    if state.sqlite_mode() == StateBackend::Sqlite {
+        if state.sqlite_is_broken() {
+            return None;
+        }
+        let sqlite = state.sqlite.as_ref()?;
+        let conn = sqlite.lock().expect("sqlite lock");
+        return sqlite_store::list_executions(&conn).ok();
+    }
+    Some(
+        state
+            .executions
+            .lock()
+            .expect("execution lock")
+            .values()
+            .cloned()
+            .collect(),
+    )
+}
+
+fn effects_snapshot(state: &AppState) -> Option<Vec<EffectFileRecord>> {
+    if state.sqlite_mode() == StateBackend::Sqlite {
+        if state.sqlite_is_broken() {
+            return None;
+        }
+        let sqlite = state.sqlite.as_ref()?;
+        let conn = sqlite.lock().expect("sqlite lock");
+        return sqlite_store::list_effects(&conn).ok();
+    }
+    Some(
+        state
+            .effects
+            .lock()
+            .expect("effect lock")
+            .values()
+            .cloned()
+            .collect(),
+    )
+}
+
+fn sqlite_error_response() -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": "sqlite_unavailable" })),
+    )
+        .into_response()
+}
+
+/// P0-D persist for executions. Shadow mode appends JSONL
+/// (authoritative) and shadow-writes SQLite (failure warns +
+/// counts, never changes the response). SQLite mode writes
+/// SQLite in one transaction (event + state + derived Inbox)
+/// and regenerates the JSONL audit export best-effort; no
+/// JSONL append happens. A SQLite-mode failure marks the state
+/// broken so migrated-domain routes fail closed.
 pub(crate) fn persist_execution(state: &AppState, record: &ExecutionFileRecord) {
-    let Some(path) = &state.executions_path else { return };
-    append_execution(path, record);
+    match state.sqlite_mode() {
+        StateBackend::Sqlite => {
+            let Some(sqlite) = &state.sqlite else {
+                *state.sqlite_broken.lock().expect("sqlite broken lock") = true;
+                eprintln!("warning: P0-D SQLite unavailable for execution {}", record.execution_id);
+                return;
+            };
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            match sqlite_store::upsert_execution(&mut conn, record) {
+                Ok(()) => {
+                    if let Some(path) = &state.executions_path {
+                        if let Err(detail) = sqlite_store::export_executions(&conn, path) {
+                            eprintln!("warning: P0-D executions audit export failed: {detail}");
+                        }
+                    }
+                }
+                Err(detail) => {
+                    *state.sqlite_broken.lock().expect("sqlite broken lock") = true;
+                    eprintln!("warning: P0-D SQLite execution persist failed: {detail}");
+                }
+            }
+        }
+        StateBackend::Shadow => {
+            if let Some(path) = &state.executions_path {
+                append_execution(path, record);
+            }
+            if let Some(sqlite) = &state.sqlite {
+                let mut conn = sqlite.lock().expect("sqlite lock");
+                if let Err(detail) = sqlite_store::upsert_execution(&mut conn, record) {
+                    *state.sqlite_shadow_failures.lock().expect("shadow failures lock") += 1;
+                    eprintln!("warning: P0-D shadow execution write failed: {detail}");
+                }
+            }
+        }
+        StateBackend::Jsonl => {
+            if let Some(path) = &state.executions_path {
+                append_execution(path, record);
+            }
+        }
+    }
 }
 
 fn execution_number(execution_id: &str) -> u64 {
@@ -6900,9 +7364,50 @@ fn effect_number(effect_id: &str) -> u64 {
     effect_id.strip_prefix("effect-").and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)
 }
 
+/// P0-D persist for effects: same mode rules as
+/// `persist_execution` (shadow dual-write; SQLite primary +
+/// audit export; failure marks the state broken).
 pub(crate) fn persist_effect(state: &AppState, record: &EffectFileRecord) {
-    let Some(path) = &state.effects_path else { return };
-    append_effect(path, record);
+    match state.sqlite_mode() {
+        StateBackend::Sqlite => {
+            let Some(sqlite) = &state.sqlite else {
+                *state.sqlite_broken.lock().expect("sqlite broken lock") = true;
+                eprintln!("warning: P0-D SQLite unavailable for effect {}", record.effect_id);
+                return;
+            };
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            match sqlite_store::upsert_effect(&mut conn, record) {
+                Ok(()) => {
+                    if let Some(path) = &state.effects_path {
+                        if let Err(detail) = sqlite_store::export_effects(&conn, path) {
+                            eprintln!("warning: P0-D effects audit export failed: {detail}");
+                        }
+                    }
+                }
+                Err(detail) => {
+                    *state.sqlite_broken.lock().expect("sqlite broken lock") = true;
+                    eprintln!("warning: P0-D SQLite effect persist failed: {detail}");
+                }
+            }
+        }
+        StateBackend::Shadow => {
+            if let Some(path) = &state.effects_path {
+                append_effect(path, record);
+            }
+            if let Some(sqlite) = &state.sqlite {
+                let mut conn = sqlite.lock().expect("sqlite lock");
+                if let Err(detail) = sqlite_store::upsert_effect(&mut conn, record) {
+                    *state.sqlite_shadow_failures.lock().expect("shadow failures lock") += 1;
+                    eprintln!("warning: P0-D shadow effect write failed: {detail}");
+                }
+            }
+        }
+        StateBackend::Jsonl => {
+            if let Some(path) = &state.effects_path {
+                append_effect(path, record);
+            }
+        }
+    }
 }
 
 /// Phase 2 dual-write entry: append one Effect line mirroring a
@@ -6972,6 +7477,33 @@ pub(crate) fn transition_effect(
     if !crate::effect_store::is_new_effect_status(to) {
         return Err(400);
     }
+    // P0-D: in SQLite mode the current row comes from SQLite
+    // (broken SQLite -> 500, never a stale map row).
+    if state.sqlite_mode() == StateBackend::Sqlite {
+        let Some(records) = effects_snapshot(state) else {
+            return Err(500);
+        };
+        let Some(current) = records.into_iter().find(|r| r.effect_id == effect_id) else {
+            return Err(404);
+        };
+        if !crate::effect_store::valid_effect_transition(&current.status, to) {
+            return Err(409);
+        }
+        let mut next = current.clone();
+        next.status = to.to_string();
+        if reconciliation.is_some() {
+            next.reconciliation = reconciliation;
+        }
+        if detail.is_some() {
+            next.detail = detail;
+        }
+        state.effects.lock().expect("effect lock").insert(next.effect_id.clone(), next.clone());
+        persist_effect(state, &next);
+        if state.sqlite_is_broken() {
+            return Err(500);
+        }
+        return Ok(next);
+    }
     let mut effects = state.effects.lock().expect("effect lock");
     let Some(current) = effects.get(effect_id).cloned() else {
         return Err(404);
@@ -7026,6 +7558,20 @@ pub(crate) fn stamp_effect_approval(
     effect_id: &str,
     approval_id: &str,
 ) {
+    // P0-D: in SQLite mode the row comes from SQLite; a broken
+    // database stamps nothing.
+    if state.sqlite_mode() == StateBackend::Sqlite {
+        let Some(records) = effects_snapshot(state) else {
+            return;
+        };
+        let Some(mut record) = records.into_iter().find(|r| r.effect_id == effect_id) else {
+            return;
+        };
+        record.approval_id = Some(approval_id.to_string());
+        state.effects.lock().expect("effect lock").insert(record.effect_id.clone(), record.clone());
+        persist_effect(state, &record);
+        return;
+    }
     let mut effects = state.effects.lock().expect("effect lock");
     let Some(mut record) = effects.get(effect_id).cloned() else {
         return;
@@ -7037,12 +7583,7 @@ pub(crate) fn stamp_effect_approval(
 }
 
 pub(crate) fn effect_by_id(state: &AppState, effect_id: &str) -> Option<EffectFileRecord> {
-    state
-        .effects
-        .lock()
-        .expect("effect lock")
-        .get(effect_id)
-        .cloned()
+    effects_snapshot(state)?.into_iter().find(|r| r.effect_id == effect_id)
 }
 
 /// The Effect an approval authorizes, resolved through the
@@ -7060,11 +7601,10 @@ pub(crate) fn effect_for_approval(
     // Lock order discipline: never hold the effects lock while
     // taking the approvals lock (consume paths take approvals
     // first, then effects). Snapshot effects, release, then read
-    // the approval binding.
-    let mut records: Vec<EffectFileRecord> = {
-        let effects = state.effects.lock().expect("effect lock");
-        effects.values().cloned().collect()
-    };
+    // the approval binding. P0-D: the snapshot is SQLite in
+    // SQLite mode; a broken database yields no candidate (the
+    // caller treats that as a binding mismatch, fail closed).
+    let mut records = effects_snapshot(state)?;
     records.sort_by_key(|r| effect_number(&r.effect_id));
     // Prefer the approval's own binding when it resolves.
     let bound = {
@@ -7101,6 +7641,11 @@ pub(crate) enum IdempotencyDecision {
     Proceed,
     Replay(EffectFileRecord),
     Blocked(EffectFileRecord),
+    /// P0-D: the migrated-domain store is unavailable (SQLite
+    /// broken in SQLite mode). Callers must refuse the write,
+    /// never proceed on a missing row and never replay a
+    /// fabricated one.
+    Unavailable,
 }
 
 pub(crate) fn check_idempotency(
@@ -7122,14 +7667,18 @@ pub(crate) fn check_idempotency(
         scope,
         digest,
     );
-    let effects = state.effects.lock().expect("effect lock");
-    let mut records: Vec<EffectFileRecord> = effects
-        .values()
+    // P0-D: in SQLite mode the idempotency check reads SQLite;
+    // a broken database refuses the write (Unavailable), it
+    // never degrades to Proceed on an empty map.
+    let Some(records) = effects_snapshot(state) else {
+        return IdempotencyDecision::Unavailable;
+    };
+    let mut records: Vec<EffectFileRecord> = records
+        .into_iter()
         .filter(|r| {
             r.idempotency_key.as_deref() == Some(key.as_str())
                 && exclude_effect_id.is_none_or(|id| r.effect_id != id)
         })
-        .cloned()
         .collect();
     records.sort_by_key(|r| effect_number(&r.effect_id));
     match records.into_iter().next() {
@@ -7344,11 +7893,9 @@ pub(crate) fn record_connector_effect(
 /// executions were persisted) has none, and its effects carry
 /// `None` rather than a fabricated id.
 pub(crate) fn execution_for_loop(state: &AppState, loop_id: &str) -> Option<String> {
-    state
-        .executions
-        .lock()
-        .expect("execution lock")
-        .values()
+    // P0-D: SQLite snapshot in SQLite mode (None when broken).
+    executions_snapshot(state)?
+        .into_iter()
         .find(|r| r.loop_id.as_deref() == Some(loop_id))
         .map(|r| r.execution_id.clone())
 }
@@ -7360,11 +7907,9 @@ pub(crate) fn execution_for_loop(state: &AppState, loop_id: &str) -> Option<Stri
 /// phase 4 (Q6) decision; until then, latest-wins is the honest
 /// mapping for the attempt that just wrote.
 pub(crate) fn execution_for_task(state: &AppState, task_id: &str) -> Option<String> {
-    state
-        .executions
-        .lock()
-        .expect("execution lock")
-        .values()
+    // P0-D: SQLite snapshot in SQLite mode (None when broken).
+    executions_snapshot(state)?
+        .into_iter()
         .filter(|r| r.task_id.as_deref() == Some(task_id))
         .max_by_key(|r| execution_number(&r.execution_id))
         .map(|r| r.execution_id.clone())
@@ -7603,6 +8148,14 @@ async fn tasks_execute(
             )
                 .into_response();
         }
+        // P0-D: broken migrated-domain store fails closed.
+        IdempotencyDecision::Unavailable => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "sqlite_unavailable" })),
+            )
+                .into_response();
+        }
         IdempotencyDecision::Proceed => {}
     }
     let task_effect = record_effect(
@@ -7829,17 +8382,37 @@ struct ExecutionGetQuery {
     execution_id: String,
 }
 
-async fn executions_list(State(state): State<AppState>) -> Json<Vec<ExecutionFileRecord>> {
+async fn executions_list(State(state): State<AppState>) -> impl IntoResponse {
+    // P0-D: SQLite mode reads SQLite; a broken database fails
+    // closed (5xx) instead of serving a stale map.
+    if state.sqlite_mode() == StateBackend::Sqlite {
+        let Some(records) = executions_snapshot(&state) else {
+            return sqlite_error_response();
+        };
+        let mut records = records;
+        records.sort_by_key(|r| execution_number(&r.execution_id));
+        return Json(records).into_response();
+    }
     let mut records: Vec<ExecutionFileRecord> =
         state.executions.lock().expect("execution lock").values().cloned().collect();
     records.sort_by_key(|r| execution_number(&r.execution_id));
-    Json(records)
+    Json(records).into_response()
 }
 
 async fn executions_get(
     State(state): State<AppState>,
     Query(query): Query<ExecutionGetQuery>,
 ) -> impl IntoResponse {
+    if state.sqlite_mode() == StateBackend::Sqlite {
+        let Some(records) = executions_snapshot(&state) else {
+            return sqlite_error_response();
+        };
+        return match records.into_iter().find(|r| r.execution_id == query.execution_id) {
+            Some(record) => Json(record).into_response(),
+            None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown execution" })))
+                .into_response(),
+        };
+    }
     match state.executions.lock().expect("execution lock").get(&query.execution_id) {
         Some(record) => Json(record.clone()).into_response(),
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown execution" })))
@@ -7855,17 +8428,37 @@ struct EffectGetQuery {
     effect_id: String,
 }
 
-async fn effects_list(State(state): State<AppState>) -> Json<Vec<EffectFileRecord>> {
+async fn effects_list(State(state): State<AppState>) -> impl IntoResponse {
+    // P0-D: SQLite mode reads SQLite; a broken database fails
+    // closed (5xx) instead of serving a stale map.
+    if state.sqlite_mode() == StateBackend::Sqlite {
+        let Some(records) = effects_snapshot(&state) else {
+            return sqlite_error_response();
+        };
+        let mut records = records;
+        records.sort_by_key(|r| effect_number(&r.effect_id));
+        return Json(records).into_response();
+    }
     let mut records: Vec<EffectFileRecord> =
         state.effects.lock().expect("effect lock").values().cloned().collect();
     records.sort_by_key(|r| effect_number(&r.effect_id));
-    Json(records)
+    Json(records).into_response()
 }
 
 async fn effects_get(
     State(state): State<AppState>,
     Query(query): Query<EffectGetQuery>,
 ) -> impl IntoResponse {
+    if state.sqlite_mode() == StateBackend::Sqlite {
+        let Some(records) = effects_snapshot(&state) else {
+            return sqlite_error_response();
+        };
+        return match records.into_iter().find(|r| r.effect_id == query.effect_id) {
+            Some(record) => Json(record).into_response(),
+            None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown effect" })))
+                .into_response(),
+        };
+    }
     match state.effects.lock().expect("effect lock").get(&query.effect_id) {
         Some(record) => Json(record.clone()).into_response(),
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown effect" })))
@@ -7909,6 +8502,8 @@ async fn effects_transition(
         Err(404) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown effect" })))
             .into_response(),
         Err(400) => bad_request("unknown effect status"),
+        // P0-D: broken SQLite fails closed (5xx), never 409.
+        Err(500) => sqlite_error_response(),
         Err(_) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": "effect_transition_refused" })),
@@ -8002,6 +8597,140 @@ async fn effects_reconcile(
             Json(serde_json::json!({ "error": error })),
         )
             .into_response(),
+    }
+}
+
+// --- P0-D Inbox / Outbox routes (gateway only, no client) ---
+//
+// Inbox first batch: approval_required, review_required,
+// failed, unknown_requires_reconciliation. Rows are derived
+// in the same SQLite transaction as the triggering transition
+// (see sqlite_store); failed rows close only by user ack,
+// the others close automatically on decision / reconciliation
+// or by ack. Outbox first batch: local_notification only,
+// pending -> sent | failed, no automatic retry, requeue is an
+// internal function with no route. Without a configured
+// SQLite database these routes answer 500 (the Inbox /
+// Outbox live in SQLite); a broken database also answers 5xx.
+
+#[derive(Debug, Deserialize)]
+struct InboxListQuery {
+    kind: Option<String>,
+    open_only: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InboxIdQuery {
+    inbox_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InboxAckDto {
+    inbox_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OutboxIdQuery {
+    outbox_id: String,
+}
+
+fn sqlite_not_configured() -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": "sqlite_not_configured" })),
+    )
+        .into_response()
+}
+
+async fn inbox_list(
+    State(state): State<AppState>,
+    Query(query): Query<InboxListQuery>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite && state.sqlite_mode() != StateBackend::Shadow {
+        return sqlite_not_configured();
+    }
+    let open_only = query.open_only.as_deref() == Some("true") || query.open_only.as_deref() == Some("1");
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::list_inbox(&conn, query.kind.as_deref(), open_only) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(_) => sqlite_error_response(),
+    }
+}
+
+async fn inbox_get(
+    State(state): State<AppState>,
+    Query(query): Query<InboxIdQuery>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::get_inbox(&conn, &query.inbox_id) {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown inbox item" })))
+            .into_response(),
+        Err(_) => sqlite_error_response(),
+    }
+}
+
+async fn inbox_ack(
+    State(state): State<AppState>,
+    Json(req): Json<InboxAckDto>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::ack_inbox(&mut conn, &req.inbox_id) {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown inbox item" })))
+            .into_response(),
+        Err(_) => sqlite_error_response(),
+    }
+}
+
+async fn outbox_list(State(state): State<AppState>) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::list_outbox(&conn) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(_) => sqlite_error_response(),
+    }
+}
+
+async fn outbox_get(
+    State(state): State<AppState>,
+    Query(query): Query<OutboxIdQuery>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::get_outbox(&conn, &query.outbox_id) {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown outbox item" })))
+            .into_response(),
+        Err(_) => sqlite_error_response(),
     }
 }
 
@@ -8529,6 +9258,14 @@ async fn device_set(
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
+            )
+                .into_response();
+        }
+        // P0-D: broken migrated-domain store fails closed.
+        IdempotencyDecision::Unavailable => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "sqlite_unavailable" })),
             )
                 .into_response();
         }
@@ -9078,6 +9815,11 @@ pub fn app(state: AppState) -> Router {
         .route("/effects/get", get(effects_get))
         .route("/effects/transition", post(effects_transition))
         .route("/effects/reconcile", post(effects_reconcile))
+        .route("/inbox/list", get(inbox_list))
+        .route("/inbox/get", get(inbox_get))
+        .route("/inbox/ack", post(inbox_ack))
+        .route("/outbox/list", get(outbox_list))
+        .route("/outbox/get", get(outbox_get))
         .route("/sessions/create", post(sessions_create))
         .route("/sessions/list", get(sessions_list))
         .route("/sessions/get", get(sessions_get))
