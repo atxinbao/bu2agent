@@ -89,6 +89,7 @@ import { AgentView } from "./views/AgentView";
 import { ConnectorsView } from "./views/ConnectorsView";
 import { TasksView } from "./views/TasksView";
 import { DevicesView } from "./views/DevicesView";
+import { RemindersView } from "./views/RemindersView";
 import { LoopClient, type LoopGateway } from "./domain/loop_client";
 import { InvokeLoopClient } from "./domain/invoke_loop_client";
 import { LoopsView } from "./views/LoopsView";
@@ -152,7 +153,7 @@ interface Clients {
   evidence: EvidenceGateway;
 }
 
-type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "peers" | "spaces" | "feed" | "mail" | "settings";
+type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "settings";
 
 // Visible navigation: the workbench (sessions) is the only
 // chat entry and the default view (R1, 2026-10-28). The legacy
@@ -165,6 +166,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "connectors", label: "Connectors" },
   { id: "tasks", label: "Tasks" },
   { id: "devices", label: "Devices" },
+  { id: "reminders", label: "Reminders" },
   { id: "loops", label: "Loops" },
   { id: "peers", label: "Peers" },
   { id: "spaces", label: "Spaces" },
@@ -615,6 +617,12 @@ export function App() {
           <p className="empty">Choosing transport…</p>
         ) : (
           <DevicesView agent={clients.agent} devices={clients.devices} nodes={clients.nodes} effects={clients.effects} evidence={clients.evidence} />
+        ))}
+      {tab === "reminders" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : (
+          <RemindersView agent={clients.agent} devices={clients.devices} effects={clients.effects} evidence={clients.evidence} />
         ))}
       {tab === "loops" && clients && <LoopsView loops={clients.loops} agent={clients.agent} executions={clients.executions} effects={clients.effects} evidence={clients.evidence} />}
       {tab === "settings" && (
