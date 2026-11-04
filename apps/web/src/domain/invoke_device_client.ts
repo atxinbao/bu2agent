@@ -16,6 +16,7 @@ interface ServerDeviceActionRecord {
   target_completed: boolean;
   status: string;
   detail: string | null;
+  effect_id?: string | null;
 }
 
 function toRecord(server: ServerDeviceActionRecord): DeviceActionRecord {
@@ -27,6 +28,7 @@ function toRecord(server: ServerDeviceActionRecord): DeviceActionRecord {
     targetCompleted: server.target_completed,
     status: server.status,
     detail: server.detail,
+    effectId: server.effect_id ?? null,
   };
 }
 

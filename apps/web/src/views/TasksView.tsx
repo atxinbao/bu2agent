@@ -5,6 +5,20 @@ import type { ChatState } from "../domain/chat";
 import type { FileGateway, GatewayFileEntry } from "../domain/file_client";
 import type { AgentGateway } from "../domain/agent_client";
 import type { TaskGateway, TaskRecord } from "../domain/task_client";
+// P0-R R5: Execution / Effect / Evidence / Assignment clients
+// are optional props (App.tsx still needs to pass them —
+// outside this task's file scope); the view takes them as
+// props like every other client, so App.tsx's transport choice
+// applies unchanged. When absent the Execution section below
+// says so and the rest of the view works as before.
+import type { AssignmentsGateway } from "../domain/assignments_client";
+import type { EffectRecord, EffectsGateway } from "../domain/effects_client";
+import type { EvidenceGateway, EvidenceRow } from "../domain/evidence_client";
+import type {
+  ExecutionRecord,
+  ExecutionsGateway,
+} from "../domain/executions_client";
+import { ExecutionDetail } from "./ExecutionDetail";
 
 // Tasks view: the deterministic task loop, driven step by step
 // from the frontend (see the task-loop design doc). No model
@@ -35,6 +49,10 @@ interface TasksViewProps {
   files: FileGateway;
   agent: AgentGateway;
   tasks: TaskGateway;
+  executions?: ExecutionsGateway | null;
+  effects?: EffectsGateway | null;
+  evidence?: EvidenceGateway | null;
+  assignments?: AssignmentsGateway | null;
   // Settings page's default working directory (root-relative,
   // "" = file root). Only the initial directory for a new
   // task and its default artifact path; an explicitly typed
@@ -60,6 +78,10 @@ export function TasksView({
   files,
   agent,
   tasks,
+  executions: executionsClient = null,
+  effects: effectsClient = null,
+  evidence: evidenceClient = null,
+  assignments: assignmentsClient = null,
   defaultDir = "",
   defaultDirValid = true,
 }: TasksViewProps) {
@@ -78,6 +100,44 @@ export function TasksView({
   // still interrupted. While this is true, polling continues
   // until the runner leaves interrupted.
   const [resuming, setResuming] = useState(false);
+  // P0-R R5 Execution section: gateway rows loaded once per
+  // selected task and filtered client-side (the list routes
+  // take no filter parameters). These are the same rows the
+  // Workbench Inbox and Loops views read; nothing is cached
+  // or derived here beyond the id filters.
+  const [taskExecutions, setTaskExecutions] = useState<ExecutionRecord[]>([]);
+  const [taskEffects, setTaskEffects] = useState<EffectRecord[]>([]);
+  const [taskEvidence, setTaskEvidence] = useState<EvidenceRow[]>([]);
+  const [execError, setExecError] = useState("");
+
+  async function refreshExecutionData(taskId: string) {
+    if (!executionsClient) return;
+    setExecError("");
+    try {
+      const [allExecutions, allEffects, allEvidence] = await Promise.all([
+        executionsClient.list(),
+        effectsClient ? effectsClient.list() : Promise.resolve([] as EffectRecord[]),
+        evidenceClient ? evidenceClient.list() : Promise.resolve([] as EvidenceRow[]),
+      ]);
+      const mine = allExecutions.filter((e) => e.taskId === taskId);
+      const ids = new Set(mine.map((e) => e.executionId));
+      setTaskExecutions(mine);
+      setTaskEffects(allEffects.filter((e) => e.executionId !== null && ids.has(e.executionId)));
+      setTaskEvidence(allEvidence.filter((e) => e.executionId !== null && ids.has(e.executionId)));
+    } catch (e) {
+      setExecError(`执行记录读取失败：${errText(e)}`);
+    }
+  }
+
+  useEffect(() => {
+    if (current) void refreshExecutionData(current.taskId);
+    else {
+      setTaskExecutions([]);
+      setTaskEffects([]);
+      setTaskEvidence([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [current?.taskId]);
 
   async function refreshTasks() {
     try {
@@ -534,6 +594,32 @@ export function TasksView({
               <button onClick={() => void handleViewArtifact(current)} disabled={busy}>
                 查看产物
               </button>
+            </div>
+          )}
+          <h3>Execution</h3>
+          {!executionsClient && (
+            <p className="note">执行记录客户端尚未接入：待 App 接线传入客户端后，这里显示该任务的执行与 Effect 记录。</p>
+          )}
+          {executionsClient && (
+            <div>
+              <button onClick={() => void refreshExecutionData(current.taskId)} disabled={busy}>
+                刷新执行记录
+              </button>
+              {execError !== "" && <p>错误：{execError}</p>}
+              {taskExecutions.length === 0 && <p className="empty">该任务暂无执行记录。</p>}
+              {taskExecutions.map((execution) => (
+                <ExecutionDetail
+                  key={execution.executionId}
+                  execution={execution}
+                  effects={taskEffects.filter((e) => e.executionId === execution.executionId)}
+                  evidence={taskEvidence}
+                  effectsClient={effectsClient}
+                  executionsClient={executionsClient}
+                  assignmentsClient={assignmentsClient}
+                  onRefresh={() => void refreshExecutionData(current.taskId)}
+                  onError={(message) => setExecError(message)}
+                />
+              ))}
             </div>
           )}
         </div>

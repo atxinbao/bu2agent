@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
 import type { FileGateway, GatewayFileEntry, GatewayLibraryItem } from "../domain/file_client";
+// P0-R R5: optional props (App.tsx still needs to pass them —
+// outside this task's file scope); taken as props so App.tsx's
+// transport choice applies unchanged.
+import type { EffectRecord, EffectsGateway } from "../domain/effects_client";
+import type { EvidenceGateway, EvidenceRow } from "../domain/evidence_client";
+import { EffectBadge, effectNumber, latestEvidenceFor } from "./ExecutionDetail";
 
 // Files view over the FileGateway interface: the view never
 // knows whether it runs on invoke or on HTTP. Writes and
@@ -21,10 +27,14 @@ import type { FileGateway, GatewayFileEntry, GatewayLibraryItem } from "../domai
 // path, so no write can land in a fallback location.
 export function FilesView({
   client,
+  effects: effectsClient = null,
+  evidence: evidenceClient = null,
   defaultDir = "",
   defaultDirValid = true,
 }: {
   client: FileGateway;
+  effects?: EffectsGateway | null;
+  evidence?: EvidenceGateway | null;
   defaultDir?: string;
   defaultDirValid?: boolean;
 }) {
@@ -50,6 +60,36 @@ export function FilesView({
   const [showLibrary, setShowLibrary] = useState(false);
   const [exportTarget, setExportTarget] = useState("");
   const [thumbnail, setThumbnail] = useState<string | null>(null);
+  // P0-R R5: the selected file's latest Effect, filtered
+  // client-side by scope == path (the list route takes no
+  // filter). No file history page, no directory aggregation.
+  const [fileEffects, setFileEffects] = useState<EffectRecord[]>([]);
+  const [fileEvidence, setFileEvidence] = useState<EvidenceRow[]>([]);
+  const [fileEffectError, setFileEffectError] = useState<string | null>(null);
+
+  async function refreshFileEffect(path: string) {
+    if (!effectsClient) return;
+    setFileEffectError(null);
+    try {
+      const [allEffects, allEvidence] = await Promise.all([
+        effectsClient.list(),
+        evidenceClient ? evidenceClient.list() : Promise.resolve([] as EvidenceRow[]),
+      ]);
+      setFileEffects(allEffects.filter((e) => e.scope === path));
+      setFileEvidence(allEvidence);
+    } catch (err) {
+      setFileEffectError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  useEffect(() => {
+    if (selectedPath !== null) void refreshFileEffect(selectedPath);
+    else {
+      setFileEffects([]);
+      setFileEvidence([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPath]);
 
   async function refresh(path: string) {
     setBusy(true);
@@ -337,6 +377,34 @@ export function FilesView({
             <input value={exportTarget} placeholder="Absolute export path" onChange={(event) => setExportTarget(event.target.value)} />
             <button type="button" onClick={() => void exportSelected()} disabled={busy || !writesAllowed}>Export</button>
           </div>
+          <h4>Effect</h4>
+          {!effectsClient && (
+            <p className="note">Effect 客户端尚未接入：待 App 接线传入客户端后，这里显示该文件的最新 Effect 记录。</p>
+          )}
+          {effectsClient && (() => {
+            const sorted = [...fileEffects].sort((a, b) => effectNumber(b.effectId) - effectNumber(a.effectId));
+            const latest = sorted[0] ?? null;
+            return (
+              <div>
+                <button type="button" onClick={() => void refreshFileEffect(selectedPath)} disabled={busy}>
+                  刷新 Effect
+                </button>
+                {fileEffectError !== null && <p className="error">{fileEffectError}</p>}
+                {!latest && <p className="empty">该文件暂无 Effect 记录。</p>}
+                {latest && (
+                  <p>
+                    <EffectBadge
+                      effect={latest}
+                      latestEvidence={latestEvidenceFor(latest.effectId, fileEvidence)}
+                      effectsClient={effectsClient}
+                      onRefresh={() => void refreshFileEffect(selectedPath)}
+                      onError={(message) => setFileEffectError(message)}
+                    />
+                  </p>
+                )}
+              </div>
+            );
+          })()}
         </div>
       )}
       {selectedStat !== null && (

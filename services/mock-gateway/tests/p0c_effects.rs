@@ -607,8 +607,11 @@ async fn unknown_reconciliation_completed_inconclusive_and_no_readback() {
     assert_eq!(body["status"], "unknown");
     h.fake.set_fault(None);
 
-    // No readback: an fs Effect driven to unknown has no
-    // re-check method; reconcile refuses and leaves it unknown.
+    // P0-R: an fs Effect driven to unknown is now recomputable
+    // (overwrite digest re-check). The file was never written,
+    // so the re-check is inconclusive and the row returns to
+    // `unknown` with no conclusion — never `failed`, and no
+    // longer a 409: fs gained a readback method in P0-R.
     let approval3 = h
         .request_approval("fs.write", json!({"path": "n.txt", "content_base64": "aGVsbG8="}))
         .await;
@@ -623,8 +626,9 @@ async fn unknown_reconciliation_completed_inconclusive_and_no_readback() {
         assert_eq!(status, 200, "to {to}");
     }
     let (status, body) = h.post("/effects/reconcile", json!({"effect_id": fs_id})).await;
-    assert_eq!(status, 409, "{body}");
-    assert_eq!(body["error"], "effect_no_readback");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "unknown");
+    assert!(body["reconciliation"].is_null(), "no verdict on an inconclusive re-check");
     assert_eq!(h.effect(&fs_id).await["status"], "unknown");
 
     // actions_refresh drives the same reconciliation for the

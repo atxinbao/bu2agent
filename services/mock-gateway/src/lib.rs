@@ -25,6 +25,7 @@ pub mod task_runner;
 pub mod execution_store;
 pub mod effect_store;
 pub mod sqlite_store;
+pub mod evidence;
 pub mod session_store;
 pub mod connector_store;
 pub mod vault_store;

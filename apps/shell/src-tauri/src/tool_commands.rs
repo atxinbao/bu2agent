@@ -1223,3 +1223,117 @@ pub fn email_message_get(message_id: String) -> Result<MessageView, String> {
 pub fn email_message_attachment(message_id: String, index: usize) -> Result<Vec<u8>, String> {
     email_client()?.attachment_download(&message_id, index).map_err(agent_err_string)
 }
+
+// --- Effects / Executions / Inbox / Assignments / Evidence (P0-R R4) ---
+//
+// One command per gateway route, each backed by its desktop
+// client. Every command carries rename_all = "snake_case"
+// (Task 9 lesson: without it, multi-word invoke arguments
+// never arrive). Errors use the err_string form, never a
+// response body. The returned record types are the desktop
+// client types verbatim (they already serialize snake_case),
+// so no Out wrappers are needed here.
+
+use agent_desktop::effects_client::{EffectRecord, EffectsClient};
+use agent_desktop::executions_client::{ExecutionRecord, ExecutionsClient};
+use agent_desktop::inbox_client::{InboxClient, InboxRow};
+use agent_desktop::assignments_client::{AssignmentRow, AssignmentsClient, TakeoverOutcome};
+use agent_desktop::evidence_client::{EvidenceClient, EvidenceRow};
+
+fn effects_client() -> Result<EffectsClient, String> {
+    EffectsClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+fn executions_client() -> Result<ExecutionsClient, String> {
+    ExecutionsClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+fn inbox_client() -> Result<InboxClient, String> {
+    InboxClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+fn assignments_client() -> Result<AssignmentsClient, String> {
+    AssignmentsClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+fn evidence_client() -> Result<EvidenceClient, String> {
+    EvidenceClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn effect_list() -> Result<Vec<EffectRecord>, String> {
+    effects_client()?.list().map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn effect_get(effect_id: String) -> Result<EffectRecord, String> {
+    effects_client()?.get(&effect_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn effect_reconcile(effect_id: String) -> Result<EffectRecord, String> {
+    effects_client()?.reconcile(&effect_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn effect_verify(effect_id: String) -> Result<EvidenceRow, String> {
+    effects_client()?.verify(&effect_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn execution_list() -> Result<Vec<ExecutionRecord>, String> {
+    executions_client()?.list().map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn execution_get(execution_id: String) -> Result<ExecutionRecord, String> {
+    executions_client()?.get(&execution_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn execution_transition(
+    execution_id: String,
+    status: String,
+) -> Result<ExecutionRecord, String> {
+    executions_client()?.transition(&execution_id, &status).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn inbox_list(kind: Option<String>, open_only: bool) -> Result<Vec<InboxRow>, String> {
+    inbox_client()?.list(kind.as_deref(), open_only).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn inbox_get(inbox_id: String) -> Result<InboxRow, String> {
+    inbox_client()?.get(&inbox_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn inbox_ack(inbox_id: String) -> Result<InboxRow, String> {
+    inbox_client()?.ack(&inbox_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn assignment_list() -> Result<Vec<AssignmentRow>, String> {
+    assignments_client()?.list().map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn assignment_get(assignment_id: String) -> Result<AssignmentRow, String> {
+    assignments_client()?.get(&assignment_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn assignment_takeover(execution_id: String) -> Result<TakeoverOutcome, String> {
+    assignments_client()?.takeover(&execution_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn evidence_list() -> Result<Vec<EvidenceRow>, String> {
+    evidence_client()?.list().map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn evidence_get(evidence_id: String) -> Result<EvidenceRow, String> {
+    evidence_client()?.get(&evidence_id).map_err(|e| err_string(&e))
+}

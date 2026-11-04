@@ -6,6 +6,12 @@ import type {
   DeviceReminder,
 } from "../domain/device_client";
 import type { Node, NodeGateway } from "../domain/node_client";
+// P0-R R5: optional props (App.tsx still needs to pass them —
+// outside this task's file scope); taken as props so App.tsx's
+// transport choice applies unchanged.
+import type { EffectRecord, EffectsGateway } from "../domain/effects_client";
+import type { EvidenceGateway, EvidenceRow } from "../domain/evidence_client";
+import { EffectBadge, effectNumber, latestEvidenceFor } from "./ExecutionDetail";
 
 // Devices view: the B-layer single-device validation loop,
 // driven step by step from the frontend (see the device-loop
@@ -26,13 +32,21 @@ interface DevicesViewProps {
   agent: AgentGateway;
   devices: DeviceGateway;
   nodes: NodeGateway;
+  effects?: EffectsGateway | null;
+  evidence?: EvidenceGateway | null;
 }
 
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-export function DevicesView({ agent, devices, nodes }: DevicesViewProps) {
+export function DevicesView({
+  agent,
+  devices,
+  nodes,
+  effects: effectsClient = null,
+  evidence: evidenceClient = null,
+}: DevicesViewProps) {
   const [reminders, setReminders] = useState<DeviceReminder[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [targetCompleted, setTargetCompleted] = useState(true);
@@ -49,6 +63,49 @@ export function DevicesView({ agent, devices, nodes }: DevicesViewProps) {
   const [nodeName, setNodeName] = useState("");
   const [nodeMessage, setNodeMessage] = useState("");
   const [nodeError, setNodeError] = useState("");
+  // P0-R R5 Effect badges: gateway rows only, filtered
+  // client-side. The badge prefers the action's own
+  // effect_id (P0-C direct binding); scope matching —
+  // device/reminders rows scope the reminder id, legacy
+  // device rows scope the action id — is only the
+  // pre-P0-C fallback, and takes the latest row. Device
+  // action management itself is untouched.
+  const [effectRows, setEffectRows] = useState<EffectRecord[]>([]);
+  const [effectEvidence, setEffectEvidence] = useState<EvidenceRow[]>([]);
+  const [effectError, setEffectError] = useState("");
+
+  function effectForAction(action: DeviceActionRecord): EffectRecord | null {
+    // Direct binding first: the action's own planned Effect
+    // (P0-C). Scope matching is only the pre-P0-C fallback,
+    // where no effect_id exists on the row.
+    if (action.effectId) {
+      const direct = effectRows.find((e) => e.effectId === action.effectId);
+      if (direct) return direct;
+    }
+    const matches = effectRows.filter(
+      (e) =>
+        (e.capability === "device" || e.capability === "devices")
+        && (e.scope === action.reminderId || e.scope === action.actionId),
+    );
+    if (matches.length === 0) return null;
+    matches.sort((a, b) => effectNumber(b.effectId) - effectNumber(a.effectId));
+    return matches[0];
+  }
+
+  async function refreshEffectRows() {
+    if (!effectsClient) return;
+    setEffectError("");
+    try {
+      const [allEffects, allEvidence] = await Promise.all([
+        effectsClient.list(),
+        evidenceClient ? evidenceClient.list() : Promise.resolve([] as EvidenceRow[]),
+      ]);
+      setEffectRows(allEffects);
+      setEffectEvidence(allEvidence);
+    } catch (e) {
+      setEffectError(`Effect 记录读取失败：${errText(e)}`);
+    }
+  }
 
   async function refreshNodes() {
     try {
@@ -129,6 +186,7 @@ export function DevicesView({ agent, devices, nodes }: DevicesViewProps) {
   useEffect(() => {
     void refreshReminders();
     void refreshActions();
+    void refreshEffectRows();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -257,6 +315,7 @@ export function DevicesView({ agent, devices, nodes }: DevicesViewProps) {
   }
 
   const selected = reminders.find((r) => r.id === selectedId) ?? null;
+  const currentEffect = current ? effectForAction(current) : null;
 
   return (
     <div>
@@ -313,6 +372,22 @@ export function DevicesView({ agent, devices, nodes }: DevicesViewProps) {
             目标 {current.targetCompleted ? "已完成" : "未完成"} · 状态 {current.status}
             {current.detail ? ` · ${current.detail}` : ""}
           </p>
+          {effectsClient && (
+            <p>
+              Effect：{currentEffect ? (
+                <EffectBadge
+                  effect={currentEffect}
+                  latestEvidence={latestEvidenceFor(currentEffect.effectId, effectEvidence)}
+                  effectsClient={effectsClient}
+                  onRefresh={() => void refreshEffectRows()}
+                  onError={(message) => setEffectError(message)}
+                />
+              ) : (
+                "暂无对应 Effect 记录（按 scope 匹配，未找到）。"
+              )}
+            </p>
+          )}
+          {effectError !== "" && <p>错误：{effectError}</p>}
           <div>
             {current.status === "requested" && (
               <>
@@ -379,15 +454,34 @@ export function DevicesView({ agent, devices, nodes }: DevicesViewProps) {
         ))}
       </ul>
       <h3>动作列表</h3>
+      {effectsClient && (
+        <button type="button" onClick={() => void refreshEffectRows()} disabled={busy}>
+          刷新 Effect 角标
+        </button>
+      )}
       <ul>
-        {actionList.map((a) => (
-          <li key={a.actionId}>
-            <button onClick={() => void handleSelect(a)} disabled={busy}>
-              {a.actionId}
-            </button>{" "}
-            {a.reminderId} · 目标 {a.targetCompleted ? "已完成" : "未完成"} · {a.status}
-          </li>
-        ))}
+        {actionList.map((a) => {
+          const eff = effectsClient ? effectForAction(a) : null;
+          return (
+            <li key={a.actionId}>
+              <button onClick={() => void handleSelect(a)} disabled={busy}>
+                {a.actionId}
+              </button>{" "}
+              {a.reminderId} · 目标 {a.targetCompleted ? "已完成" : "未完成"} · {a.status}
+              {effectsClient && eff && (
+                <span>
+                  {" "}· Effect：<EffectBadge
+                    effect={eff}
+                    latestEvidence={latestEvidenceFor(eff.effectId, effectEvidence)}
+                    effectsClient={effectsClient}
+                    onRefresh={() => void refreshEffectRows()}
+                    onError={(message) => setEffectError(message)}
+                  />
+                </span>
+              )}
+            </li>
+          );
+        })}
       </ul>
     </div>
   );

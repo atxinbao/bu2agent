@@ -14,6 +14,19 @@ import type {
 } from "../domain/chat_records_client";
 import type { StreamEvent, StreamGateway } from "../domain/stream_client";
 import { LoopReminderApproval } from "./LoopReminderApproval";
+// P0-R R5: Inbox / Execution clients are optional props
+// (App.tsx still needs to pass them — outside this task's file
+// scope); the view takes them as props like every other client,
+// so App.tsx's transport choice applies unchanged.
+import type { AssignmentsGateway } from "../domain/assignments_client";
+import type { EffectRecord, EffectsGateway } from "../domain/effects_client";
+import type { EvidenceGateway, EvidenceRow } from "../domain/evidence_client";
+import type {
+  ExecutionRecord,
+  ExecutionsGateway,
+} from "../domain/executions_client";
+import type { InboxGateway, InboxRow } from "../domain/inbox_client";
+import { ExecutionDetail } from "./ExecutionDetail";
 
 // Workbench (Round 3, 3a+3b): one list on the left, a timeline in
 // the middle, an on-demand file preview on the right. Navigation
@@ -93,10 +106,20 @@ export interface WorkbenchViewProps {
   chatRecords: ChatRecordsGateway;
   streams: StreamGateway;
   onNavigate: (tab: "tasks" | "loops" | "files") => void;
+  inbox?: InboxGateway | null;
+  executions?: ExecutionsGateway | null;
+  effects?: EffectsGateway | null;
+  evidence?: EvidenceGateway | null;
+  assignments?: AssignmentsGateway | null;
 }
 
 export function WorkbenchView(props: WorkbenchViewProps) {
   const { sessions, tasks, loops, agent, files, chatRecords, streams, onNavigate } = props;
+  const inboxClient = props.inbox ?? null;
+  const executionsClient = props.executions ?? null;
+  const effectsClient = props.effects ?? null;
+  const evidenceClient = props.evidence ?? null;
+  const assignmentsClient = props.assignments ?? null;
   const [items, setItems] = useState<WorkItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -142,6 +165,66 @@ export function WorkbenchView(props: WorkbenchViewProps) {
   const [streamNotice, setStreamNotice] = useState("");
   const [streamBusy, setStreamBusy] = useState(false);
   const selectionToken = useRef(0);
+  // P0-R R5 Inbox section: open rows only, from the gateway;
+  // no push, no reminder mechanism beyond the open count.
+  // Clicking a row expands the same ExecutionDetail the Tasks
+  // view uses, inline — never a new page.
+  const [inboxRows, setInboxRows] = useState<InboxRow[]>([]);
+  const [inboxError, setInboxError] = useState("");
+  const [inboxNotice, setInboxNotice] = useState("");
+  const [expandedExecutionId, setExpandedExecutionId] = useState<string | null>(null);
+  const [inboxExecutions, setInboxExecutions] = useState<ExecutionRecord[]>([]);
+  const [inboxEffects, setInboxEffects] = useState<EffectRecord[]>([]);
+  const [inboxEvidence, setInboxEvidence] = useState<EvidenceRow[]>([]);
+
+  async function refreshInbox() {
+    if (!inboxClient) return;
+    setInboxError("");
+    try {
+      setInboxRows(await inboxClient.list(undefined, true));
+    } catch (e) {
+      setInboxError(errText(e));
+    }
+  }
+
+  async function expandInboxRow(row: InboxRow) {
+    if (!row.executionId) {
+      setExpandedExecutionId(null);
+      setInboxNotice("该待办未关联执行记录，无法展开详情。");
+      return;
+    }
+    setInboxNotice("");
+    const id = row.executionId;
+    if (expandedExecutionId === id) {
+      setExpandedExecutionId(null);
+      return;
+    }
+    setExpandedExecutionId(id);
+    try {
+      const [allExecutions, allEffects, allEvidence] = await Promise.all([
+        executionsClient ? executionsClient.list() : Promise.resolve([] as ExecutionRecord[]),
+        effectsClient ? effectsClient.list() : Promise.resolve([] as EffectRecord[]),
+        evidenceClient ? evidenceClient.list() : Promise.resolve([] as EvidenceRow[]),
+      ]);
+      setInboxExecutions(allExecutions);
+      setInboxEffects(allEffects);
+      setInboxEvidence(allEvidence);
+    } catch (e) {
+      setInboxError(errText(e));
+    }
+  }
+
+  async function ackInboxRow(row: InboxRow) {
+    if (!inboxClient) return;
+    setInboxError("");
+    try {
+      await inboxClient.ack(row.inboxId);
+      setInboxNotice(`已确认待办 ${row.inboxId}。`);
+      await refreshInbox();
+    } catch (e) {
+      setInboxError(errText(e));
+    }
+  }
 
   // 详情查询与显式操作共用同一快照更新列表，避免已执行项仍被标为待审批。
   function updateLoop(snapshot: LoopSnapshot) {
@@ -281,6 +364,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
   useEffect(() => {
     void refreshList();
     void refreshUnread();
+    void refreshInbox();
     // Mount only: refreshes come from explicit actions below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1028,6 +1112,58 @@ export function WorkbenchView(props: WorkbenchViewProps) {
           </div>
         )}
         {previewError && <p className="error" role="alert">{previewError}</p>}
+      </div>
+      <div>
+        <h3>Inbox（待办）</h3>
+        {!inboxClient && (
+          <p className="note">待办客户端尚未接入：待 App 接线传入客户端后，这里显示未关闭的待办（含 verification_mismatch 类）。</p>
+        )}
+        {inboxClient && (
+          <div>
+            <p>未关闭待办 {inboxRows.length} 条。点一行在行内展开执行详情，不跳新页面。</p>
+            <button type="button" onClick={() => void refreshInbox()}>
+              刷新待办
+            </button>
+            {inboxError && <p className="error" role="alert">{inboxError}</p>}
+            {inboxNotice && <p className="note">{inboxNotice}</p>}
+            {inboxRows.length === 0 && <p className="empty">暂无未关闭待办。</p>}
+            <ul>
+              {inboxRows.map((row) => {
+                const expanded = expandedExecutionId !== null
+                  && row.executionId !== null
+                  && expandedExecutionId === row.executionId;
+                const execution = inboxExecutions.find((e) => e.executionId === row.executionId);
+                return (
+                  <li key={row.inboxId}>
+                    <button type="button" onClick={() => void expandInboxRow(row)}>
+                      {row.inboxId} · {row.kind}
+                      {row.executionId ? ` · 执行 ${row.executionId}` : ""}
+                      {row.effectId ? ` · Effect ${row.effectId}` : ""}
+                    </button>{" "}
+                    <button type="button" onClick={() => void ackInboxRow(row)}>
+                      确认
+                    </button>
+                    {expanded && execution && (
+                      <ExecutionDetail
+                        execution={execution}
+                        effects={inboxEffects.filter((e) => e.executionId === execution.executionId)}
+                        evidence={inboxEvidence}
+                        effectsClient={effectsClient}
+                        executionsClient={executionsClient}
+                        assignmentsClient={assignmentsClient}
+                        onRefresh={() => void refreshInbox()}
+                        onError={(message) => setInboxError(message)}
+                      />
+                    )}
+                    {expanded && !execution && (
+                      <p className="note">该执行记录尚未载入：点“刷新待办”后重试，或到任务页查看。</p>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
       </div>
     </section>
   );

@@ -376,19 +376,19 @@ pub struct AppState {
     actions: Arc<Mutex<HashMap<String, DeviceActionRecord>>>,
     next_action_id: Arc<Mutex<u64>>,
     actions_path: Option<PathBuf>,
-    device_backend: Arc<dyn ReminderBackend>,
+    pub(crate) device_backend: Arc<dyn ReminderBackend>,
     device_reminder_pin: Option<String>,
     notes: Arc<Mutex<Vec<MockNote>>>,
     messages: Arc<Mutex<Vec<MockMessage>>>,
     next_note_id: Arc<Mutex<u64>>,
     next_message_id: Arc<Mutex<u64>>,
-    connector_accounts: Arc<Mutex<HashMap<String, ConnectorAccount>>>,
+    pub(crate) connector_accounts: Arc<Mutex<HashMap<String, ConnectorAccount>>>,
     next_account_id: Arc<Mutex<u64>>,
-    connector_connections: Arc<Mutex<HashMap<String, bool>>>,
+    pub(crate) connector_connections: Arc<Mutex<HashMap<String, bool>>>,
     connector_state_path: Option<PathBuf>,
-    vault_slots: Arc<Mutex<HashMap<String, CredentialSlot>>>,
-    vault_catalog: Arc<Mutex<HashMap<String, CatalogEntry>>>,
-    vault_custom: Arc<Mutex<HashMap<String, CustomConnectorDef>>>,
+    pub(crate) vault_slots: Arc<Mutex<HashMap<String, CredentialSlot>>>,
+    pub(crate) vault_catalog: Arc<Mutex<HashMap<String, CatalogEntry>>>,
+    pub(crate) vault_custom: Arc<Mutex<HashMap<String, CustomConnectorDef>>>,
     vault_tickets: Arc<Mutex<HashMap<String, CaptureTicket>>>,
     next_ticket_id: Arc<Mutex<u64>>,
     vault_state_path: Option<PathBuf>,
@@ -2338,9 +2338,15 @@ async fn files_export(State(state): State<AppState>, Json(req): Json<ExportReque
         // one terminal row.
         if let Some(effect) = &bound_effect {
             let _ = transition_effect(&state, &effect.effect_id, "succeeded", None, None);
+            // P0-R: the generic hook skips export rows (the
+            // target path is not on the Effect row), so the
+            // baseline is recorded here from the canonical
+            // absolute target the copy actually wrote.
+            record_export_evidence(&state, &effect.effect_id, effect.execution_id.as_deref(), &target_abs);
         } else {
             let scope = crate::operation_binding::normalize_path(&req.from).unwrap_or_default();
-            record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "export".to_string(), scope, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "succeeded".to_string() });
+            let record = record_effect(&state, NewEffect { execution_id: Some(adapter_execution(&state)), capability: "fs".to_string(), operation: "export".to_string(), scope, input_digest: Some(digest), approval_id: req.approval_id.clone(), status: "succeeded".to_string() });
+            record_export_evidence(&state, &record.effect_id, record.execution_id.as_deref(), &target_abs);
         }
         Json(serde_json::json!({"from":req.from,"to":req.to,"size_bytes":bytes})).into_response()
     }, Err(_) => { if let Some(effect) = &bound_effect { let _ = transition_effect(&state, &effect.effect_id, "failed", None, None); } (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"cannot export file"}))).into_response() } }
@@ -4187,6 +4193,10 @@ async fn connectors_accounts_unlink(
     account.unlinked = true;
     let updated = account.clone();
     persist_connector_line(&state, &ConnectorStateLine::Account(updated.clone()));
+    // P0-R: the write-time Evidence hook inside the Effect
+    // mirror re-locks the accounts map, so the guard must be
+    // released first (the borrow ends at the clone above).
+    drop(accounts);
     // Phase 2: a successful unlink mirrors into an Effect, even
     // when idempotent (the tombstone line was still appended).
     record_connector_effect(&state, "connectors", "unlink", &updated.account_id);
@@ -4439,6 +4449,9 @@ async fn vault_custom_register(
     };
     custom.insert(id, def.clone());
     persist_vault_line(&state, &VaultStateLine::CustomConnector(def.clone()));
+    // P0-R: release the guard before the Effect mirror (its
+    // write-time Evidence hook re-locks the custom map).
+    drop(custom);
     // Phase 2: a successful custom-connector registration mirrors
     // into an Effect.
     record_connector_effect(&state, "custom-connectors", "register", &def.id);
@@ -4477,6 +4490,9 @@ async fn vault_custom_delete(
     def.deleted = true;
     let updated = def.clone();
     persist_vault_line(&state, &VaultStateLine::CustomConnector(updated.clone()));
+    // P0-R: release the guard before the Effect mirror (its
+    // write-time Evidence hook re-locks the custom map).
+    drop(custom);
     // Phase 2: a successful custom-connector delete mirrors into
     // an Effect.
     record_connector_effect(&state, "custom-connectors", "delete", &req.id);
@@ -4565,6 +4581,9 @@ async fn vault_credentials_delete(
     slot.deleted = true;
     let updated = slot.clone();
     persist_vault_line(&state, &VaultStateLine::Credential(updated.clone()));
+    // P0-R: release the guard before the Effect mirror (its
+    // write-time Evidence hook re-locks the slots map).
+    drop(slots);
     // Phase 2: a successful credential delete (real backend
     // erasure + tombstone) mirrors into an Effect.
     record_connector_effect(&state, "credentials", "delete", &req.handle);
@@ -4597,6 +4616,9 @@ async fn vault_credentials_capture(
     slot.updated_ms = now_ms();
     let updated = slot.clone();
     persist_vault_line(&state, &VaultStateLine::Credential(updated.clone()));
+    // P0-R: release the guard before the Effect mirror (its
+    // write-time Evidence hook re-locks the slots map).
+    drop(slots);
     // Phase 2: a successful credential capture (secret rotation)
     // mirrors into an Effect; the secret itself never does.
     record_connector_effect(&state, "credentials", "capture", &req.handle);
@@ -4768,6 +4790,9 @@ async fn vault_catalog_update(
     entry.updated_ms = now_ms();
     let updated = entry.clone();
     persist_vault_line(&state, &VaultStateLine::Catalog(updated.clone()));
+    // P0-R: release the guard before the Effect mirror (its
+    // write-time Evidence hook re-locks the catalog map).
+    drop(catalog);
     // Phase 2: a successful catalog update mirrors into an Effect.
     record_connector_effect(&state, "catalog", "update", &req.id);
     Json(catalog_view(&updated)).into_response()
@@ -4792,6 +4817,9 @@ async fn vault_catalog_delete(
     entry.deleted = true;
     let updated = entry.clone();
     persist_vault_line(&state, &VaultStateLine::Catalog(updated.clone()));
+    // P0-R: release the guard before the Effect mirror (its
+    // write-time Evidence hook re-locks the catalog map).
+    drop(catalog);
     // Phase 2: a successful catalog delete mirrors into an Effect.
     record_connector_effect(&state, "catalog", "delete", &req.id);
     Json(catalog_view(&updated)).into_response()
@@ -7641,6 +7669,65 @@ pub(crate) fn persist_effect(state: &AppState, record: &EffectFileRecord) {
     }
 }
 
+/// P0-R: write one write-time Evidence row for a just-succeeded
+/// Effect, best-effort. Evidence is derived data: it never fails
+/// the effect write, never marks SQLite broken, and never runs
+/// without a configured SQLite connection (the events-table
+/// precedent: in pure JSONL mode Evidence simply does not
+/// exist). Device rows are excluded here (their mirror comes
+/// from reconcile, not from the write); export rows are
+/// excluded (the target path is not on the Effect row — the
+/// export sites call `record_export_evidence` explicitly).
+/// Observation failure means no row, never a fabricated row.
+pub(crate) fn record_write_time_evidence(state: &AppState, record: &EffectFileRecord) {
+    if record.status != "succeeded" {
+        return;
+    }
+    if matches!(record.capability.as_str(), "device" | "devices") {
+        return;
+    }
+    if record.capability == "fs" && record.operation == "export" {
+        return;
+    }
+    let Some(draft) = crate::evidence::write_time_observation(state, record) else {
+        return;
+    };
+    record_evidence_best_effort(state, &draft);
+}
+
+/// Best-effort Evidence insert: warn-only, never
+/// broken-marking, never counted as a shadow failure (Evidence
+/// is derived, not authoritative state). No-op without a
+/// configured SQLite connection.
+pub(crate) fn record_evidence_best_effort(state: &AppState, draft: &crate::evidence::OwnedEvidence) {
+    let Some(sqlite) = &state.sqlite else {
+        return;
+    };
+    let Ok(mut conn) = sqlite.lock() else {
+        eprintln!("warning: evidence insert skipped (sqlite lock)");
+        return;
+    };
+    if let Err(detail) = crate::sqlite_store::insert_evidence(&mut conn, &draft.as_draft()) {
+        eprintln!("warning: evidence insert failed: {detail}");
+    }
+}
+
+/// P0-R: write-time Evidence for an export success, from the
+/// absolute target path the Effect row does not carry.
+/// Best-effort, same contract as `record_evidence_best_effort`.
+pub(crate) fn record_export_evidence(
+    state: &AppState,
+    effect_id: &str,
+    execution_id: Option<&str>,
+    target_abs: &std::path::Path,
+) {
+    let Some(draft) = crate::evidence::export_write_time(state, effect_id, execution_id, target_abs)
+    else {
+        return;
+    };
+    record_evidence_best_effort(state, &draft);
+}
+
 /// Phase 2 dual-write entry: append one Effect line mirroring a
 /// durable side effect, and keep it in the in-memory map for the
 /// read-only `/effects` routes. Best-effort like every other JSONL
@@ -7685,6 +7772,9 @@ pub(crate) fn record_effect(state: &AppState, effect: NewEffect) -> EffectFileRe
     };
     state.effects.lock().expect("effect lock").insert(record.effect_id.clone(), record.clone());
     persist_effect(state, &record);
+    // P0-R: a directly recorded `succeeded` row gets its
+    // write-time baseline now (planned/failed rows: no-op).
+    record_write_time_evidence(state, &record);
     record
 }
 
@@ -7733,6 +7823,9 @@ pub(crate) fn transition_effect(
         if state.sqlite_is_broken() {
             return Err(500);
         }
+        // P0-R: a transition to `succeeded` gets its write-time
+        // baseline now (other targets: no-op).
+        record_write_time_evidence(state, &next);
         return Ok(next);
     }
     let mut effects = state.effects.lock().expect("effect lock");
@@ -7753,6 +7846,8 @@ pub(crate) fn transition_effect(
     effects.insert(next.effect_id.clone(), next.clone());
     drop(effects);
     persist_effect(state, &next);
+    // P0-R: same write-time baseline as the SQLite branch.
+    record_write_time_evidence(state, &next);
     Ok(next)
 }
 
@@ -7992,11 +8087,8 @@ pub(crate) fn device_effect_digest(reminder_id: &str, target_completed: bool) ->
 /// P0-C reconciliation driver, shared by `/effects/reconcile`
 /// and `actions_refresh`. The caller guarantees the Effect is
 /// `unknown` and hands over its device action. Returns the new
-/// Effect row, or an error string: `effect_no_readback` when
-/// no device action backs the Effect (fs/task/connector/loop
-/// Effects have no readback method and are left `unknown` by
-/// design, never invented), `effect_action_mismatch` when the
-/// backing action is no longer `unknown`.
+/// Effect row, or an error string: `effect_action_mismatch`
+/// when the backing action is no longer `unknown`.
 /// Hard constraint, mirroring the device rule: a failed or
 /// inconclusive re-check never writes `unknown` as `failed`.
 /// Only a conclusive proof lands on `reconciled`: a state match
@@ -8004,6 +8096,10 @@ pub(crate) fn device_effect_digest(reminder_id: &str, target_completed: bool) ->
 /// cannot land on a reminder that no longer exists). Anything
 /// else (query error, unchanged state) returns the Effect to
 /// `unknown` via `reconciling -> unknown`.
+/// P0-R: a conclusive device verdict also writes its reconcile
+/// Evidence mirror (best-effort, derived data): `verified` for
+/// a completed re-check, `mismatch` for a failed one.
+/// Inconclusive re-checks write no mirror.
 pub(crate) fn reconcile_device_effect(
     state: &AppState,
     effect: &EffectFileRecord,
@@ -8032,20 +8128,39 @@ pub(crate) fn reconcile_device_effect_with_outcome(
     outcome: ResolveOutcome,
 ) -> Result<EffectFileRecord, String> {
     match outcome {
-        ResolveOutcome::Completed(_) => {
+        ResolveOutcome::Completed(reminder) => {
             let reconciliation = Reconciliation {
                 result: "completed".to_string(),
                 checked_ms: crate::effect_store::now_ms(),
                 detail: None,
             };
-            transition_effect(
+            let record = transition_effect(
                 state,
                 &effect.effect_id,
                 "reconciled",
                 Some(reconciliation),
                 None,
             )
-            .map_err(|_| "effect_transition_failed".to_string())
+            .map_err(|_| "effect_transition_failed".to_string())?;
+            // P0-R reconcile mirror: the completed re-check is
+            // observed as a verified Evidence row (best-effort).
+            let draft = crate::evidence::OwnedEvidence {
+                effect_id: effect.effect_id.clone(),
+                execution_id: effect.execution_id.clone(),
+                source: "reconcile".to_string(),
+                verdict: "verified".to_string(),
+                reason: "record_match".to_string(),
+                observed_json: serde_json::to_string(&serde_json::json!({
+                    "kind": "reminder",
+                    "completed": reminder.completed,
+                }))
+                .unwrap_or_else(|_| "{}".to_string()),
+                checked_ms: crate::effect_store::now_ms() as i64,
+                origin_device_id: state.origin_device_id.clone(),
+                schema_version: 1,
+            };
+            record_evidence_best_effort(state, &draft);
+            Ok(record)
         }
         ResolveOutcome::Failed(e) => {
             let reconciliation = Reconciliation {
@@ -8053,14 +8168,30 @@ pub(crate) fn reconcile_device_effect_with_outcome(
                 checked_ms: crate::effect_store::now_ms(),
                 detail: Some(e.to_string()),
             };
-            transition_effect(
+            let record = transition_effect(
                 state,
                 &effect.effect_id,
                 "reconciled",
                 Some(reconciliation),
                 None,
             )
-            .map_err(|_| "effect_transition_failed".to_string())
+            .map_err(|_| "effect_transition_failed".to_string())?;
+            // P0-R reconcile mirror: the missing target is
+            // observed as a mismatch Evidence row (best-effort).
+            let draft = crate::evidence::OwnedEvidence {
+                effect_id: effect.effect_id.clone(),
+                execution_id: effect.execution_id.clone(),
+                source: "reconcile".to_string(),
+                verdict: "mismatch".to_string(),
+                reason: "target_missing".to_string(),
+                observed_json: serde_json::to_string(&serde_json::json!({"kind": "absent"}))
+                    .unwrap_or_else(|_| "{}".to_string()),
+                checked_ms: crate::effect_store::now_ms() as i64,
+                origin_device_id: state.origin_device_id.clone(),
+                schema_version: 1,
+            };
+            record_evidence_best_effort(state, &draft);
+            Ok(record)
         }
         ResolveOutcome::StillUnknown(maybe_err) => {
             // Inconclusive: back to unknown, no reconciliation
@@ -8068,6 +8199,168 @@ pub(crate) fn reconcile_device_effect_with_outcome(
             // masquerade as a verdict). The detail, if any, is
             // carried on the action record by the caller.
             let _ = maybe_err;
+            transition_effect(state, &effect.effect_id, "unknown", None, None)
+                .map_err(|_| "effect_transition_failed".to_string())
+        }
+    }
+}
+
+/// P0-R generalized reconciliation driver, used by
+/// `/effects/reconcile`. First half is the device path,
+/// unchanged: status checks, move to `reconciling`, conclusion
+/// write-back, failure constraints. Every other class goes
+/// through the observation dispatch in `evidence.rs`:
+/// - `unknown` and `started` are accepted; a `started` row
+///   first crosses the legal edge `started -> unknown`.
+/// - a landed observation reconciles with `completed` and a
+///   verified mirror; a device-reminder-missing observation
+///   reconciles with `failed` and a mismatch mirror; an
+///   inconclusive observation returns the row to `unknown`
+///   with no mirror and no conclusion.
+/// - rows with no observation method answer
+///   `effect_no_readback`; rows without the information an
+///   observation needs answer `evidence_missing`.
+///
+/// The driver never rewrites a terminal state and never
+/// invents a method for a class that has none.
+pub(crate) fn reconcile_effect(
+    state: &AppState,
+    effect: &EffectFileRecord,
+) -> Result<EffectFileRecord, String> {
+    if effect.status != "unknown" && effect.status != "started" {
+        return Err("effect_not_unknown".to_string());
+    }
+    // Validate before any mutation, so a 409 leaves the row
+    // exactly as it was (a started row that fails validation
+    // stays started, not silently crossed to unknown).
+    let device_action = if matches!(effect.capability.as_str(), "device" | "devices") {
+        let action = {
+            let actions = state.actions.lock().expect("action lock");
+            actions
+                .values()
+                .find(|a| {
+                    a.effect_id.as_deref() == Some(&effect.effect_id)
+                        || (effect.execution_id.is_some()
+                            && a.execution_id == effect.execution_id)
+                })
+                .cloned()
+        };
+        let Some(action) = action else {
+            return Err("effect_no_readback".to_string());
+        };
+        if action.status != "unknown" {
+            return Err("effect_action_mismatch".to_string());
+        }
+        Some(action)
+    } else {
+        None
+    };
+    let outcome = if device_action.is_none() {
+        // Write-time baseline for classes that need it (export,
+        // rename). Absent in JSONL mode and for legacy rows; a
+        // failed lookup degrades to the legacy path (which stays
+        // honest: it can only verify, never falsely mismatch).
+        let write_evidence = match &state.sqlite {
+            Some(sqlite) => {
+                let conn = sqlite.lock().expect("sqlite lock");
+                match crate::sqlite_store::latest_write_evidence_for_effect(&conn, &effect.effect_id)
+                {
+                    Ok(row) => row,
+                    Err(detail) => {
+                        eprintln!("warning: evidence lookup failed: {detail}");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        match crate::evidence::reconcile_outcome(state, effect, write_evidence.as_ref()) {
+            Ok(outcome) => Some(outcome),
+            Err(crate::evidence::ObserveError::NoMethod) => {
+                return Err("effect_no_readback".to_string());
+            }
+            Err(crate::evidence::ObserveError::MissingEvidence) => {
+                return Err("evidence_missing".to_string());
+            }
+        }
+    } else {
+        None
+    };
+    // A `started` row first crosses the legal edge
+    // `started -> unknown`, then follows the normal driver.
+    let mut effect = effect.clone();
+    if effect.status == "started" {
+        effect = transition_effect(state, &effect.effect_id, "unknown", None, None)
+            .map_err(|_| "effect_transition_failed".to_string())?;
+    }
+    if let Some(action) = device_action {
+        return reconcile_device_effect(state, &effect, &action);
+    }
+    let outcome = outcome.expect("non-device reconcile has an outcome");
+    match outcome {
+        crate::evidence::ReconcileOutcome::Landed { observed, reason } => {
+            transition_effect(state, &effect.effect_id, "reconciling", None, None)
+                .map_err(|_| "effect_transition_failed".to_string())?;
+            let reconciliation = Reconciliation {
+                result: "completed".to_string(),
+                checked_ms: crate::effect_store::now_ms(),
+                detail: None,
+            };
+            let record = transition_effect(
+                state,
+                &effect.effect_id,
+                "reconciled",
+                Some(reconciliation),
+                None,
+            )
+            .map_err(|_| "effect_transition_failed".to_string())?;
+            let draft = crate::evidence::OwnedEvidence {
+                effect_id: effect.effect_id.clone(),
+                execution_id: effect.execution_id.clone(),
+                source: "reconcile".to_string(),
+                verdict: "verified".to_string(),
+                reason: reason.to_string(),
+                observed_json: serde_json::to_string(&observed).unwrap_or_else(|_| "{}".to_string()),
+                checked_ms: crate::effect_store::now_ms() as i64,
+                origin_device_id: state.origin_device_id.clone(),
+                schema_version: 1,
+            };
+            record_evidence_best_effort(state, &draft);
+            Ok(record)
+        }
+        crate::evidence::ReconcileOutcome::NotLanded { observed, reason } => {
+            transition_effect(state, &effect.effect_id, "reconciling", None, None)
+                .map_err(|_| "effect_transition_failed".to_string())?;
+            let reconciliation = Reconciliation {
+                result: "failed".to_string(),
+                checked_ms: crate::effect_store::now_ms(),
+                detail: None,
+            };
+            let record = transition_effect(
+                state,
+                &effect.effect_id,
+                "reconciled",
+                Some(reconciliation),
+                None,
+            )
+            .map_err(|_| "effect_transition_failed".to_string())?;
+            let draft = crate::evidence::OwnedEvidence {
+                effect_id: effect.effect_id.clone(),
+                execution_id: effect.execution_id.clone(),
+                source: "reconcile".to_string(),
+                verdict: "mismatch".to_string(),
+                reason: reason.to_string(),
+                observed_json: serde_json::to_string(&observed).unwrap_or_else(|_| "{}".to_string()),
+                checked_ms: crate::effect_store::now_ms() as i64,
+                origin_device_id: state.origin_device_id.clone(),
+                schema_version: 1,
+            };
+            record_evidence_best_effort(state, &draft);
+            Ok(record)
+        }
+        crate::evidence::ReconcileOutcome::Inconclusive { .. } => {
+            transition_effect(state, &effect.effect_id, "reconciling", None, None)
+                .map_err(|_| "effect_transition_failed".to_string())?;
             transition_effect(state, &effect.effect_id, "unknown", None, None)
                 .map_err(|_| "effect_transition_failed".to_string())
         }
@@ -8450,21 +8743,26 @@ async fn tasks_execute(
         )
             .into_response();
     }
-    let mut tasks = state.tasks.lock().expect("task lock");
-    if let Some(current) = tasks.get_mut(&req.task_id) {
+    // P0-R: the tasks guard must be released before the Effect
+    // transition below: its write-time Evidence hook re-locks
+    // the tasks map to read the completed record.
+    let updated = {
+        let mut tasks = state.tasks.lock().expect("task lock");
+        let Some(current) = tasks.get_mut(&req.task_id) else {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" }))).into_response();
+        };
         current.status = "completed".to_string();
         current.error = None;
-        let updated = current.clone();
-        persist_task(&state, &updated);
-        // P0-C: a successful task write drives the planned
-        // Effect to `succeeded`. The digest is the artifact
-        // write digest the approval gate consumed; the
-        // operation is the task execution, not the underlying
-        // file write.
-        let _ = transition_effect(&state, &task_effect.effect_id, "succeeded", None, None);
-        return Json(updated).into_response();
-    }
-    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" }))).into_response()
+        current.clone()
+    };
+    persist_task(&state, &updated);
+    // P0-C: a successful task write drives the planned
+    // Effect to `succeeded`. The digest is the artifact
+    // write digest the approval gate consumed; the
+    // operation is the task execution, not the underlying
+    // file write.
+    let _ = transition_effect(&state, &task_effect.effect_id, "succeeded", None, None);
+    Json(updated).into_response()
 }
 
 async fn tasks_reject(
@@ -9009,14 +9307,18 @@ struct EffectReconcileDto {
     effect_id: String,
 }
 
-/// P0-C: re-check an `unknown` Effect. Only device Effects have
-/// a readback method (their backing action re-queries the
-/// reminder backend); every other Effect type answers 409
-/// `effect_no_readback` and stays `unknown` — no re-check
-/// method is invented for it. A conclusive re-check lands on
-/// `reconciled` with its conclusion; an inconclusive one
-/// returns the Effect to `unknown`. The backing action record
-/// is updated to match, when one exists.
+/// P0-R: re-check an `unknown` or `started` Effect. Device
+/// Effects keep their action-based re-check; every other class
+/// goes through the observation dispatch: a landed observation
+/// reconciles with `completed`, a device-reminder-missing one
+/// with `failed`, an inconclusive one returns the row to
+/// `unknown`. Rows with no observation method answer 409
+/// `effect_no_readback`; rows without the information an
+/// observation needs answer 409 `evidence_missing`. A
+/// conclusive re-check lands on `reconciled` with its
+/// conclusion; an inconclusive one returns the Effect to
+/// `unknown`. The backing action record is updated to match,
+/// when one exists.
 async fn effects_reconcile(
     State(state): State<AppState>,
     Json(req): Json<EffectReconcileDto>,
@@ -9025,46 +9327,16 @@ async fn effects_reconcile(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown effect" })))
             .into_response();
     };
-    if effect.status != "unknown" {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "effect_not_unknown", "status": effect.status })),
-        )
-            .into_response();
-    }
-    // Backing device action: by the P0-C effect id, or (for
-    // pre-P0-C device Effects) by the shared execution id.
-    let action = {
-        let actions = state.actions.lock().expect("action lock");
-        actions
-            .values()
-            .find(|a| {
-                a.effect_id.as_deref() == Some(&effect.effect_id)
-                    || (effect.execution_id.is_some()
-                        && a.execution_id == effect.execution_id)
-            })
-            .cloned()
-    };
-    let Some(action) = action else {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "effect_no_readback", "effect_id": effect.effect_id })),
-        )
-            .into_response();
-    };
-    if action.status != "unknown" {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "effect_action_mismatch", "action_status": action.status })),
-        )
-            .into_response();
-    }
-    match reconcile_device_effect(&state, &effect, &action) {
+    match reconcile_effect(&state, &effect) {
         Ok(record) => {
             // Mirror the verdict onto the action record, as
-            // actions_refresh does.
+            // actions_refresh does (device class only; other
+            // classes have no backing action to update).
             let mut actions = state.actions.lock().expect("action lock");
-            if let Some(current) = actions.get_mut(&action.action_id) {
+            if let Some(current) = actions.values_mut().find(|a| {
+                a.effect_id.as_deref() == Some(&record.effect_id)
+                    || (record.execution_id.is_some() && a.execution_id == record.execution_id)
+            }) {
                 match record.reconciliation.as_ref().map(|r| r.result.as_str()) {
                     Some("completed") => {
                         current.status = "completed".to_string();
@@ -9080,15 +9352,194 @@ async fn effects_reconcile(
                     _ => {}
                 }
                 let updated = current.clone();
+                drop(actions);
                 persist_action(&state, &updated);
             }
             Json(record).into_response()
         }
-        Err(error) => (
+        Err(error) => {
+            // Preserve the P0-C shape for the status gate:
+            // `effect_not_unknown` carries the row's status.
+            let mut body = serde_json::json!({ "error": error });
+            if error == "effect_not_unknown" {
+                body["status"] = serde_json::json!(effect.status);
+            }
+            (StatusCode::CONFLICT, Json(body)).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EffectVerifyDto {
+    effect_id: String,
+}
+
+/// P0-R: verify a `succeeded` Effect against the world, without
+/// consuming any approval, writing any idempotency key, or
+/// changing the Effect row. The response is the new Evidence
+/// row. Non-`succeeded` rows answer 409 `effect_not_verifiable`
+/// (with the row's status); rows without the information an
+/// observation needs answer 409 `evidence_missing`; rows with
+/// no observation method answer 409 `effect_no_readback`.
+/// A `mismatch` verdict opens a `verification_mismatch` Inbox
+/// row (deduped); a later `verified` verdict auto-closes it.
+/// A mismatch never enqueues Outbox. Evidence lives only in
+/// SQLite: without a configured database this answers 500.
+async fn effects_verify(
+    State(state): State<AppState>,
+    Json(req): Json<EffectVerifyDto>,
+) -> impl IntoResponse {
+    let Some(effect) = effect_by_id(&state, &req.effect_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown effect" })))
+            .into_response();
+    };
+    if effect.status != "succeeded" {
+        return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": error })),
+            Json(serde_json::json!({ "error": "effect_not_verifiable", "status": effect.status })),
+        )
+            .into_response();
+    }
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite && state.sqlite_mode() != StateBackend::Shadow {
+        return sqlite_not_configured();
+    }
+    let outcome = if matches!(effect.capability.as_str(), "device" | "devices") {
+        // The backing action carries the target flag the
+        // Effect row does not.
+        let action = {
+            let actions = state.actions.lock().expect("action lock");
+            actions
+                .values()
+                .find(|a| {
+                    a.effect_id.as_deref() == Some(&effect.effect_id)
+                        || (effect.execution_id.is_some()
+                            && a.execution_id == effect.execution_id)
+                })
+                .cloned()
+        };
+        let Some(action) = action else {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "evidence_missing" })),
+            )
+                .into_response();
+        };
+        crate::evidence::device_verify_outcome(
+            &state,
+            action.target_completed,
+            &action.reminder_id,
+        )
+    } else {
+        let write_evidence = {
+            let conn = sqlite.lock().expect("sqlite lock");
+            match crate::sqlite_store::latest_write_evidence_for_effect(&conn, &effect.effect_id) {
+                Ok(row) => row,
+                Err(detail) => {
+                    eprintln!("warning: evidence lookup failed: {detail}");
+                    None
+                }
+            }
+        };
+        match crate::evidence::verify_outcome(&state, &effect, write_evidence.as_ref()) {
+            Ok(outcome) => outcome,
+            Err(crate::evidence::ObserveError::NoMethod) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "effect_no_readback" })),
+                )
+                    .into_response();
+            }
+            Err(crate::evidence::ObserveError::MissingEvidence) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "evidence_missing" })),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let (verdict, reason, observed) = match outcome {
+        crate::evidence::VerifyOutcome::Verified { observed, reason } => {
+            ("verified", reason, observed)
+        }
+        crate::evidence::VerifyOutcome::Mismatch { observed, reason } => {
+            ("mismatch", reason, observed)
+        }
+        crate::evidence::VerifyOutcome::Inconclusive { observed, reason } => {
+            ("inconclusive", reason, observed)
+        }
+    };
+    let draft = crate::evidence::OwnedEvidence {
+        effect_id: effect.effect_id.clone(),
+        execution_id: effect.execution_id.clone(),
+        source: "verify".to_string(),
+        verdict: verdict.to_string(),
+        reason: reason.to_string(),
+        observed_json: serde_json::to_string(&observed).unwrap_or_else(|_| "{}".to_string()),
+        checked_ms: crate::effect_store::now_ms() as i64,
+        origin_device_id: state.origin_device_id.clone(),
+        schema_version: 1,
+    };
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    match crate::sqlite_store::record_verification(&mut conn, &draft.as_draft()) {
+        Ok(row) => Json(row).into_response(),
+        Err(_) => sqlite_error_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EvidenceIdQuery {
+    evidence_id: String,
+}
+
+/// P0-R: list Evidence rows (bare JSON array, seq order, like
+/// `/effects/list`). Same SQLite gate as the Inbox routes.
+async fn evidence_list(State(state): State<AppState>) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite && state.sqlite_mode() != StateBackend::Shadow {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    match crate::sqlite_store::list_evidence(&conn) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(_) => sqlite_error_response(),
+    }
+}
+
+/// P0-R: get one Evidence row by id, or 404 `unknown evidence`.
+async fn evidence_get(
+    State(state): State<AppState>,
+    Query(query): Query<EvidenceIdQuery>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite && state.sqlite_mode() != StateBackend::Shadow {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    match crate::sqlite_store::get_evidence(&conn, &query.evidence_id) {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown evidence" })),
         )
             .into_response(),
+        Err(_) => sqlite_error_response(),
     }
 }
 
@@ -10311,6 +10762,9 @@ pub fn app(state: AppState) -> Router {
         .route("/effects/get", get(effects_get))
         .route("/effects/transition", post(effects_transition))
         .route("/effects/reconcile", post(effects_reconcile))
+        .route("/effects/verify", post(effects_verify))
+        .route("/evidence/list", get(evidence_list))
+        .route("/evidence/get", get(evidence_get))
         .route("/inbox/list", get(inbox_list))
         .route("/inbox/get", get(inbox_get))
         .route("/inbox/ack", post(inbox_ack))

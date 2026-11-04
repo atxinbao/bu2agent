@@ -2,6 +2,17 @@ import { useEffect, useRef, useState } from "react";
 import type { AgentGateway } from "../domain/agent_client";
 import { isTerminal, type LoopGateway, type LoopSnapshot, type LoopStatus } from "../domain/loop_client";
 import { LoopReminderApproval } from "./LoopReminderApproval";
+// P0-R R5: optional props (App.tsx still needs to pass them —
+// outside this task's file scope); taken as props so App.tsx's
+// transport choice applies unchanged. Read-only here: loop
+// start/stop and approval flow are untouched.
+import type { EffectRecord, EffectsGateway } from "../domain/effects_client";
+import type { EvidenceGateway, EvidenceRow } from "../domain/evidence_client";
+import type {
+  ExecutionRecord,
+  ExecutionsGateway,
+} from "../domain/executions_client";
+import { ExecutionDetail } from "./ExecutionDetail";
 
 const LAST_ID = "bu2agent.lastLoopId";
 const labels: Record<LoopStatus, string> = {
@@ -18,13 +29,62 @@ function errorText(e: unknown): string {
   return `响应未确认：${text}。请先查询状态，不要重复发起或批准。`;
 }
 
-export function LoopsView({ loops, agent }: { loops: LoopGateway; agent: AgentGateway }) {
+export function LoopsView({
+  loops,
+  agent,
+  executions: executionsClient = null,
+  effects: effectsClient = null,
+  evidence: evidenceClient = null,
+}: {
+  loops: LoopGateway;
+  agent: AgentGateway;
+  executions?: ExecutionsGateway | null;
+  effects?: EffectsGateway | null;
+  evidence?: EvidenceGateway | null;
+}) {
   const [prompt, setPrompt] = useState("");
   const [maxCalls, setMaxCalls] = useState(5);
   const [budgetSeconds, setBudgetSeconds] = useState(120);
   const [lookupId, setLookupId] = useState(savedId);
   const [current, setCurrent] = useState<LoopSnapshot | null>(null);
   const [busy, setBusy] = useState(false);
+  // P0-R R5: this loop's Executions, filtered client-side by
+  // loop_id (the list route takes no filter), plus their
+  // Effects and latest Evidence. Same gateway rows the Tasks
+  // and Workbench views read.
+  const [loopExecutions, setLoopExecutions] = useState<ExecutionRecord[]>([]);
+  const [loopEffects, setLoopEffects] = useState<EffectRecord[]>([]);
+  const [loopEvidence, setLoopEvidence] = useState<EvidenceRow[]>([]);
+  const [loopEffectError, setLoopEffectError] = useState("");
+
+  async function refreshLoopEffects(loopId: string) {
+    if (!executionsClient) return;
+    setLoopEffectError("");
+    try {
+      const [allExecutions, allEffects, allEvidence] = await Promise.all([
+        executionsClient.list(),
+        effectsClient ? effectsClient.list() : Promise.resolve([] as EffectRecord[]),
+        evidenceClient ? evidenceClient.list() : Promise.resolve([] as EvidenceRow[]),
+      ]);
+      const mine = allExecutions.filter((e) => e.loopId === loopId);
+      const ids = new Set(mine.map((e) => e.executionId));
+      setLoopExecutions(mine);
+      setLoopEffects(allEffects.filter((e) => e.executionId !== null && ids.has(e.executionId)));
+      setLoopEvidence(allEvidence.filter((e) => e.executionId !== null && ids.has(e.executionId)));
+    } catch (e) {
+      setLoopEffectError(errorText(e));
+    }
+  }
+
+  useEffect(() => {
+    if (current) void refreshLoopEffects(current.loop_id);
+    else {
+      setLoopExecutions([]);
+      setLoopEffects([]);
+      setLoopEvidence([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [current?.loop_id]);
   const [cancelling, setCancelling] = useState(false);
   const [error, setError] = useState("");
   const snapshot = useRef(current);
@@ -181,6 +241,30 @@ export function LoopsView({ loops, agent }: { loops: LoopGateway; agent: AgentGa
         {item.late && <p>迟到结果：{item.late.result.status}（仅归档，不回传模型、不推进循环）{item.status === "unknown" && "；原调用仍为 unknown。"}</p>}
       </li>)}</ol>
       {!!current.late_model_arrivals_ms.length && <p>迟到模型响应 {current.late_model_arrivals_ms.length} 次，仅保留到达元数据，未触发工具。</p>}
+      <h3>执行与 Effect</h3>
+      {!executionsClient && (
+        <p className="note">执行记录客户端尚未接入：待 App 接线传入客户端后，这里显示该循环的执行与 Effect 记录。</p>
+      )}
+      {executionsClient && (
+        <div>
+          <button onClick={() => { setLoopEffectError(""); void refreshLoopEffects(current.loop_id); }}>刷新执行记录</button>
+          {loopEffectError && <p className="error" role="alert">{loopEffectError}</p>}
+          {loopExecutions.length === 0 && <p className="empty">该循环暂无执行记录。</p>}
+          {loopExecutions.map((execution) => (
+            <ExecutionDetail
+              key={execution.executionId}
+              execution={execution}
+              effects={loopEffects.filter((e) => e.executionId === execution.executionId)}
+              evidence={loopEvidence}
+              effectsClient={effectsClient}
+              executionsClient={executionsClient}
+              showActions={false}
+              onRefresh={() => void refreshLoopEffects(current.loop_id)}
+              onError={(message) => setLoopEffectError(message)}
+            />
+          ))}
+        </div>
+      )}
     </>}
   </section>;
 }

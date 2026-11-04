@@ -26,6 +26,11 @@ export interface DeviceActionRecord {
   targetCompleted: boolean;
   status: string;
   detail: string | null;
+  // P0-C planned Effect for this action, null for pre-P0-C
+  // rows; the Devices Effect badge prefers this over
+  // scope matching (a reminder id can repeat across
+  // actions, an effect id cannot).
+  effectId: string | null;
 }
 
 interface ServerDeviceActionRecord {
@@ -36,6 +41,7 @@ interface ServerDeviceActionRecord {
   target_completed: boolean;
   status: string;
   detail: string | null;
+  effect_id?: string | null;
 }
 
 function toRecord(server: ServerDeviceActionRecord): DeviceActionRecord {
@@ -47,6 +53,7 @@ function toRecord(server: ServerDeviceActionRecord): DeviceActionRecord {
     targetCompleted: server.target_completed,
     status: server.status,
     detail: server.detail,
+    effectId: server.effect_id ?? null,
   };
 }
 

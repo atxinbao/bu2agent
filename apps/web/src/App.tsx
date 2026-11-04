@@ -59,6 +59,31 @@ import {
   type DeviceGateway,
 } from "./domain/device_client";
 import { InvokeDeviceClient } from "./domain/invoke_device_client";
+import {
+  EffectsClient,
+  type EffectsGateway,
+} from "./domain/effects_client";
+import { InvokeEffectsClient } from "./domain/invoke_effects_client";
+import {
+  ExecutionsClient,
+  type ExecutionsGateway,
+} from "./domain/executions_client";
+import { InvokeExecutionsClient } from "./domain/invoke_executions_client";
+import {
+  InboxClient,
+  type InboxGateway,
+} from "./domain/inbox_client";
+import { InvokeInboxClient } from "./domain/invoke_inbox_client";
+import {
+  AssignmentsClient,
+  type AssignmentsGateway,
+} from "./domain/assignments_client";
+import { InvokeAssignmentsClient } from "./domain/invoke_assignments_client";
+import {
+  EvidenceClient,
+  type EvidenceGateway,
+} from "./domain/evidence_client";
+import { InvokeEvidenceClient } from "./domain/invoke_evidence_client";
 import { FilesView } from "./views/FilesView";
 import { AgentView } from "./views/AgentView";
 import { ConnectorsView } from "./views/ConnectorsView";
@@ -120,6 +145,11 @@ interface Clients {
   nodes: NodeGateway;
   streams: StreamGateway;
   email: EmailGateway;
+  effects: EffectsGateway;
+  executions: ExecutionsGateway;
+  inbox: InboxGateway;
+  assignments: AssignmentsGateway;
+  evidence: EvidenceGateway;
 }
 
 type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "loops" | "peers" | "spaces" | "feed" | "mail" | "settings";
@@ -207,6 +237,11 @@ export function App() {
           nodes: new InvokeNodeClient(),
           streams: new InvokeStreamClient(),
           email: new InvokeEmailClient(),
+          effects: new InvokeEffectsClient(),
+          executions: new InvokeExecutionsClient(),
+          inbox: new InvokeInboxClient(),
+          assignments: new InvokeAssignmentsClient(),
+          evidence: new InvokeEvidenceClient(),
         };
         transportName = "invoke (Rust client)";
       } catch {
@@ -230,6 +265,11 @@ export function App() {
           nodes: new NodeClient(MOCK_BASE_URL),
           streams: new StreamClient(MOCK_BASE_URL),
           email: new EmailClient(MOCK_BASE_URL),
+          effects: new EffectsClient(MOCK_BASE_URL),
+          executions: new ExecutionsClient(MOCK_BASE_URL),
+          inbox: new InboxClient(MOCK_BASE_URL),
+          assignments: new AssignmentsClient(MOCK_BASE_URL),
+          evidence: new EvidenceClient(MOCK_BASE_URL),
         };
         transportName = "http (browser preview)";
       }
@@ -497,6 +537,11 @@ export function App() {
             files={clients.files}
             chatRecords={clients.chatRecords}
             streams={clients.streams}
+            inbox={clients.inbox}
+            executions={clients.executions}
+            effects={clients.effects}
+            evidence={clients.evidence}
+            assignments={clients.assignments}
             onNavigate={(target) => setTab(target)}
           />
         ))}
@@ -506,6 +551,8 @@ export function App() {
         ) : (
           <FilesView
             client={clients.files}
+            effects={clients.effects}
+            evidence={clients.evidence}
             defaultDir={defaultDir ?? ""}
             defaultDirValid={defaultDirValid}
           />
@@ -555,6 +602,10 @@ export function App() {
             files={clients.files}
             agent={clients.agent}
             tasks={clients.tasks}
+            executions={clients.executions}
+            effects={clients.effects}
+            evidence={clients.evidence}
+            assignments={clients.assignments}
             defaultDir={defaultDir ?? ""}
             defaultDirValid={defaultDirValid}
           />
@@ -563,9 +614,9 @@ export function App() {
         (clients === null ? (
           <p className="empty">Choosing transport…</p>
         ) : (
-          <DevicesView agent={clients.agent} devices={clients.devices} nodes={clients.nodes} />
+          <DevicesView agent={clients.agent} devices={clients.devices} nodes={clients.nodes} effects={clients.effects} evidence={clients.evidence} />
         ))}
-      {tab === "loops" && clients && <LoopsView loops={clients.loops} agent={clients.agent} />}
+      {tab === "loops" && clients && <LoopsView loops={clients.loops} agent={clients.agent} executions={clients.executions} effects={clients.effects} evidence={clients.evidence} />}
       {tab === "settings" && (
         <SettingsView
           settings={new InvokeSettingsClient()}

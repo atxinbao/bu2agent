@@ -244,7 +244,22 @@ fn main() {
             settings_commands::settings_key_status,
             settings_commands::settings_key_save,
             settings_commands::settings_key_remove,
-            settings_commands::device_authorization
+            settings_commands::device_authorization,
+            tool_commands::effect_list,
+            tool_commands::effect_get,
+            tool_commands::effect_reconcile,
+            tool_commands::effect_verify,
+            tool_commands::execution_list,
+            tool_commands::execution_get,
+            tool_commands::execution_transition,
+            tool_commands::inbox_list,
+            tool_commands::inbox_get,
+            tool_commands::inbox_ack,
+            tool_commands::assignment_list,
+            tool_commands::assignment_get,
+            tool_commands::assignment_takeover,
+            tool_commands::evidence_list,
+            tool_commands::evidence_get
         ])
         .setup(|_app| {
             #[cfg(not(test))]

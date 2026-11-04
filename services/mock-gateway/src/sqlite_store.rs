@@ -44,8 +44,11 @@ use crate::approval_store::ApprovalFileRecord;
 use crate::effect_store::EffectFileRecord;
 use crate::execution_store::ExecutionFileRecord;
 
-/// DB schema version written by the v1 migration.
-pub const DB_SCHEMA_VERSION: i64 = 1;
+/// DB schema version. v1 is the P0-D baseline (10 tables);
+/// v2 adds the P0-R evidence table (see SCHEMA_V2). Row-level
+/// `schema_version` fields are a separate concept (the record
+/// contract version, still 1 for P0-A+ rows) and are untouched.
+pub const DB_SCHEMA_VERSION: i64 = 2;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -226,13 +229,37 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 ";
 
+/// P0-R v2 migration: the evidence table only. No FKs (same
+/// convention as v1), no changes to existing tables, and no
+/// backfill: evidence exists only for rows observed from P0-R
+/// on. `observed_json` is a serialized JSON object; it never
+/// carries file bytes, credential values, or session text
+/// (enforced at the observation site, not by the schema).
+const SCHEMA_V2: &str = "
+CREATE TABLE IF NOT EXISTS evidence (
+    seq INTEGER NOT NULL,
+    evidence_id TEXT PRIMARY KEY,
+    effect_id TEXT NOT NULL,
+    execution_id TEXT,
+    source TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    observed_json TEXT NOT NULL,
+    checked_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    created_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_effect ON evidence(effect_id);
+";
+
 fn err(e: rusqlite::Error) -> String {
     format!("sqlite: {e}")
 }
 
 /// Open (creating parent directories) and migrate a database
 /// file. Idempotent: re-opening an already-migrated file is a
-/// no-op, and the schema version ends at 1 either way.
+/// no-op, and the schema version ends at 2 either way.
 pub fn open_db(path: &Path) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -260,17 +287,30 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         .map_err(err)?
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(0);
-    if version < DB_SCHEMA_VERSION {
+    if version < 1 {
         tx.execute_batch(SCHEMA_V1).map_err(err)?;
         tx.execute(
-            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', ?1)
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '1')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![DB_SCHEMA_VERSION.to_string()],
+            [],
         )
         .map_err(err)?;
         tx.execute(
             "INSERT OR IGNORE INTO db_meta (key, value) VALUES ('import_done', '0')",
             [],
+        )
+        .map_err(err)?;
+    }
+    // P0-R v2 step: evidence table only. A fresh database runs
+    // v1 then v2 in the same transaction; a v1 database runs
+    // v2 only; an already-v2 database skips both. The version
+    // is advanced to 2 only after the v2 DDL succeeds.
+    if version < 2 {
+        tx.execute_batch(SCHEMA_V2).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![DB_SCHEMA_VERSION.to_string()],
         )
         .map_err(err)?;
     }
@@ -1420,6 +1460,222 @@ pub fn ack_inbox(conn: &mut Connection, inbox_id: &str) -> Result<Option<InboxRo
     }
     tx.commit().map_err(err)?;
     Ok(Some(row))
+}
+
+/// P0-R evidence row: one observation of one Effect's
+/// concluded state. `source` is `write` (observed at write
+/// time, verdict `verified`), `verify` (a later read-only
+/// observation), or `reconcile` (the mirror of a reconcile
+/// conclusion). `verdict` is `verified`, `mismatch`, or
+/// `inconclusive`. `observed_json` is a serialized JSON object
+/// describing only what was observed (hashes, lengths, flags,
+/// kinds) — never file bytes, credential values, or session
+/// text. `schema_version` is the record contract version (1,
+/// same as P0-A rows), not the database schema version.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceRow {
+    pub evidence_id: String,
+    pub effect_id: String,
+    pub execution_id: Option<String>,
+    pub source: String,
+    pub verdict: String,
+    pub reason: String,
+    pub observed_json: String,
+    pub checked_ms: i64,
+    pub origin_device_id: String,
+    pub schema_version: i64,
+    pub created_ms: i64,
+}
+
+/// Draft for one evidence insert. `observed_json` must already
+/// be serialized by the caller (observation site).
+pub struct EvidenceDraft<'a> {
+    pub effect_id: &'a str,
+    pub execution_id: Option<&'a str>,
+    pub source: &'a str,
+    pub verdict: &'a str,
+    pub reason: &'a str,
+    pub observed_json: &'a str,
+    pub checked_ms: i64,
+    pub origin_device_id: &'a str,
+    pub schema_version: i64,
+}
+
+fn evidence_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceRow> {
+    Ok(EvidenceRow {
+        evidence_id: row.get(1)?,
+        effect_id: row.get(2)?,
+        execution_id: row.get(3)?,
+        source: row.get(4)?,
+        verdict: row.get(5)?,
+        reason: row.get(6)?,
+        observed_json: row.get(7)?,
+        checked_ms: row.get(8)?,
+        origin_device_id: row.get(9)?,
+        schema_version: row.get(10)?,
+        created_ms: row.get(11)?,
+    })
+}
+
+fn insert_evidence_tx(
+    tx: &rusqlite::Transaction<'_>,
+    draft: &EvidenceDraft<'_>,
+) -> Result<EvidenceRow, String> {
+    let seq: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM evidence",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(err)?;
+    let evidence_id = format!("evidence-{seq}");
+    tx.execute(
+        "INSERT INTO evidence (seq, evidence_id, effect_id, execution_id, source, verdict, reason, observed_json, checked_ms, origin_device_id, schema_version, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            seq,
+            evidence_id,
+            draft.effect_id,
+            draft.execution_id,
+            draft.source,
+            draft.verdict,
+            draft.reason,
+            draft.observed_json,
+            draft.checked_ms,
+            draft.origin_device_id,
+            draft.schema_version,
+            draft.checked_ms,
+        ],
+    )
+    .map_err(err)?;
+    Ok(EvidenceRow {
+        evidence_id,
+        effect_id: draft.effect_id.to_string(),
+        execution_id: draft.execution_id.map(str::to_string),
+        source: draft.source.to_string(),
+        verdict: draft.verdict.to_string(),
+        reason: draft.reason.to_string(),
+        observed_json: draft.observed_json.to_string(),
+        checked_ms: draft.checked_ms,
+        origin_device_id: draft.origin_device_id.to_string(),
+        schema_version: draft.schema_version,
+        created_ms: draft.checked_ms,
+    })
+}
+
+/// Insert one evidence row in its own transaction. Evidence is
+/// derived data: callers treat failure as best-effort (warn,
+/// never fail the effect write that produced it).
+pub fn insert_evidence(
+    conn: &mut Connection,
+    draft: &EvidenceDraft<'_>,
+) -> Result<EvidenceRow, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let row = insert_evidence_tx(&tx, draft)?;
+    tx.commit().map_err(err)?;
+    Ok(row)
+}
+
+pub fn list_evidence(conn: &Connection) -> Result<Vec<EvidenceRow>, String> {
+    let mut stmt = conn
+        .prepare("SELECT seq, evidence_id, effect_id, execution_id, source, verdict, reason, observed_json, checked_ms, origin_device_id, schema_version, created_ms FROM evidence ORDER BY seq ASC")
+        .map_err(err)?;
+    let rows = stmt
+        .query_map([], evidence_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<EvidenceRow>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+pub fn get_evidence(
+    conn: &Connection,
+    evidence_id: &str,
+) -> Result<Option<EvidenceRow>, String> {
+    conn.query_row(
+        "SELECT seq, evidence_id, effect_id, execution_id, source, verdict, reason, observed_json, checked_ms, origin_device_id, schema_version, created_ms FROM evidence WHERE evidence_id = ?1",
+        params![evidence_id],
+        evidence_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+pub fn latest_evidence_for_effect(
+    conn: &Connection,
+    effect_id: &str,
+) -> Result<Option<EvidenceRow>, String> {
+    conn.query_row(
+        "SELECT seq, evidence_id, effect_id, execution_id, source, verdict, reason, observed_json, checked_ms, origin_device_id, schema_version, created_ms FROM evidence WHERE effect_id = ?1 ORDER BY seq DESC LIMIT 1",
+        params![effect_id],
+        evidence_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// Latest write-time Evidence (source `write`) for an effect.
+/// Verify compares against this baseline, never against a later
+/// verify/reconcile row: a drifted file verified once as
+/// `mismatch` must verify as `verified` again once restored,
+/// which only the write-time baseline can express.
+pub fn latest_write_evidence_for_effect(
+    conn: &Connection,
+    effect_id: &str,
+) -> Result<Option<EvidenceRow>, String> {
+    conn.query_row(
+        "SELECT seq, evidence_id, effect_id, execution_id, source, verdict, reason, observed_json, checked_ms, origin_device_id, schema_version, created_ms FROM evidence WHERE effect_id = ?1 AND source = 'write' ORDER BY seq DESC LIMIT 1",
+        params![effect_id],
+        evidence_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// Record one verify observation together with its Inbox
+/// side effects, in a single transaction: a `mismatch` verdict
+/// opens a `verification_mismatch` row (deduped against an
+/// already-open row for the same effect), a `verified` verdict
+/// auto-closes any open `verification_mismatch` row for the
+/// effect. An `inconclusive` verdict touches no Inbox row.
+/// The verify handler uses this; write-time and reconcile
+/// mirrors use `insert_evidence` (they never open Inbox rows).
+pub fn record_verification(
+    conn: &mut Connection,
+    draft: &EvidenceDraft<'_>,
+) -> Result<EvidenceRow, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let row = insert_evidence_tx(&tx, draft)?;
+    if draft.verdict == "mismatch" {
+        let open: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM inbox WHERE kind = 'verification_mismatch' AND effect_id = ?1 AND resolved_ms IS NULL",
+                params![draft.effect_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(err)?;
+        if open == 0 {
+            let source_event_id = format!("evidence:{}", row.evidence_id);
+            insert_inbox(
+                &tx,
+                "verification_mismatch",
+                draft.execution_id,
+                Some(draft.effect_id),
+                None,
+                &source_event_id,
+                draft.checked_ms,
+            )?;
+        }
+    } else if draft.verdict == "verified" {
+        auto_close_inbox(
+            &tx,
+            "verification_mismatch",
+            "effect_id",
+            draft.effect_id,
+            draft.checked_ms,
+        )?;
+    }
+    tx.commit().map_err(err)?;
+    Ok(row)
 }
 
 fn outbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
@@ -2790,11 +3046,11 @@ mod tests {
     fn p0d_schema_applies_cleanly_and_reapply_is_idempotent() {
         let path = temp_db("schema");
         let mut conn = open_db(&path).expect("open");
-        assert_eq!(schema_version(&conn).expect("version"), 1);
+        assert_eq!(schema_version(&conn).expect("version"), 2);
         assert!(!import_done(&conn).expect("import flag"));
         // Re-applying migrations changes nothing.
         apply_migrations(&mut conn).expect("reapply");
-        assert_eq!(schema_version(&conn).expect("version again"), 1);
+        assert_eq!(schema_version(&conn).expect("version again"), 2);
         // db_meta holds the two bootstrap rows (schema version
         // + import flag); every other table starts empty.
         assert_eq!(count_table(&conn, "db_meta").expect("count"), 2);
@@ -3244,7 +3500,9 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("collect");
         assert!(names.contains(&"detail".to_string()), "{names:?}");
-        assert_eq!(schema_version(&conn).expect("version"), 1);
+        // P0-R: the v1 fixture migrates to v2 (evidence table)
+        // as well as gaining the detail column.
+        assert_eq!(schema_version(&conn).expect("version"), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
