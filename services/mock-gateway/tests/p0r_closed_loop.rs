@@ -638,13 +638,26 @@ async fn r7_export_verify_reads_evidence_target_path() {
     let export_id = h.export("src.txt", &target_str).await;
 
     // The Evidence baseline records the absolute target path.
+    // The gateway canonicalizes it (canonicalize(parent) for a
+    // not-yet-existing target), so the expectation must be
+    // canonicalized the same way: on macOS temp_dir() sits
+    // under symlinked /var (-> /private/var) and on Windows
+    // canonicalize adds the \\?\ prefix, while the raw test
+    // path has neither. Comparing against the raw path fails
+    // deterministically on macOS + Windows and passes on Linux
+    // (CI 41815085670). The request still carries the raw path;
+    // only the expectation is canonicalized.
+    let expected = std::fs::canonicalize(&export_dir)
+        .unwrap()
+        .join("out.txt");
+    let expected_str = expected.to_string_lossy().to_string();
     let baseline = h
         .evidence_for(&export_id)
         .await
         .into_iter()
         .find(|e| e["source"] == "write")
         .expect("export write-time baseline");
-    assert_eq!(observed(&baseline)["target_path"], target_str);
+    assert_eq!(observed(&baseline)["target_path"], expected_str);
 
     let (status, row) = h.verify(&export_id).await;
     assert_eq!(status, 200, "{row}");
@@ -674,13 +687,16 @@ async fn r8_task_product_verify() {
     let (status, _) = h.post("/tasks/run", json!({"task_id": task_id})).await;
     assert_eq!(status, 200);
     let mut task = Value::Null;
+    // 30 s budget (was 5 s): the 5 s bound is tight on slow CI
+    // runners under full parallel load (macOS/Windows), and this
+    // poll only waits longer before failing — no semantic change.
     for _ in 0..200 {
         let (_, got) = h.get(&format!("/tasks/get?task_id={task_id}")).await;
         if got["status"] == "draft_ready" {
             task = got;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
     assert_eq!(task["status"], "draft_ready", "task never reached draft_ready: {task}");
     let task_approval = task["approval_id"].as_str().unwrap().to_string();
