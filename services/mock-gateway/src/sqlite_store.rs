@@ -180,6 +180,9 @@ CREATE TABLE IF NOT EXISTS workspace_snapshots (
     instruction_digest TEXT NOT NULL,
     origin_device_id TEXT NOT NULL,
     schema_version INTEGER NOT NULL,
+    binding_location_id TEXT,
+    binding_worktree_id TEXT,
+    binding_root_digest TEXT,
     created_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS worker_sessions (
@@ -319,23 +322,56 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     // scan records its note ("process ended" / "clean shutdown")
     // there. Nullable, idempotent, schema version stays 1: this
     // is a column backfill, not a v2 migration, and it changes
-    // no existing row (old rows read detail as NULL).
-    let has_detail: bool = {
+    // no existing row (old rows read detail as NULL). A missing
+    // table (a partial fixture, never a real migrated database)
+    // is a no-op, not an error: ALTER TABLE on a missing table
+    // would fail the whole migration.
+    backfill_column(&tx, "worker_sessions", "detail")?;
+    // P3-A additive columns: databases migrated before P3-A
+    // have no binding columns on workspace_snapshots. Nullable,
+    // idempotent, schema version stays 2: this is a column
+    // backfill, not a v3 migration, and it changes no existing
+    // row (old rows read the three bindings as NULL).
+    for column in [
+        "binding_location_id",
+        "binding_worktree_id",
+        "binding_root_digest",
+    ] {
+        backfill_column(&tx, "workspace_snapshots", column)?;
+    }
+    tx.commit().map_err(err)?;
+    Ok(())
+}
+
+/// Add a nullable TEXT column when the table exists and the
+/// column is missing. Idempotent; a missing table is a no-op.
+fn backfill_column(tx: &rusqlite::Transaction<'_>, table: &str, column: &str) -> Result<(), String> {
+    let table_exists: bool = tx
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(err)
+        .map(|count| count > 0)?;
+    if !table_exists {
+        return Ok(());
+    }
+    let has_column: bool = {
         let mut stmt = tx
-            .prepare("PRAGMA table_info(worker_sessions)")
+            .prepare(&format!("PRAGMA table_info({table})"))
             .map_err(err)?;
         let names = stmt
             .query_map([], |row| row.get::<_, String>(1))
             .map_err(err)?
             .collect::<Result<Vec<String>, _>>()
             .map_err(err)?;
-        names.iter().any(|name| name == "detail")
+        names.iter().any(|name| name == column)
     };
-    if !has_detail {
-        tx.execute("ALTER TABLE worker_sessions ADD COLUMN detail TEXT", [])
+    if !has_column {
+        tx.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])
             .map_err(err)?;
     }
-    tx.commit().map_err(err)?;
     Ok(())
 }
 
@@ -1918,6 +1954,12 @@ pub struct SnapshotRow {
     pub instruction_digest: String,
     pub origin_device_id: String,
     pub schema_version: i64,
+    /// P3-A: frozen binding (NULL when the execution is
+    /// unbound): the Location id, the Worktree id, and the
+    /// Location's root_sha256 fingerprint.
+    pub binding_location_id: Option<String>,
+    pub binding_worktree_id: Option<String>,
+    pub binding_root_digest: Option<String>,
 }
 
 fn seam_seq(conn: &Connection, table: &str, id: &str) -> Result<i64, String> {
@@ -1974,9 +2016,9 @@ pub fn insert_snapshot(conn: &mut Connection, row: &SnapshotRow) -> Result<(), S
     let seq = seam_seq(conn, "workspace_snapshots", &row.snapshot_id)?;
     let now = now_ms() as i64;
     conn.execute(
-        "INSERT INTO workspace_snapshots (seq, snapshot_id, content_sha256, files_root, connector_ids_json, device_ids_json, policy_binding_ids_json, memory_scope, instruction_digest, origin_device_id, schema_version, created_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![seq, row.snapshot_id, row.content_sha256, row.files_root, row.connector_ids_json, row.device_ids_json, row.policy_binding_ids_json, row.memory_scope, row.instruction_digest, row.origin_device_id, row.schema_version, now],
+        "INSERT INTO workspace_snapshots (seq, snapshot_id, content_sha256, files_root, connector_ids_json, device_ids_json, policy_binding_ids_json, memory_scope, instruction_digest, origin_device_id, schema_version, binding_location_id, binding_worktree_id, binding_root_digest, created_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![seq, row.snapshot_id, row.content_sha256, row.files_root, row.connector_ids_json, row.device_ids_json, row.policy_binding_ids_json, row.memory_scope, row.instruction_digest, row.origin_device_id, row.schema_version, row.binding_location_id, row.binding_worktree_id, row.binding_root_digest, now],
     )
     .map_err(err)?;
     Ok(())
@@ -2108,6 +2150,9 @@ pub fn sha256_hex(data: &[u8]) -> String {
 /// itself and the snapshot_id / seq / time columns.
 pub fn snapshot_content_sha256(row: &SnapshotRow) -> String {
     let value = serde_json::json!({
+        "binding_location_id": row.binding_location_id,
+        "binding_root_digest": row.binding_root_digest,
+        "binding_worktree_id": row.binding_worktree_id,
         "connector_ids_json": row.connector_ids_json,
         "device_ids_json": row.device_ids_json,
         "files_root": row.files_root,
@@ -2213,6 +2258,9 @@ fn snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRow> {
         instruction_digest: row.get(7)?,
         origin_device_id: row.get(8)?,
         schema_version: row.get(9)?,
+        binding_location_id: row.get(10)?,
+        binding_worktree_id: row.get(11)?,
+        binding_root_digest: row.get(12)?,
     })
 }
 
@@ -2221,7 +2269,7 @@ const EFFECT_COLS: &str = "effect_id, execution_id, capability, operation, scope
 const ASSIGNMENT_COLS: &str = "assignment_id, execution_id, worker_session_id, origin_device_id, status, detail, lease_expires_ms, heartbeat_ms, schema_version";
 const WORKER_COLS: &str = "worker_session_id, origin_device_id, status, detail, schema_version";
 const CHECKPOINT_COLS: &str = "checkpoint_id, execution_id, execution_seq, kind, payload_json, origin_device_id, schema_version";
-const SNAPSHOT_COLS: &str = "snapshot_id, content_sha256, files_root, connector_ids_json, device_ids_json, policy_binding_ids_json, memory_scope, instruction_digest, origin_device_id, schema_version";
+const SNAPSHOT_COLS: &str = "snapshot_id, content_sha256, files_root, connector_ids_json, device_ids_json, policy_binding_ids_json, memory_scope, instruction_digest, origin_device_id, schema_version, binding_location_id, binding_worktree_id, binding_root_digest";
 
 /// One transaction-local seq: the id suffix when the id carries
 /// one, else MAX(seq) + 1 (mirrors the seam convention).
@@ -2313,9 +2361,9 @@ fn insert_snapshot_tx(
     let seq = tx_seq(tx, "workspace_snapshots", &row.snapshot_id)?;
     let now = now_ms() as i64;
     tx.execute(
-        "INSERT INTO workspace_snapshots (seq, snapshot_id, content_sha256, files_root, connector_ids_json, device_ids_json, policy_binding_ids_json, memory_scope, instruction_digest, origin_device_id, schema_version, created_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![seq, row.snapshot_id, row.content_sha256, row.files_root, row.connector_ids_json, row.device_ids_json, row.policy_binding_ids_json, row.memory_scope, row.instruction_digest, row.origin_device_id, row.schema_version, now],
+        "INSERT INTO workspace_snapshots (seq, snapshot_id, content_sha256, files_root, connector_ids_json, device_ids_json, policy_binding_ids_json, memory_scope, instruction_digest, origin_device_id, schema_version, binding_location_id, binding_worktree_id, binding_root_digest, created_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![seq, row.snapshot_id, row.content_sha256, row.files_root, row.connector_ids_json, row.device_ids_json, row.policy_binding_ids_json, row.memory_scope, row.instruction_digest, row.origin_device_id, row.schema_version, row.binding_location_id, row.binding_worktree_id, row.binding_root_digest, now],
     )
     .map_err(err)?;
     Ok(())
@@ -3375,6 +3423,9 @@ mod tests {
                 instruction_digest: "def".to_string(),
                 origin_device_id: "mac-local".to_string(),
                 schema_version: 1,
+                binding_location_id: None,
+                binding_worktree_id: None,
+                binding_root_digest: None,
             },
         )
         .expect("snapshot");
@@ -3462,6 +3513,9 @@ mod tests {
             instruction_digest: "abc".to_string(),
             origin_device_id: "mac-local".to_string(),
             schema_version: 1,
+            binding_location_id: None,
+            binding_worktree_id: None,
+            binding_root_digest: None,
         };
         let hash = snapshot_content_sha256(&row);
         assert_eq!(hash, snapshot_content_sha256(&row));
@@ -3504,6 +3558,68 @@ mod tests {
         // as well as gaining the detail column.
         assert_eq!(schema_version(&conn).expect("version"), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p3a_migration_backfills_snapshot_binding_columns() {
+        // A database migrated before P3-A: schema version 2,
+        // but the workspace_snapshots table predates the three
+        // binding columns. The backfill adds them nullable and
+        // the version stays 2 (column backfill, not a v3).
+        let dir = std::env::temp_dir()
+            .join(format!("mock-sqlite-p3a-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("gateway.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("open raw");
+            conn.execute_batch(
+                "CREATE TABLE db_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO db_meta VALUES ('db_schema_version', '2'), ('import_done', '0');
+                 CREATE TABLE workspace_snapshots (seq INTEGER NOT NULL, snapshot_id TEXT PRIMARY KEY, content_sha256 TEXT NOT NULL, files_root TEXT NOT NULL, connector_ids_json TEXT NOT NULL, device_ids_json TEXT NOT NULL, policy_binding_ids_json TEXT NOT NULL, memory_scope TEXT NOT NULL, instruction_digest TEXT NOT NULL, origin_device_id TEXT NOT NULL, schema_version INTEGER NOT NULL, created_ms INTEGER);",
+            )
+            .expect("old schema");
+        }
+        let mut conn = open_db(&path).expect("reopen");
+        apply_migrations(&mut conn).expect("migrate");
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(workspace_snapshots)")
+            .expect("pragma");
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert!(names.contains(&"binding_location_id".to_string()), "{names:?}");
+        assert!(names.contains(&"binding_worktree_id".to_string()), "{names:?}");
+        assert!(names.contains(&"binding_root_digest".to_string()), "{names:?}");
+        assert_eq!(schema_version(&conn).expect("version"), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p3a_snapshot_hash_covers_binding_keys() {
+        let row = SnapshotRow {
+            snapshot_id: "snapshot-1".to_string(),
+            content_sha256: String::new(),
+            files_root: "/tmp/root".to_string(),
+            connector_ids_json: "[]".to_string(),
+            device_ids_json: "[]".to_string(),
+            policy_binding_ids_json: "[]".to_string(),
+            memory_scope: "default".to_string(),
+            instruction_digest: "abc".to_string(),
+            origin_device_id: "mac-local".to_string(),
+            schema_version: 1,
+            binding_location_id: None,
+            binding_worktree_id: None,
+            binding_root_digest: None,
+        };
+        let hash = snapshot_content_sha256(&row);
+        let mut bound = row.clone();
+        bound.binding_location_id = Some("location-1".to_string());
+        bound.binding_worktree_id = Some("worktree-1".to_string());
+        bound.binding_root_digest = Some("deadbeef".to_string());
+        assert_ne!(hash, snapshot_content_sha256(&bound));
     }
 
     #[test]

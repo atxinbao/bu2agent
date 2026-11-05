@@ -134,6 +134,22 @@ use crate::chat_store::{
 use crate::node_store::{
     append_node, load_nodes, next_node_number, Node, NODE_DISCONNECTED, NODE_ONLINE,
 };
+use crate::binding_store::{
+    append_binding, load_bindings, next_workspace_number, WorkspaceBinding, BINDING_ACTIVE,
+    BINDING_ARCHIVED,
+};
+use crate::project_store::{
+    append_project, load_projects, next_project_number, Project, PROJECT_ACTIVE,
+    PROJECT_ARCHIVED,
+};
+use crate::location_store::{
+    append_location, load_locations, next_location_number, Location, LOCATION_ACTIVE,
+    LOCATION_ARCHIVED,
+};
+use crate::worktree_store::{
+    append_worktree, load_worktrees, next_worktree_number, Worktree, WORKTREE_ACTIVE,
+    WORKTREE_ARCHIVED,
+};
 use crate::stream_store::{
     append_stream_line, events_after, last_event_id, load_stream_state, next_poke_order,
     next_stream_number, next_subscription_number, project_thread_events, StreamLine,
@@ -416,6 +432,18 @@ pub struct AppState {
     nodes: Arc<Mutex<HashMap<String, Node>>>,
     next_node_id: Arc<Mutex<u64>>,
     node_state_path: Option<PathBuf>,
+    bindings: Arc<Mutex<HashMap<String, WorkspaceBinding>>>,
+    next_workspace_id: Arc<Mutex<u64>>,
+    binding_state_path: Option<PathBuf>,
+    projects: Arc<Mutex<HashMap<String, Project>>>,
+    next_project_id: Arc<Mutex<u64>>,
+    project_state_path: Option<PathBuf>,
+    locations: Arc<Mutex<HashMap<String, Location>>>,
+    next_location_id: Arc<Mutex<u64>>,
+    location_state_path: Option<PathBuf>,
+    worktrees: Arc<Mutex<HashMap<String, Worktree>>>,
+    next_worktree_id: Arc<Mutex<u64>>,
+    worktree_state_path: Option<PathBuf>,
     stream_subscriptions: Arc<Mutex<HashMap<String, StreamSubscription>>>,
     next_subscription_id: Arc<Mutex<u64>>,
     next_stream_id: Arc<Mutex<u64>>,
@@ -559,6 +587,21 @@ impl AppState {
         if let Ok(voice_state_path) = std::env::var("MOCK_VOICE_STATE_PATH") {
             state = state.with_voice_state_path(PathBuf::from(voice_state_path));
         }
+        // P3-A: engineering record stores. Production state
+        // reads MOCK_*_STATE_PATH; the shell wires these from
+        // the fixed record directory (gateway_home.rs).
+        if let Ok(binding_state_path) = std::env::var("MOCK_BINDING_STATE_PATH") {
+            state = state.with_binding_state_path(PathBuf::from(binding_state_path));
+        }
+        if let Ok(project_state_path) = std::env::var("MOCK_PROJECT_STATE_PATH") {
+            state = state.with_project_state_path(PathBuf::from(project_state_path));
+        }
+        if let Ok(location_state_path) = std::env::var("MOCK_LOCATION_STATE_PATH") {
+            state = state.with_location_state_path(PathBuf::from(location_state_path));
+        }
+        if let Ok(worktree_state_path) = std::env::var("MOCK_WORKTREE_STATE_PATH") {
+            state = state.with_worktree_state_path(PathBuf::from(worktree_state_path));
+        }
         // Task 22: on macOS the production mail source asks
         // Mail.app via AppleScript; every other platform
         // keeps the Unavailable source (501, never fake
@@ -700,6 +743,18 @@ impl AppState {
             nodes: Arc::new(Mutex::new(HashMap::new())),
             next_node_id: Arc::new(Mutex::new(1)),
             node_state_path: None,
+            bindings: Arc::new(Mutex::new(HashMap::new())),
+            next_workspace_id: Arc::new(Mutex::new(1)),
+            binding_state_path: None,
+            projects: Arc::new(Mutex::new(HashMap::new())),
+            next_project_id: Arc::new(Mutex::new(1)),
+            project_state_path: None,
+            locations: Arc::new(Mutex::new(HashMap::new())),
+            next_location_id: Arc::new(Mutex::new(1)),
+            location_state_path: None,
+            worktrees: Arc::new(Mutex::new(HashMap::new())),
+            next_worktree_id: Arc::new(Mutex::new(1)),
+            worktree_state_path: None,
             stream_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             next_subscription_id: Arc::new(Mutex::new(1)),
             next_stream_id: Arc::new(Mutex::new(1)),
@@ -1279,6 +1334,44 @@ impl AppState {
                     error: Some(ErrorCode::ToolFailed),
                     body: email_error_text(err),
                 },
+                Err(_) => ToolOutcome::unknown(),
+            };
+        }
+        // P3-A: read-only code search. Deliberately not added
+        // to dispatch_agent_tool: like the mail tools, this is
+        // a loop-only tool and the file fallthrough below
+        // indexes args["path"], which code.search args do not
+        // carry. Zero Effect; results go only to the model
+        // context — the query and the hits are never logged.
+        if tool == "code.search" {
+            let query = args.get("query").cloned().unwrap_or_default();
+            let worktree_id = args
+                .get("worktree_id")
+                .filter(|id| !id.is_empty())
+                .map(String::as_str);
+            let path = args.get("path").cloned().unwrap_or_default();
+            let max_results = args
+                .get("max_results")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(crate::code_search::CODE_SEARCH_MAX_RESULTS);
+            if query.trim().is_empty() {
+                return ToolOutcome::failed(ErrorCode::InvalidArguments);
+            }
+            let root = match resolve_code_search_root(self, worktree_id, binding.as_ref()) {
+                Ok(root) => root,
+                Err(_) => return ToolOutcome::failed(ErrorCode::InvalidArguments),
+            };
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::code_search::search_code(&root, &query, &path, max_results)
+            })
+            .await;
+            return match outcome {
+                Ok(Ok(found)) => ToolOutcome::success(
+                    serde_json::to_string(&found).unwrap_or_else(|_| {
+                        "{\"results\":[],\"truncated\":false}".to_string()
+                    }),
+                ),
+                Ok(Err(_)) => ToolOutcome::failed(ErrorCode::InvalidArguments),
                 Err(_) => ToolOutcome::unknown(),
             };
         }
@@ -1944,6 +2037,66 @@ impl AppState {
         self.next_node_id = Arc::new(Mutex::new(next_node_number(&records)));
         self.nodes = Arc::new(Mutex::new(nodes));
         self.node_state_path = Some(path);
+        self
+    }
+
+    /// Test seam: load workspace bindings from a JSONL file,
+    /// mirroring with_node_state_path. Production state reads
+    /// MOCK_BINDING_STATE_PATH.
+    pub fn with_binding_state_path(mut self, path: PathBuf) -> Self {
+        let records = load_bindings(&path);
+        let mut bindings = HashMap::new();
+        for record in &records {
+            bindings.insert(record.workspace_id.clone(), record.clone());
+        }
+        self.next_workspace_id = Arc::new(Mutex::new(next_workspace_number(&records)));
+        self.bindings = Arc::new(Mutex::new(bindings));
+        self.binding_state_path = Some(path);
+        self
+    }
+
+    /// Test seam: load projects from a JSONL file, mirroring
+    /// with_node_state_path. Production state reads
+    /// MOCK_PROJECT_STATE_PATH.
+    pub fn with_project_state_path(mut self, path: PathBuf) -> Self {
+        let records = load_projects(&path);
+        let mut projects = HashMap::new();
+        for record in &records {
+            projects.insert(record.project_id.clone(), record.clone());
+        }
+        self.next_project_id = Arc::new(Mutex::new(next_project_number(&records)));
+        self.projects = Arc::new(Mutex::new(projects));
+        self.project_state_path = Some(path);
+        self
+    }
+
+    /// Test seam: load locations from a JSONL file, mirroring
+    /// with_node_state_path. Production state reads
+    /// MOCK_LOCATION_STATE_PATH.
+    pub fn with_location_state_path(mut self, path: PathBuf) -> Self {
+        let records = load_locations(&path);
+        let mut locations = HashMap::new();
+        for record in &records {
+            locations.insert(record.location_id.clone(), record.clone());
+        }
+        self.next_location_id = Arc::new(Mutex::new(next_location_number(&records)));
+        self.locations = Arc::new(Mutex::new(locations));
+        self.location_state_path = Some(path);
+        self
+    }
+
+    /// Test seam: load worktrees from a JSONL file, mirroring
+    /// with_node_state_path. Production state reads
+    /// MOCK_WORKTREE_STATE_PATH.
+    pub fn with_worktree_state_path(mut self, path: PathBuf) -> Self {
+        let records = load_worktrees(&path);
+        let mut worktrees = HashMap::new();
+        for record in &records {
+            worktrees.insert(record.worktree_id.clone(), record.clone());
+        }
+        self.next_worktree_id = Arc::new(Mutex::new(next_worktree_number(&records)));
+        self.worktrees = Arc::new(Mutex::new(worktrees));
+        self.worktree_state_path = Some(path);
         self
     }
 
@@ -6244,6 +6397,26 @@ fn persist_node(state: &AppState, record: &Node) {
     append_node(path, record);
 }
 
+fn persist_binding(state: &AppState, record: &WorkspaceBinding) {
+    let Some(path) = &state.binding_state_path else { return };
+    append_binding(path, record);
+}
+
+fn persist_project(state: &AppState, record: &Project) {
+    let Some(path) = &state.project_state_path else { return };
+    append_project(path, record);
+}
+
+fn persist_location(state: &AppState, record: &Location) {
+    let Some(path) = &state.location_state_path else { return };
+    append_location(path, record);
+}
+
+fn persist_worktree(state: &AppState, record: &Worktree) {
+    let Some(path) = &state.worktree_state_path else { return };
+    append_worktree(path, record);
+}
+
 fn node_number(node_id: &str) -> u64 {
     node_id.strip_prefix("node-").and_then(|s| s.parse().ok()).unwrap_or(0)
 }
@@ -6361,6 +6534,497 @@ async fn nodes_unpair(
     // Re-unpair is idempotent success, mirroring the
     // delete-turn tombstone: no new snapshot, same record.
     Json(record.clone()).into_response()
+}
+
+// --- Engineering record surface (P3-A, record subset) ---
+//
+// WorkspaceBinding + Project + Location + Worktree: four
+// JSONL record stores, no Effect, no approval loop (direct
+// management actions, like the Task 9 connector surface).
+// List hides archived rows; get returns archived rows with
+// their status. Archive is a status flip, never a delete:
+// there is no hard-delete route and directories are never
+// removed. Creation validation failures are all 400.
+
+fn workspace_number(id: &str) -> u64 {
+    id.strip_prefix("workspace-").and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+fn project_number(id: &str) -> u64 {
+    id.strip_prefix("project-").and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+fn location_number(id: &str) -> u64 {
+    id.strip_prefix("location-").and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+fn worktree_number(id: &str) -> u64 {
+    id.strip_prefix("worktree-").and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+fn unknown_record(what: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": format!("unknown {what}") })),
+    )
+        .into_response()
+}
+
+/// P3-A archive check point for a Worktree: P3-B wires the
+/// non-terminal Patch check here (a proposed or
+/// partially_applied Patch blocks with 409). P3-A has no
+/// Patch store, so nothing blocks yet; the call site stays
+/// the same for P3-B.
+fn worktree_archive_blocked(_state: &AppState, _worktree_id: &str) -> Option<&'static str> {
+    None
+}
+
+#[derive(Debug, Deserialize)]
+struct BindingCreateDto {
+    display_name: Option<String>,
+    path: Option<String>,
+}
+
+async fn bindings_create(
+    State(state): State<AppState>,
+    Json(req): Json<BindingCreateDto>,
+) -> impl IntoResponse {
+    let Some(display_name) = req.display_name.filter(|n| !n.trim().is_empty()) else {
+        return bad_request("display_name is required");
+    };
+    let Some(raw_path) = req.path.filter(|p| !p.trim().is_empty()) else {
+        return bad_request("path is required");
+    };
+    // The picked directory is canonicalized at creation (a
+    // symlinked pick binds its real target); a missing path
+    // or a non-directory is a 400.
+    let Ok(canonical) = Path::new(&raw_path).canonicalize() else {
+        return bad_request("directory does not exist");
+    };
+    if !canonical.is_dir() {
+        return bad_request("path is not a directory");
+    }
+    let canonical_root = canonical.to_string_lossy().into_owned();
+    let mut next = state.next_workspace_id.lock().expect("workspace id lock");
+    let id = format!("workspace-{}", *next);
+    *next += 1;
+    drop(next);
+    let now = now_ms();
+    let record = WorkspaceBinding {
+        workspace_id: id.clone(),
+        display_name,
+        allowed_roots: vec![canonical_root],
+        policy_digest: compute_policy_digest(&state),
+        status: BINDING_ACTIVE.to_string(),
+        created_ms: now,
+        updated_ms: now,
+    };
+    state
+        .bindings
+        .lock()
+        .expect("binding lock")
+        .insert(record.workspace_id.clone(), record.clone());
+    persist_binding(&state, &record);
+    Json(record).into_response()
+}
+
+async fn bindings_list(State(state): State<AppState>) -> Json<Vec<WorkspaceBinding>> {
+    let bindings = state.bindings.lock().expect("binding lock");
+    let mut records: Vec<WorkspaceBinding> = bindings
+        .values()
+        .filter(|b| b.status == BINDING_ACTIVE)
+        .cloned()
+        .collect();
+    records.sort_by_key(|b| workspace_number(&b.workspace_id));
+    Json(records)
+}
+
+async fn bindings_get(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let bindings = state.bindings.lock().expect("binding lock");
+    match bindings.get(&id) {
+        Some(record) => Json(record.clone()).into_response(),
+        None => unknown_record("binding"),
+    }
+}
+
+async fn bindings_archive(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut bindings = state.bindings.lock().expect("binding lock");
+    let Some(record) = bindings.get_mut(&id) else {
+        return unknown_record("binding");
+    };
+    if record.status == BINDING_ARCHIVED {
+        return Json(record.clone()).into_response();
+    }
+    // Archive guard (plan §3.8): an active Location blocks.
+    let blocked = state
+        .locations
+        .lock()
+        .expect("location lock")
+        .values()
+        .any(|l| l.workspace_id == id && l.status == LOCATION_ACTIVE);
+    if blocked {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "binding_has_active_locations" })),
+        )
+            .into_response();
+    }
+    record.status = BINDING_ARCHIVED.to_string();
+    record.updated_ms = now_ms();
+    let updated = record.clone();
+    persist_binding(&state, &updated);
+    Json(updated).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectCreateDto {
+    name: Option<String>,
+    description: Option<String>,
+}
+
+async fn projects_create(
+    State(state): State<AppState>,
+    Json(req): Json<ProjectCreateDto>,
+) -> impl IntoResponse {
+    let Some(name) = req.name.filter(|n| !n.trim().is_empty()) else {
+        return bad_request("name is required");
+    };
+    let Some(description) = req.description.filter(|d| !d.trim().is_empty()) else {
+        return bad_request("description is required");
+    };
+    let mut next = state.next_project_id.lock().expect("project id lock");
+    let id = format!("project-{}", *next);
+    *next += 1;
+    drop(next);
+    let now = now_ms();
+    let record = Project {
+        project_id: id.clone(),
+        name,
+        description,
+        status: PROJECT_ACTIVE.to_string(),
+        created_ms: now,
+        updated_ms: now,
+    };
+    state
+        .projects
+        .lock()
+        .expect("project lock")
+        .insert(record.project_id.clone(), record.clone());
+    persist_project(&state, &record);
+    Json(record).into_response()
+}
+
+async fn projects_list(State(state): State<AppState>) -> Json<Vec<Project>> {
+    let projects = state.projects.lock().expect("project lock");
+    let mut records: Vec<Project> = projects
+        .values()
+        .filter(|p| p.status == PROJECT_ACTIVE)
+        .cloned()
+        .collect();
+    records.sort_by_key(|p| project_number(&p.project_id));
+    Json(records)
+}
+
+async fn projects_get(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let projects = state.projects.lock().expect("project lock");
+    match projects.get(&id) {
+        Some(record) => Json(record.clone()).into_response(),
+        None => unknown_record("project"),
+    }
+}
+
+async fn projects_archive(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    // A project is pure metadata: archive is always allowed.
+    // Existing references keep reading back with status
+    // archived; nothing is deleted or unlinked.
+    let mut projects = state.projects.lock().expect("project lock");
+    let Some(record) = projects.get_mut(&id) else {
+        return unknown_record("project");
+    };
+    if record.status == PROJECT_ARCHIVED {
+        return Json(record.clone()).into_response();
+    }
+    record.status = PROJECT_ARCHIVED.to_string();
+    record.updated_ms = now_ms();
+    let updated = record.clone();
+    persist_project(&state, &updated);
+    Json(updated).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct LocationCreateDto {
+    workspace_id: Option<String>,
+    name: Option<String>,
+    path: Option<String>,
+}
+
+async fn locations_create(
+    State(state): State<AppState>,
+    Json(req): Json<LocationCreateDto>,
+) -> impl IntoResponse {
+    let Some(workspace_id) = req.workspace_id.filter(|w| !w.trim().is_empty()) else {
+        return bad_request("workspace_id is required");
+    };
+    let Some(name) = req.name.filter(|n| !n.trim().is_empty()) else {
+        return bad_request("name is required");
+    };
+    let Some(raw_path) = req.path.filter(|p| !p.trim().is_empty()) else {
+        return bad_request("path is required");
+    };
+    // The binding must exist and be active.
+    let allowed_roots = {
+        let bindings = state.bindings.lock().expect("binding lock");
+        let Some(binding) = bindings.get(&workspace_id) else {
+            return bad_request("unknown workspace");
+        };
+        if binding.status != BINDING_ACTIVE {
+            return bad_request("workspace is archived");
+        }
+        binding.allowed_roots.clone()
+    };
+    // The candidate must exist and be a directory, and after
+    // canonicalizing BOTH sides it must sit inside one of the
+    // binding's allowed roots (settings_store's
+    // validate_working_dir pattern: a symlinked escape
+    // canonicalizes outside the root and fails here).
+    let Ok(candidate) = Path::new(&raw_path).canonicalize() else {
+        return bad_request("directory does not exist");
+    };
+    if !candidate.is_dir() {
+        return bad_request("path is not a directory");
+    }
+    let inside = allowed_roots.iter().any(|root| {
+        Path::new(root)
+            .canonicalize()
+            .is_ok_and(|canonical_root| candidate.strip_prefix(&canonical_root).is_ok())
+    });
+    if !inside {
+        return bad_request("directory is outside the workspace binding");
+    }
+    let canonical_root = candidate.to_string_lossy().into_owned();
+    let root_sha256 = location_root_sha256(&workspace_id, &canonical_root);
+    let mut next = state.next_location_id.lock().expect("location id lock");
+    let id = format!("location-{}", *next);
+    *next += 1;
+    drop(next);
+    let now = now_ms();
+    let record = Location {
+        location_id: id.clone(),
+        workspace_id,
+        name,
+        canonical_root,
+        root_sha256,
+        status: LOCATION_ACTIVE.to_string(),
+        created_ms: now,
+        updated_ms: now,
+    };
+    state
+        .locations
+        .lock()
+        .expect("location lock")
+        .insert(record.location_id.clone(), record.clone());
+    persist_location(&state, &record);
+    Json(record).into_response()
+}
+
+async fn locations_list(State(state): State<AppState>) -> Json<Vec<Location>> {
+    let locations = state.locations.lock().expect("location lock");
+    let mut records: Vec<Location> = locations
+        .values()
+        .filter(|l| l.status == LOCATION_ACTIVE)
+        .cloned()
+        .collect();
+    records.sort_by_key(|l| location_number(&l.location_id));
+    Json(records)
+}
+
+async fn locations_get(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let locations = state.locations.lock().expect("location lock");
+    match locations.get(&id) {
+        Some(record) => Json(record.clone()).into_response(),
+        None => unknown_record("location"),
+    }
+}
+
+async fn locations_archive(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut locations = state.locations.lock().expect("location lock");
+    let Some(record) = locations.get_mut(&id) else {
+        return unknown_record("location");
+    };
+    if record.status == LOCATION_ARCHIVED {
+        return Json(record.clone()).into_response();
+    }
+    // Archive guard (plan §3.8): an active Worktree blocks.
+    let blocked = state
+        .worktrees
+        .lock()
+        .expect("worktree lock")
+        .values()
+        .any(|w| w.location_id == id && w.status == WORKTREE_ACTIVE);
+    if blocked {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "location_has_active_worktrees" })),
+        )
+            .into_response();
+    }
+    record.status = LOCATION_ARCHIVED.to_string();
+    record.updated_ms = now_ms();
+    let updated = record.clone();
+    persist_location(&state, &updated);
+    Json(updated).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct WorktreeCreateDto {
+    location_id: Option<String>,
+    directory_relative: Option<String>,
+    branch_label: Option<String>,
+    project_id: Option<String>,
+}
+
+async fn worktrees_create(
+    State(state): State<AppState>,
+    Json(req): Json<WorktreeCreateDto>,
+) -> impl IntoResponse {
+    let Some(location_id) = req.location_id.filter(|l| !l.trim().is_empty()) else {
+        return bad_request("location_id is required");
+    };
+    let directory_relative = req.directory_relative.unwrap_or_default();
+    let branch_label = req.branch_label.unwrap_or_default();
+    if branch_label.len() > 4096 {
+        return bad_request("branch_label is too long");
+    }
+    // The location must exist and be active.
+    let canonical_root = {
+        let locations = state.locations.lock().expect("location lock");
+        let Some(location) = locations.get(&location_id) else {
+            return bad_request("unknown location");
+        };
+        if location.status != LOCATION_ACTIVE {
+            return bad_request("location is archived");
+        }
+        match location_canonical_root(location) {
+            Some(root) => root,
+            None => return bad_request("location directory is unavailable"),
+        }
+    };
+    // A stated project must exist (an archived project may
+    // still be referenced; it reads back with its status).
+    if let Some(project_id) = &req.project_id {
+        let projects = state.projects.lock().expect("project lock");
+        if !projects.contains_key(project_id) {
+            return bad_request("unknown project");
+        }
+    }
+    // `directory_relative` is lexically normalized (`..` and
+    // absolute paths rejected); "" means the Location root.
+    let relative = if directory_relative.is_empty() {
+        String::new()
+    } else {
+        match crate::operation_binding::normalize_path(&directory_relative) {
+            Some(normalized) => normalized,
+            None => return bad_request("directory escapes the location"),
+        }
+    };
+    // Join, canonicalize, and containment-check back inside
+    // the root; the directory must already exist (P3-A creates
+    // no directories and runs no `git worktree add`).
+    let Some(_target) =
+        crate::code_search::worktree_canonical_dir(&canonical_root, &relative)
+    else {
+        return bad_request("directory does not exist or escapes the location");
+    };
+    let mut next = state.next_worktree_id.lock().expect("worktree id lock");
+    let id = format!("worktree-{}", *next);
+    *next += 1;
+    drop(next);
+    let now = now_ms();
+    let record = Worktree {
+        worktree_id: id.clone(),
+        location_id,
+        directory_relative: relative,
+        branch_label,
+        project_id: req.project_id,
+        status: WORKTREE_ACTIVE.to_string(),
+        created_ms: now,
+        updated_ms: now,
+    };
+    state
+        .worktrees
+        .lock()
+        .expect("worktree lock")
+        .insert(record.worktree_id.clone(), record.clone());
+    persist_worktree(&state, &record);
+    Json(record).into_response()
+}
+
+async fn worktrees_list(State(state): State<AppState>) -> Json<Vec<Worktree>> {
+    let worktrees = state.worktrees.lock().expect("worktree lock");
+    let mut records: Vec<Worktree> = worktrees
+        .values()
+        .filter(|w| w.status == WORKTREE_ACTIVE)
+        .cloned()
+        .collect();
+    records.sort_by_key(|w| worktree_number(&w.worktree_id));
+    Json(records)
+}
+
+async fn worktrees_get(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let worktrees = state.worktrees.lock().expect("worktree lock");
+    match worktrees.get(&id) {
+        Some(record) => Json(record.clone()).into_response(),
+        None => unknown_record("worktree"),
+    }
+}
+
+async fn worktrees_archive(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut worktrees = state.worktrees.lock().expect("worktree lock");
+    let Some(record) = worktrees.get_mut(&id) else {
+        return unknown_record("worktree");
+    };
+    if record.status == WORKTREE_ARCHIVED {
+        return Json(record.clone()).into_response();
+    }
+    // Archive guard (plan §3.8): a non-terminal Patch blocks.
+    // P3-A has no Patch store; the check point lives in
+    // worktree_archive_blocked for P3-B to wire.
+    if let Some(code) = worktree_archive_blocked(&state, &id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": code })),
+        )
+            .into_response();
+    }
+    record.status = WORKTREE_ARCHIVED.to_string();
+    record.updated_ms = now_ms();
+    let updated = record.clone();
+    persist_worktree(&state, &updated);
+    Json(updated).into_response()
 }
 
 // --- Chat record surface (Task 18, record subset) ---
@@ -7436,6 +8100,17 @@ struct TaskCreateDto {
 #[derive(Debug, Deserialize)]
 struct TaskGetQuery {
     task_id: String,
+    /// P3-A: optional bound worktree for the execute step.
+    /// Validated only: an unknown or archived worktree is a
+    /// 400. It is not frozen into the task Execution's
+    /// snapshot — that Execution was created at tasks_run,
+    /// before this step, and snapshots are immutable. The
+    /// snapshot freeze (§3.6) covers loop executions; a task
+    /// binding freeze needs its own decision (a run-time
+    /// field, or a fresh execution at execute time) and is
+    /// out of P3-A scope.
+    #[serde(default)]
+    worktree_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7610,10 +8285,116 @@ fn execution_number(execution_id: &str) -> u64 {
 /// The snapshot id is tied to the execution number
 /// (`snapshot-N` for `execution-N`): one execution, one
 /// snapshot, no second counter that could race the id lock.
+/// P3-A: the two policy digests the snapshot freezes as
+/// `policy_binding_ids_json` entries, shared with the
+/// binding's single `policy_digest` so no third digest
+/// vocabulary exists. `network-rules` is the live network
+/// rule list; `permissions` is the effective policy.
+fn policy_digests(state: &AppState) -> (String, String) {
+    let rules = state.policy_rules.lock().expect("policy rules lock").clone().unwrap_or_default();
+    let rules_json = serde_json::to_value(&rules).expect("network rules serialize");
+    let rules_digest = sqlite_store::sha256_hex(sqlite_store::canonical_json(&rules_json).as_bytes());
+    let effective = policy_effective(state);
+    let effective_json = serde_json::to_value(&effective).expect("effective policy serialize");
+    let permissions_digest =
+        sqlite_store::sha256_hex(sqlite_store::canonical_json(&effective_json).as_bytes());
+    (rules_digest, permissions_digest)
+}
+
+/// P3-A: the binding's single policy digest, frozen at
+/// binding creation: `sha256(canonical_json({network_rules,
+/// effective_permissions}))` over the two digests above.
+pub(crate) fn compute_policy_digest(state: &AppState) -> String {
+    let (rules_digest, permissions_digest) = policy_digests(state);
+    let value = serde_json::json!({
+        "network_rules": rules_digest,
+        "effective_permissions": permissions_digest,
+    });
+    sqlite_store::sha256_hex(sqlite_store::canonical_json(&value).as_bytes())
+}
+
+/// P3-A: a Location's root fingerprint:
+/// `sha256(canonical_json({workspace_id, canonical_root}))`.
+/// It detects "the root was rebound", not content drift.
+pub(crate) fn location_root_sha256(workspace_id: &str, canonical_root: &str) -> String {
+    let value = serde_json::json!({
+        "workspace_id": workspace_id,
+        "canonical_root": canonical_root,
+    });
+    sqlite_store::sha256_hex(sqlite_store::canonical_json(&value).as_bytes())
+}
+
+/// P3-A: the binding frozen into a new Execution's snapshot.
+/// All three values come from the bound Worktree's Location;
+/// `root_digest` is that Location's `root_sha256`.
+#[derive(Debug, Clone)]
+pub(crate) struct SnapshotBinding {
+    pub location_id: String,
+    pub worktree_id: String,
+    pub root_digest: String,
+}
+
+/// Resolve a worktree id to its snapshot binding. The
+/// worktree must exist and be active, and its Location must
+/// exist and be active; anything else is a caller error.
+pub(crate) fn resolve_worktree_binding(
+    state: &AppState,
+    worktree_id: &str,
+) -> Result<SnapshotBinding, &'static str> {
+    let worktrees = state.worktrees.lock().expect("worktree lock");
+    let Some(worktree) = worktrees.get(worktree_id) else {
+        return Err("unknown worktree");
+    };
+    if worktree.status != WORKTREE_ACTIVE {
+        return Err("worktree is archived");
+    }
+    let location_id = worktree.location_id.clone();
+    let worktree_id = worktree.worktree_id.clone();
+    drop(worktrees);
+    let locations = state.locations.lock().expect("location lock");
+    let Some(location) = locations.get(&location_id) else {
+        return Err("unknown location");
+    };
+    if location.status != LOCATION_ACTIVE {
+        return Err("location is archived");
+    }
+    Ok(SnapshotBinding {
+        location_id,
+        worktree_id,
+        root_digest: location.root_sha256.clone(),
+    })
+}
+
+/// Canonical directory of a worktree: its Location's
+/// canonical root joined with `directory_relative`, then
+/// canonicalized and containment-checked back inside the
+/// root (a symlinked `directory_relative` that escapes is
+/// rejected). `None` when the directory does not exist or
+/// escapes.
+pub(crate) fn worktree_canonical_root(state: &AppState, worktree: &Worktree) -> Option<PathBuf> {
+    let locations = state.locations.lock().expect("location lock");
+    let location = locations.get(&worktree.location_id)?;
+    let root = Path::new(&location.canonical_root);
+    crate::code_search::worktree_canonical_dir(root, &worktree.directory_relative)
+}
+
+/// P3-A: the canonical root of a Location, for containment
+/// checks. The stored `canonical_root` was canonicalized at
+/// creation; re-canonicalizing here keeps the check honest
+/// if the directory was replaced by a symlink since.
+fn location_canonical_root(location: &Location) -> Option<PathBuf> {
+    let canonical = Path::new(&location.canonical_root).canonicalize().ok()?;
+    if !canonical.is_dir() {
+        return None;
+    }
+    Some(canonical)
+}
+
 fn build_workspace_snapshot(
     state: &AppState,
     snapshot_id: &str,
     instruction_digest: &str,
+    binding: Option<&SnapshotBinding>,
 ) -> sqlite_store::SnapshotRow {
     let home = match &state.sqlite_path {
         Some(path) => path.parent().map(|parent| parent.to_path_buf()),
@@ -7660,13 +8441,7 @@ fn build_workspace_snapshot(
         .collect();
     device_ids.sort();
     device_ids.dedup();
-    let rules = state.policy_rules.lock().expect("policy rules lock").clone().unwrap_or_default();
-    let rules_json = serde_json::to_value(&rules).expect("network rules serialize");
-    let rules_digest = sqlite_store::sha256_hex(sqlite_store::canonical_json(&rules_json).as_bytes());
-    let effective = policy_effective(state);
-    let effective_json = serde_json::to_value(&effective).expect("effective policy serialize");
-    let permissions_digest =
-        sqlite_store::sha256_hex(sqlite_store::canonical_json(&effective_json).as_bytes());
+    let (rules_digest, permissions_digest) = policy_digests(state);
     let policy_binding_ids_json = serde_json::to_string(&[
         format!("network-rules:sha256:{rules_digest}"),
         format!("permissions:sha256:{permissions_digest}"),
@@ -7683,6 +8458,9 @@ fn build_workspace_snapshot(
         instruction_digest: instruction_digest.to_string(),
         origin_device_id: state.origin_device_id.clone(),
         schema_version: 1,
+        binding_location_id: binding.map(|b| b.location_id.clone()),
+        binding_worktree_id: binding.map(|b| b.worktree_id.clone()),
+        binding_root_digest: binding.map(|b| b.root_digest.clone()),
     };
     row.content_sha256 = sqlite_store::snapshot_content_sha256(&row);
     row
@@ -7692,6 +8470,18 @@ pub(crate) fn create_execution(
     state: &AppState,
     task_id: Option<String>,
     loop_id: Option<String>,
+) -> ExecutionFileRecord {
+    create_execution_with_binding(state, task_id, loop_id, None)
+}
+
+/// P3-A: Execution creation with an optional frozen binding.
+/// The snapshot's three binding columns come from here; every
+/// other creation path passes `None` and keeps them NULL.
+pub(crate) fn create_execution_with_binding(
+    state: &AppState,
+    task_id: Option<String>,
+    loop_id: Option<String>,
+    binding: Option<SnapshotBinding>,
 ) -> ExecutionFileRecord {
     let mut next = state.next_execution_id.lock().expect("execution id lock");
     let number = *next;
@@ -7716,7 +8506,12 @@ pub(crate) fn create_execution(
     };
     let worker_session_id = state.current_worker_session();
     let snapshot = if state.sqlite.is_some() {
-        Some(build_workspace_snapshot(state, &format!("snapshot-{number}"), &instruction_digest))
+        Some(build_workspace_snapshot(
+            state,
+            &format!("snapshot-{number}"),
+            &instruction_digest,
+            binding.as_ref(),
+        ))
     } else {
         None
     };
@@ -8545,6 +9340,69 @@ pub(crate) fn execution_for_loop(state: &AppState, loop_id: &str) -> Option<Stri
         .map(|r| r.execution_id.clone())
 }
 
+/// P3-A: the worktree id frozen in an Execution's snapshot,
+/// if any. SQLite mode only: JSONL mode has no snapshot rows,
+/// so the caller falls back to the files root.
+fn execution_snapshot_binding_worktree(state: &AppState, execution_id: &str) -> Option<String> {
+    let sqlite = state.sqlite.as_ref()?;
+    if state.sqlite_is_broken() {
+        return None;
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    let executions = sqlite_store::list_executions(&conn).ok()?;
+    let execution = executions
+        .into_iter()
+        .find(|e| e.execution_id == execution_id)?;
+    let snapshot_id = execution.workspace_snapshot_id?;
+    sqlite_store::get_snapshot(&conn, &snapshot_id)
+        .ok()?
+        .and_then(|row| row.binding_worktree_id)
+}
+
+/// P3-A: resolve the search root for a code.search call. An
+/// explicit worktree_id wins (it must exist and be active);
+/// otherwise the calling loop's Execution snapshot supplies
+/// the bound worktree; an unbound execution falls back to the
+/// files root (today's file-tool behaviour).
+fn resolve_code_search_root(
+    state: &AppState,
+    worktree_id: Option<&str>,
+    binding: Option<&ApprovalBinding>,
+) -> Result<PathBuf, &'static str> {
+    if let Some(id) = worktree_id.filter(|id| !id.is_empty()) {
+        let worktree = {
+            let worktrees = state.worktrees.lock().expect("worktree lock");
+            let Some(worktree) = worktrees.get(id) else {
+                return Err("unknown worktree");
+            };
+            if worktree.status != WORKTREE_ACTIVE {
+                return Err("worktree is archived");
+            }
+            worktree.clone()
+        };
+        return worktree_canonical_root(state, &worktree).ok_or("worktree directory unavailable");
+    }
+    if let Some(binding) = binding {
+        if let Some(execution_id) = execution_for_loop(state, &binding.loop_id) {
+            if let Some(bound_id) = execution_snapshot_binding_worktree(state, &execution_id) {
+                let worktree = {
+                    let worktrees = state.worktrees.lock().expect("worktree lock");
+                    worktrees
+                        .get(&bound_id)
+                        .filter(|w| w.status == WORKTREE_ACTIVE)
+                        .cloned()
+                };
+                if let Some(worktree) = worktree {
+                    if let Some(root) = worktree_canonical_root(state, &worktree) {
+                        return Ok(root);
+                    }
+                }
+            }
+        }
+    }
+    Ok(state.files_root.clone())
+}
+
 /// Execution of the current attempt of a task. A task resume spawns
 /// a fresh runner attempt and a fresh Execution, so the latest
 /// (largest execution-N) record for the task is the current
@@ -8736,6 +9594,12 @@ async fn tasks_execute(
     if record.status != "draft_ready" {
         return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not executable" })))
             .into_response();
+    }
+    // P3-A: a stated worktree must exist and be active.
+    if let Some(worktree_id) = &req.worktree_id {
+        if let Err(detail) = resolve_worktree_binding(&state, worktree_id) {
+            return bad_request(detail);
+        }
     }
     let Some(approval_id) = record.approval_id.clone() else {
         return (
@@ -10666,10 +11530,20 @@ async fn loop_start(
     State(state): State<AppState>,
     Json(req): Json<crate::loop_engine::StartLoop>,
 ) -> axum::response::Response {
+    // P3-A: an explicitly bound worktree must exist and be
+    // active; its binding freezes into the Execution snapshot.
+    // A bad id is a caller error, before the loop starts.
+    let binding = match &req.worktree_id {
+        None => None,
+        Some(worktree_id) => match resolve_worktree_binding(&state, worktree_id) {
+            Ok(binding) => Some(binding),
+            Err(detail) => return bad_request(detail),
+        },
+    };
     let result = state.loops.start(req);
     if let Ok(view) = &result {
         // P0 phase 1: the loop attempt gets its Execution shell record.
-        create_execution(&state, None, Some(view.record.loop_id.clone()));
+        create_execution_with_binding(&state, None, Some(view.record.loop_id.clone()), binding);
         spawn_driver(&state, &view.record.loop_id);
     }
     loop_response(&state, result)
@@ -10762,6 +11636,23 @@ pub fn app(state: AppState) -> Router {
         .route("/api/nodes/heartbeat", post(nodes_heartbeat))
         .route("/api/nodes/disconnect", post(nodes_disconnect))
         .route("/api/nodes/unpair", post(nodes_unpair))
+        // P3-A: engineering records (16 routes).
+        .route("/bindings/create", post(bindings_create))
+        .route("/bindings/list", get(bindings_list))
+        .route("/bindings/{id}", get(bindings_get))
+        .route("/bindings/{id}/archive", post(bindings_archive))
+        .route("/projects/create", post(projects_create))
+        .route("/projects/list", get(projects_list))
+        .route("/projects/{id}", get(projects_get))
+        .route("/projects/{id}/archive", post(projects_archive))
+        .route("/locations/create", post(locations_create))
+        .route("/locations/list", get(locations_list))
+        .route("/locations/{id}", get(locations_get))
+        .route("/locations/{id}/archive", post(locations_archive))
+        .route("/worktrees/create", post(worktrees_create))
+        .route("/worktrees/list", get(worktrees_list))
+        .route("/worktrees/{id}", get(worktrees_get))
+        .route("/worktrees/{id}/archive", post(worktrees_archive))
         .route("/approval/check", post(approval_check))
         .route("/files/list", get(files_list))
         .route("/files/read", get(files_read))

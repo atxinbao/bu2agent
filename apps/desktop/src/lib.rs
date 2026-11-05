@@ -50,6 +50,7 @@ pub mod transport;
 pub mod task_client;
 pub mod effects_client;
 pub mod executions_client;
+pub mod engineering_client;
 pub mod inbox_client;
 pub mod assignments_client;
 pub mod evidence_client;

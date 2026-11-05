@@ -41,6 +41,11 @@ use agent_desktop::chat_records_client::{
     UnreadCount,
 };
 use agent_desktop::node_client::{Node, NodeClient};
+use agent_desktop::engineering_client::{
+    EngineeringClient, Location, Project, Worktree, WorkspaceBinding,
+};
+use tauri::AppHandle;
+use tauri_plugin_dialog::DialogExt;
 use agent_desktop::stream_client::{
     StreamCancelResult, StreamClient, StreamEvents, StreamOpen, StreamPoke, StreamSubscription,
     SxsSelection,
@@ -1070,6 +1075,140 @@ pub fn node_disconnect(node_id: String) -> Result<Node, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn node_unpair(node_id: String) -> Result<Node, String> {
     node_client()?.unpair_node(&node_id).map_err(agent_err_string)
+}
+
+// --- Engineering record surface (P3-A, record subset) ---
+//
+// All commands carry rename_all = "snake_case" (Task 9
+// lesson): the invoke client sends snake_case params.
+// DTOs mirror the HTTP routes field for field (C1).
+
+fn engineering_client() -> Result<EngineeringClient, String> {
+    EngineeringClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_binding_create(
+    display_name: String,
+    path: String,
+) -> Result<WorkspaceBinding, String> {
+    engineering_client()?
+        .create_binding(&display_name, &path)
+        .map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_binding_list() -> Result<Vec<WorkspaceBinding>, String> {
+    engineering_client()?.list_bindings().map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_binding_get(workspace_id: String) -> Result<WorkspaceBinding, String> {
+    engineering_client()?.get_binding(&workspace_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_binding_archive(workspace_id: String) -> Result<WorkspaceBinding, String> {
+    engineering_client()?.archive_binding(&workspace_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_project_create(
+    name: String,
+    description: String,
+) -> Result<Project, String> {
+    engineering_client()?.create_project(&name, &description).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_project_list() -> Result<Vec<Project>, String> {
+    engineering_client()?.list_projects().map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_project_get(project_id: String) -> Result<Project, String> {
+    engineering_client()?.get_project(&project_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_project_archive(project_id: String) -> Result<Project, String> {
+    engineering_client()?.archive_project(&project_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_location_create(
+    workspace_id: String,
+    name: String,
+    path: String,
+) -> Result<Location, String> {
+    engineering_client()?
+        .create_location(&workspace_id, &name, &path)
+        .map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_location_list() -> Result<Vec<Location>, String> {
+    engineering_client()?.list_locations().map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_location_get(location_id: String) -> Result<Location, String> {
+    engineering_client()?.get_location(&location_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_location_archive(location_id: String) -> Result<Location, String> {
+    engineering_client()?.archive_location(&location_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_worktree_create(
+    location_id: String,
+    directory_relative: String,
+    branch_label: String,
+    project_id: Option<String>,
+) -> Result<Worktree, String> {
+    engineering_client()?
+        .create_worktree(&location_id, &directory_relative, &branch_label, project_id.as_deref())
+        .map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_worktree_list() -> Result<Vec<Worktree>, String> {
+    engineering_client()?.list_worktrees().map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_worktree_get(worktree_id: String) -> Result<Worktree, String> {
+    engineering_client()?.get_worktree(&worktree_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_worktree_archive(worktree_id: String) -> Result<Worktree, String> {
+    engineering_client()?.archive_worktree(&worktree_id).map_err(|e| err_string(&e))
+}
+
+/// P3-A: directory picker shell command for the
+/// EngineeringView "bind repository" flow. The dialog plugin
+/// is already a dependency and initialized in main.rs; the
+/// capability file grants `dialog:default`. The gateway
+/// canonicalizes and validates the picked directory at
+/// binding creation, so this command validates nothing — a
+/// cancelled picker returns `None`.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn pick_directory(app: AppHandle) -> Result<Option<String>, String> {
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    app.dialog()
+        .file()
+        .set_title("选择仓库目录")
+        .pick_folder(move |picked| {
+            let _ = tx.try_send(picked.and_then(|p| p.into_path().ok()));
+        });
+    let picked = rx
+        .recv()
+        .await
+        .ok_or_else(|| "directory picker closed unexpectedly".to_string())?;
+    Ok(picked.map(|p| p.to_string_lossy().into_owned()))
 }
 
 // --- Chat stream surface (Task 20, stream form subset) ---

@@ -44,6 +44,12 @@ impl ToolRegistry {
         registry.tools.push(ToolSpec { name: "mail.list".to_string(), requires_approval: false, capability: "mail".to_string() });
         registry.tools.push(ToolSpec { name: "mail.send".to_string(), requires_approval: true, capability: "mail".to_string() });
         registry.tools.push(ToolSpec { name: "reminders.set_completed".to_string(), requires_approval: true, capability: "reminders".to_string() });
+        // P2: the loop mail tools were missing from phase4; the
+        // desktop AgentClient reports unknown tool without them.
+        registry.tools.push(ToolSpec { name: "email.threads".to_string(), requires_approval: false, capability: "mail".to_string() });
+        registry.tools.push(ToolSpec { name: "email.message".to_string(), requires_approval: false, capability: "mail".to_string() });
+        // P3-A: read-only code search, no approval.
+        registry.tools.push(ToolSpec { name: "code.search".to_string(), requires_approval: false, capability: "code".to_string() });
         registry
     }
 

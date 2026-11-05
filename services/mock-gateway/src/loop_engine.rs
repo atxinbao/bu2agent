@@ -327,6 +327,10 @@ pub struct StartLoop {
     pub prompt: String,
     pub max_calls: Option<usize>,
     pub budget_ms: Option<u64>,
+    /// P3-A: optional bound worktree. The loop's Execution
+    /// snapshot freezes this worktree's location, id, and root
+    /// digest; absent means unbound (today's behaviour).
+    pub worktree_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -494,7 +498,7 @@ pub fn loop_tool_requires_approval(tool: &str) -> bool {
 }
 
 pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, ErrorCode> {
-    if !matches!(tool, "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message") {
+    if !matches!(tool, "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "code.search") {
         return Err(ErrorCode::InvalidTool);
     }
     let object = args.as_object().ok_or(ErrorCode::InvalidArguments)?;
@@ -543,6 +547,57 @@ pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, E
             .filter(|id| !id.trim().is_empty() && id.len() <= 4096)
             .ok_or(ErrorCode::InvalidArguments)?;
         return Ok(BTreeMap::from([("id".into(), id.to_string())]));
+    }
+    if tool == "code.search" {
+        // P3-A: read-only content search. query is required and
+        // non-empty; worktree_id and path are optional (path is
+        // a worktree-relative prefix, "" = the worktree root);
+        // max_results defaults to 50 and clamps to 50. Values
+        // stay strings in the normalized map; the dispatcher
+        // parses them back.
+        if object
+            .keys()
+            .any(|k| !matches!(k.as_str(), "query" | "worktree_id" | "path" | "max_results"))
+        {
+            return Err(ErrorCode::InvalidArguments);
+        }
+        let query = object
+            .get("query")
+            .and_then(Value::as_str)
+            .filter(|q| !q.trim().is_empty() && q.len() <= 4096)
+            .ok_or(ErrorCode::InvalidArguments)?;
+        let worktree_id = match object.get("worktree_id") {
+            None => String::new(),
+            Some(Value::String(id)) if !id.trim().is_empty() && id.len() <= 4096 => {
+                id.to_string()
+            }
+            Some(_) => return Err(ErrorCode::InvalidArguments),
+        };
+        let path = match object.get("path") {
+            None => String::new(),
+            Some(Value::String(p)) => {
+                crate::code_search::normalize_search_path(p).ok_or(ErrorCode::InvalidArguments)?
+            }
+            Some(_) => return Err(ErrorCode::InvalidArguments),
+        };
+        let max_results = match object.get("max_results") {
+            None => 50usize,
+            Some(Value::Number(n)) => {
+                let v = n.as_u64().ok_or(ErrorCode::InvalidArguments)? as usize;
+                if v == 0 {
+                    50
+                } else {
+                    v.min(crate::code_search::CODE_SEARCH_MAX_RESULTS)
+                }
+            }
+            Some(_) => return Err(ErrorCode::InvalidArguments),
+        };
+        return Ok(BTreeMap::from([
+            ("query".into(), query.to_string()),
+            ("worktree_id".into(), worktree_id),
+            ("path".into(), path),
+            ("max_results".into(), max_results.to_string()),
+        ]));
     }
     if tool == "reminders.list" {
         if !object.is_empty() {
@@ -1147,7 +1202,7 @@ impl LoopEngine {
                                 // 非法工具名不原样写盘，避免把模型任意文本带入审计。
                                 let tool = if matches!(
                                     proposal.tool.as_str(),
-                                    "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message"
+                                    "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "code.search"
                                 ) {
                                     proposal.tool.clone()
                                 } else {

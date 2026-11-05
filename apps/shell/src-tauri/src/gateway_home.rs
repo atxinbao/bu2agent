@@ -57,6 +57,10 @@ pub struct GatewayPaths {
     pub node_state_path: PathBuf,
     pub stream_state_path: PathBuf,
     pub voice_state_path: PathBuf,
+    pub binding_state_path: PathBuf,
+    pub project_state_path: PathBuf,
+    pub location_state_path: PathBuf,
+    pub worktree_state_path: PathBuf,
     pub executions_path: PathBuf,
     pub effects_path: PathBuf,
     /// P0-D: the unified-plane SQLite database, next to the
@@ -85,6 +89,10 @@ pub fn gateway_paths(working_dir: &Path) -> GatewayPaths {
         node_state_path: data.join("nodes.jsonl"),
         stream_state_path: data.join("stream.jsonl"),
         voice_state_path: data.join("voice.jsonl"),
+        binding_state_path: data.join("bindings.jsonl"),
+        project_state_path: data.join("projects.jsonl"),
+        location_state_path: data.join("locations.jsonl"),
+        worktree_state_path: data.join("worktrees.jsonl"),
         executions_path: data.join("executions.jsonl"),
         effects_path: data.join("effects.jsonl"),
         sqlite_path: data.join("gateway.sqlite3"),
@@ -122,6 +130,10 @@ pub fn gateway_env(paths: &GatewayPaths, addr: &str) -> Vec<(String, String)> {
     push("MOCK_NODE_STATE_PATH", &paths.node_state_path.to_string_lossy());
     push("MOCK_STREAM_STATE_PATH", &paths.stream_state_path.to_string_lossy());
     push("MOCK_VOICE_STATE_PATH", &paths.voice_state_path.to_string_lossy());
+    push("MOCK_BINDING_STATE_PATH", &paths.binding_state_path.to_string_lossy());
+    push("MOCK_PROJECT_STATE_PATH", &paths.project_state_path.to_string_lossy());
+    push("MOCK_LOCATION_STATE_PATH", &paths.location_state_path.to_string_lossy());
+    push("MOCK_WORKTREE_STATE_PATH", &paths.worktree_state_path.to_string_lossy());
     push("MOCK_EXECUTIONS_PATH", &paths.executions_path.to_string_lossy());
     push("MOCK_EFFECTS_PATH", &paths.effects_path.to_string_lossy());
     push("MOCK_SQLITE_PATH", &paths.sqlite_path.to_string_lossy());

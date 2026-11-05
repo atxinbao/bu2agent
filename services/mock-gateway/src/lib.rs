@@ -38,6 +38,11 @@ pub mod chat_store;
 pub mod node_store;
 pub mod stream_store;
 pub mod voice_store;
+pub mod binding_store;
+pub mod project_store;
+pub mod location_store;
+pub mod worktree_store;
+pub mod code_search;
 pub mod mail_source;
 pub mod device_store;
 pub mod device_backend;
@@ -100,7 +105,7 @@ pub fn start_stream(stream_id: &str, turn_id: &str, text: &str) -> Vec<Subscript
 /// (never a real tool). `None` means the tool is unknown.
 pub fn tool_requires_approval(name: &str) -> Option<bool> {
     match name {
-        "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" | "email.threads" | "email.message" => Some(false),
+        "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" | "email.threads" | "email.message" | "code.search" => Some(false),
         "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "fs.export" | "notes.create" | "mail.send" | "reminders.set_completed" => Some(true),
         _ => None,
     }
@@ -223,6 +228,10 @@ mod tests {
         assert_eq!(tool_requires_approval("notes.create"), Some(true));
         assert_eq!(tool_requires_approval("mail.send"), Some(true));
         assert_eq!(tool_requires_approval("reminders.set_completed"), Some(true));
+        assert_eq!(tool_requires_approval("email.threads"), Some(false));
+        assert_eq!(tool_requires_approval("email.message"), Some(false));
+        // P3-A: code.search is a read-only loop tool, no approval.
+        assert_eq!(tool_requires_approval("code.search"), Some(false));
         assert_eq!(tool_requires_approval("no.such.tool"), None);
     }
 

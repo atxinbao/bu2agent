@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Default capability: the main window may call the shell's own commands.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:default"]
 }

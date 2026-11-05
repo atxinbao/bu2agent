@@ -1,0 +1,527 @@
+import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useState } from "react";
+import type {
+  Binding,
+  EngineeringGateway,
+  Location,
+  Project,
+  Worktree,
+} from "../domain/engineering_client";
+import type { LoopGateway } from "../domain/loop_client";
+
+// P3-A 工程视图（基线 P3）：绑定与记录的只读管理面，只做 UI。
+// 本页不写任何文件、不建 Patch、不跑任何命令（子进程、git、
+// 测试一律没有，见方案 §8 排除清单）；P3-A 全程只读搜索。
+// Location 只是目录绑定，没有 git 语义；Worktree 的
+// branch_label 只是展示字符串，不代表已连接 git 分支或
+// 真实工作树——文案不得让用户误以为已连接 git 仓库。
+// Project 在 P3-A 没有独立管理 UI（方案 §3.5）：只在
+// Worktree 创建表单的 project 选择框与 Worktree 详情里出现。
+// code.search 是 loop 工具，不走领域客户端：本页的搜索入口
+// 发起一个循环（照 MailView“摘要为草稿”的 loops.start 写法），
+// 搜索结果在 Loops 页的循环执行详情里展示（tool 调用记录），
+// 不在本页内展示。
+
+const LOOP_MAX_CALLS = 5;
+const LOOP_BUDGET_MS = 120000;
+
+interface EngineeringViewProps {
+  engineering: EngineeringGateway;
+  loops: LoopGateway;
+  isInvoke: boolean;
+  onNavigate: (target: "loops") => void;
+}
+
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+export function EngineeringView({
+  engineering,
+  loops,
+  isInvoke,
+  onNavigate,
+}: EngineeringViewProps) {
+  const [bindings, setBindings] = useState<Binding[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [locations, setLocations] = useState<Location[]>([]);
+  const [worktrees, setWorktrees] = useState<Worktree[]>([]);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  // 绑定表单：Invoke 环境用目录选择器，HTTP 环境用路径文本输入。
+  const [bindingName, setBindingName] = useState("");
+  const [bindingPath, setBindingPath] = useState("");
+  // Location 表单。
+  const [locationBindingId, setLocationBindingId] = useState("");
+  const [locationName, setLocationName] = useState("");
+  const [locationPath, setLocationPath] = useState("");
+  // Worktree 表单。
+  const [worktreeLocationId, setWorktreeLocationId] = useState("");
+  const [worktreeDir, setWorktreeDir] = useState("");
+  const [worktreeBranch, setWorktreeBranch] = useState("");
+  const [worktreeProjectId, setWorktreeProjectId] = useState("");
+  // code.search 入口。
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchWorktreeId, setSearchWorktreeId] = useState("");
+
+  async function refreshAll() {
+    try {
+      const [nextBindings, nextProjects, nextLocations, nextWorktrees] =
+        await Promise.all([
+          engineering.bindingList(),
+          engineering.projectList(),
+          engineering.locationList(),
+          engineering.worktreeList(),
+        ]);
+      setBindings(nextBindings);
+      setProjects(nextProjects);
+      setLocations(nextLocations);
+      setWorktrees(nextWorktrees);
+    } catch (e) {
+      setError(`工程记录读取失败：${errText(e)}`);
+    }
+  }
+
+  useEffect(() => {
+    void refreshAll();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function projectName(projectId: string | null): string {
+    if (projectId === null) return "（未关联 Project）";
+    const found = projects.find((p) => p.projectId === projectId);
+    return found ? `${found.name}（${found.projectId}）` : projectId;
+  }
+
+  async function handleBind() {
+    const displayName = bindingName.trim();
+    if (displayName === "") {
+      setError("绑定仓库需要先填显示名称。");
+      return;
+    }
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      let path: string;
+      if (isInvoke) {
+        // pick_directory 是 Rust 侧的壳命令：弹目录选择器，
+        // 取消返回 null（与 tool_commands.rs 对过，命令已落地）。
+        const picked = await invoke<string | null>("pick_directory");
+        if (picked === null || picked === "") {
+          setMessage("已取消选择目录，未绑定。");
+          return;
+        }
+        path = picked;
+      } else {
+        // HTTP 预览没有 Tauri 对话框：直接输路径绑定，
+        // 与选择器是等价入口（dev 模式）。
+        path = bindingPath.trim();
+        if (path === "") {
+          setError("HTTP 预览没有目录选择器，请直接输入要绑定的目录路径。");
+          return;
+        }
+      }
+      const created = await engineering.bindingCreate(displayName, path);
+      setBindingName("");
+      setBindingPath("");
+      await refreshAll();
+      setMessage(`已绑定 ${created.displayName}（${created.workspaceId}）。`);
+    } catch (e) {
+      setError(`绑定失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCreateLocation() {
+    if (locationBindingId === "" || locationName.trim() === "" || locationPath.trim() === "") {
+      setError("新建 Location 需要先选所属绑定，并填名字与路径。");
+      return;
+    }
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      const created = await engineering.locationCreate(
+        locationBindingId,
+        locationName.trim(),
+        locationPath.trim(),
+      );
+      setLocationName("");
+      setLocationPath("");
+      await refreshAll();
+      setMessage(`已新建 Location ${created.name}（${created.locationId}）。`);
+    } catch (e) {
+      setError(`新建 Location 失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCreateWorktree() {
+    if (worktreeLocationId === "") {
+      setError("新建 Worktree 需要先选所属 Location。");
+      return;
+    }
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      const created = await engineering.worktreeCreate(
+        worktreeLocationId,
+        worktreeDir.trim(),
+        worktreeBranch.trim(),
+        worktreeProjectId === "" ? null : worktreeProjectId,
+      );
+      setWorktreeDir("");
+      setWorktreeBranch("");
+      setWorktreeProjectId("");
+      await refreshAll();
+      setMessage(`已新建 Worktree（${created.worktreeId}）。`);
+    } catch (e) {
+      setError(`新建 Worktree 失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleArchive(
+    kind: "binding" | "location" | "worktree",
+    id: string,
+  ) {
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      if (kind === "binding") {
+        await engineering.bindingArchive(id);
+      } else if (kind === "location") {
+        await engineering.locationArchive(id);
+      } else {
+        await engineering.worktreeArchive(id);
+      }
+      await refreshAll();
+      setMessage(`已归档 ${id}。`);
+    } catch (e) {
+      // 归档守则的 409（如仍有 active 下级）由服务端报错；
+      // 客户端不改写措辞，原样展示。
+      setError(`归档失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSearch() {
+    const query = searchQuery.trim();
+    if (query === "") {
+      setError("搜索需要先填 query（不能为空）。");
+      return;
+    }
+    if (searchWorktreeId === "") {
+      setError("搜索需要先选一个 Worktree 作为作用域。");
+      return;
+    }
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      const worktree = worktrees.find((w) => w.worktreeId === searchWorktreeId);
+      const scope =
+        worktree === undefined
+          ? searchWorktreeId
+          : `${searchWorktreeId}（Location ${worktree.locationId} 下相对目录“${worktree.directoryRelative === "" ? "（根）" : worktree.directoryRelative}”）`;
+      const prompt =
+        `请在指定的 Worktree 中搜索代码。\n` +
+        `\n` +
+        `Worktree：${scope}\n` +
+        `搜索 query：${query}\n` +
+        `\n` +
+        `步骤：\n` +
+        `1. 用 code.search 工具搜索该 query，作用域就是上述 Worktree（传 worktree_id=${searchWorktreeId}）；只读，不写任何文件。\n` +
+        `2. 列出命中文件与行号（1-based），每条命中附一行短上下文；超过上限被截断时注明 truncated。\n` +
+        `3. 只汇报工具结果实际返回过的内容，不猜测未命中的文件。\n`;
+      const snapshot = await loops.start(prompt, LOOP_MAX_CALLS, LOOP_BUDGET_MS);
+      // Loops 页挂载时按 localStorage 里的上次循环 ID 恢复；
+      // 把新循环 ID 存下，跳转后直接跟进该循环的审批。
+      try {
+        localStorage.setItem("bu2agent.lastLoopId", snapshot.loop_id);
+      } catch {
+        // 存储不可用不影响跳转，Loops 页可按 ID 手动查询。
+      }
+      onNavigate("loops");
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section>
+      <h2>工程</h2>
+      <p className="note">
+        绑定与记录的只读管理面：绑定仓库、建 Location / Worktree、
+        用 code.search 读代码。P3-A 全程只读，不写任何文件，不建
+        Patch，不跑任何命令。Location 只是目录绑定，没有 git 语义；
+        Worktree 的分支标签只是展示字符串，不代表已连接 git 分支
+        或真实工作树。
+      </p>
+      <div className="row">
+        <button type="button" onClick={() => void refreshAll()} disabled={busy}>
+          刷新
+        </button>
+      </div>
+      {error !== "" && (
+        <p className="error" role="alert">
+          {error}
+        </p>
+      )}
+      {message !== "" && <p>{message}</p>}
+
+      <h3>绑定仓库</h3>
+      <p className="note">
+        绑定只登记你选定的目录（网关会 canonicalize 后登记为允许根）；
+        绑定本身不读、不写该目录下的任何文件。
+      </p>
+      <div className="row">
+        <label>
+          显示名称
+          <input
+            type="text"
+            value={bindingName}
+            onChange={(event) => setBindingName(event.target.value)}
+            placeholder="如 bu2agent"
+          />
+        </label>
+        {!isInvoke && (
+          <label>
+            目录路径
+            <input
+              type="text"
+              value={bindingPath}
+              onChange={(event) => setBindingPath(event.target.value)}
+              placeholder="HTTP 预览：直接输入绝对路径"
+            />
+          </label>
+        )}
+        <button type="button" onClick={() => void handleBind()} disabled={busy}>
+          {isInvoke ? "选择目录并绑定" : "绑定"}
+        </button>
+      </div>
+      {bindings.length === 0 && <p className="empty">暂无绑定。</p>}
+      <ul>
+        {bindings.map((binding) => (
+          <li key={binding.workspaceId}>
+            <p>
+              {binding.displayName} · {binding.workspaceId} · 允许根：
+              {binding.allowedRoots.join("、") || "（无）"}
+            </p>
+            <p>
+              policy_digest：{binding.policyDigest}
+            </p>
+            <button
+              type="button"
+              onClick={() => void handleArchive("binding", binding.workspaceId)}
+              disabled={busy}
+            >
+              归档
+            </button>
+          </li>
+        ))}
+      </ul>
+
+      <h3>Location</h3>
+      <p className="note">
+        Location 是绑定下的目录锚点：名字 + 一条已登记绑定内的路径。
+        只是目录绑定，没有 git 语义；不创建目录。归档时若其下仍有
+        active Worktree，服务端会 409 拒绝，须先归档下级。
+      </p>
+      <div className="row">
+        <label>
+          所属绑定
+          <select
+            value={locationBindingId}
+            onChange={(event) => setLocationBindingId(event.target.value)}
+          >
+            <option value="">（请选择）</option>
+            {bindings.map((binding) => (
+              <option key={binding.workspaceId} value={binding.workspaceId}>
+                {binding.displayName}（{binding.workspaceId}）
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          名字
+          <input
+            type="text"
+            value={locationName}
+            onChange={(event) => setLocationName(event.target.value)}
+            placeholder="如 bu2agent 根目录"
+          />
+        </label>
+        <label>
+          路径
+          <input
+            type="text"
+            value={locationPath}
+            onChange={(event) => setLocationPath(event.target.value)}
+            placeholder="须在所属绑定的允许根内"
+          />
+        </label>
+        <button type="button" onClick={() => void handleCreateLocation()} disabled={busy}>
+          新建 Location
+        </button>
+      </div>
+      {locations.length === 0 && <p className="empty">暂无 Location。</p>}
+      <ul>
+        {locations.map((location) => (
+          <li key={location.locationId}>
+            <p>
+              {location.name} · {location.locationId} · {location.status}
+            </p>
+            <p>
+              所属绑定：{location.workspaceId} · 根：{location.canonicalRoot}
+            </p>
+            <p>root_sha256：{location.rootSha256}</p>
+            {location.status === "active" && (
+              <button
+                type="button"
+                onClick={() => void handleArchive("location", location.locationId)}
+                disabled={busy}
+              >
+                归档
+              </button>
+            )}
+          </li>
+        ))}
+      </ul>
+
+      <h3>Worktree</h3>
+      <p className="note">
+        Worktree 是读代码的锚点：Location 下的一个相对目录（留空即
+        Location 根本身）。P3-A 不执行真实 git worktree add，不建目录，
+        不改分支；branch_label 只是展示字符串。
+      </p>
+      <div className="row">
+        <label>
+          所属 Location
+          <select
+            value={worktreeLocationId}
+            onChange={(event) => setWorktreeLocationId(event.target.value)}
+          >
+            <option value="">（请选择）</option>
+            {locations.map((location) => (
+              <option key={location.locationId} value={location.locationId}>
+                {location.name}（{location.locationId}）
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          相对目录
+          <input
+            type="text"
+            value={worktreeDir}
+            onChange={(event) => setWorktreeDir(event.target.value)}
+            placeholder="留空即 Location 根目录"
+          />
+        </label>
+        <label>
+          分支标签（仅展示）
+          <input
+            type="text"
+            value={worktreeBranch}
+            onChange={(event) => setWorktreeBranch(event.target.value)}
+            placeholder="如 main"
+          />
+        </label>
+        <label>
+          Project（可选）
+          <select
+            value={worktreeProjectId}
+            onChange={(event) => setWorktreeProjectId(event.target.value)}
+          >
+            <option value="">（不关联）</option>
+            {projects.map((project) => (
+              <option key={project.projectId} value={project.projectId}>
+                {project.name}（{project.projectId}）
+              </option>
+            ))}
+          </select>
+        </label>
+        <button type="button" onClick={() => void handleCreateWorktree()} disabled={busy}>
+          新建 Worktree
+        </button>
+      </div>
+      {worktrees.length === 0 && <p className="empty">暂无 Worktree。</p>}
+      <ul>
+        {worktrees.map((worktree) => (
+          <li key={worktree.worktreeId}>
+            <p>
+              {worktree.worktreeId} · {worktree.status} · 相对目录：
+              {worktree.directoryRelative === "" ? "（Location 根目录）" : worktree.directoryRelative}
+              {worktree.branchLabel !== "" ? ` · 分支标签：${worktree.branchLabel}` : ""}
+            </p>
+            <p>
+              所属 Location：{worktree.locationId} · Project：
+              {projectName(worktree.projectId)}
+            </p>
+            {worktree.status === "active" && (
+              <button
+                type="button"
+                onClick={() => void handleArchive("worktree", worktree.worktreeId)}
+                disabled={busy}
+              >
+                归档
+              </button>
+            )}
+          </li>
+        ))}
+      </ul>
+
+      <h3>搜索代码（code.search）</h3>
+      <p className="note">
+        只读搜索：循环用 code.search 在选定的 Worktree 里找 query，
+        列出命中文件与行号。搜索结果在 Loops 页的循环执行详情里
+        展示（tool 调用记录），不在本页内展示。
+      </p>
+      <div className="row">
+        <label>
+          Worktree
+          <select
+            value={searchWorktreeId}
+            onChange={(event) => setSearchWorktreeId(event.target.value)}
+          >
+            <option value="">（请选择）</option>
+            {worktrees
+              .filter((worktree) => worktree.status === "active")
+              .map((worktree) => (
+                <option key={worktree.worktreeId} value={worktree.worktreeId}>
+                  {worktree.worktreeId}
+                  {worktree.directoryRelative === ""
+                    ? "（Location 根目录）"
+                    : `（${worktree.directoryRelative}）`}
+                </option>
+              ))}
+          </select>
+        </label>
+        <label>
+          query
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            placeholder="如 plan_loop_effect"
+          />
+        </label>
+        <button type="button" onClick={() => void handleSearch()} disabled={busy}>
+          搜索
+        </button>
+      </div>
+    </section>
+  );
+}
