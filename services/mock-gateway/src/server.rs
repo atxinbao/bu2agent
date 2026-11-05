@@ -3270,6 +3270,24 @@ async fn approval_decide(
     // decide persistence, exactly like loop approvals already did:
     // a decision that cannot be audited must not take effect.
     let bound = record.binding.is_some() || record.operation_digest.is_some();
+    // P3-B window fix (U3): approving an already-approved,
+    // unconsumed approval is an idempotent no-op, not an error.
+    // A UI that decides-then-applies (PatchesView's "approve and
+    // apply") otherwise cannot apply a file whose approval was
+    // already decided elsewhere: the repeated decide 409s and the
+    // apply step is never reached. Reject-on-approved and any
+    // decide on a consumed or rejected record still 409 below;
+    // the apply command remains the real approval gate.
+    if bound
+        && status == ApprovalStatus::Approved
+        && record.status == ApprovalStatus::Approved
+        && !record.consumed
+    {
+        let current = req.status.clone();
+        let tool_call_id = req.tool_call_id.clone();
+        drop(approvals);
+        return Json(serde_json::json!({ "tool_call_id": tool_call_id, "status": current })).into_response();
+    }
     if bound && (record.consumed || record.status != ApprovalStatus::Pending || status == ApprovalStatus::Edited) {
         return (StatusCode::CONFLICT, Json(serde_json::json!({"error":"loop_approval_already_decided_or_invalid"}))).into_response();
     }

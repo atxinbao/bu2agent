@@ -151,3 +151,80 @@ async fn approval_survives_server_restart() {
     assert!(lines[5].contains("effect_binding"), "last line: {}", lines[5]);
     let _ = std::fs::remove_dir_all(&files_root);
 }
+
+/// P3-B window fix (U3): deciding approve on an already-approved,
+/// unconsumed bound approval is an idempotent no-op (200), not a
+/// 409. A UI that decides-then-applies (PatchesView's "approve and
+/// apply") otherwise cannot apply a file whose approval was already
+/// decided elsewhere: the repeated decide 409s and the apply step
+/// is never reached. Reject-on-approved and any decide on a
+/// consumed record still 409, and the re-approve neither consumes
+/// the approval nor breaks its one execution.
+#[tokio::test]
+async fn decide_approve_is_idempotent_for_approved_unconsumed_bound_approval() {
+    let (files_root, approvals_path) = temp_paths("reapprove");
+    let state =
+        AppState::with_files_root_and_approvals(files_root.clone(), Some(approvals_path.clone()));
+    let (addr, server) = start_server(state).await;
+
+    let (status, body) = post(addr, "/approval/request", "{\"tool\":\"fs.write\",\"path\":\"reapprove.txt\",\"content_base64\":\"YmVmb3Jl\"}").await;
+    assert!(status.contains("200"), "request status: {status} body: {body}");
+    let id: String = serde_json::from_str::<serde_json::Value>(&body)
+        .expect("request json")["tool_call_id"]
+        .as_str()
+        .expect("tool_call_id string")
+        .to_string();
+    assert_eq!(id, "approval-1");
+
+    let (status, _) = post(
+        addr,
+        "/approval/decide",
+        &format!("{{\"tool_call_id\":\"{id}\",\"status\":\"approved\"}}"),
+    )
+    .await;
+    assert!(status.contains("200"), "first decide status: {status}");
+
+    // Second approve of the same approved, unconsumed record:
+    // 200, not 409.
+    let (status, body) = post(
+        addr,
+        "/approval/decide",
+        &format!("{{\"tool_call_id\":\"{id}\",\"status\":\"approved\"}}"),
+    )
+    .await;
+    assert!(status.contains("200"), "re-approve status: {status} body: {body}");
+    assert!(body.contains("\"approved\""), "re-approve body: {body}");
+
+    // Reject-on-approved still fails closed.
+    let (status, _) = post(
+        addr,
+        "/approval/decide",
+        &format!("{{\"tool_call_id\":\"{id}\",\"status\":\"rejected\"}}"),
+    )
+    .await;
+    assert!(status.contains("409"), "reject-on-approved status: {status}");
+
+    // The re-approve neither consumed the approval nor broke its
+    // one execution: the bound write still executes exactly once.
+    let (status, _) = post(
+        addr,
+        "/agent/tool/call",
+        &format!(
+            "{{\"tool\":\"fs.write\",\"args\":{{\"path\":\"reapprove.txt\",\"text\":\"before\"}},\"tool_call_id\":\"{id}\"}}"
+        ),
+    )
+    .await;
+    assert!(status.contains("200"), "bound write status: {status}");
+
+    // And a decide on the now-consumed record still 409s.
+    let (status, _) = post(
+        addr,
+        "/approval/decide",
+        &format!("{{\"tool_call_id\":\"{id}\",\"status\":\"approved\"}}"),
+    )
+    .await;
+    assert!(status.contains("409"), "decide-on-consumed status: {status}");
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(&files_root);
+}
