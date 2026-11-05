@@ -17,7 +17,10 @@
 //
 // `echo` is a Mock-only demo tool (no approval), not a real
 // tool; the registry tools are fs.list / fs.read (no
-// approval) and fs.write / fs.delete (approval).
+// approval) and fs.write / fs.delete / reminders.set_completed
+// (approval). The reminders entry was missing until the P1
+// window validation caught it (U2: `unknown tool` before any
+// request); the gateway and desktop registries already had it.
 
 export type ToolDecision = "ask" | "approve" | "reject";
 
@@ -73,6 +76,7 @@ function requiresApproval(tool: string): boolean | undefined {
       return false;
     case "fs.write":
     case "fs.delete":
+    case "reminders.set_completed":
       return true;
     default:
       return undefined;
