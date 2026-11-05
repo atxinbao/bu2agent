@@ -494,10 +494,56 @@ pub fn loop_tool_requires_approval(tool: &str) -> bool {
 }
 
 pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, ErrorCode> {
-    if !matches!(tool, "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed") {
+    if !matches!(tool, "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message") {
         return Err(ErrorCode::InvalidTool);
     }
     let object = args.as_object().ok_or(ErrorCode::InvalidArguments)?;
+    if tool == "email.threads" {
+        // P2: read-only mail listing. Both args optional; limit
+        // clamps like the /api/email/threads route (default 50,
+        // max 200), offset defaults to 0. Values stay strings in
+        // the normalized map; the dispatcher parses them back.
+        if object
+            .keys()
+            .any(|k| !matches!(k.as_str(), "limit" | "offset"))
+        {
+            return Err(ErrorCode::InvalidArguments);
+        }
+        let limit = match object.get("limit") {
+            None => crate::mail_source::clamp_limit(None).to_string(),
+            Some(Value::Number(n)) => {
+                let v = n.as_u64().ok_or(ErrorCode::InvalidArguments)?;
+                crate::mail_source::clamp_limit(Some(v as usize)).to_string()
+            }
+            Some(_) => return Err(ErrorCode::InvalidArguments),
+        };
+        let offset = match object.get("offset") {
+            None => "0".to_string(),
+            Some(Value::Number(n)) => {
+                let v = n.as_u64().ok_or(ErrorCode::InvalidArguments)?;
+                v.to_string()
+            }
+            Some(_) => return Err(ErrorCode::InvalidArguments),
+        };
+        return Ok(BTreeMap::from([
+            ("limit".into(), limit),
+            ("offset".into(), offset),
+        ]));
+    }
+    if tool == "email.message" {
+        // P2: read one message by id. The id is validated like
+        // the reminders.set_completed id (non-empty, bounded);
+        // the body itself is never a digest input.
+        if object.keys().any(|k| k.as_str() != "id") {
+            return Err(ErrorCode::InvalidArguments);
+        }
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty() && id.len() <= 4096)
+            .ok_or(ErrorCode::InvalidArguments)?;
+        return Ok(BTreeMap::from([("id".into(), id.to_string())]));
+    }
     if tool == "reminders.list" {
         if !object.is_empty() {
             return Err(ErrorCode::InvalidArguments);
@@ -1101,7 +1147,7 @@ impl LoopEngine {
                                 // 非法工具名不原样写盘，避免把模型任意文本带入审计。
                                 let tool = if matches!(
                                     proposal.tool.as_str(),
-                                    "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed"
+                                    "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message"
                                 ) {
                                     proposal.tool.clone()
                                 } else {

@@ -1191,6 +1191,97 @@ impl AppState {
             self.record_loop_effect(&tool, &args, &approval_id, &binding, &outcome);
             return outcome;
         }
+        // P2: read-only mail tools. They mirror reminders.list, not
+        // fs.read: the source is AppState.mail_source (the same
+        // MailSource the /api/email/* routes use, never the mock
+        // connector list), and the call runs on a blocking thread
+        // because AppleScript is synchronous. Reads produce no
+        // Effect and need no approval (registered Some(false)).
+        // Deliberately not added to dispatch_agent_tool: like
+        // reminders.*, these are loop-only tools, and the file
+        // fallthrough below indexes args["path"], which mail args
+        // do not carry.
+        if tool == "email.threads" {
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(50);
+            let offset = args
+                .get("offset")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let source = Arc::clone(&self.mail_source);
+            return match tokio::task::spawn_blocking(move || source.threads(limit, offset))
+                .await
+            {
+                Ok(Ok(threads)) => {
+                    let mut out = String::new();
+                    for t in &threads {
+                        out.push_str(&format!(
+                            "thread: {} | subject: {} | messages: {} | snippet: {}\n",
+                            t.thread_id,
+                            t.subject,
+                            t.message_ids.join(", "),
+                            t.snippet,
+                        ));
+                    }
+                    if out.is_empty() {
+                        out.push_str("（收件箱暂无线程。）\n");
+                    }
+                    ToolOutcome::success(email_rendered(out))
+                }
+                Ok(Err(err)) => ToolOutcome {
+                    status: crate::loop_engine::CallStatus::Failed,
+                    error: Some(ErrorCode::ToolFailed),
+                    body: email_error_text(err),
+                },
+                Err(_) => ToolOutcome::unknown(),
+            };
+        }
+        if tool == "email.message" {
+            let Some(id) = args.get("id").cloned() else {
+                return ToolOutcome::failed(ErrorCode::InvalidArguments);
+            };
+            let source = Arc::clone(&self.mail_source);
+            return match tokio::task::spawn_blocking(move || source.message(&id)).await {
+                Ok(Ok(message)) => {
+                    // MessageView carries no thread id; derive it
+                    // with the same functions the routes use, so the
+                    // citation anchor matches the thread listing.
+                    let thread_id = crate::mail_source::thread_id_for(
+                        &crate::mail_source::normalize_subject(&message.subject),
+                    );
+                    let attachments = if message.attachments.is_empty() {
+                        "none".to_string()
+                    } else {
+                        message
+                            .attachments
+                            .iter()
+                            .map(|a| format!("{} ({})", a.name, a.index))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    let out = format!(
+                        "message: {}\nthread: {}\nsubject: {}\nfrom: {}\nto: {}\ndate: {}\nattachments: {}\nbody:\n{}",
+                        message.message_id,
+                        thread_id,
+                        message.subject,
+                        message.from,
+                        message.to.join(", "),
+                        message.date,
+                        attachments,
+                        message.body_text,
+                    );
+                    ToolOutcome::success(email_rendered(out))
+                }
+                Ok(Err(err)) => ToolOutcome {
+                    status: crate::loop_engine::CallStatus::Failed,
+                    error: Some(ErrorCode::ToolFailed),
+                    body: email_error_text(err),
+                },
+                Err(_) => ToolOutcome::unknown(),
+            };
+        }
         if let Some(backend) = backend {
             let outcome = backend.execute(tool.clone(), args.clone()).await;
             if tool == "fs.write" {
@@ -7038,6 +7129,36 @@ async fn voice_onboarding_reset(State(state): State<AppState>) -> Json<serde_jso
 // NotFound -> 404, Unavailable -> 501, Denied -> 403,
 // Upstream -> 502. The packaged Mac app uses the
 // AppleScript source; other platforms answer 501.
+
+/// P2: loop-tool rendering for mail reads. Plain text so the model
+/// can cite message/thread ids directly. When the rendering exceeds
+/// the loop's 4096-byte tool-result bound, a truncation notice
+/// leads: it survives ToolMessage::from_outcome's cut from the
+/// start, while the summary's truncated flag still reports the cut.
+/// Bodies are never logged; only the rendered tool result (which
+/// the model sees) carries the notice.
+const EMAIL_TRUNCATION_NOTICE: &str =
+    "（注：内容过长已截断，仅展示前一部分；摘要/引用时请注明基于已读部分。）";
+
+fn email_rendered(rendered: String) -> String {
+    if rendered.len() > 4096 {
+        format!("{EMAIL_TRUNCATION_NOTICE}\n{rendered}")
+    } else {
+        rendered
+    }
+}
+
+/// P2: generic loop-tool error text for mail failures. Mirrors
+/// mail_error_response's public strings, never the underlying
+/// detail (stderr may contain local paths).
+fn email_error_text(err: MailError) -> String {
+    match err {
+        MailError::NotFound(what) => format!("unknown {what}"),
+        MailError::Unavailable(_) => "mail source unavailable".to_string(),
+        MailError::Denied => "mail automation denied".to_string(),
+        MailError::Upstream(_) => "mail source error".to_string(),
+    }
+}
 
 fn mail_error_response(err: MailError, not_found_what: &'static str) -> axum::response::Response {
     match err {

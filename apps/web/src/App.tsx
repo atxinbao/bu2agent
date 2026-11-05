@@ -44,6 +44,7 @@ import { EmailClient } from "./domain/email_client";
 import type { EmailGateway } from "./domain/email_client";
 import { InvokeEmailClient } from "./domain/invoke_email_client";
 import { MailView } from "./views/MailView";
+import { NotesView } from "./views/NotesView";
 import { NodeClient, type NodeGateway } from "./domain/node_client";
 import { InvokeNodeClient } from "./domain/invoke_node_client";
 import { StreamClient, type StreamGateway } from "./domain/stream_client";
@@ -153,7 +154,7 @@ interface Clients {
   evidence: EvidenceGateway;
 }
 
-type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "settings";
+type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "notes" | "settings";
 
 // Visible navigation: the workbench (sessions) is the only
 // chat entry and the default view (R1, 2026-10-28). The legacy
@@ -172,6 +173,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "spaces", label: "Spaces" },
   { id: "feed", label: "Feed" },
   { id: "mail", label: "Mail" },
+  { id: "notes", label: "Notes" },
   { id: "settings", label: "设置" },
 ];
 
@@ -593,7 +595,13 @@ export function App() {
         (clients === null ? (
           <p className="empty">Choosing transport…</p>
         ) : (
-          <MailView email={clients.email} />
+          <MailView email={clients.email} loops={clients.loops} onNavigate={(target) => setTab(target)} />
+        ))}
+      {tab === "notes" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : (
+          <NotesView files={clients.files} effects={clients.effects} evidence={clients.evidence} />
         ))}
       {tab === "tasks" &&
         (clients === null ? (

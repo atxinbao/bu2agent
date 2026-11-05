@@ -18,12 +18,29 @@ import type {
   MessageView,
   ThreadView,
 } from "../domain/email_client";
+import type { LoopGateway } from "../domain/loop_client";
+
+// P2 摘要为草稿入口：直接调 loop，不走 Workbench 对话。循环
+// 内读邮件（email.threads / email.message，只读工具）后用
+// fs.write 写草稿；写草稿的审批在 Loops 页的等待审批 UI 里
+// 批，与现有循环流程一致。MailView 本身仍只读：不加发送、
+// 不加删除。
+const LOOP_MAX_CALLS = 5;
+const LOOP_BUDGET_MS = 120000;
 
 function errText(e: unknown): string {
   return typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
 }
 
-export function MailView({ email }: { email: EmailGateway }) {
+export function MailView({
+  email,
+  loops,
+  onNavigate,
+}: {
+  email: EmailGateway;
+  loops: LoopGateway;
+  onNavigate: (target: "loops") => void;
+}) {
   const [mailbox, setMailbox] = useState<MailboxInfo | null>(null);
   const [setup, setSetup] = useState<MailboxSetup | null>(null);
   const [threads, setThreads] = useState<ThreadView[] | null>(null);
@@ -88,6 +105,41 @@ export function MailView({ email }: { email: EmailGateway }) {
       anchor.download = name;
       anchor.click();
       URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function summarizeToDraft() {
+    if (message === null || thread === null) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const draftPath = `drafts/draft-${Date.now()}.md`;
+      const prompt =
+        `请把下面这封邮件摘要为一篇草稿笔记。\n` +
+        `\n` +
+        `邮件 message id：${message.messageId}\n` +
+        `线程 thread id：${thread.threadId}\n` +
+        `目标草稿路径：${draftPath}\n` +
+        `\n` +
+        `步骤：\n` +
+        `1. 用 email.message 工具读取 message id 为 ${message.messageId} 的邮件（必要时用 email.threads 工具确认它所在的线程）；只读，不做任何发送或删除。\n` +
+        `2. 用中文写一份摘要，保留原文要点。\n` +
+        `3. 用 fs.write 把摘要写入目标路径 ${draftPath}（覆盖写入该文件）。\n` +
+        `4. 草稿开头以纯文本写明引用：message:${message.messageId}、thread:${thread.threadId}、标题：${message.subject}、发件人：${message.from}、日期：${message.date}；引用只写工具结果实际返回过的内容。\n` +
+        `5. 若邮件正文在工具结果中被截断，摘要中必须注明“基于已读部分”，不得冒充读过全文。\n`;
+      const snapshot = await loops.start(prompt, LOOP_MAX_CALLS, LOOP_BUDGET_MS);
+      // Loops 页挂载时按 localStorage 里的上次循环 ID 恢复；
+      // 把新循环 ID 存下，跳转后直接跟进该循环的审批。
+      try {
+        localStorage.setItem("bu2agent.lastLoopId", snapshot.loop_id);
+      } catch {
+        // 存储不可用不影响跳转，Loops 页可按 ID 手动查询。
+      }
+      onNavigate("loops");
     } catch (err) {
       setError(errText(err));
     } finally {
@@ -166,6 +218,13 @@ export function MailView({ email }: { email: EmailGateway }) {
           <p>
             发件人：{message.from} · 收件人：{message.to.join("、")} · {message.date}
           </p>
+          {thread !== null && (
+            <div className="row">
+              <button type="button" onClick={() => void summarizeToDraft()} disabled={busy}>
+                摘要为草稿
+              </button>
+            </div>
+          )}
           <pre>{message.bodyText}</pre>
           {message.attachments.length > 0 && (
             <div>
