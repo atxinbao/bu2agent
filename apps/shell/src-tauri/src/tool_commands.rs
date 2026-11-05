@@ -42,7 +42,8 @@ use agent_desktop::chat_records_client::{
 };
 use agent_desktop::node_client::{Node, NodeClient};
 use agent_desktop::engineering_client::{
-    EngineeringClient, Location, Project, Worktree, WorkspaceBinding,
+    EngineeringClient, Location, Patch, PatchApplyResult, PatchDetail, Project,
+    Worktree, WorkspaceBinding,
 };
 use tauri::AppHandle;
 use tauri_plugin_dialog::DialogExt;
@@ -1186,6 +1187,46 @@ pub fn engineering_worktree_get(worktree_id: String) -> Result<Worktree, String>
 #[tauri::command(rename_all = "snake_case")]
 pub fn engineering_worktree_archive(worktree_id: String) -> Result<Worktree, String> {
     engineering_client()?.archive_worktree(&worktree_id).map_err(|e| err_string(&e))
+}
+
+// --- Patches (P3-B, plan §4.7) ---
+//
+// The four Patch routes over invoke. DTOs mirror the HTTP
+// routes field for field (C1); the list filter is an
+// Option, so the invoke client sends null for "all".
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_patch_list(status: Option<String>) -> Result<Vec<Patch>, String> {
+    engineering_client()?
+        .list_patches(status.as_deref())
+        .map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_patch_get(patch_id: String) -> Result<PatchDetail, String> {
+    engineering_client()?.get_patch(&patch_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_patch_apply(
+    patch_id: String,
+    patch_file_id: String,
+    expected_old_sha256: Option<String>,
+    approval_id: String,
+) -> Result<PatchApplyResult, String> {
+    engineering_client()?
+        .apply_patch(
+            &patch_id,
+            &patch_file_id,
+            expected_old_sha256.as_deref(),
+            &approval_id,
+        )
+        .map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_patch_reject(patch_id: String) -> Result<PatchDetail, String> {
+    engineering_client()?.reject_patch(&patch_id).map_err(|e| err_string(&e))
 }
 
 /// P3-A: directory picker shell command for the

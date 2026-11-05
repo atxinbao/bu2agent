@@ -994,6 +994,7 @@ impl AppState {
             .unwrap_or("failed");
         if let Some(approval_id) = approval_id {
             if self.transition_bound_loop_effect(approval_id, terminal) {
+                sync_patch_file_after_loop_write(self, approval_id, terminal);
                 return;
             }
         }
@@ -1376,6 +1377,18 @@ impl AppState {
             };
         }
         if let Some(backend) = backend {
+            // P3-B (§10-8a): the SAME three-way stale check as
+            // the apply command, for a tool backend that
+            // executes fs.write. The production backend is
+            // None (the fallthrough below dispatches), but a
+            // custom backend must not bypass the check either.
+            if tool == "fs.write" {
+                if let Some(outcome) = check_loop_patch_write(self, &approval_id, &|outcome| {
+                    self.record_loop_effect(&tool, &args, &approval_id, &binding, outcome)
+                }) {
+                    return outcome;
+                }
+            }
             let outcome = backend.execute(tool.clone(), args.clone()).await;
             if tool == "fs.write" {
                 self.record_loop_effect(&tool, &args, &approval_id, &binding, &outcome);
@@ -1416,6 +1429,7 @@ impl AppState {
                 // terminal-row recording (legacy approval).
                 if let Some(approval_id) = approval_id {
                     if self.transition_bound_loop_effect(approval_id, terminal) {
+                        sync_patch_file_after_loop_write(self, approval_id, terminal);
                         return;
                     }
                 }
@@ -1435,6 +1449,16 @@ impl AppState {
                 );
             }
         };
+        // P3-B (§10-8a): the loop entry calls the SAME
+        // three-way stale check as the apply command, before
+        // the fs.write dispatch. A drifted proposal fails
+        // here (patch_stale), the PatchFile goes stale in the
+        // same tx, and the file is untouched.
+        if tool == "fs.write" {
+            if let Some(outcome) = check_loop_patch_write(self, &approval_id, &record_fs_effect) {
+                return outcome;
+            }
+        }
         let response = tokio::task::spawn_blocking(move || {
             let write_path = write_target.as_ref().map(|(path, _)| state.files_root.join(path));
             let response = state.loop_fault.dispatch(write_path.as_deref(), || dispatch_agent_tool(
@@ -3254,6 +3278,15 @@ async fn approval_decide(
         if bound { record.status = ApprovalStatus::Pending; return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"approval_audit_failed"}))).into_response(); }
         eprintln!("warning: approval persistence failed: {detail}");
     }
+    // P3-B (§4.5): a rejected approval rejects its PatchFile.
+    // Runs after the approvals lock is released (the linkage
+    // only touches SQLite).
+    let rejected = status == ApprovalStatus::Rejected;
+    let tool_call_id = req.tool_call_id.clone();
+    drop(approvals);
+    if rejected {
+        link_patch_file_rejected_on_approval(&state, &tool_call_id);
+    }
     Json(serde_json::json!({ "tool_call_id": req.tool_call_id, "status": req.status })).into_response()
 }
 
@@ -3560,6 +3593,11 @@ pub(crate) fn decide_approval_rejected(state: &AppState, approval_id: &str) -> R
         record.status = ApprovalStatus::Pending;
         return Err(format!("approval_audit_failed: {detail}"));
     }
+    drop(approvals);
+    // P3-B (§4.5): a rejected approval rejects its PatchFile
+    // (task artifact approvals carry no PatchFile; the
+    // linkage is a no-op for them).
+    link_patch_file_rejected_on_approval(state, approval_id);
     Ok(())
 }
 
@@ -6570,13 +6608,24 @@ fn unknown_record(what: &str) -> Response {
         .into_response()
 }
 
-/// P3-A archive check point for a Worktree: P3-B wires the
-/// non-terminal Patch check here (a proposed or
-/// partially_applied Patch blocks with 409). P3-A has no
-/// Patch store, so nothing blocks yet; the call site stays
-/// the same for P3-B.
-fn worktree_archive_blocked(_state: &AppState, _worktree_id: &str) -> Option<&'static str> {
-    None
+/// P3-B archive check (plan §3.8 "non-terminal Patch"): a
+/// Worktree is blocked while any of its PatchFiles is pending
+/// or failed — the work the Patch still owes. A stale Patch
+/// with no pending/failed file does not block: its files are
+/// terminally refused and the Patch is an audit row. Without
+/// SQLite there is no Patch store, so nothing blocks.
+fn worktree_archive_blocked(state: &AppState, worktree_id: &str) -> Option<&'static str> {
+    if state.sqlite_mode() != StateBackend::Sqlite || state.sqlite_is_broken() {
+        return None;
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return None;
+    };
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::worktree_has_actionable_patch(&conn, worktree_id) {
+        Ok(true) => Some("worktree_has_active_patch"),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -8932,6 +8981,764 @@ pub(crate) fn check_idempotency(
     }
 }
 
+// ---------------------------------------------------------------------------
+// P3-B patches (plan §4).
+//
+// One Patch is one loop execution's change set inside one
+// Worktree (grouping key (execution_id, worktree_id)); each
+// PatchFile is one proposed file write with its own planned
+// fs.write Effect and its own approval. Patch status is
+// STORED state maintained by the single recompute function
+// (sqlite_store::recompute_patch_status); read paths never
+// recompute. The apply command and the loop entry share the
+// three-way stale check below (§10-8a): a drifted proposal
+// never writes, whatever entry it arrives through.
+// ---------------------------------------------------------------------------
+
+/// The three-way apply/check outcome (plan §4.4). `Write`
+/// and `AlreadyNew` are the only outcomes that may land the
+/// proposed content; `Stale` and `Unavailable` never write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchCheck {
+    /// Current bytes equal the proposal-time old bytes (or
+    /// the file is still absent when old_sha256 is null).
+    Write,
+    /// Current bytes already equal the proposed new bytes:
+    /// skip the file write, records only.
+    AlreadyNew,
+    /// Current bytes match neither old nor new: drifted.
+    Stale,
+    /// The target cannot be resolved or read (worktree gone,
+    /// symlink escape, unreadable): refuse, fail closed.
+    Unavailable,
+}
+
+/// Resolve (worktree, canonical target, worktree-relative
+/// path) for a proposed fs.write path. The path is joined
+/// onto the files root, canonicalized (R7 pattern:
+/// canonicalize the target when it exists, else canonicalize
+/// the parent + join the name), and required to stay inside
+/// the canonical files root; then it is stripped against
+/// each ACTIVE Worktree's canonical root. Unique hit wins,
+/// zero hits -> no Patch (e.g. P2 drafts), multiple (nested)
+/// -> deepest/longest prefix. The relative path is stored
+/// with forward slashes (cross-platform stable).
+fn resolve_worktree_for_path(
+    state: &AppState,
+    path: &str,
+) -> Option<(crate::worktree_store::Worktree, PathBuf, String)> {
+    let files_root = std::fs::canonicalize(&state.files_root).ok()?;
+    let joined = state.files_root.join(path);
+    let canonical = if joined.exists() {
+        std::fs::canonicalize(&joined).unwrap_or(joined.clone())
+    } else if let (Some(parent), Some(name)) = (joined.parent(), joined.file_name()) {
+        std::fs::canonicalize(parent)
+            .map(|p| p.join(name))
+            .unwrap_or(joined.clone())
+    } else {
+        return None;
+    };
+    if !canonical.starts_with(&files_root) {
+        return None;
+    }
+    let worktrees: Vec<crate::worktree_store::Worktree> = state
+        .worktrees
+        .lock()
+        .expect("worktree lock")
+        .values()
+        .filter(|w| w.status == crate::worktree_store::WORKTREE_ACTIVE)
+        .cloned()
+        .collect();
+    let mut best: Option<(PathBuf, crate::worktree_store::Worktree, PathBuf)> = None;
+    for worktree in worktrees {
+        let Some(root) = worktree_canonical_root(state, &worktree) else {
+            continue;
+        };
+        let Ok(relative) = canonical.strip_prefix(&root) else {
+            continue;
+        };
+        let longer = best
+            .as_ref()
+            .is_none_or(|(best_root, _, _)| root.as_os_str().len() > best_root.as_os_str().len());
+        if longer {
+            best = Some((root, worktree, relative.to_path_buf()));
+        }
+    }
+    let (_root, worktree, relative) = best?;
+    let path_relative = relative
+        .to_string_lossy()
+        .replace('\\', "/");
+    Some((worktree, canonical, path_relative))
+}
+
+/// Resolve the on-disk target of a PatchFile: the worktree's
+/// canonical root joined with the worktree-relative path,
+/// canonicalized (R7 pattern) and containment-checked back
+/// inside the root. A symlinked escape, a missing
+/// worktree/location, a `..` in the stored relative path, or
+/// an unreadable parent all return None (Unavailable — never
+/// a write). A missing parent falls back to the lexical join
+/// (the write creates the parent directories).
+fn resolve_patch_target(
+    state: &AppState,
+    patch: &sqlite_store::PatchRecord,
+    file: &sqlite_store::PatchFileRecord,
+) -> Option<PathBuf> {
+    let rel = Path::new(&file.path_relative);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+    {
+        return None;
+    }
+    let worktree = {
+        let worktrees = state.worktrees.lock().expect("worktree lock");
+        worktrees.get(&patch.worktree_id)?.clone()
+    };
+    let root = worktree_canonical_root(state, &worktree)?;
+    let target = root.join(rel);
+    let canonical = if target.exists() {
+        std::fs::canonicalize(&target).unwrap_or(target.clone())
+    } else if let (Some(parent), Some(name)) = (target.parent(), target.file_name()) {
+        std::fs::canonicalize(parent)
+            .map(|p| p.join(name))
+            .unwrap_or(target.clone())
+    } else {
+        target.clone()
+    };
+    if !canonical.starts_with(&root) {
+        return None;
+    }
+    Some(canonical)
+}
+
+/// The shared three-way stale check (plan §4.4 + §10-8a):
+/// the apply command and the loop entry call this SAME
+/// function, so a drifted proposal can never write through
+/// either entry. The returned target is the resolved path
+/// the check read (Some whenever the check could read the
+/// current state, None on Unavailable).
+fn check_patch_write(
+    state: &AppState,
+    patch: &sqlite_store::PatchRecord,
+    file: &sqlite_store::PatchFileRecord,
+) -> (PatchCheck, Option<PathBuf>) {
+    let Some(target) = resolve_patch_target(state, patch, file) else {
+        return (PatchCheck::Unavailable, None);
+    };
+    let current: Option<String> = match std::fs::read(&target) {
+        Ok(bytes) => Some(crate::operation_binding::sha256_hex(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return (PatchCheck::Unavailable, None),
+    };
+    let check = match current.as_deref() {
+        None if file.old_sha256.is_none() => PatchCheck::Write,
+        None => PatchCheck::Stale,
+        Some(hash) if Some(hash) == file.old_sha256.as_deref() => PatchCheck::Write,
+        Some(hash) if hash == file.new_sha256 => PatchCheck::AlreadyNew,
+        Some(_) => PatchCheck::Stale,
+    };
+    (check, Some(target))
+}
+
+/// Set one PatchFile's status (and recompute its Patch) in
+/// its own transaction. Used by the loop entry's sync and by
+/// the apply's stale marking; the apply success/failure
+/// record updates use their own single-tx helpers instead.
+fn sync_patch_file_status(
+    state: &AppState,
+    patch_file_id: &str,
+    status: &str,
+) -> Result<(sqlite_store::PatchFileRecord, sqlite_store::PatchRecord), String> {
+    let Some(sqlite) = &state.sqlite else {
+        return Err("sqlite_not_configured".to_string());
+    };
+    let mut conn = sqlite.lock().map_err(|_| "sqlite lock".to_string())?;
+    let tx = conn.transaction().map_err(|e| format!("sqlite: {e}"))?;
+    let out = sqlite_store::update_patch_file_status_tx(
+        &tx,
+        patch_file_id,
+        status,
+        now_ms() as i64,
+    )?;
+    tx.commit().map_err(|e| format!("sqlite: {e}"))?;
+    Ok(out)
+}
+
+/// Stamp the Patch attribution into an Effect's `detail`
+/// field (plan §4.2), mirroring `stamp_effect_approval`
+/// above: the Effect row structure is unchanged, the
+/// attribution is a detail string only, never a gate input.
+fn stamp_effect_detail(state: &AppState, effect_id: &str, detail: &str) {
+    if state.sqlite_mode() == StateBackend::Sqlite {
+        let Some(records) = effects_snapshot(state) else {
+            return;
+        };
+        let Some(mut record) = records.into_iter().find(|r| r.effect_id == effect_id) else {
+            return;
+        };
+        record.detail = Some(detail.to_string());
+        state
+            .effects
+            .lock()
+            .expect("effect lock")
+            .insert(record.effect_id.clone(), record.clone());
+        persist_effect(state, &record);
+        return;
+    }
+    let mut effects = state.effects.lock().expect("effect lock");
+    let Some(mut record) = effects.get(effect_id).cloned() else {
+        return;
+    };
+    record.detail = Some(detail.to_string());
+    effects.insert(record.effect_id.clone(), record.clone());
+    drop(effects);
+    persist_effect(state, &record);
+}
+
+/// P3-B grouping (plan §4.2): called from `plan_loop_effect`
+/// for a gated fs.write proposal. SQLite-only; in JSONL/
+/// Shadow modes there is no Patch store and grouping is
+/// skipped (loop behaviour unchanged). Finds or creates the
+/// (execution, worktree) Patch, appends the PatchFile with
+/// the gateway-computed diff, and stamps the attribution
+/// into the Effect's detail field. Any failure warns on
+/// stderr and leaves the loop unaffected (fail-open for
+/// grouping; apply fails closed). The 1 MiB/file cap is
+/// already enforced upstream by `normalize()`; a text over
+/// the cap never reaches here, and grouping defensively
+/// skips it anyway.
+fn maybe_group_patch(
+    state: &AppState,
+    effect: &EffectFileRecord,
+    approval_id: &str,
+    path: &str,
+    new_text: &str,
+) {
+    if state.sqlite_mode() != StateBackend::Sqlite || state.sqlite_is_broken() {
+        return;
+    }
+    if new_text.len() > 1024 * 1024 {
+        return;
+    }
+    let Some(execution_id) = effect.execution_id.as_deref() else {
+        return;
+    };
+    let Some((worktree, canonical_target, path_relative)) =
+        resolve_worktree_for_path(state, path)
+    else {
+        return;
+    };
+    // Proposal-time disk state: old bytes + hashes + diff.
+    // The hash is over the exact bytes; the diff is over
+    // lossy text (a non-UTF-8 old file shows replacement
+    // characters in the review artifact, never in the check).
+    let old_bytes = std::fs::read(&canonical_target).ok();
+    let old_sha256 = old_bytes
+        .as_ref()
+        .map(|b| crate::operation_binding::sha256_hex(b));
+    let old_text = old_bytes
+        .as_ref()
+        .map(|b| String::from_utf8_lossy(b).into_owned());
+    let new_sha256 = crate::operation_binding::sha256_hex(new_text.as_bytes());
+    let diff = crate::patch_store::unified_diff(old_text.as_deref(), new_text, &path_relative);
+    let Some(sqlite) = &state.sqlite else {
+        return;
+    };
+    let now = now_ms() as i64;
+    let (patch, file) = {
+        let mut conn = match sqlite.lock() {
+            Ok(conn) => conn,
+            Err(_) => {
+                eprintln!("warning: patch grouping skipped (sqlite lock)");
+                return;
+            }
+        };
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(detail) => {
+                eprintln!("warning: patch grouping transaction failed: {detail}");
+                return;
+            }
+        };
+        let patch = match sqlite_store::find_latest_patch_tx(
+            &tx,
+            execution_id,
+            &worktree.worktree_id,
+        ) {
+            Ok(Some(patch)) => patch,
+            Ok(None) => {
+                let snapshot_id = sqlite_store::get_execution(&tx, execution_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|e| e.workspace_snapshot_id);
+                match sqlite_store::insert_patch_tx(
+                    &tx,
+                    execution_id,
+                    snapshot_id.as_deref(),
+                    &worktree.worktree_id,
+                    worktree.project_id.as_deref(),
+                    now,
+                ) {
+                    Ok(patch) => patch,
+                    Err(detail) => {
+                        eprintln!("warning: patch creation failed: {detail}");
+                        return;
+                    }
+                }
+            }
+            Err(detail) => {
+                eprintln!("warning: patch lookup failed: {detail}");
+                return;
+            }
+        };
+        let file = match sqlite_store::insert_patch_file_tx(
+            &tx,
+            &patch.patch_id,
+            &path_relative,
+            old_sha256.as_deref(),
+            &new_sha256,
+            &diff,
+            new_text,
+            &effect.effect_id,
+            Some(approval_id),
+            now,
+        ) {
+            Ok(file) => file,
+            Err(detail) => {
+                eprintln!("warning: patch file insert failed: {detail}");
+                return;
+            }
+        };
+        if let Err(detail) = tx.commit() {
+            eprintln!("warning: patch grouping commit failed: {detail}");
+            return;
+        }
+        (patch, file)
+    };
+    stamp_effect_detail(
+        state,
+        &effect.effect_id,
+        &format!(
+            "patch:{} patchfile:{} worktree:{} path:{}",
+            patch.patch_id, file.patch_file_id, worktree.worktree_id, path_relative
+        ),
+    );
+}
+
+/// Sync a PatchFile after a loop write lands (plan §4.4/§4.5):
+/// a succeeded loop write applies its PatchFile; a failed one
+/// fails it (pending only); an unknown outcome changes nothing
+/// (the write may or may not have landed — honest). No-op when
+/// the approval has no PatchFile (a non-Patch write), and a
+/// no-op when the file is already past the target state (the
+/// loop-entry AlreadyNew/Stale paths sync first, then drive
+/// the Effect through the same record path — the second sync
+/// is idempotent). Best-effort: a sync failure warns; the
+/// Effect transition already stands.
+fn sync_patch_file_after_loop_write(state: &AppState, approval_id: &str, terminal: &str) {
+    if state.sqlite_mode() != StateBackend::Sqlite || state.sqlite_is_broken() {
+        return;
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return;
+    };
+    let file = {
+        let conn = match sqlite.lock() {
+            Ok(conn) => conn,
+            Err(_) => return,
+        };
+        match sqlite_store::patch_file_by_approval(&conn, approval_id) {
+            Ok(Some(file)) => file,
+            _ => return,
+        }
+    };
+    let target = match terminal {
+        "succeeded" if file.status == "pending" || file.status == "failed" => "applied",
+        "failed" if file.status == "pending" => "failed",
+        _ => return,
+    };
+    if let Err(detail) = sync_patch_file_status(state, &file.patch_file_id, target) {
+        eprintln!("warning: patch file sync after loop write failed: {detail}");
+    }
+}
+
+/// P3-B loop entry (§10-8a): the SAME three-way stale
+/// check as the apply command, run before an fs.write
+/// dispatch. Returns Some(outcome) when the loop call is
+/// settled here — the file was already new (records only,
+/// no write), the proposal drifted (PatchFile -> stale, no
+/// write), or the target is unresolvable (fail closed, no
+/// write). None means dispatch proceeds. The bound Effect
+/// is driven through the caller's `drive` function (the
+/// same path the dispatch uses), so no Effect is stranded
+/// in `started`.
+fn check_loop_patch_write(
+    state: &AppState,
+    approval_id: &Option<String>,
+    drive: &dyn Fn(&ToolOutcome),
+) -> Option<ToolOutcome> {
+    let approval_id = approval_id.as_ref()?;
+    if state.sqlite_mode() != StateBackend::Sqlite || state.sqlite_is_broken() {
+        return None;
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return None;
+    };
+    let (file, patch) = {
+        let conn = sqlite.lock().expect("sqlite lock");
+        let file =
+            sqlite_store::patch_file_by_approval(&conn, approval_id).ok().flatten()?;
+        let patch = sqlite_store::get_patch(&conn, &file.patch_id).ok().flatten()?;
+        (file, patch)
+    };
+    match check_patch_write(state, &patch, &file) {
+        (PatchCheck::Write, _) => {
+            // A rejected file never writes, even when the
+            // bytes still match the proposal: the explicit
+            // reject (or the approval-reject linkage) is a
+            // hard stop for this change set, and the loop
+            // entry must refuse it just as the apply command
+            // refuses it with patch_rejected. Without this,
+            // approving the approval after rejecting the
+            // Patch would let the loop land the rejected
+            // write anyway. The file is already `rejected`,
+            // so no sync is needed.
+            if file.status == "rejected" {
+                let outcome = ToolOutcome {
+                    status: crate::loop_engine::CallStatus::Failed,
+                    error: Some(ErrorCode::ToolFailed),
+                    body: format!(
+                        "patch_rejected: the patch was rejected; the write was refused and {} stays rejected",
+                        file.patch_file_id
+                    ),
+                };
+                drive(&outcome);
+                Some(outcome)
+            } else {
+                None
+            }
+        }
+        (PatchCheck::AlreadyNew, _) => {
+            match sync_patch_file_status(state, &file.patch_file_id, "applied") {
+                Ok(_) => {
+                    let outcome = ToolOutcome::success(format!(
+                        "file already contains the proposed content; no write performed ({} applied)",
+                        file.patch_file_id
+                    ));
+                    drive(&outcome);
+                    Some(outcome)
+                }
+                Err(detail) => {
+                    eprintln!(
+                        "warning: patch file sync failed after already-new loop check: {detail}"
+                    );
+                    let outcome = ToolOutcome::unknown();
+                    drive(&outcome);
+                    Some(outcome)
+                }
+            }
+        }
+        (PatchCheck::Stale, _) => {
+            if let Err(detail) = sync_patch_file_status(state, &file.patch_file_id, "stale") {
+                eprintln!("warning: patch file stale-marking failed: {detail}");
+            }
+            let outcome = ToolOutcome {
+                status: crate::loop_engine::CallStatus::Failed,
+                error: Some(ErrorCode::ToolFailed),
+                body: format!(
+                    "patch_stale: the file changed since the proposal; the write was refused and {} is marked stale",
+                    file.patch_file_id
+                ),
+            };
+            drive(&outcome);
+            Some(outcome)
+        }
+        (PatchCheck::Unavailable, _) => {
+            let outcome = ToolOutcome::unknown();
+            drive(&outcome);
+            Some(outcome)
+        }
+    }
+}
+
+/// Approval-reject linkage (plan §4.5): when an approval
+/// bound to a PatchFile is rejected, the file becomes
+/// `rejected` (pending/failed only; stale stays stale) and
+/// its Patch recomputes. Best-effort: a SQLite failure
+/// warns and leaves the file pending — the reject itself
+/// already stands, and the file can never be applied on a
+/// rejected approval anyway.
+fn link_patch_file_rejected_on_approval(state: &AppState, approval_id: &str) {
+    if state.sqlite_mode() != StateBackend::Sqlite || state.sqlite_is_broken() {
+        return;
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return;
+    };
+    let (file, _patch) = {
+        let conn = match sqlite.lock() {
+            Ok(conn) => conn,
+            Err(_) => return,
+        };
+        let Some(file) = sqlite_store::patch_file_by_approval(&conn, approval_id)
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        if file.status != "pending" && file.status != "failed" {
+            return;
+        }
+        (file, ())
+    };
+    if let Err(detail) =
+        sync_patch_file_status(state, &file.patch_file_id, "rejected")
+    {
+        eprintln!("warning: patch file reject linkage failed: {detail}");
+    }
+}
+
+/// Apply one PatchFile under ONE approvals lock hold (plan
+/// §4.4). The three-way check, the approval burn and the
+/// Effect authorize/start all serialize here, so a
+/// concurrent apply of the same file cannot double-write.
+/// `consume_loop_approval` and
+/// `consume_bound_approval_for_effect` cannot be called
+/// from inside this hold (a std Mutex is not reentrant — it
+/// would deadlock), so the loop-approval validation below
+/// mirrors their checks; keep in sync: Approved only (a
+/// bound approval can never be Edited), unconsumed,
+/// `effect_binding` is this file's Effect, the Effect
+/// exists with the same digest at planned/authorized, and
+/// the approval's `tool` is fs.write. Error codes reuse the
+/// existing bound-gate replies (`approval_required`,
+/// `approval_rejected`, `approval_binding_mismatch`,
+/// `approval_audit_failed`, `effect_transition_failed`).
+fn apply_patch_file_locked(
+    state: &AppState,
+    patch_id: &str,
+    patch_file_id: &str,
+    expected_old_sha256: Option<&str>,
+    approval_id: &str,
+) -> Result<(sqlite_store::PatchFileRecord, EffectFileRecord, bool), Box<Response>> {
+    let not_found = |error: &str| -> Box<Response> {
+        Box::new((StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": error }))).into_response())
+    };
+    let forbidden = |error: &str| -> Box<Response> {
+        Box::new((StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": error }))).into_response())
+    };
+    let conflict = |error: &str| -> Box<Response> {
+        Box::new((StatusCode::CONFLICT, Json(serde_json::json!({ "error": error }))).into_response())
+    };
+    let bad_request = |error: &str| -> Box<Response> {
+        Box::new((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": error }))).into_response())
+    };
+    let internal = |error: &str| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response()
+    };
+    // Patches are SQLite-only (plan §4.6).
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return Err(Box::new(sqlite_not_configured()));
+    }
+    if state.sqlite_is_broken() {
+        return Err(Box::new(sqlite_error_response()));
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return Err(Box::new(sqlite_not_configured()));
+    };
+    let mut approvals = state.approvals.lock().expect("approval lock");
+    let (patch, file) = {
+        let conn = sqlite.lock().expect("sqlite lock");
+        let patch = match sqlite_store::get_patch(&conn, patch_id) {
+            Ok(Some(patch)) => patch,
+            Ok(None) => return Err(not_found("unknown patch")),
+            Err(_) => return Err(Box::new(internal("sqlite_unavailable"))),
+        };
+        let file = match sqlite_store::get_patch_file(&conn, patch_file_id) {
+            Ok(Some(file)) => file,
+            Ok(None) => return Err(not_found("unknown patch file")),
+            Err(_) => return Err(Box::new(internal("sqlite_unavailable"))),
+        };
+        if file.patch_id != patch.patch_id {
+            return Err(not_found("unknown patch file"));
+        }
+        (patch, file)
+    };
+    // Idempotent replay (plan §4.4): an already-applied file
+    // returns 200 + replayed:true with no re-check/re-write.
+    if file.status == "applied" {
+        let effect = effect_by_id(state, &file.effect_id)
+            .ok_or_else(|| internal("unknown effect"))?;
+        return Ok((file, effect, true));
+    }
+    if patch.status == "rejected" {
+        return Err(conflict("patch_rejected"));
+    }
+    if file.status == "rejected" {
+        return Err(conflict("patch_file_rejected"));
+    }
+    if file.status == "stale" {
+        return Err(conflict("patch_stale"));
+    }
+    if file.status != "pending" && file.status != "failed" {
+        return Err(conflict("patch_file_not_appliable"));
+    }
+    if expected_old_sha256 != file.old_sha256.as_deref() {
+        return Err(bad_request("expected_old_sha256_mismatch"));
+    }
+    // Loop-approval validation (mirror of
+    // consume_loop_approval + consume_bound_approval_for_effect).
+    let Some(record) = approvals.get_mut(approval_id) else {
+        return Err(forbidden("approval_required"));
+    };
+    if record.tool != "fs.write" {
+        return Err(forbidden("approval_required"));
+    }
+    if record.status == ApprovalStatus::Rejected {
+        return Err(forbidden("approval_rejected"));
+    }
+    if record.status != ApprovalStatus::Approved {
+        return Err(forbidden("approval_required"));
+    }
+    if record.consumed {
+        return Err(forbidden("approval_binding_mismatch"));
+    }
+    if record.effect_binding.as_deref() != Some(file.effect_id.as_str()) {
+        return Err(forbidden("approval_binding_mismatch"));
+    }
+    let digest = record.operation_digest.clone();
+    let effect = match effect_by_id(state, &file.effect_id) {
+        Some(effect)
+            if effect.input_digest.as_deref() == digest.as_deref()
+                && (effect.status == "planned" || effect.status == "authorized") => effect,
+        _ => return Err(forbidden("approval_binding_mismatch")),
+    };
+    // Three-way check, before the approval is burned: a
+    // drifted proposal never consumes its approval.
+    let (check, target) = check_patch_write(state, &patch, &file);
+    if check == PatchCheck::Stale {
+        if let Err(detail) = sync_patch_file_status(state, &file.patch_file_id, "stale") {
+            eprintln!("warning: patch file stale-marking failed: {detail}");
+        }
+        return Err(conflict("patch_stale"));
+    }
+    if check == PatchCheck::Unavailable {
+        return Err(Box::new(internal("patch_target_unavailable")));
+    }
+    // Burn the approval (persist failure -> 500 with the
+    // in-memory consumed flag kept, the P0-C fail-closed
+    // rule), then drive planned -> authorized -> started.
+    record.consumed = true;
+    if let Err(detail) = persist_approval(state, approval_id, record) {
+        eprintln!("warning: bound approval consumption persistence failed: {detail}");
+        return Err(Box::new(internal("approval_audit_failed")));
+    }
+    if effect.status == "planned"
+        && transition_effect(state, &effect.effect_id, "authorized", None, None).is_err()
+    {
+        return Err(Box::new(internal("effect_transition_failed")));
+    }
+    start_bound_effect(state, &effect)?;
+    // Write (or skip it on the AlreadyNew branch), then one
+    // SQLite transaction for the records.
+    let replayed = check == PatchCheck::AlreadyNew;
+    if !replayed {
+        let target = target.ok_or_else(|| internal("patch_target_unavailable"))?;
+        if let Some(parent) = target.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                return Err(Box::new(internal("patch_write_failed")));
+            }
+        }
+        if std::fs::write(&target, &file.new_text).is_err() {
+            // The approval is spent and the Effect is started;
+            // leave an honest failed state (best-effort tx) so
+            // the file is retryable through a fresh proposal.
+            let mut failed = effect.clone();
+            failed.status = "failed".to_string();
+            let now = now_ms() as i64;
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            if let Ok(tx) = conn.transaction() {
+                let _ = sqlite_store::fail_patch_records_tx(
+                    &tx,
+                    &failed,
+                    &file.patch_file_id,
+                    now,
+                );
+                let _ = tx.commit();
+            }
+            state
+                .effects
+                .lock()
+                .expect("effect lock")
+                .insert(failed.effect_id.clone(), failed.clone());
+            return Err(Box::new(internal("patch_write_failed")));
+        }
+    }
+    let mut succeeded = effect.clone();
+    succeeded.status = "succeeded".to_string();
+    let owned_evidence = crate::evidence::write_time_observation(state, &succeeded);
+    let evidence_draft = owned_evidence.as_ref().map(|o| o.as_draft());
+    let now = now_ms() as i64;
+    let (file, _patch) = {
+        let mut conn = sqlite.lock().expect("sqlite lock");
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(_) => return Err(Box::new(internal("sqlite_unavailable"))),
+        };
+        let out = match sqlite_store::apply_patch_records_tx(
+            &tx,
+            &succeeded,
+            evidence_draft.as_ref(),
+            &file.patch_file_id,
+            now,
+        ) {
+            Ok(out) => out,
+            Err(detail) => {
+                eprintln!("warning: patch apply records failed: {detail}");
+                drop(tx);
+                // The file is written (or was already new) but
+                // the records did not land; mark the file failed
+                // (best-effort) so a fresh proposal can recover
+                // it instead of leaving it pending forever.
+                let mut failed = effect.clone();
+                failed.status = "failed".to_string();
+                let mut conn = sqlite.lock().expect("sqlite lock");
+                if let Ok(tx) = conn.transaction() {
+                    let _ = sqlite_store::fail_patch_records_tx(
+                        &tx,
+                        &failed,
+                        &file.patch_file_id,
+                        now,
+                    );
+                    let _ = tx.commit();
+                }
+                state
+                    .effects
+                    .lock()
+                    .expect("effect lock")
+                    .insert(failed.effect_id.clone(), failed.clone());
+                return Err(Box::new(internal("sqlite_unavailable")));
+            }
+        };
+        if tx.commit().is_err() {
+            return Err(Box::new(internal("sqlite_unavailable")));
+        }
+        out
+    };
+    state
+        .effects
+        .lock()
+        .expect("effect lock")
+        .insert(succeeded.effect_id.clone(), succeeded.clone());
+    Ok((file, succeeded, replayed))
+}
+
 /// P0-C loop planning: a proposed gated call gets its planned
 /// Effect at proposal time (the engine calls this right after
 /// `request_loop_approval`), and the approval is bound to it.
@@ -8980,6 +9787,20 @@ pub(crate) fn plan_loop_effect(
         drop(approvals);
         if let Err(detail) = persist_approval(state, approval_id, &bound) {
             eprintln!("warning: loop effect binding persistence failed: {detail}");
+        }
+    }
+    // P3-B grouping (§4.2): a gated fs.write proposal joins
+    // the (execution, worktree) Patch. Grouping is fail-open
+    // (see maybe_group_patch); it never changes the proposal.
+    if binding.tool == "fs.write" {
+        if let Some(text) = args.get("text") {
+            maybe_group_patch(
+                state,
+                &record,
+                approval_id,
+                args.get("path").map(String::as_str).unwrap_or(""),
+                text,
+            );
         }
     }
     Some(record)
@@ -10478,6 +11299,178 @@ async fn effects_verify(
     }
 }
 
+// --- P3-B patches (plan §4.7) ---
+//
+// Patches exist only in SQLite (plan §4.6): the routes
+// answer 500 `sqlite_not_configured` without a configured
+// SQLite database, and 500 `sqlite_unavailable` on a broken
+// one — the same fail-closed gate as the Evidence routes.
+// List/get read; apply/reject mutate and are SQLite-mode
+// only (in Shadow mode there is no Patch store to mutate).
+
+#[derive(Debug, Deserialize)]
+struct PatchListQuery {
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchApplyRequest {
+    #[serde(default)]
+    expected_old_sha256: Option<String>,
+    approval_id: String,
+}
+
+async fn patches_list(
+    State(state): State<AppState>,
+    Query(query): Query<PatchListQuery>,
+) -> impl IntoResponse {
+    if let Some(status) = &query.status {
+        if !crate::patch_store::PATCH_STATUSES.contains(&status.as_str()) {
+            return bad_request("unknown patch status");
+        }
+    }
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite && state.sqlite_mode() != StateBackend::Shadow {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::list_patches(&conn) {
+        Ok(rows) => {
+            let rows: Vec<_> = match &query.status {
+                Some(status) => rows
+                    .into_iter()
+                    .filter(|r| &r.status == status)
+                    .collect(),
+                None => rows,
+            };
+            Json(rows).into_response()
+        }
+        Err(_) => sqlite_error_response(),
+    }
+}
+
+async fn patches_get(
+    State(state): State<AppState>,
+    axum::extract::Path(patch_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite && state.sqlite_mode() != StateBackend::Shadow {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    let patch = match sqlite_store::get_patch(&conn, &patch_id) {
+        Ok(Some(patch)) => patch,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown patch" })))
+                .into_response()
+        }
+        Err(_) => return sqlite_error_response(),
+    };
+    let files = match sqlite_store::list_patch_files(&conn, &patch_id) {
+        Ok(files) => files,
+        Err(_) => return sqlite_error_response(),
+    };
+    Json(serde_json::json!({ "patch": patch, "files": files })).into_response()
+}
+
+async fn patches_apply(
+    State(state): State<AppState>,
+    axum::extract::Path((patch_id, patch_file_id)): axum::extract::Path<(String, String)>,
+    Json(req): Json<PatchApplyRequest>,
+) -> impl IntoResponse {
+    if req.approval_id.trim().is_empty() {
+        return bad_request("approval_id is required");
+    }
+    match apply_patch_file_locked(
+        &state,
+        &patch_id,
+        &patch_file_id,
+        req.expected_old_sha256.as_deref(),
+        &req.approval_id,
+    ) {
+        Ok((patch_file, effect, replayed)) => Json(serde_json::json!({
+            "patch_file": patch_file,
+            "effect": effect,
+            "replayed": replayed,
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+async fn patches_reject(
+    State(state): State<AppState>,
+    axum::extract::Path(patch_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    let patch = {
+        let conn = sqlite.lock().expect("sqlite lock");
+        match sqlite_store::get_patch(&conn, &patch_id) {
+            Ok(Some(patch)) => patch,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "unknown patch" })),
+                )
+                    .into_response()
+            }
+            Err(_) => return sqlite_error_response(),
+        }
+    };
+    // Already rejected -> 200 idempotent (the get shape).
+    if patch.status == "rejected" {
+        let conn = sqlite.lock().expect("sqlite lock");
+        let files = sqlite_store::list_patch_files(&conn, &patch_id).unwrap_or_default();
+        return Json(serde_json::json!({ "patch": patch, "files": files })).into_response();
+    }
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(_) => return sqlite_error_response(),
+    };
+    let patch = match sqlite_store::reject_patch_tx(&tx, &patch_id, now_ms() as i64) {
+        Ok(patch) => patch,
+        Err(code) if code == "patch_has_applied_files" => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "patch_has_applied_files" })),
+            )
+                .into_response()
+        }
+        Err(code) if code == "patch_not_found" => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "unknown patch" })),
+            )
+                .into_response()
+        }
+        Err(_) => return sqlite_error_response(),
+    };
+    if tx.commit().is_err() {
+        return sqlite_error_response();
+    }
+    let files = sqlite_store::list_patch_files(&conn, &patch_id).unwrap_or_default();
+    Json(serde_json::json!({ "patch": patch, "files": files })).into_response()
+}
+
 #[derive(Debug, Deserialize)]
 struct EvidenceIdQuery {
     evidence_id: String,
@@ -11653,6 +12646,13 @@ pub fn app(state: AppState) -> Router {
         .route("/worktrees/list", get(worktrees_list))
         .route("/worktrees/{id}", get(worktrees_get))
         .route("/worktrees/{id}/archive", post(worktrees_archive))
+        .route("/patches/list", get(patches_list))
+        .route("/patches/{id}", get(patches_get))
+        .route(
+            "/patches/{patch_id}/files/{patch_file_id}/apply",
+            post(patches_apply),
+        )
+        .route("/patches/{id}/reject", post(patches_reject))
         .route("/approval/check", post(approval_check))
         .route("/files/list", get(files_list))
         .route("/files/read", get(files_read))

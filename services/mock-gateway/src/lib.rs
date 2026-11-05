@@ -14,6 +14,7 @@
 
 pub mod approval_store;
 pub mod operation_binding;
+pub mod patch_store;
 pub mod loop_engine;
 pub mod loop_fault;
 pub mod loop_store;

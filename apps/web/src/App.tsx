@@ -91,6 +91,7 @@ import {
 } from "./domain/engineering_client";
 import { InvokeEngineeringClient } from "./domain/invoke_engineering_client";
 import { EngineeringView } from "./views/EngineeringView";
+import { PatchesView } from "./views/PatchesView";
 import { FilesView } from "./views/FilesView";
 import { AgentView } from "./views/AgentView";
 import { ConnectorsView } from "./views/ConnectorsView";
@@ -161,7 +162,7 @@ interface Clients {
   engineering: EngineeringGateway;
 }
 
-type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "notes" | "engineering" | "settings";
+type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "notes" | "engineering" | "patches" | "settings";
 
 // Visible navigation: the workbench (sessions) is the only
 // chat entry and the default view (R1, 2026-10-28). The legacy
@@ -182,6 +183,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "mail", label: "Mail" },
   { id: "notes", label: "Notes" },
   { id: "engineering", label: "工程" },
+  { id: "patches", label: "补丁" },
   { id: "settings", label: "设置" },
 ];
 
@@ -618,6 +620,12 @@ export function App() {
           <p className="empty">Choosing transport…</p>
         ) : (
           <EngineeringView engineering={clients.engineering} loops={clients.loops} isInvoke={isInvoke} onNavigate={(target) => setTab(target)} />
+        ))}
+      {tab === "patches" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : (
+          <PatchesView engineering={clients.engineering} agent={clients.agent} effects={clients.effects} evidence={clients.evidence} inbox={clients.inbox} />
         ))}
       {tab === "tasks" &&
         (clients === null ? (

@@ -45,10 +45,12 @@ use crate::effect_store::EffectFileRecord;
 use crate::execution_store::ExecutionFileRecord;
 
 /// DB schema version. v1 is the P0-D baseline (10 tables);
-/// v2 adds the P0-R evidence table (see SCHEMA_V2). Row-level
-/// `schema_version` fields are a separate concept (the record
-/// contract version, still 1 for P0-A+ rows) and are untouched.
-pub const DB_SCHEMA_VERSION: i64 = 2;
+/// v2 adds the P0-R evidence table (see SCHEMA_V2); v3 adds
+/// the P3-B patches + patch_files tables (see SCHEMA_V3).
+/// Row-level `schema_version` fields are a separate concept
+/// (the record contract version, still 1 for P0-A+ rows) and
+/// are untouched.
+pub const DB_SCHEMA_VERSION: i64 = 3;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -256,6 +258,47 @@ CREATE TABLE IF NOT EXISTS evidence (
 CREATE INDEX IF NOT EXISTS idx_evidence_effect ON evidence(effect_id);
 ";
 
+/// P3-B v3 migration: the patches + patch_files tables only.
+/// No FKs (same convention as v1/v2), no changes to existing
+/// tables, and no backfill: patches exist only for proposals
+/// made after P3-B, like v2 evidence. `new_text` on a
+/// patch_files row is the proposed file bytes verbatim (the
+/// execution input for apply); it is `skip_serializing` on
+/// the row struct so it never leaves the gateway — the API
+/// shape carries the review artifact (`diff`) only. P3-A
+/// JSONL records (bindings/projects/locations/worktrees)
+/// stay JSONL; this migration touches no store but SQLite.
+const SCHEMA_V3: &str = "
+CREATE TABLE IF NOT EXISTS patches (
+    seq INTEGER NOT NULL,
+    patch_id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL,
+    workspace_snapshot_id TEXT,
+    worktree_id TEXT NOT NULL,
+    project_id TEXT,
+    status TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER
+);
+CREATE TABLE IF NOT EXISTS patch_files (
+    seq INTEGER NOT NULL,
+    patch_file_id TEXT PRIMARY KEY,
+    patch_id TEXT NOT NULL,
+    path_relative TEXT NOT NULL,
+    old_sha256 TEXT,
+    new_sha256 TEXT NOT NULL,
+    diff TEXT NOT NULL,
+    new_text TEXT NOT NULL,
+    effect_id TEXT NOT NULL,
+    approval_id TEXT,
+    status TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_patch_files_patch ON patch_files(patch_id);
+CREATE INDEX IF NOT EXISTS idx_patch_files_effect ON patch_files(effect_id);
+";
+
 fn err(e: rusqlite::Error) -> String {
     format!("sqlite: {e}")
 }
@@ -310,6 +353,19 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     // is advanced to 2 only after the v2 DDL succeeds.
     if version < 2 {
         tx.execute_batch(SCHEMA_V2).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '2')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // P3-B v3 step: patches + patch_files tables only, same
+    // shape as the v2 step. The version is advanced to 3 only
+    // after the v3 DDL succeeds; a fresh database runs v1, v2
+    // and v3 in the same transaction.
+    if version < 3 {
+        tx.execute_batch(SCHEMA_V3).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1609,6 +1665,478 @@ pub fn insert_evidence(
     let row = insert_evidence_tx(&tx, draft)?;
     tx.commit().map_err(err)?;
     Ok(row)
+}
+
+// ---------------------------------------------------------------------------
+// P3-B patches. One Patch is one loop execution's change set
+// inside one Worktree (grouping key (execution_id,
+// worktree_id), plan §4.2); each PatchFile is one proposed
+// file write with its own planned fs.write Effect and its own
+// approval. Patch status is STORED state maintained by the
+// single recompute function below (plan §4.5); read paths
+// never recompute.
+// ---------------------------------------------------------------------------
+
+/// One Patch row (plan §4.1). `workspace_snapshot_id` is the
+/// proposing execution's snapshot id when one exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchRecord {
+    pub patch_id: String,
+    pub execution_id: String,
+    pub workspace_snapshot_id: Option<String>,
+    pub worktree_id: String,
+    pub project_id: Option<String>,
+    pub status: String,
+    pub created_ms: i64,
+    pub updated_at_ms: Option<i64>,
+}
+
+/// One PatchFile row (plan §4.1). `old_sha256` is None when
+/// the file did not exist at proposal time (`/dev/null`
+/// semantics). `new_text` is the proposed bytes verbatim —
+/// the execution input for apply (the loop's proposed text
+/// lives only in memory, so without this column an apply
+/// after a gateway restart would have no bytes to write;
+/// reconstructing bytes from the diff was rejected as
+/// fragile). It is `skip_serializing` so it never leaves
+/// the gateway in an API response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchFileRecord {
+    pub patch_file_id: String,
+    pub patch_id: String,
+    pub path_relative: String,
+    pub old_sha256: Option<String>,
+    pub new_sha256: String,
+    pub diff: String,
+    #[serde(skip_serializing, default)]
+    pub new_text: String,
+    pub effect_id: String,
+    pub approval_id: Option<String>,
+    pub status: String,
+    pub created_ms: i64,
+    pub updated_at_ms: Option<i64>,
+}
+
+const PATCH_COLS: &str = "seq, patch_id, execution_id, workspace_snapshot_id, worktree_id, project_id, status, created_ms, updated_at_ms";
+const PATCH_FILE_COLS: &str = "seq, patch_file_id, patch_id, path_relative, old_sha256, new_sha256, diff, new_text, effect_id, approval_id, status, created_ms, updated_at_ms";
+
+fn patch_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PatchRecord> {
+    Ok(PatchRecord {
+        patch_id: row.get(1)?,
+        execution_id: row.get(2)?,
+        workspace_snapshot_id: row.get(3)?,
+        worktree_id: row.get(4)?,
+        project_id: row.get(5)?,
+        status: row.get(6)?,
+        created_ms: row.get(7)?,
+        updated_at_ms: row.get(8)?,
+    })
+}
+
+fn patch_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PatchFileRecord> {
+    Ok(PatchFileRecord {
+        patch_file_id: row.get(1)?,
+        patch_id: row.get(2)?,
+        path_relative: row.get(3)?,
+        old_sha256: row.get(4)?,
+        new_sha256: row.get(5)?,
+        diff: row.get(6)?,
+        new_text: row.get(7)?,
+        effect_id: row.get(8)?,
+        approval_id: row.get(9)?,
+        status: row.get(10)?,
+        created_ms: row.get(11)?,
+        updated_at_ms: row.get(12)?,
+    })
+}
+
+/// Patch status truth table (plan §4.5 + §10-3 precedence):
+/// all applied -> applied; any applied -> partially_applied;
+/// any stale (with 0 applied) -> stale; all rejected ->
+/// rejected; otherwise proposed (>= 1 pending/failed).
+/// Explicit reject bypasses this function and stores
+/// `rejected` directly: a patch whose files are [stale,
+/// rejected] must read `rejected` after an explicit reject,
+/// not `stale`.
+pub fn recompute_patch_status(files: &[PatchFileRecord]) -> &'static str {
+    if files.is_empty() {
+        return "proposed";
+    }
+    if files.iter().all(|f| f.status == "applied") {
+        return "applied";
+    }
+    if files.iter().any(|f| f.status == "applied") {
+        return "partially_applied";
+    }
+    if files.iter().any(|f| f.status == "stale") {
+        return "stale";
+    }
+    if files.iter().all(|f| f.status == "rejected") {
+        return "rejected";
+    }
+    "proposed"
+}
+
+fn list_patch_files_tx(
+    tx: &rusqlite::Transaction<'_>,
+    patch_id: &str,
+) -> Result<Vec<PatchFileRecord>, String> {
+    let mut stmt = tx
+        .prepare(&format!(
+            "SELECT {PATCH_FILE_COLS} FROM patch_files WHERE patch_id = ?1 ORDER BY seq ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![patch_id], patch_file_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<PatchFileRecord>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+fn update_patch_status_tx(
+    tx: &rusqlite::Transaction<'_>,
+    patch_id: &str,
+    status: &str,
+    now_ms: i64,
+) -> Result<PatchRecord, String> {
+    tx.execute(
+        "UPDATE patches SET status = ?1, updated_at_ms = ?2 WHERE patch_id = ?3",
+        params![status, now_ms, patch_id],
+    )
+    .map_err(err)?;
+    let patch = tx
+        .query_row(
+            &format!("SELECT {PATCH_COLS} FROM patches WHERE patch_id = ?1"),
+            params![patch_id],
+            patch_from_row,
+        )
+        .optional()
+        .map_err(err)?
+        .ok_or_else(|| "sqlite: patch row missing after status update".to_string())?;
+    Ok(patch)
+}
+
+/// Create a Patch in `proposed` status. Caller is inside a
+/// transaction (grouping holds the SQLite connection mutex
+/// for the whole get-or-create, so two proposals for the
+/// same (execution, worktree) cannot create two patches).
+pub fn insert_patch_tx(
+    tx: &rusqlite::Transaction<'_>,
+    execution_id: &str,
+    workspace_snapshot_id: Option<&str>,
+    worktree_id: &str,
+    project_id: Option<&str>,
+    now_ms: i64,
+) -> Result<PatchRecord, String> {
+    let seq: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM patches",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(err)?;
+    let patch_id = next_prefixed_id(tx, "patches", "patch_id", "patch-")?;
+    tx.execute(
+        "INSERT INTO patches (seq, patch_id, execution_id, workspace_snapshot_id, worktree_id, project_id, status, created_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'proposed', ?7, ?7)",
+        params![seq, patch_id, execution_id, workspace_snapshot_id, worktree_id, project_id, now_ms],
+    )
+    .map_err(err)?;
+    Ok(PatchRecord {
+        patch_id,
+        execution_id: execution_id.to_string(),
+        workspace_snapshot_id: workspace_snapshot_id.map(str::to_string),
+        worktree_id: worktree_id.to_string(),
+        project_id: project_id.map(str::to_string),
+        status: "proposed".to_string(),
+        created_ms: now_ms,
+        updated_at_ms: Some(now_ms),
+    })
+}
+
+/// Append a PatchFile in `pending` status to a Patch.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_patch_file_tx(
+    tx: &rusqlite::Transaction<'_>,
+    patch_id: &str,
+    path_relative: &str,
+    old_sha256: Option<&str>,
+    new_sha256: &str,
+    diff: &str,
+    new_text: &str,
+    effect_id: &str,
+    approval_id: Option<&str>,
+    now_ms: i64,
+) -> Result<PatchFileRecord, String> {
+    let seq: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM patch_files",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(err)?;
+    let patch_file_id = next_prefixed_id(tx, "patch_files", "patch_file_id", "patchfile-")?;
+    tx.execute(
+        "INSERT INTO patch_files (seq, patch_file_id, patch_id, path_relative, old_sha256, new_sha256, diff, new_text, effect_id, approval_id, status, created_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?11)",
+        params![seq, patch_file_id, patch_id, path_relative, old_sha256, new_sha256, diff, new_text, effect_id, approval_id, now_ms],
+    )
+    .map_err(err)?;
+    // Appending a file changes the Patch's derived status
+    // (e.g. an `applied` Patch with a new pending file is
+    // `partially_applied` again), so recompute here too —
+    // the insert is the only other PatchFile change besides
+    // update_patch_file_status_tx.
+    let files = list_patch_files_tx(tx, patch_id)?;
+    let patch_status = recompute_patch_status(&files);
+    update_patch_status_tx(tx, patch_id, patch_status, now_ms)?;
+    Ok(PatchFileRecord {
+        patch_file_id,
+        patch_id: patch_id.to_string(),
+        path_relative: path_relative.to_string(),
+        old_sha256: old_sha256.map(str::to_string),
+        new_sha256: new_sha256.to_string(),
+        diff: diff.to_string(),
+        new_text: new_text.to_string(),
+        effect_id: effect_id.to_string(),
+        approval_id: approval_id.map(str::to_string),
+        status: "pending".to_string(),
+        created_ms: now_ms,
+        updated_at_ms: Some(now_ms),
+    })
+}
+
+/// The Patch for (execution, worktree), if any: the newest
+/// one, whatever its status. Grouping is keyed on
+/// (execution, worktree) alone (plan §4.2: "later
+/// same-(execution, worktree) proposals append PatchFile"),
+/// so there is exactly one Patch per key and a later
+/// proposal always appends to it — even after the Patch went
+/// `applied` (a new file flips it back to
+/// `partially_applied`) or `rejected` (a new file flips it
+/// back to `proposed`; the rejected files stay rejected).
+/// Patch status is a derived summary of its files, not a
+/// lifecycle lock on the aggregate.
+pub fn find_latest_patch_tx(
+    tx: &rusqlite::Transaction<'_>,
+    execution_id: &str,
+    worktree_id: &str,
+) -> Result<Option<PatchRecord>, String> {
+    tx.query_row(
+        &format!(
+            "SELECT {PATCH_COLS} FROM patches WHERE execution_id = ?1 AND worktree_id = ?2 ORDER BY seq DESC LIMIT 1"
+        ),
+        params![execution_id, worktree_id],
+        patch_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+pub fn list_patches(conn: &Connection) -> Result<Vec<PatchRecord>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {PATCH_COLS} FROM patches ORDER BY seq ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map([], patch_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<PatchRecord>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+pub fn get_patch(conn: &Connection, patch_id: &str) -> Result<Option<PatchRecord>, String> {
+    conn.query_row(
+        &format!("SELECT {PATCH_COLS} FROM patches WHERE patch_id = ?1"),
+        params![patch_id],
+        patch_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+pub fn list_patch_files(conn: &Connection, patch_id: &str) -> Result<Vec<PatchFileRecord>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {PATCH_FILE_COLS} FROM patch_files WHERE patch_id = ?1 ORDER BY seq ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![patch_id], patch_file_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<PatchFileRecord>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+pub fn get_patch_file(
+    conn: &Connection,
+    patch_file_id: &str,
+) -> Result<Option<PatchFileRecord>, String> {
+    conn.query_row(
+        &format!("SELECT {PATCH_FILE_COLS} FROM patch_files WHERE patch_file_id = ?1"),
+        params![patch_file_id],
+        patch_file_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// The PatchFile whose fs.write Effect this is, if any
+/// (loop entry + apply look the PatchFile up by effect).
+pub fn patch_file_by_effect(
+    conn: &Connection,
+    effect_id: &str,
+) -> Result<Option<PatchFileRecord>, String> {
+    conn.query_row(
+        &format!("SELECT {PATCH_FILE_COLS} FROM patch_files WHERE effect_id = ?1"),
+        params![effect_id],
+        patch_file_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// The PatchFile bound to this approval, if any
+/// (approval-reject linkage).
+pub fn patch_file_by_approval(
+    conn: &Connection,
+    approval_id: &str,
+) -> Result<Option<PatchFileRecord>, String> {
+    conn.query_row(
+        &format!("SELECT {PATCH_FILE_COLS} FROM patch_files WHERE approval_id = ?1"),
+        params![approval_id],
+        patch_file_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// Set a PatchFile's status and recompute its Patch status
+/// in the same transaction; returns the updated file row
+/// and the updated patch row. This is the ONE recompute
+/// call site: every PatchFile change flows through here.
+pub fn update_patch_file_status_tx(
+    tx: &rusqlite::Transaction<'_>,
+    patch_file_id: &str,
+    status: &str,
+    now_ms: i64,
+) -> Result<(PatchFileRecord, PatchRecord), String> {
+    tx.execute(
+        "UPDATE patch_files SET status = ?1, updated_at_ms = ?2 WHERE patch_file_id = ?3",
+        params![status, now_ms, patch_file_id],
+    )
+    .map_err(err)?;
+    let file = tx
+        .query_row(
+            &format!("SELECT {PATCH_FILE_COLS} FROM patch_files WHERE patch_file_id = ?1"),
+            params![patch_file_id],
+            patch_file_from_row,
+        )
+        .optional()
+        .map_err(err)?
+        .ok_or_else(|| "sqlite: patch file row missing after status update".to_string())?;
+    let files = list_patch_files_tx(tx, &file.patch_id)?;
+    let patch_status = recompute_patch_status(&files);
+    let patch = update_patch_status_tx(tx, &file.patch_id, patch_status, now_ms)?;
+    Ok((file, patch))
+}
+
+/// The record update for a failed apply attempt, in ONE
+/// transaction: the Effect to `failed` and the PatchFile to
+/// `failed` + Patch recompute. Best-effort: the caller warns
+/// on failure but still reports the write failure (the file
+/// is retryable through a fresh proposal, not stuck pending).
+pub fn fail_patch_records_tx(
+    tx: &rusqlite::Transaction<'_>,
+    effect: &EffectFileRecord,
+    patch_file_id: &str,
+    now_ms: i64,
+) -> Result<(PatchFileRecord, PatchRecord), String> {
+    upsert_effect_tx(tx, effect)?;
+    update_patch_file_status_tx(tx, patch_file_id, "failed", now_ms)
+}
+
+/// The post-write record update for a successful apply, in
+/// ONE transaction: the Effect's terminal transition, the
+/// write-time Evidence row (when the observation exists),
+/// and the PatchFile -> applied + Patch recompute. The
+/// caller has already written the file (or skipped the
+/// write on the AlreadyNew branch); a failure here leaves
+/// the file new and the records old, and the next apply
+/// recovers through the AlreadyNew branch.
+pub fn apply_patch_records_tx(
+    tx: &rusqlite::Transaction<'_>,
+    effect: &EffectFileRecord,
+    evidence: Option<&EvidenceDraft<'_>>,
+    patch_file_id: &str,
+    now_ms: i64,
+) -> Result<(PatchFileRecord, PatchRecord), String> {
+    upsert_effect_tx(tx, effect)?;
+    if let Some(draft) = evidence {
+        insert_evidence_tx(tx, draft)?;
+    }
+    update_patch_file_status_tx(tx, patch_file_id, "applied", now_ms)
+}
+
+/// Reject a whole Patch. Fails with `patch_has_applied_files`
+/// when any file is already applied (409 at the route);
+/// otherwise pending/failed files become `rejected`, stale
+/// files stay `stale`, and the Patch is stored as `rejected`
+/// directly (NOT via the recompute function — see its doc
+/// comment). Returns `patch_not_found` when the patch does
+/// not exist.
+pub fn reject_patch_tx(
+    tx: &rusqlite::Transaction<'_>,
+    patch_id: &str,
+    now_ms: i64,
+) -> Result<PatchRecord, String> {
+    let exists: Option<String> = tx
+        .query_row(
+            "SELECT patch_id FROM patches WHERE patch_id = ?1",
+            params![patch_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(err)?;
+    if exists.is_none() {
+        return Err("patch_not_found".to_string());
+    }
+    let files = list_patch_files_tx(tx, patch_id)?;
+    if files.iter().any(|f| f.status == "applied") {
+        return Err("patch_has_applied_files".to_string());
+    }
+    for file in &files {
+        if file.status == "pending" || file.status == "failed" {
+            tx.execute(
+                "UPDATE patch_files SET status = 'rejected', updated_at_ms = ?1 WHERE patch_file_id = ?2",
+                params![now_ms, file.patch_file_id],
+            )
+            .map_err(err)?;
+        }
+    }
+    update_patch_status_tx(tx, patch_id, "rejected", now_ms)
+}
+
+/// Archive guard (P3-A §3.8 "non-terminal Patch"): a
+/// Worktree is blocked while any of its PatchFiles is
+/// pending or failed — the work the Patch still owes. A
+/// stale Patch with no pending/failed file does not block:
+/// its files are terminally refused and the Patch is an
+/// audit row.
+pub fn worktree_has_actionable_patch(
+    conn: &Connection,
+    worktree_id: &str,
+) -> Result<bool, String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM patch_files pf JOIN patches p ON p.patch_id = pf.patch_id WHERE p.worktree_id = ?1 AND pf.status IN ('pending', 'failed')",
+            params![worktree_id],
+            |row| row.get(0),
+        )
+        .map_err(err)?;
+    Ok(count > 0)
 }
 
 pub fn list_evidence(conn: &Connection) -> Result<Vec<EvidenceRow>, String> {
@@ -3094,11 +3622,14 @@ mod tests {
     fn p0d_schema_applies_cleanly_and_reapply_is_idempotent() {
         let path = temp_db("schema");
         let mut conn = open_db(&path).expect("open");
-        assert_eq!(schema_version(&conn).expect("version"), 2);
+        assert_eq!(schema_version(&conn).expect("version"), DB_SCHEMA_VERSION);
         assert!(!import_done(&conn).expect("import flag"));
         // Re-applying migrations changes nothing.
         apply_migrations(&mut conn).expect("reapply");
-        assert_eq!(schema_version(&conn).expect("version again"), 2);
+        assert_eq!(
+            schema_version(&conn).expect("version again"),
+            DB_SCHEMA_VERSION
+        );
         // db_meta holds the two bootstrap rows (schema version
         // + import flag); every other table starts empty.
         assert_eq!(count_table(&conn, "db_meta").expect("count"), 2);
@@ -3113,6 +3644,9 @@ mod tests {
             "checkpoints",
             "inbox",
             "outbox",
+            "evidence",
+            "patches",
+            "patch_files",
         ] {
             assert_eq!(count_table(&conn, table).expect("count"), 0, "{table}");
         }
@@ -3555,8 +4089,9 @@ mod tests {
             .expect("collect");
         assert!(names.contains(&"detail".to_string()), "{names:?}");
         // P0-R: the v1 fixture migrates to v2 (evidence table)
-        // as well as gaining the detail column.
-        assert_eq!(schema_version(&conn).expect("version"), 2);
+        // as well as gaining the detail column; P3-B carries it
+        // on to the current version (patches tables).
+        assert_eq!(schema_version(&conn).expect("version"), DB_SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3593,7 +4128,7 @@ mod tests {
         assert!(names.contains(&"binding_location_id".to_string()), "{names:?}");
         assert!(names.contains(&"binding_worktree_id".to_string()), "{names:?}");
         assert!(names.contains(&"binding_root_digest".to_string()), "{names:?}");
-        assert_eq!(schema_version(&conn).expect("version"), 2);
+        assert_eq!(schema_version(&conn).expect("version"), DB_SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

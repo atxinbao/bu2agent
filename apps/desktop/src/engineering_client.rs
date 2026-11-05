@@ -10,8 +10,62 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::effects_client::EffectRecord;
 use crate::http_client::{transport_error, HttpClient};
 use crate::Result;
+
+/// One Patch aggregate (P3-B, plan §4.1). Field names are
+/// the gateway's snake_case JSON names, verbatim (C1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Patch {
+    pub patch_id: String,
+    pub execution_id: String,
+    #[serde(default)]
+    pub workspace_snapshot_id: Option<String>,
+    pub worktree_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    pub status: String,
+    pub created_ms: i64,
+    #[serde(default)]
+    pub updated_at_ms: Option<i64>,
+}
+
+/// One PatchFile row (P3-B, plan §4.1). `new_text` never
+/// leaves the gateway, so there is no such field here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchFile {
+    pub patch_file_id: String,
+    pub patch_id: String,
+    pub path_relative: String,
+    #[serde(default)]
+    pub old_sha256: Option<String>,
+    pub new_sha256: String,
+    pub diff: String,
+    pub effect_id: String,
+    #[serde(default)]
+    pub approval_id: Option<String>,
+    pub status: String,
+    pub created_ms: i64,
+    #[serde(default)]
+    pub updated_at_ms: Option<i64>,
+}
+
+/// GET /patches/{id}: the Patch with its files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchDetail {
+    pub patch: Patch,
+    pub files: Vec<PatchFile>,
+}
+
+/// POST .../apply: the applied file, its Effect, and whether
+/// the write was a replay of an already-applied file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchApplyResult {
+    pub patch_file: PatchFile,
+    pub effect: EffectRecord,
+    pub replayed: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceBinding {
@@ -178,5 +232,42 @@ impl EngineeringClient {
     pub fn archive_worktree(&self, worktree_id: &str) -> Result<Worktree> {
         self.http
             .post_json(&format!("/worktrees/{worktree_id}/archive"), "{}")
+    }
+
+    pub fn list_patches(&self, status: Option<&str>) -> Result<Vec<Patch>> {
+        let path = match status {
+            Some(status) if !status.is_empty() => {
+                format!("/patches/list?status={status}")
+            }
+            _ => "/patches/list".to_string(),
+        };
+        self.http.get_json(&path)
+    }
+
+    pub fn get_patch(&self, patch_id: &str) -> Result<PatchDetail> {
+        self.http.get_json(&format!("/patches/{patch_id}"))
+    }
+
+    pub fn apply_patch(
+        &self,
+        patch_id: &str,
+        patch_file_id: &str,
+        expected_old_sha256: Option<&str>,
+        approval_id: &str,
+    ) -> Result<PatchApplyResult> {
+        let body = serde_json::to_string(&serde_json::json!({
+            "expected_old_sha256": expected_old_sha256,
+            "approval_id": approval_id,
+        }))
+        .map_err(|_| transport_error("cannot encode patch apply request"))?;
+        self.http.post_json(
+            &format!("/patches/{patch_id}/files/{patch_file_id}/apply"),
+            &body,
+        )
+    }
+
+    pub fn reject_patch(&self, patch_id: &str) -> Result<PatchDetail> {
+        self.http
+            .post_json(&format!("/patches/{patch_id}/reject"), "{}")
     }
 }

@@ -39,6 +39,138 @@ export interface Location {
   status: string;
 }
 
+import {
+  toEffectRecord,
+  type EffectRecord,
+  type ServerEffectRecord,
+} from "./effects_client";
+
+// Patch aggregate (P3-B, plan §4.1/§4.7). A Patch is one loop
+// execution's change set in one worktree; a PatchFile is one
+// proposed fs.write. The gateway computes the diff and both
+// hashes at proposal time; `new_text` never leaves the
+// gateway (skip_serializing), so there is no such field here.
+// Status words are the gateway's stored words, verbatim:
+// proposed | partially_applied | applied | rejected | stale
+// for the Patch; pending | applied | failed | rejected |
+// stale for a PatchFile.
+
+export interface Patch {
+  patchId: string;
+  executionId: string;
+  workspaceSnapshotId: string | null;
+  worktreeId: string;
+  projectId: string | null;
+  status: string;
+  createdMs: number;
+  updatedMs: number | null;
+}
+
+export interface PatchFile {
+  patchFileId: string;
+  patchId: string;
+  pathRelative: string;
+  oldSha256: string | null;
+  newSha256: string;
+  diff: string;
+  effectId: string;
+  approvalId: string | null;
+  status: string;
+  createdMs: number;
+  updatedMs: number | null;
+}
+
+export interface PatchDetail {
+  patch: Patch;
+  files: PatchFile[];
+}
+
+export interface PatchApplyResult {
+  patchFile: PatchFile;
+  effect: EffectRecord;
+  replayed: boolean;
+}
+
+interface ServerPatch {
+  patch_id: string;
+  execution_id: string;
+  workspace_snapshot_id?: string | null;
+  worktree_id: string;
+  project_id?: string | null;
+  status: string;
+  created_ms: number;
+  updated_at_ms?: number | null;
+}
+
+interface ServerPatchFile {
+  patch_file_id: string;
+  patch_id: string;
+  path_relative: string;
+  old_sha256?: string | null;
+  new_sha256: string;
+  diff: string;
+  effect_id: string;
+  approval_id?: string | null;
+  status: string;
+  created_ms: number;
+  updated_at_ms?: number | null;
+}
+
+interface ServerPatchDetail {
+  patch: ServerPatch;
+  files: ServerPatchFile[];
+}
+
+interface ServerPatchApplyResult {
+  patch_file: ServerPatchFile;
+  effect: ServerEffectRecord;
+  replayed: boolean;
+}
+
+function toPatch(server: ServerPatch): Patch {
+  return {
+    patchId: server.patch_id,
+    executionId: server.execution_id,
+    workspaceSnapshotId: server.workspace_snapshot_id ?? null,
+    worktreeId: server.worktree_id,
+    projectId: server.project_id ?? null,
+    status: server.status,
+    createdMs: server.created_ms,
+    updatedMs: server.updated_at_ms ?? null,
+  };
+}
+
+function toPatchFile(server: ServerPatchFile): PatchFile {
+  return {
+    patchFileId: server.patch_file_id,
+    patchId: server.patch_id,
+    pathRelative: server.path_relative,
+    oldSha256: server.old_sha256 ?? null,
+    newSha256: server.new_sha256,
+    diff: server.diff,
+    effectId: server.effect_id,
+    approvalId: server.approval_id ?? null,
+    status: server.status,
+    createdMs: server.created_ms,
+    updatedMs: server.updated_at_ms ?? null,
+  };
+}
+
+function toPatchDetail(server: ServerPatchDetail): PatchDetail {
+  return {
+    patch: toPatch(server.patch),
+    files: server.files.map(toPatchFile),
+  };
+}
+
+function toPatchApplyResult(server: ServerPatchApplyResult): PatchApplyResult {
+  return {
+    patchFile: toPatchFile(server.patch_file),
+    effect: toEffectRecord(server.effect),
+    replayed: server.replayed,
+  };
+}
+
 export interface Worktree {
   worktreeId: string;
   locationId: string;
@@ -149,6 +281,20 @@ export interface EngineeringGateway {
   worktreeList(): Promise<Worktree[]>;
   worktreeGet(worktreeId: string): Promise<Worktree>;
   worktreeArchive(worktreeId: string): Promise<Worktree>;
+  // Patches (P3-B): list (optional status filter), get with
+  // files, apply one file (expected old hash + already-approved
+  // approval), reject a whole Patch. No Patch-level approval
+  // or Effect exists; approve goes through the existing
+  // approval decide route, then apply consumes it.
+  patchList(status?: string | null): Promise<Patch[]>;
+  patchGet(patchId: string): Promise<PatchDetail>;
+  patchApply(
+    patchId: string,
+    patchFileId: string,
+    expectedOldSha256: string | null,
+    approvalId: string,
+  ): Promise<PatchApplyResult>;
+  patchReject(patchId: string): Promise<PatchDetail>;
 }
 
 export class EngineeringClient implements EngineeringGateway {
@@ -301,5 +447,45 @@ export class EngineeringClient implements EngineeringGateway {
       {},
     );
     return toWorktree(record);
+  }
+
+  async patchList(status?: string | null): Promise<Patch[]> {
+    const query =
+      status === null || status === undefined || status === ""
+        ? "/patches/list"
+        : `/patches/list?status=${encodeURIComponent(status)}`;
+    const records = await this.request<ServerPatch[]>(query);
+    return records.map(toPatch);
+  }
+
+  async patchGet(patchId: string): Promise<PatchDetail> {
+    const detail = await this.request<ServerPatchDetail>(
+      `/patches/${encodeURIComponent(patchId)}`,
+    );
+    return toPatchDetail(detail);
+  }
+
+  async patchApply(
+    patchId: string,
+    patchFileId: string,
+    expectedOldSha256: string | null,
+    approvalId: string,
+  ): Promise<PatchApplyResult> {
+    const result = await this.post<ServerPatchApplyResult>(
+      `/patches/${encodeURIComponent(patchId)}/files/${encodeURIComponent(patchFileId)}/apply`,
+      {
+        expected_old_sha256: expectedOldSha256,
+        approval_id: approvalId,
+      },
+    );
+    return toPatchApplyResult(result);
+  }
+
+  async patchReject(patchId: string): Promise<PatchDetail> {
+    const detail = await this.post<ServerPatchDetail>(
+      `/patches/${encodeURIComponent(patchId)}/reject`,
+      {},
+    );
+    return toPatchDetail(detail);
   }
 }

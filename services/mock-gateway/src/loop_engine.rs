@@ -952,14 +952,68 @@ impl LoopEngine {
             let index = live.record.queue_position;
             if index < live.record.calls.len() {
                 if live.record.calls[index].status == CallStatus::AwaitingApproval {
+                    // P3-B: a plain step (no approval carried) on
+                    // a parked loop is a no-op returning the
+                    // awaiting view — the loop cannot advance
+                    // without a decision. Only a WRONG approval
+                    // is a binding mismatch. Without this, the
+                    // driver (spawned after a replay resume)
+                    // parking the loop at the next approval and
+                    // a concurrent plain step would 403 the drive
+                    // for a loop that is merely waiting.
+                    if request.approval_id.is_none() && request.binding.is_none() {
+                        return Ok(live.view());
+                    }
                     let call = &live.record.calls[index];
                     if request.approval_id != call.approval_id || request.binding != call.binding {
                         return Err(LoopError(403, "approval_binding_mismatch"));
                     }
-                    let status = app.loop_approval_status(
+                    let status = match app.loop_approval_status(
                         call.approval_id.as_ref().unwrap(),
                         call.binding.as_ref().unwrap(),
-                    )?;
+                    ) {
+                        Ok(status) => status,
+                        Err(e) => {
+                            // P3-B: the write may already have
+                            // landed through the apply command,
+                            // which consumed this approval and
+                            // drove the bound Effect to succeeded.
+                            // In that case the call replays (the
+                            // same gate execute_loop_tool applies:
+                            // "replayed from existing effect")
+                            // instead of failing the resume —
+                            // otherwise every apply-command write
+                            // would strand its loop at
+                            // awaiting_approval. Only a succeeded
+                            // (or reconciled-completed) Effect
+                            // replays; any other state keeps the
+                            // error.
+                            let replayed = call
+                                .approval_id
+                                .as_ref()
+                                .and_then(|id| {
+                                    crate::server::effect_for_approval(&app, id, None)
+                                })
+                                .is_some_and(|effect| {
+                                    effect.status == "succeeded"
+                                        || (effect.status == "reconciled"
+                                            && effect.reconciliation.as_ref().is_some_and(
+                                                |r| r.result == "completed",
+                                            ))
+                                });
+                            if replayed {
+                                let result = ToolMessage::from_outcome(
+                                    ToolOutcome::success(
+                                        "replayed from existing effect".to_string(),
+                                    ),
+                                );
+                                live.deliver(index, result, None);
+                                self.save(live)?;
+                                return Ok(live.view());
+                            }
+                            return Err(e);
+                        }
+                    };
                     match status {
                         agent_desktop::approval::ApprovalStatus::Rejected => {
                             let result = ToolMessage::from_outcome(ToolOutcome {

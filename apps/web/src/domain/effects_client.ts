@@ -38,7 +38,7 @@ interface ServerReconciliation {
   detail?: string | null;
 }
 
-interface ServerEffectRecord {
+export interface ServerEffectRecord {
   effect_id: string;
   execution_id: string | null;
   capability: string;
@@ -54,7 +54,7 @@ interface ServerEffectRecord {
   detail?: string | null;
 }
 
-function toRecord(server: ServerEffectRecord): EffectRecord {
+export function toEffectRecord(server: ServerEffectRecord): EffectRecord {
   return {
     effectId: server.effect_id,
     executionId: server.execution_id,
@@ -105,14 +105,14 @@ export class EffectsClient implements EffectsGateway {
 
   async list(): Promise<EffectRecord[]> {
     const records = await this.request<ServerEffectRecord[]>("/effects/list");
-    return records.map(toRecord);
+    return records.map(toEffectRecord);
   }
 
   async get(effectId: string): Promise<EffectRecord> {
     const record = await this.request<ServerEffectRecord>(
       `/effects/get?effect_id=${effectId}`,
     );
-    return toRecord(record);
+    return toEffectRecord(record);
   }
 
   private async postEffectId<T>(path: string, effectId: string): Promise<T> {
@@ -128,7 +128,7 @@ export class EffectsClient implements EffectsGateway {
       "/effects/reconcile",
       effectId,
     );
-    return toRecord(record);
+    return toEffectRecord(record);
   }
 
   async verify(effectId: string): Promise<EvidenceRow> {

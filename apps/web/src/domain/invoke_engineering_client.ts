@@ -1,8 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
+import {
+  toEffectRecord,
+  type ServerEffectRecord,
+} from "./effects_client";
 import type {
   Binding,
   EngineeringGateway,
   Location,
+  Patch,
+  PatchApplyResult,
+  PatchDetail,
+  PatchFile,
   Project,
   Worktree,
 } from "./engineering_client";
@@ -72,6 +80,89 @@ function toLocation(server: ServerLocation): Location {
     canonicalRoot: server.canonical_root,
     rootSha256: server.root_sha256,
     status: server.status,
+  };
+}
+
+// The Rust patch DTOs serialize snake_case (C1: field-identical
+// with the HTTP routes); the domain shape is camelCase, so the
+// mapping lives here, not in the view.
+interface ServerPatch {
+  patch_id: string;
+  execution_id: string;
+  workspace_snapshot_id?: string | null;
+  worktree_id: string;
+  project_id?: string | null;
+  status: string;
+  created_ms: number;
+  updated_at_ms?: number | null;
+}
+
+interface ServerPatchFile {
+  patch_file_id: string;
+  patch_id: string;
+  path_relative: string;
+  old_sha256?: string | null;
+  new_sha256: string;
+  diff: string;
+  effect_id: string;
+  approval_id?: string | null;
+  status: string;
+  created_ms: number;
+  updated_at_ms?: number | null;
+}
+
+interface ServerPatchDetail {
+  patch: ServerPatch;
+  files: ServerPatchFile[];
+}
+
+interface ServerPatchApplyResult {
+  patch_file: ServerPatchFile;
+  effect: ServerEffectRecord;
+  replayed: boolean;
+}
+
+function toPatch(server: ServerPatch): Patch {
+  return {
+    patchId: server.patch_id,
+    executionId: server.execution_id,
+    workspaceSnapshotId: server.workspace_snapshot_id ?? null,
+    worktreeId: server.worktree_id,
+    projectId: server.project_id ?? null,
+    status: server.status,
+    createdMs: server.created_ms,
+    updatedMs: server.updated_at_ms ?? null,
+  };
+}
+
+function toPatchFile(server: ServerPatchFile): PatchFile {
+  return {
+    patchFileId: server.patch_file_id,
+    patchId: server.patch_id,
+    pathRelative: server.path_relative,
+    oldSha256: server.old_sha256 ?? null,
+    newSha256: server.new_sha256,
+    diff: server.diff,
+    effectId: server.effect_id,
+    approvalId: server.approval_id ?? null,
+    status: server.status,
+    createdMs: server.created_ms,
+    updatedMs: server.updated_at_ms ?? null,
+  };
+}
+
+function toPatchDetail(server: ServerPatchDetail): PatchDetail {
+  return {
+    patch: toPatch(server.patch),
+    files: server.files.map(toPatchFile),
+  };
+}
+
+function toPatchApplyResult(server: ServerPatchApplyResult): PatchApplyResult {
+  return {
+    patchFile: toPatchFile(server.patch_file),
+    effect: toEffectRecord(server.effect),
+    replayed: server.replayed,
   };
 }
 
@@ -213,5 +304,44 @@ export class InvokeEngineeringClient implements EngineeringGateway {
       worktree_id: worktreeId,
     });
     return toWorktree(record);
+  }
+
+  async patchList(status?: string | null): Promise<Patch[]> {
+    const records = await invoke<ServerPatch[]>("engineering_patch_list", {
+      status: status ?? null,
+    });
+    return records.map(toPatch);
+  }
+
+  async patchGet(patchId: string): Promise<PatchDetail> {
+    const detail = await invoke<ServerPatchDetail>("engineering_patch_get", {
+      patch_id: patchId,
+    });
+    return toPatchDetail(detail);
+  }
+
+  async patchApply(
+    patchId: string,
+    patchFileId: string,
+    expectedOldSha256: string | null,
+    approvalId: string,
+  ): Promise<PatchApplyResult> {
+    const result = await invoke<ServerPatchApplyResult>(
+      "engineering_patch_apply",
+      {
+        patch_id: patchId,
+        patch_file_id: patchFileId,
+        expected_old_sha256: expectedOldSha256,
+        approval_id: approvalId,
+      },
+    );
+    return toPatchApplyResult(result);
+  }
+
+  async patchReject(patchId: string): Promise<PatchDetail> {
+    const detail = await invoke<ServerPatchDetail>("engineering_patch_reject", {
+      patch_id: patchId,
+    });
+    return toPatchDetail(detail);
   }
 }
