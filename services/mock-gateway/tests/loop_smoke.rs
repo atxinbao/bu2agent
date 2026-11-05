@@ -1097,9 +1097,11 @@ async fn restart_inflight_write_becomes_unknown_and_interrupted_without_reexecut
 #[tokio::test]
 async fn tool_budget_exhaustion_keeps_failed_and_unknown_after_late_success() {
     let h = Harness::new(vec![calls(vec![write("out", "x")])]).await;
-    *h.files.delay.lock().unwrap() = Duration::from_millis(160);
+    // Windows runner 在两个准备步骤之间可能消耗数十毫秒；预留审批所需预算，
+    // 同时让工具执行稳定超过剩余预算，保持该测试的时序确定性。
+    *h.files.delay.lock().unwrap() = Duration::from_millis(1_200);
     let start = h
-        .ok("/agent/loop/start", json!({"prompt":"task","budget_ms":60}))
+        .ok("/agent/loop/start", json!({"prompt":"task","budget_ms":1_000}))
         .await;
     let id = start["loop_id"].as_str().unwrap();
     h.step(id).await;
@@ -1108,7 +1110,7 @@ async fn tool_budget_exhaustion_keeps_failed_and_unknown_after_late_success() {
     assert_eq!(result["status"], "failed");
     assert_eq!(result["error"], "budget_exceeded");
     assert_eq!(result["unknown_writes"], json!([1]));
-    tokio::time::sleep(Duration::from_millis(180)).await;
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
     let result = h.get(id).await;
     assert_eq!(result["status"], "failed");
     assert_eq!(result["calls"][0]["status"], "unknown");
