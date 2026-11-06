@@ -872,23 +872,17 @@ fn upsert_effect_tx(
     )?;
     let source = format!("event-{event_id}");
     match record.status.as_str() {
-        "failed" => {
-            // P3-C (§5.4): a failed test run opens no Inbox
-            // row — a test failure is a known result (the
-            // suite's verdict), not something to review.
-            // Every other failed Effect opens a `failed` row
-            // as before.
-            if !(record.capability == "test" && record.operation == "run") {
-                insert_inbox(
-                    tx,
-                    "failed",
-                    record.execution_id.as_deref(),
-                    Some(&record.effect_id),
-                    None,
-                    &source,
-                    now,
-                )?;
-            }
+        // 测试失败是已知结果，不进 Inbox；其他失败仍保留待处理行。
+        "failed" if !(record.capability == "test" && record.operation == "run") => {
+            insert_inbox(
+                tx,
+                "failed",
+                record.execution_id.as_deref(),
+                Some(&record.effect_id),
+                None,
+                &source,
+                now,
+            )?;
         }
         "unknown" => insert_inbox(
             tx,

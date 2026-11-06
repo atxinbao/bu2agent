@@ -12,6 +12,7 @@ path = "src/lib.rs"
 agent-desktop = { path = "../../apps/desktop" }
 axum = "0.8"
 base64 = "0.22"
+dunce = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # P0-D: SQLite persistence for the unified plane (executions /
 # effects / approvals + events + Inbox / Outbox). Sync API matches

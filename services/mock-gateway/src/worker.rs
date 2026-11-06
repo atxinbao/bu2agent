@@ -534,7 +534,9 @@ pub fn resolve_command(
                     binary,
                     "worktree".to_string(),
                     "add".to_string(),
-                    target.to_string_lossy().into_owned(),
+                    // Git for Windows 不接受普通盘符路径的 verbatim 前缀；
+                    // 仅转换命令参数，绑定校验仍使用上面的 canonical 路径。
+                    dunce::simplified(&target).to_string_lossy().into_owned(),
                     "-b".to_string(),
                     branch,
                 ],
@@ -694,7 +696,7 @@ async fn drain_readers(
 }
 
 /// Build the child command: argv array, `env_clear` plus the
-/// minimal set {PATH, HOME, TMPDIR} (plan §3.4). Proxy
+/// minimal set {PATH, HOME, TMPDIR} plus Windows toolchain discovery. Proxy
 /// variables are never set; no credential ever enters the
 /// environment. The binary's directory leads PATH so the
 /// resolved binary is the one that runs even under a thin
@@ -731,6 +733,35 @@ fn build_child_command(
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     cmd.env("TMPDIR", tmpdir);
+    // Windows 的 rustc 依赖这些系统/SDK 变量定位 MSVC；丢失后可能
+    // 误选 PATH 中 Git 自带的 GNU link.exe。只传递明确的工具链变量。
+    #[cfg(windows)]
+    for key in [
+        "SystemRoot",
+        "SystemDrive",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "VSINSTALLDIR",
+        "VCINSTALLDIR",
+        "VCToolsInstallDir",
+        "WindowsSdkDir",
+        "WindowsSDKVersion",
+        "UniversalCRTSdkDir",
+        "UCRTVersion",
+        "INCLUDE",
+        "LIB",
+        "LIBPATH",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -1942,6 +1973,17 @@ mod tests {
         assert_eq!(add.argv[4], "-b");
         assert_eq!(add.argv[5], "scratch-1");
         assert!(Path::new(&add.argv[3]).is_absolute());
+        // 命令路径与已校验目标必须相同，Windows 普通路径不带 verbatim 前缀。
+        assert_eq!(
+            Path::new(&add.argv[3])
+                .parent()
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            root.canonicalize().unwrap()
+        );
+        #[cfg(windows)]
+        assert!(!add.argv[3].starts_with(r"\\?\"), "{}", add.argv[3]);
         // commit: message in argv, 60s default.
         let commit = resolve_command(
             "git-commit",
