@@ -151,6 +151,9 @@ fn approval_record(id: &str, tool: &str, status: &str) -> ApprovalFileRecord {
         // P3-C field; snapshot fixtures model pre-P3-C rows,
         // which carry no Worker command spec.
         command: None,
+        // E2-A field; snapshot fixtures model pre-E2-A rows,
+        // which carry no consuming worker session.
+        consumed_by_worker_session_id: None,
     }
 }
 

@@ -109,7 +109,30 @@ fn set_status(state: &AppState, task_id: &str, status: &str, error: Option<Strin
 }
 
 pub(crate) fn fail(state: &AppState, task_id: &str, error: &str) {
+    // E2-A §2.2: `failed` is only reachable from running /
+    // interrupted / draft_ready (the fail call sites). A fail
+    // raced past a terminal transition (cancelled / completed /
+    // rejected) is dropped, not forced: terminal is terminal.
+    let from = state
+        .tasks
+        .lock()
+        .expect("task lock")
+        .get(task_id)
+        .map(|r| r.status.clone());
+    match from.as_deref() {
+        Some(from) if crate::task_store::valid_task_status_transition(from, "failed") => {}
+        _ => {
+            eprintln!(
+                "warning: refusing to fail task {} from {}",
+                task_id,
+                from.as_deref().unwrap_or("?")
+            );
+            return;
+        }
+    }
     set_status(state, task_id, "failed", Some(error.to_string()));
+    // E2-A §2.3: the terminal Task closes its Execution.
+    crate::server::close_execution_for_task(state, task_id, "failed");
 }
 
 /// Create a bound fs.write approval for a draft, mirroring the

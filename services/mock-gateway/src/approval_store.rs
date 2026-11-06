@@ -54,6 +54,12 @@ pub struct ApprovalFileRecord {
     /// for every other tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<crate::server::CommandSpec>,
+    /// E2-A §2.7: the worker session that consumed this
+    /// approval to create a run (digest-bound and loop-bound
+    /// alike). None for old rows and for approvals never used
+    /// to create a run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumed_by_worker_session_id: Option<String>,
 }
 
 /// Read every well-formed record from `path`, in file order.
@@ -137,6 +143,7 @@ mod tests {
             effect_binding: None,
             message: None,
             command: None,
+            consumed_by_worker_session_id: None,
         }
     }
 

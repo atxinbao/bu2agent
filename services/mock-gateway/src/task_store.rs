@@ -99,6 +99,41 @@ pub fn append_task(path: &Path, record: &TaskFileRecord) {
 }
 
 /// Next task number: one past the largest `task-N` suffix seen, minimum 1.
+/// E2-A §2.2: the Task lifecycle edge table, mirroring
+/// `valid_effect_transition` (effect_store.rs). The table is
+/// the full runtime enumeration (full-repo grep, 2026-11-06):
+/// 8 status words, 13 edges. Every runtime Task status write
+/// goes through one of these edges; the manual
+/// `POST /tasks/update` override is NOT governed by it (it is
+/// a word-whitelist free setter, locked by task_smoke /
+/// task_persistence / p0_snapshot, e.g. created→completed and
+/// completed→rejected are legal there but are not runtime
+/// edges). `fail()` contributes two edges the call sites hide
+/// (interrupted→failed from restore_or_regenerate,
+/// draft_ready→failed from the tasks_execute write-failure
+/// path); the remaining eleven are the direct writes in
+/// server.rs tasks_run/tasks_cancel/tasks_execute/tasks_reject,
+/// task_runner run_task/restore_or_regenerate/generate_body,
+/// and the with_tasks_path restart fold (running→interrupted).
+pub fn valid_task_status_transition(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("created", "running")
+            | ("running", "draft_ready")
+            | ("running", "failed")
+            | ("running", "cancelled")
+            | ("running", "interrupted")
+            | ("interrupted", "running")
+            | ("interrupted", "draft_ready")
+            | ("interrupted", "rejected")
+            | ("interrupted", "failed")
+            | ("draft_ready", "completed")
+            | ("draft_ready", "rejected")
+            | ("draft_ready", "cancelled")
+            | ("draft_ready", "failed")
+    )
+}
+
 pub fn next_task_number(records: &[TaskFileRecord]) -> u64 {
     records
         .iter()
@@ -195,5 +230,45 @@ mod tests {
         ];
         assert_eq!(next_task_number(&records), 4);
         assert_eq!(next_task_number(&[]), 1);
+    }
+
+    #[test]
+    fn task_status_transition_table() {
+        // All thirteen runtime edges accept; everything else
+        // refuses, including the manual-override jumps the
+        // /tasks/update route allows (created→completed,
+        // completed→rejected) and identity transitions.
+        for (from, to) in [
+            ("created", "running"),
+            ("running", "draft_ready"),
+            ("running", "failed"),
+            ("running", "cancelled"),
+            ("running", "interrupted"),
+            ("interrupted", "running"),
+            ("interrupted", "draft_ready"),
+            ("interrupted", "rejected"),
+            ("interrupted", "failed"),
+            ("draft_ready", "completed"),
+            ("draft_ready", "rejected"),
+            ("draft_ready", "cancelled"),
+            ("draft_ready", "failed"),
+        ] {
+            assert!(valid_task_status_transition(from, to), "{from}→{to}");
+        }
+        for (from, to) in [
+            ("created", "completed"),
+            ("created", "draft_ready"),
+            ("completed", "rejected"),
+            ("completed", "running"),
+            ("failed", "created"),
+            ("rejected", "failed"),
+            ("cancelled", "created"),
+            ("running", "running"),
+            ("created", "created"),
+            ("bogus", "running"),
+            ("running", "bogus"),
+        ] {
+            assert!(!valid_task_status_transition(from, to), "{from}→{to}");
+        }
     }
 }

@@ -1064,15 +1064,32 @@ impl LoopEngine {
                 Err(_) => return,
             };
             if view.record.status.terminal() || view.record.status == LoopStatus::AwaitingApproval {
+                // E2-A §2.3: a terminal observation closes the
+                // Execution (idempotent: an already-closed one
+                // is a no-op). AwaitingApproval is not terminal
+                // and closes nothing.
+                if view.record.status.terminal() {
+                    crate::server::close_execution_for_loop(&app, &loop_id, &view.record.status);
+                }
                 return;
             }
             if steps >= 50 {
-                let mut state = self.state.lock().unwrap();
-                if let Some(live) = state.loops.get_mut(&loop_id) {
-                    if !live.record.status.terminal() {
-                        live.finish(LoopStatus::Failed, Some(ErrorCode::DriverLimit));
-                        let _ = self.save(live);
+                // E2-A §2.3: the DriverLimit failure closes the
+                // Execution (the status is cloned out so the
+                // close runs after the engine borrow ends).
+                let mut failed_status: Option<LoopStatus> = None;
+                {
+                    let mut state = self.state.lock().unwrap();
+                    if let Some(live) = state.loops.get_mut(&loop_id) {
+                        if !live.record.status.terminal() {
+                            live.finish(LoopStatus::Failed, Some(ErrorCode::DriverLimit));
+                            failed_status = Some(live.record.status.clone());
+                            let _ = self.save(live);
+                        }
                     }
+                }
+                if let Some(status) = failed_status {
+                    crate::server::close_execution_for_loop(&app, &loop_id, &status);
                 }
                 return;
             }
@@ -1086,6 +1103,15 @@ impl LoopEngine {
             {
                 Ok(view) => {
                     if view.record.status.terminal() || view.record.status == LoopStatus::AwaitingApproval {
+                        // E2-A §2.3: the resumed step ended the
+                        // loop; close its Execution.
+                        if view.record.status.terminal() {
+                            crate::server::close_execution_for_loop(
+                                &app,
+                                &loop_id,
+                                &view.record.status,
+                            );
+                        }
                         return;
                     }
                 }

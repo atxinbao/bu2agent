@@ -601,13 +601,26 @@ async fn e2slice_c19_takeover_bound_run_superseded_after_assignment_ends() {
     let slow = fake_git_slow(&dir, 5);
     let h = Harness::serve(&dir, Some(slow)).await;
     let worktree = h.setup_worktree(&repo).await;
-    // Run 1 binds no assignment; takeover creates one.
-    let (status, run) = h
-        .create_run(json!({"worktree_id": worktree, "command": "git-status", "timeout_ms": 30000}))
-        .await;
-    assert_eq!(status, 201, "{run}");
-    let execution_id = run["execution_id"].as_str().unwrap().to_string();
-    h.wait_run("run-1", 15).await;
+    // E2-A §2.3: a run that succeeds closes its Execution, so
+    // the old setup (run-1 succeeds, then takeover + run-2 on
+    // the same Execution) now 409s `execution_terminal` at the
+    // takeover. The supersede under test needs a NON-terminal
+    // Execution with no completed run on it, so the Execution
+    // is a store-level fixture (there is no bare-Execution
+    // creation route); the takeover → bind → supersede flow
+    // under test is unchanged, and the final assertions
+    // (superseded run wrote no Effect, opened no Inbox row)
+    // are unchanged.
+    let execution_id = "execution-9000".to_string();
+    {
+        let conn = db(&dir);
+        conn.execute(
+            "INSERT INTO executions (seq, execution_id, task_id, loop_id, session_id, worker_session_id, workspace_snapshot_id, status, origin_device_id, schema_version, created_ms, updated_at_ms) VALUES (?1, ?2, NULL, NULL, NULL, NULL, NULL, 'running', 'unknown', 1, ?3, ?3)",
+            rusqlite::params![9000i64, execution_id, sqlite_store::now_ms() as i64],
+        )
+        .expect("insert fixture execution");
+    }
+    // Takeover creates the assignment the run binds.
     let takeover = h
         .ok_post(
             "/assignments/takeover",
@@ -618,7 +631,7 @@ async fn e2slice_c19_takeover_bound_run_superseded_after_assignment_ends() {
         .as_str()
         .unwrap()
         .to_string();
-    // Run 2 binds the takeover's assignment.
+    // Run 1 binds the takeover's assignment.
     let (status, run) = h
         .create_run(
             json!({"worktree_id": worktree, "command": "git-status", "timeout_ms": 30000, "execution_id": execution_id}),
@@ -626,7 +639,7 @@ async fn e2slice_c19_takeover_bound_run_superseded_after_assignment_ends() {
         .await;
     assert_eq!(status, 201, "{run}");
     assert_eq!(run["assignment_id"], assignment_id);
-    h.wait_run_status("run-2", "running", 15).await;
+    h.wait_run_status("run-1", "running", 15).await;
     // The assignment ends (terminal transition drives it to
     // `done`; a takeover cannot supersede an active
     // assignment by design — it 409s — so the terminal
@@ -640,7 +653,7 @@ async fn e2slice_c19_takeover_bound_run_superseded_after_assignment_ends() {
         )
         .await;
     assert_eq!(transitioned["status"], "failed");
-    let row = h.wait_run("run-2", 20).await;
+    let row = h.wait_run("run-1", 20).await;
     assert_eq!(row["status"], "superseded", "{row}");
     assert!(row["effect_id"].is_null());
     assert!(
@@ -723,15 +736,29 @@ async fn e2slice_c20_restart_orphans_running_run_and_keeps_counter_and_deadline(
 async fn e2slice_c20_expired_deadline_refuses_new_run() {
     let dir = temp_dir("c20-deadline");
     let repo = init_repo(&dir);
-    let h = Harness::serve(&dir, Some(real_git())).await;
+    // E2-A §2.3: a run that succeeds closes its Execution, so
+    // the old setup (run-1 succeeds, then a second run on the
+    // same Execution) now 409s `execution_terminal` at create
+    // time. The deadline-refusal path instead needs a
+    // NON-terminal Execution: run-1 times out, which leaves
+    // its Execution at `needs_review` (recoverable, per the
+    // §2.3 timeout mapping) — the exact recovery shape the
+    // second run exercises.
+    let fake = fake_git_sleeping(&dir);
+    let h = Harness::serve(&dir, Some(fake)).await;
     let worktree = h.setup_worktree(&repo).await;
     let (status, run) = h
-        .create_run(json!({"worktree_id": worktree, "command": "git-status"}))
+        .create_run(json!({"worktree_id": worktree, "command": "git-status", "timeout_ms": 2000}))
         .await;
     assert_eq!(status, 201, "{run}");
     let execution_id = run["execution_id"].as_str().unwrap().to_string();
     let row = h.wait_run("run-1", 15).await;
-    assert_eq!(row["status"], "succeeded");
+    assert_eq!(row["status"], "timeout", "{row}");
+    assert_eq!(
+        h.ok_get(&format!("/executions/get?execution_id={execution_id}"))
+            .await["status"],
+        "needs_review"
+    );
     // Move the deadline into the past (test seam: direct
     // SQLite write; production sets it only at run
     // creation). A new run must refuse to start and fail

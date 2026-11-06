@@ -91,6 +91,22 @@ pub fn is_terminal_run_status(status: &str) -> bool {
     )
 }
 
+/// E2-A §2.8: Worker run status → Execution status for the
+/// historical reconciliation (the same mapping as the §2.3
+/// coupling: succeeded→completed, failed→failed,
+/// cancelled→cancelled, timeout/orphaned/lost→needs_review).
+/// `superseded` has no target: the takeover owner owns that
+/// Execution now. Non-terminal run words return None.
+pub fn run_status_to_execution(status: &str) -> Option<&'static str> {
+    match status {
+        "succeeded" => Some("completed"),
+        "failed" => Some("failed"),
+        "cancelled" => Some("cancelled"),
+        "timeout" | "orphaned" | "lost" => Some("needs_review"),
+        _ => None,
+    }
+}
+
 fn now_ms() -> i64 {
     crate::effect_store::now_ms() as i64
 }
@@ -1357,6 +1373,17 @@ async fn assignment_still_active(state: &AppState, run: &WorkerRunRow) -> bool {
 /// Run-specific digest (slice formula): commits the argv,
 /// command, cwd and run id, so each run owns its unknown /
 /// test Effect row and no two runs share an idempotency key.
+///
+/// E2-A §2.4: this digest IS the Worker driver dedupe — the
+/// driver deliberately has no `check_idempotency` call. A
+/// duplicate run cannot be created through the route in the
+/// first place: a digest-bound approval is single-use
+/// (replay → 403 `approval_binding_mismatch`), the run row
+/// carries a UNIQUE `approval_id` index (concurrent replay →
+/// 409 `approval_already_used`), and one Execution admits at
+/// most one queued/running run (→ 409
+/// `execution_has_running_worker`). Locked by A4 in
+/// tests/e2a_ledger.rs.
 pub(crate) fn run_digest(run: &WorkerRunRow) -> String {
     crate::sqlite_store::sha256_hex(
         crate::sqlite_store::canonical_json(&serde_json::json!({
@@ -1659,6 +1686,21 @@ async fn finish_terminal(
                 execution_id,
                 &state.origin_device_id,
             );
+            // E2-A §2.3: the terminal run closes its Execution
+            // (succeeded→completed, failed→failed). The close
+            // shares the `applied` gate with the checkpoint:
+            // a superseded run never owned the Execution.
+            // P3-C §5.4: a test run's failure is a result, not
+            // something to review — its close opens no failed
+            // Inbox row (the (test,run) Effect already opens
+            // none), while every other failed run does.
+            let target = if status == "succeeded" { "completed" } else { "failed" };
+            drop(conn);
+            if run.command == "cargo-test" {
+                crate::server::close_execution_no_inbox(state, execution_id, target);
+            } else {
+                crate::server::close_execution(state, execution_id, target);
+            }
         }
     }
 }
@@ -1724,6 +1766,12 @@ async fn finish_unknown(
                 execution_id,
                 &state.origin_device_id,
             );
+            // E2-A §2.3: timeout / wait-failure is not a
+            // terminal outcome — the Execution goes to
+            // `needs_review` (visible, recoverable), never to
+            // a fabricated terminal word.
+            drop(conn);
+            crate::server::close_execution(state, execution_id, "needs_review");
         }
     }
 }

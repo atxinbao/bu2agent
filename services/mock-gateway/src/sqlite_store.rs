@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     effect_binding TEXT,
     message TEXT,
     command_json TEXT,
+    consumed_by_worker_session_id TEXT,
     origin_device_id TEXT NOT NULL,
     schema_version INTEGER NOT NULL,
     created_ms INTEGER,
@@ -466,6 +467,9 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     // Databases migrated before P3-C have no approvals
     // .command_json; same backfill precedent, version stays 4.
     backfill_column(&tx, "approvals", "command_json")?;
+    // E2-A §2.7: the consuming worker session (nullable,
+    // backfill only, version stays 4). Old rows stay NULL.
+    backfill_column(&tx, "approvals", "consumed_by_worker_session_id")?;
     tx.commit().map_err(err)?;
     Ok(())
 }
@@ -708,6 +712,7 @@ fn upsert_execution_tx(
     tx: &rusqlite::Transaction<'_>,
     record: &ExecutionFileRecord,
     event_type: &str,
+    suppress_inbox: bool,
 ) -> Result<(), String> {
     let now = now_ms() as i64;
     let created_ms: Option<i64> = tx
@@ -765,8 +770,16 @@ fn upsert_execution_tx(
         record.schema_version as i64,
     )?;
     let source = format!("event-{event_id}");
+    // E2-A §2.3 + P3-C §5.4: a close suppressed by the caller
+    // opens no Inbox row. Only the Worker driver suppresses,
+    // for a test run: a test result is a result, not something
+    // to review (P3-C locks "no Inbox row" for (test,run)
+    // failures), while the Execution still closes to `failed`.
+    // A suppressed close also skips the review auto-close:
+    // it does nothing to the Inbox at all. Every other
+    // failed/needs_review close opens its row.
     match record.status.as_str() {
-        "needs_review" => insert_inbox(
+        "needs_review" if !suppress_inbox => insert_inbox(
             tx,
             "review_required",
             Some(&record.execution_id),
@@ -775,7 +788,7 @@ fn upsert_execution_tx(
             &source,
             now,
         )?,
-        "failed" => insert_inbox(
+        "failed" if !suppress_inbox => insert_inbox(
             tx,
             "failed",
             Some(&record.execution_id),
@@ -784,6 +797,7 @@ fn upsert_execution_tx(
             &source,
             now,
         )?,
+        "needs_review" | "failed" => {}
         _ => {
             // A non-review status closes open review rows for
             // this execution; failed rows are never auto-closed
@@ -884,15 +898,38 @@ fn upsert_effect_tx(
                 now,
             )?;
         }
-        "unknown" => insert_inbox(
-            tx,
-            "unknown_requires_reconciliation",
-            record.execution_id.as_deref(),
-            Some(&record.effect_id),
-            None,
-            &source,
-            now,
-        )?,
+        // E2-A §2.6: the unknown branch used to insert
+        // unconditionally, so a second upsert of the same
+        // still-unknown row (e.g. a re-persist through
+        // `persist_effect`) opened a second
+        // `unknown_requires_reconciliation` row for the same
+        // effect_id — the dedupe hole behind inbox-59/60/61
+        // and inbox-64/65/66. Same open-row guard as the
+        // approval branch below: insert only when no open row
+        // for this effect_id exists. (The `failed` branch
+        // above has the same unconditional shape; no duplicate
+        // failed row has been confirmed, so per plan §2.6 it
+        // is audited here and left unchanged.)
+        "unknown" => {
+            let open: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM inbox WHERE kind = 'unknown_requires_reconciliation' AND effect_id = ?1 AND resolved_ms IS NULL",
+                    params![record.effect_id],
+                    |row| row.get(0),
+                )
+                .map_err(err)?;
+            if open == 0 {
+                insert_inbox(
+                    tx,
+                    "unknown_requires_reconciliation",
+                    record.execution_id.as_deref(),
+                    Some(&record.effect_id),
+                    None,
+                    &source,
+                    now,
+                )?;
+            }
+        }
         "reconciled" => {
             auto_close_inbox(
                 tx,
@@ -975,14 +1012,15 @@ fn upsert_approval_tx(
         None => None,
     };
     tx.execute(
-        "INSERT INTO approvals (seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json, origin_device_id, schema_version, created_ms, updated_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        "INSERT INTO approvals (seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json, consumed_by_worker_session_id, origin_device_id, schema_version, created_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT(approval_id) DO UPDATE SET
            seq = excluded.seq, tool = excluded.tool, status = excluded.status,
            binding_json = excluded.binding_json, consumed = excluded.consumed,
            operation_digest = excluded.operation_digest, action_binding = excluded.action_binding,
            effect_binding = excluded.effect_binding, message = excluded.message,
            command_json = excluded.command_json,
+           consumed_by_worker_session_id = excluded.consumed_by_worker_session_id,
            origin_device_id = excluded.origin_device_id, schema_version = excluded.schema_version,
            created_ms = excluded.created_ms, updated_at_ms = excluded.updated_at_ms",
         params![
@@ -997,6 +1035,7 @@ fn upsert_approval_tx(
             record.effect_binding,
             record.message,
             command_json,
+            record.consumed_by_worker_session_id,
             // Approvals predate the P0-A origin field in the
             // file record; new server rows carry "unknown" here
             // only when the caller did not stamp one. The file
@@ -1062,7 +1101,7 @@ fn upsert_approval_tx(
 /// derived Inbox rows). Callers hold the `Mutex<Connection>`.
 pub fn upsert_execution(conn: &mut Connection, record: &ExecutionFileRecord) -> Result<(), String> {
     let tx = conn.transaction().map_err(err)?;
-    upsert_execution_tx(&tx, record, "execution.created")?;
+    upsert_execution_tx(&tx, record, "execution.created", false)?;
     tx.commit().map_err(err)?;
     Ok(())
 }
@@ -1172,12 +1211,13 @@ fn approval_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalFileRe
         effect_binding: row.get(8)?,
         message: row.get(9)?,
         command,
+        consumed_by_worker_session_id: row.get(11)?,
     })
 }
 
 pub fn list_approvals(conn: &Connection) -> Result<Vec<ApprovalFileRecord>, String> {
     let mut stmt = conn
-        .prepare("SELECT seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json FROM approvals ORDER BY seq ASC, approval_id ASC")
+        .prepare("SELECT seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json, consumed_by_worker_session_id FROM approvals ORDER BY seq ASC, approval_id ASC")
         .map_err(err)?;
     let rows = stmt
         .query_map([], approval_from_row)
@@ -1189,7 +1229,7 @@ pub fn list_approvals(conn: &Connection) -> Result<Vec<ApprovalFileRecord>, Stri
 
 pub fn get_approval(conn: &Connection, approval_id: &str) -> Result<Option<ApprovalFileRecord>, String> {
     conn.query_row(
-        "SELECT seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json FROM approvals WHERE approval_id = ?1",
+        "SELECT seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json, consumed_by_worker_session_id FROM approvals WHERE approval_id = ?1",
         params![approval_id],
         approval_from_row,
     )
@@ -3330,7 +3370,82 @@ pub fn get_snapshot(conn: &Connection, snapshot_id: &str) -> Result<Option<Snaps
 /// exactly the sessions it ends, nothing it did not see die.
 /// A failure leaves the transaction uncommitted; the caller
 /// fails the startup closed (no partial scan ever lands).
-pub fn recovery_scan(conn: &mut Connection, origin_device_id: &str) -> Result<String, String> {
+/// E2-A §2.5: a stale worker run the startup probe found,
+/// with the outcome the pid probe decided. `detail` is the
+/// probe outcome string ("worker run never started" /
+/// "worker process survived gateway" / "worker process ended
+/// with gateway"); it is stamped onto the scan's unknown
+/// Effect by the server, not stored here.
+pub struct StaleWorkerRun {
+    pub run: WorkerRunRow,
+    pub status: String,
+    pub detail: String,
+}
+
+/// E2-A §2.5: read-only probe (no transaction held): select
+/// the queued/running runs, decide orphaned/lost by pid, and
+/// kill the process group of a live orphan (the kill sleeps,
+/// so it must not hold a transaction). The unknown Effect is
+/// NOT created here — the server creates it through
+/// `record_effect` between probe and finalize, so the key is
+/// computed centrally and the row is exported like every
+/// other Effect. Both outcomes get an `unknown` Effect (which
+/// opens the Inbox row through the normal upsert trigger) and
+/// never an automatic retry: whether the command landed is
+/// unknown, and a retried write could land twice. The scan
+/// runs before the new worker session is created, so a run
+/// finalized here can never be re-driven by this process.
+pub fn recovery_probe(conn: &Connection) -> Result<Vec<StaleWorkerRun>, String> {
+    let stale_runs: Vec<WorkerRunRow> = {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {WORKER_RUN_COLS} FROM worker_runs WHERE status IN ('queued', 'running') ORDER BY seq ASC"
+            ))
+            .map_err(err)?;
+        let rows = stmt
+            .query_map([], worker_run_from_row)
+            .map_err(err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(err)?;
+        rows
+    };
+    let mut out = Vec::new();
+    for run in stale_runs {
+        let (status, detail) = match run.pid {
+            None => ("lost", "worker run never started"),
+            Some(pid) if crate::worker::process_alive(pid) => {
+                ("orphaned", "worker process survived gateway")
+            }
+            Some(_) => ("lost", "worker process ended with gateway"),
+        };
+        if status == "orphaned" {
+            if let Some(pid) = run.pid {
+                crate::worker::kill_process_group(pid, "TERM");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if crate::worker::process_alive(pid) {
+                    crate::worker::kill_process_group(pid, "KILL");
+                }
+            }
+        }
+        out.push(StaleWorkerRun {
+            run,
+            status: status.to_string(),
+            detail: detail.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// E2-A §2.5: the finalizing transaction for a probe: end
+/// the active worker sessions, lose their assignments, mark
+/// each probed run with its outcome + Effect id, and create
+/// the new worker session. `stale` carries
+/// (run_id, status, effect_id) per probed run.
+pub fn recovery_finalize(
+    conn: &mut Connection,
+    origin_device_id: &str,
+    stale: &[(String, String, String)],
+) -> Result<String, String> {
     let tx = conn.transaction().map_err(err)?;
     let now = now_ms() as i64;
     let ended: Vec<String> = {
@@ -3356,84 +3471,10 @@ pub fn recovery_scan(conn: &mut Connection, origin_device_id: &str) -> Result<St
             mark_assignment_tx(&tx, &row, "lost", "worker stopped", Some("assignment.lost"))?;
         }
     }
-    // E2 slice: close `worker_runs` rows the dead gateway
-    // left behind (plan §2.2). A row with a live pid is an
-    // orphan — the process survived its parent — so it is
-    // marked `orphaned` and its process group is killed; a
-    // row with a dead or missing pid is `lost`. Both get an
-    // `unknown` Effect (which opens the Inbox row through
-    // the normal upsert trigger) and never an automatic
-    // retry: whether the command landed is unknown, and a
-    // retried write could land twice. The scan runs before
-    // the new worker session is created, so a run finalized
-    // here can never be re-driven by this process.
-    let stale_runs: Vec<WorkerRunRow> = {
-        let mut stmt = tx
-            .prepare(&format!(
-                "SELECT {WORKER_RUN_COLS} FROM worker_runs WHERE status IN ('queued', 'running') ORDER BY seq ASC"
-            ))
-            .map_err(err)?;
-        let rows = stmt
-            .query_map([], worker_run_from_row)
-            .map_err(err)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(err)?;
-        rows
-    };
-    for run in &stale_runs {
-        let (status, detail) = match run.pid {
-            None => ("lost", "worker run never started"),
-            Some(pid) if crate::worker::process_alive(pid) => {
-                ("orphaned", "worker process survived gateway")
-            }
-            Some(_) => ("lost", "worker process ended with gateway"),
-        };
-        if status == "orphaned" {
-            if let Some(pid) = run.pid {
-                crate::worker::kill_process_group(pid, "TERM");
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                if crate::worker::process_alive(pid) {
-                    crate::worker::kill_process_group(pid, "KILL");
-                }
-            }
-        }
-        // P3-C: the unknown Effect uses the template's
-        // vocabulary (the driver's `unknown_effect_identity`,
-        // with no Location root — SQLite has no Location
-        // records, so a worktree-add scope falls back to the
-        // absolute path). The digest is the run-specific
-        // formula, shared with the driver.
-        let (capability, operation, scope) =
-            crate::worker::unknown_effect_identity(run, None);
-        let digest = crate::worker::run_digest(run);
-        let idempotency_key = run.execution_id.as_ref().map(|execution_id| {
-            crate::effect_store::idempotency_key(
-                execution_id,
-                &capability,
-                &operation,
-                &scope,
-                &digest,
-            )
-        });
-        let effect = EffectFileRecord {
-            effect_id: next_prefixed_id(&tx, "effects", "effect_id", "effect-")?,
-            execution_id: run.execution_id.clone(),
-            capability,
-            operation,
-            scope,
-            input_digest: Some(digest),
-            approval_id: run.approval_id.clone(),
-            status: "unknown".to_string(),
-            idempotency_key,
-            origin_device_id: origin_device_id.to_string(),
-            schema_version: 1,
-            reconciliation: None,
-            detail: Some(detail.to_string()),
-        };
-        upsert_effect_tx(&tx, &effect)?;
+    for (run_id, status, effect_id) in stale {
         tx.execute(
             "UPDATE worker_runs SET status = ?1, finished_ms = ?2, effect_id = ?3, updated_at_ms = ?2 WHERE run_id = ?4",
-            params![status, now, effect.effect_id, run.run_id],
+            params![status, now, effect_id, run_id],
         )
         .map_err(err)?;
     }
@@ -3509,7 +3550,7 @@ pub fn upsert_execution_with_snapshot(
     snapshot: &SnapshotRow,
 ) -> Result<(), String> {
     let tx = conn.transaction().map_err(err)?;
-    upsert_execution_tx(&tx, record, "execution.created")?;
+    upsert_execution_tx(&tx, record, "execution.created", false)?;
     insert_snapshot_tx(&tx, snapshot)?;
     tx.commit().map_err(err)?;
     Ok(())
@@ -3744,6 +3785,42 @@ pub fn transition_execution(
     execution_id: &str,
     status: &str,
 ) -> Result<ExecutionFileRecord, ExecutionTransitionError> {
+    transition_execution_with_event(conn, execution_id, status, "execution.transitioned", false)
+}
+
+/// E2-A §2.3 + P3-C §5.4: like `transition_execution`, but
+/// the close opens no Inbox row. Only the Worker driver uses
+/// it, for a test run (see `upsert_execution_tx`).
+pub fn transition_execution_no_inbox(
+    conn: &mut Connection,
+    execution_id: &str,
+    status: &str,
+) -> Result<ExecutionFileRecord, ExecutionTransitionError> {
+    transition_execution_with_event(conn, execution_id, status, "execution.transitioned", true)
+}
+
+/// E2-A §2.8: reconcile one stranded "running" Execution to
+/// its §2.3 target, writing the audit event as
+/// `execution.reconciled` (full post-state payload, so the
+/// fold invariant holds exactly like `execution.transitioned`).
+/// Same edge validation and terminal-Assignment discipline as
+/// `transition_execution`; the event type is the audit trail
+/// that distinguishes a reconciliation from a live transition.
+pub fn reconcile_execution(
+    conn: &mut Connection,
+    execution_id: &str,
+    status: &str,
+) -> Result<ExecutionFileRecord, ExecutionTransitionError> {
+    transition_execution_with_event(conn, execution_id, status, "execution.reconciled", false)
+}
+
+fn transition_execution_with_event(
+    conn: &mut Connection,
+    execution_id: &str,
+    status: &str,
+    event_type: &str,
+    suppress_inbox: bool,
+) -> Result<ExecutionFileRecord, ExecutionTransitionError> {
     let tx = conn.transaction().map_err(err).map_err(ExecutionTransitionError::Internal)?;
     let run = || -> Result<ExecutionFileRecord, ExecutionTransitionError> {
         let Some(mut record) = execution_row_tx(&tx, execution_id)
@@ -3755,7 +3832,7 @@ pub fn transition_execution(
             return Err(ExecutionTransitionError::Illegal);
         }
         record.status = status.to_string();
-        upsert_execution_tx(&tx, &record, "execution.transitioned")
+        upsert_execution_tx(&tx, &record, event_type, suppress_inbox)
             .map_err(ExecutionTransitionError::Internal)?;
         if crate::execution_store::execution_status_group(status) == Some("terminal") {
             let now = now_ms() as i64;
@@ -3870,6 +3947,25 @@ pub fn create_worker_run(
         params![seq, inserted.run_id, inserted.execution_id, inserted.assignment_id, inserted.worker_session_id, inserted.command, inserted.argv_json, inserted.cwd, inserted.timeout_ms, inserted.status, inserted.exit_code, inserted.pid, inserted.started_ms, inserted.finished_ms, inserted.tail, inserted.truncated as i64, inserted.effect_id, inserted.binding_location_id, inserted.binding_worktree_id, inserted.binding_root_digest, inserted.schema_version, now, inserted.approval_id],
     )
     .map_err(err)?;
+    // E2-A §2.7: write the consuming worker session back onto
+    // the approval in the SAME transaction as the run insert
+    // (plan §2.7): the run row and the approval back-pointer
+    // land or roll back together. This is a bare audit-field
+    // update, not a lifecycle change — the consumption event
+    // was already written when the approval was consumed — so
+    // it bypasses `upsert_approval_tx`'s event logic. The
+    // in-memory map is updated by the server right after the
+    // insert returns; a crash between the two loses only the
+    // cache entry (startup reloads it from SQLite).
+    if let (Some(approval_id), Some(worker_session_id)) =
+        (&inserted.approval_id, &inserted.worker_session_id)
+    {
+        tx.execute(
+            "UPDATE approvals SET consumed_by_worker_session_id = ?1, updated_at_ms = ?2 WHERE approval_id = ?3",
+            params![worker_session_id, now, approval_id],
+        )
+        .map_err(err)?;
+    }
     tx.commit().map_err(err)?;
     Ok(inserted)
 }
@@ -4143,6 +4239,7 @@ mod tests {
             effect_binding: Some("effect-1".to_string()),
             message: Some("please write".to_string()),
             command: None,
+            consumed_by_worker_session_id: None,
         }
     }
 
@@ -4742,7 +4839,10 @@ mod tests {
             },
         )
         .expect("assignment-2");
-        let new_worker = recovery_scan(&mut conn, "mac-local").expect("scan");
+        // E2-A §2.5: probe (no stale runs here) + finalize.
+        let stale = recovery_probe(&conn).expect("probe");
+        assert!(stale.is_empty());
+        let new_worker = recovery_finalize(&mut conn, "mac-local", &[]).expect("scan");
         assert_eq!(new_worker, "worker-3");
         let workers = list_worker_sessions(&conn).expect("workers");
         let w1 = workers.iter().find(|w| w.worker_session_id == "worker-1").unwrap();

@@ -295,6 +295,10 @@ pub(crate) struct ApprovalState {
     /// P3-C (§7): the resolved Worker command this approval
     /// authorizes. None for every other tool.
     command: Option<CommandSpec>,
+    /// E2-A §2.7: the worker session that consumed this
+    /// approval to create a run. None for old rows and for
+    /// approvals never used to create a run.
+    consumed_by_worker_session_id: Option<String>,
 }
 
 impl ApprovalState {
@@ -309,7 +313,7 @@ impl ApprovalState {
         consumed: bool,
         operation_digest: Option<String>,
     ) -> Self {
-        ApprovalState { tool, status, binding, consumed, operation_digest, action_binding: None, effect_binding: None, message: None, command: None }
+        ApprovalState { tool, status, binding, consumed, operation_digest, action_binding: None, effect_binding: None, message: None, command: None, consumed_by_worker_session_id: None }
     }
 
     fn is_bound(&self) -> bool {
@@ -684,7 +688,7 @@ impl AppState {
                     Some(status) => {
                         approvals.insert(
                             record.tool_call_id.clone(),
-                            ApprovalState { tool: record.tool.clone(), status, binding: record.binding.clone(), consumed: record.consumed, operation_digest: record.operation_digest.clone(), action_binding: record.action_binding.clone(), effect_binding: record.effect_binding.clone(), message: record.message.clone(), command: record.command.clone() },
+                            ApprovalState { tool: record.tool.clone(), status, binding: record.binding.clone(), consumed: record.consumed, operation_digest: record.operation_digest.clone(), action_binding: record.action_binding.clone(), effect_binding: record.effect_binding.clone(), message: record.message.clone(), command: record.command.clone(), consumed_by_worker_session_id: record.consumed_by_worker_session_id.clone() },
                         );
                     }
                     None => {
@@ -893,6 +897,8 @@ impl AppState {
             // P3-C: a worker.run approval also carries the
             // resolved command spec (argv digest, cwd, timeout).
             command,
+            // E2-A §2.7: no consumer yet at plan time.
+            consumed_by_worker_session_id: None,
         };
         let mut approvals = self.approvals.lock().unwrap();
         persist_approval(self, &id, &record)
@@ -1605,44 +1611,20 @@ impl AppState {
         // Post-dispatch Effect context for fs.write, cloned before
         // args/approval_id move into the blocking task. Reads never
         // produce an Effect, so the context exists only for writes.
-        let fs_effect = (tool == "fs.write").then(|| {
-            (
-                args.get("path").cloned().unwrap_or_default(),
-                crate::loop_engine::args_digest(&tool, &args),
-                approval_id.clone(),
-                binding.as_ref().map(|b| b.loop_id.clone()),
-            )
-        });
+        // E2-A §2.3: the single record path is record_loop_effect
+        // (the old inline dispatch closure is deleted — A12 locks
+        // the identical output). The digest, scope, approval and
+        // binding all come from these clones, exactly as the
+        // closure computed them from the same args.
+        let effect_args = (tool == "fs.write").then(|| args.clone());
+        let effect_approval = approval_id.clone();
+        let effect_binding = binding.clone();
         let record_fs_effect = |outcome: &ToolOutcome| {
-            if let Some((scope, digest, approval_id, loop_id)) = &fs_effect {
-                let status = serde_json::to_string(&outcome.status)
-                    .unwrap_or_else(|_| "\"unknown\"".to_string());
-                let status = status.trim_matches('"');
-                let terminal = crate::effect_store::map_legacy_status_to_new(status)
-                    .unwrap_or("failed");
-                // P0-C: drive the bound planned Effect when one
-                // exists; otherwise fall back to the old
-                // terminal-row recording (legacy approval).
-                if let Some(approval_id) = approval_id {
-                    if self.transition_bound_loop_effect(approval_id, terminal) {
-                        sync_patch_file_after_loop_write(self, approval_id, terminal);
-                        return;
-                    }
-                }
-                let execution_id =
-                    loop_id.as_deref().and_then(|id| execution_for_loop(self, id));
-                record_effect(
-                    self,
-                    NewEffect {
-                        execution_id,
-                        capability: "fs".to_string(),
-                        operation: "write".to_string(),
-                        scope: scope.clone(),
-                        input_digest: Some(digest.clone()),
-                        approval_id: approval_id.clone(),
-                        status: terminal.to_string(),
-                    },
-                );
+            if let Some(args) = &effect_args {
+                // `effect_args` exists only for fs.write, so the
+                // tool word is the literal, not the borrowed `tool`
+                // (the spawn below moves it into the dispatch).
+                self.record_loop_effect("fs.write", args, &effect_approval, &effect_binding, outcome);
             }
         };
         // P3-B (§10-8a): the loop entry calls the SAME
@@ -1845,6 +1827,7 @@ impl AppState {
                                             effect_binding: row.effect_binding.clone(),
                                             message: row.message.clone(),
                                             command: row.command.clone(),
+                                            consumed_by_worker_session_id: row.consumed_by_worker_session_id.clone(),
                                         },
                                     );
                                 }
@@ -1971,8 +1954,40 @@ impl AppState {
             return;
         }
         *self.recovery_scanned.lock().expect("recovery scanned lock") = true;
+        // E2-A §2.5: probe first (short lock, no transaction
+        // held across the orphan kill), then the unknown
+        // Effects go through `record_effect` (central key, map
+        // insert, audit export — never the old inline key
+        // computation), then the finalizing transaction.
+        let stale = {
+            let conn = sqlite.lock().expect("sqlite lock");
+            match sqlite_store::recovery_probe(&conn) {
+                Ok(stale) => stale,
+                Err(detail) => {
+                    eprintln!("P0-E ERROR: recovery scan failed ({detail}); migrated-domain surface is fail-closed, startup must not proceed");
+                    *self.sqlite_broken.lock().expect("sqlite broken lock") = true;
+                    *self.recovery_failed.lock().expect("recovery failed lock") = true;
+                    return;
+                }
+            }
+        };
+        let mut finalized: Vec<(String, String, String)> = Vec::new();
+        for stale_run in &stale {
+            let effect_id = self.recovery_scan_effect(stale_run);
+            // E2-A §2.3: an orphaned/lost run's Execution is not
+            // terminal — it goes to `needs_review` (visible,
+            // recoverable), never to a fabricated terminal word.
+            if let Some(execution_id) = &stale_run.run.execution_id {
+                close_execution(self, execution_id, "needs_review");
+            }
+            finalized.push((
+                stale_run.run.run_id.clone(),
+                stale_run.status.clone(),
+                effect_id,
+            ));
+        }
         let mut conn = sqlite.lock().expect("sqlite lock");
-        match sqlite_store::recovery_scan(&mut conn, &self.origin_device_id) {
+        match sqlite_store::recovery_finalize(&mut conn, &self.origin_device_id, &finalized) {
             Ok(id) => {
                 *self.current_worker_session.lock().expect("current worker lock") = Some(id);
             }
@@ -1982,6 +1997,62 @@ impl AppState {
                 *self.recovery_failed.lock().expect("recovery failed lock") = true;
             }
         }
+        // E2-A §2.8: one-time reconciliation of historical
+        // stranded "running" Executions (no new ones can be
+        // produced after §2.3, so this is a no-op after the
+        // first run that finds them). The finalize guard is
+        // dropped first: reconcile re-locks the SQLite mutex
+        // (std Mutex is not reentrant — holding it here would
+        // deadlock the snapshot read).
+        drop(conn);
+        reconcile_stranded_executions(self);
+    }
+
+    /// E2-A §2.5: create (or reuse) the unknown Effect for one
+    /// stale run, through `record_effect`. The key is
+    /// deterministic (execution + `unknown_effect_identity` +
+    /// `run_digest`, the P3-C vocabulary), so a scan that
+    /// recorded the Effect but crashed before finalizing reuses
+    /// the existing row instead of minting a duplicate (the
+    /// effects table enforces `idempotency_key` UNIQUE). The
+    /// probe outcome is stamped as the row's detail right
+    /// after recording (the stamp re-persists the row, which
+    /// the §2.6 Inbox guard makes safe).
+    fn recovery_scan_effect(&self, stale: &sqlite_store::StaleWorkerRun) -> String {
+        let (capability, operation, scope) =
+            crate::worker::unknown_effect_identity(&stale.run, None);
+        let digest = crate::worker::run_digest(&stale.run);
+        if let Some(execution_id) = &stale.run.execution_id {
+            let key = crate::effect_store::idempotency_key(
+                execution_id,
+                &capability,
+                &operation,
+                &scope,
+                &digest,
+            );
+            if let Some(records) = effects_snapshot(self) {
+                if let Some(existing) = records
+                    .iter()
+                    .find(|r| r.idempotency_key.as_deref() == Some(key.as_str()))
+                {
+                    return existing.effect_id.clone();
+                }
+            }
+        }
+        let record = record_effect(
+            self,
+            NewEffect {
+                execution_id: stale.run.execution_id.clone(),
+                capability,
+                operation,
+                scope,
+                input_digest: Some(digest),
+                approval_id: stale.run.approval_id.clone(),
+                status: "unknown".to_string(),
+            },
+        );
+        stamp_effect_detail(self, &record.effect_id, &stale.detail);
+        record.effect_id
     }
 
     /// P0-E clean-shutdown counterpart (plan §2.1), called by
@@ -2083,6 +2154,7 @@ impl AppState {
                             effect_binding: row.effect_binding.clone(),
                             message: row.message.clone(),
                             command: row.command.clone(),
+                            consumed_by_worker_session_id: row.consumed_by_worker_session_id.clone(),
                         },
                     );
                 }
@@ -3446,7 +3518,7 @@ async fn approval_request(
     let mut next = state.next_approval_id.lock().expect("approval id lock");
     let id = format!("approval-{}", *next);
     *next += 1;
-    let record = ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending, binding: None, consumed: false, operation_digest: operation_digest.clone(), action_binding: None, effect_binding: None, message: req.message.clone(), command: command_spec };
+    let record = ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending, binding: None, consumed: false, operation_digest: operation_digest.clone(), action_binding: None, effect_binding: None, message: req.message.clone(), command: command_spec, consumed_by_worker_session_id: None };
     let mut approvals = state.approvals.lock().expect("approval lock");
     if let Err(detail) = persist_approval(&state, &id, &record) {
         // Bound records fail closed like loop approvals: an id whose
@@ -3622,6 +3694,9 @@ struct ApprovalView {
     operation_digest: Option<String>,
     effect_binding: Option<String>,
     message: Option<String>,
+    /// E2-A §2.7: the worker session that consumed this
+    /// approval to create a run. Null when unconsumed.
+    consumed_by_worker_session_id: Option<String>,
 }
 
 fn approval_number(approval_id: &str) -> u64 {
@@ -3640,6 +3715,7 @@ fn approval_view(approval_id: &str, record: &ApprovalState) -> ApprovalView {
         operation_digest: record.operation_digest.clone(),
         effect_binding: record.effect_binding.clone(),
         message: record.message.clone(),
+        consumed_by_worker_session_id: record.consumed_by_worker_session_id.clone(),
     }
 }
 
@@ -3657,6 +3733,7 @@ fn approval_view_from_file(record: &ApprovalFileRecord) -> ApprovalView {
         operation_digest: record.operation_digest.clone(),
         effect_binding: record.effect_binding.clone(),
         message: record.message.clone(),
+        consumed_by_worker_session_id: record.consumed_by_worker_session_id.clone(),
     }
 }
 
@@ -3839,6 +3916,7 @@ pub(crate) fn persist_approval(state: &AppState, tool_call_id: &str, approval: &
         effect_binding: approval.effect_binding.clone(),
         message: approval.message.clone(),
         command: approval.command.clone(),
+        consumed_by_worker_session_id: approval.consumed_by_worker_session_id.clone(),
     };
     match state.sqlite_mode() {
         StateBackend::Sqlite => {
@@ -4249,6 +4327,21 @@ pub(crate) fn bound_write_gate(
     match effect_for_approval(state, id, Some(digest)) {
         Some(effect) => match effect.status.as_str() {
             "planned" | "authorized" => {
+                // E2-A §2.4: a bound Effect without an execution
+                // id or digest has no key to check — refuse with
+                // 409, not the store-broken 500 below.
+                if idempotency_key_missing(
+                    effect.execution_id.as_deref(),
+                    effect.input_digest.as_deref(),
+                ) {
+                    return Err(Box::new(
+                        (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({ "error": "effect_idempotency_unavailable" })),
+                        )
+                            .into_response(),
+                    ));
+                }
                 match check_idempotency(
                     state,
                     effect.execution_id.as_deref(),
@@ -4775,13 +4868,49 @@ async fn connectors_accounts_unlink(
     let Some(_) = registry_entry(&id) else {
         return unknown_connector();
     };
+    // Validate first (404s keep their exact shape), then gate,
+    // then mutate — the gate reads the Effects store with no
+    // locks held, matching the P0-R discipline below.
+    let account = {
+        let accounts = state.connector_accounts.lock().expect("connector accounts lock");
+        let Some(account) = accounts.get(&account_id) else {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown account" }))).into_response();
+        };
+        if account.connector_id != id {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown account" }))).into_response();
+        }
+        account.clone()
+    };
+    // E2-A §2.4: a repeat unlink with no intervening write is a
+    // replay — return the current view, append no second
+    // tombstone, record no second Effect row. (The old comment
+    // below about "even when idempotent" described the
+    // pre-gate behaviour: the first unlink still appends its
+    // tombstone; only the replay skips it.)
+    match check_connector_write(&state, "connectors", "unlink", &account_id) {
+        IdempotencyDecision::Proceed => {}
+        IdempotencyDecision::Replay(_) => {
+            return Json(account_view(&account)).into_response();
+        }
+        IdempotencyDecision::Blocked(other) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
+            )
+                .into_response();
+        }
+        IdempotencyDecision::Unavailable => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "sqlite_unavailable" })),
+            )
+                .into_response();
+        }
+    }
     let mut accounts = state.connector_accounts.lock().expect("connector accounts lock");
     let Some(account) = accounts.get_mut(&account_id) else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown account" }))).into_response();
     };
-    if account.connector_id != id {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown account" }))).into_response();
-    }
     // Idempotent: unlinking an already-unlinked account succeeds
     // with its current state, mirroring session unpin/unarchive.
     account.unlinked = true;
@@ -4829,6 +4958,31 @@ async fn connectors_connect(
         return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "connector has no linked account" })))
             .into_response();
     }
+    // E2-A §2.4: a repeat connect with no intervening write is
+    // a replay — return the current view, write nothing, record
+    // no second Effect row. (A connect after a disconnect is a
+    // new write: the disconnect intervened, so the gate
+    // Proceeds.)
+    match check_connector_write(&state, "connectors", "connect", &id) {
+        IdempotencyDecision::Proceed => {}
+        IdempotencyDecision::Replay(_) => {
+            return Json(connector_view(&state, entry)).into_response();
+        }
+        IdempotencyDecision::Blocked(other) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
+            )
+                .into_response();
+        }
+        IdempotencyDecision::Unavailable => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "sqlite_unavailable" })),
+            )
+                .into_response();
+        }
+    }
     state
         .connector_connections
         .lock()
@@ -4854,6 +5008,29 @@ async fn connectors_disconnect(
     let Some(entry) = registry_entry(&id) else {
         return unknown_connector();
     };
+    // E2-A §2.4: a repeat disconnect with no intervening write
+    // is a replay — return the current view, write nothing,
+    // record no second Effect row.
+    match check_connector_write(&state, "connectors", "disconnect", &id) {
+        IdempotencyDecision::Proceed => {}
+        IdempotencyDecision::Replay(_) => {
+            return Json(connector_view(&state, entry)).into_response();
+        }
+        IdempotencyDecision::Blocked(other) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
+            )
+                .into_response();
+        }
+        IdempotencyDecision::Unavailable => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "sqlite_unavailable" })),
+            )
+                .into_response();
+        }
+    }
     // Disconnect flips only the connection flag; linked accounts
     // stay linked, so reconnecting needs no fresh link.
     state
@@ -9277,10 +9454,22 @@ pub(crate) enum IdempotencyDecision {
     Replay(EffectFileRecord),
     Blocked(EffectFileRecord),
     /// P0-D: the migrated-domain store is unavailable (SQLite
-    /// broken in SQLite mode). Callers must refuse the write,
+    /// broken in SQLite mode). E2-A §2.4 adds the second cause:
+    /// the key inputs are null (no execution id or no digest),
+    /// so no key exists to check. Callers must refuse the write,
     /// never proceed on a missing row and never replay a
     /// fabricated one.
     Unavailable,
+}
+
+/// E2-A §2.4: whether an idempotency check has no key to
+/// check (null execution id or digest). Callers test this
+/// BEFORE `check_idempotency` so the two Unavailable causes
+/// stay distinct: missing inputs → 409
+/// `effect_idempotency_unavailable`; a broken store →
+/// 500 `sqlite_unavailable`.
+pub(crate) fn idempotency_key_missing(execution_id: Option<&str>, digest: Option<&str>) -> bool {
+    execution_id.is_none() || digest.is_none()
 }
 
 pub(crate) fn check_idempotency(
@@ -9292,8 +9481,16 @@ pub(crate) fn check_idempotency(
     digest: Option<&str>,
     exclude_effect_id: Option<&str>,
 ) -> IdempotencyDecision {
+    // E2-A §2.4: an idempotency key needs both inputs. A null
+    // execution id or digest is not a key at all: the write
+    // cannot be proven new or a replay, so the check refuses
+    // (Unavailable) instead of silently Proceeding. Callers
+    // distinguish this from a broken store with
+    // `idempotency_key_missing` (checked before the call):
+    // missing inputs → 409 `effect_idempotency_unavailable`;
+    // store-broken Unavailable → 500 `sqlite_unavailable`.
     let (Some(execution_id), Some(digest)) = (execution_id, digest) else {
-        return IdempotencyDecision::Proceed;
+        return IdempotencyDecision::Unavailable;
     };
     let key = crate::effect_store::idempotency_key(
         execution_id,
@@ -9963,6 +10160,52 @@ fn apply_patch_file_locked(
                 && (effect.status == "planned" || effect.status == "authorized") => effect,
         _ => return Err(forbidden("approval_binding_mismatch")),
     };
+    // E2-A §2.4: idempotency is the second door behind the
+    // stale check — a replayed apply (same approval, same
+    // input_digest) must not rewrite the file. The bound
+    // Effect itself is excluded: it is the current attempt
+    // (planned/authorized), not a prior write. A *different*
+    // terminal Effect with the same key (same execution,
+    // fs.write, scope, digest) proves the write already
+    // landed, so the apply returns replayed without touching
+    // the file. A bound Effect without an execution id or
+    // digest has no key to check: 409, not a silent Proceed.
+    if idempotency_key_missing(effect.execution_id.as_deref(), effect.input_digest.as_deref()) {
+        return Err(Box::new(
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "effect_idempotency_unavailable" })),
+            )
+                .into_response(),
+        ));
+    }
+    match check_idempotency(
+        state,
+        effect.execution_id.as_deref(),
+        "fs",
+        "write",
+        &file.path_relative,
+        effect.input_digest.as_deref(),
+        Some(&effect.effect_id),
+    ) {
+        IdempotencyDecision::Proceed => {}
+        IdempotencyDecision::Replay(other) => {
+            return Ok((file, other, true));
+        }
+        IdempotencyDecision::Blocked(other) => {
+            return Err(Box::new(
+                (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
+                )
+                    .into_response(),
+            ));
+        }
+        // Store broken: fail closed, never guess.
+        IdempotencyDecision::Unavailable => {
+            return Err(Box::new(internal("sqlite_unavailable")));
+        }
+    }
     // Three-way check, before the approval is burned: a
     // drifted proposal never consumes its approval.
     let (check, target) = check_patch_write(state, &patch, &file);
@@ -10466,6 +10709,72 @@ pub(crate) fn reconcile_effect(
     }
 }
 
+/// E2-A §2.4: idempotency gate for the payload-free connector
+/// writes (connect / disconnect / unlink). The recorded key
+/// cannot identify a replay on its own: `record_connector_effect`
+/// mints a fresh adapter Execution per write, so the full key is
+/// unique per call, and the digest commits only to
+/// (capability, operation, scope) — never to a payload. The
+/// gate therefore matches on the latest Effect for the same
+/// (capability, scope): only a repeat of the latest write,
+/// with no intervening write to the same scope, is a replay.
+/// That keeps the tested cycles honest — connect →
+/// disconnect → connect is a new write (the disconnect
+/// intervened), while connect → connect is a replay — and it
+/// is why the payload-bearing writes (register / delete /
+/// capture / fulfill / update) are NOT gated here: a
+/// content-blind digest would swallow a distinct second
+/// update, mask a consumed ticket, or turn a 404/409 into a
+/// replay. Those routes either refuse the repeat (404/409,
+/// no second row) or mint a genuinely new entity (link,
+/// capture) or version (update), so no duplicate row exists
+/// to close there.
+pub(crate) fn check_connector_write(
+    state: &AppState,
+    capability: &str,
+    operation: &str,
+    scope: &str,
+) -> IdempotencyDecision {
+    let digest = crate::operation_binding::operation_digest(
+        &format!("{capability}.{operation}"),
+        None,
+        &std::collections::BTreeMap::from([("id".to_string(), scope.to_string())]),
+    );
+    let Some(records) = effects_snapshot(state) else {
+        return IdempotencyDecision::Unavailable;
+    };
+    let Some(prior) = records
+        .iter()
+        .filter(|r| r.capability == capability && r.scope == scope)
+        .max_by_key(|r| effect_number(&r.effect_id))
+    else {
+        return IdempotencyDecision::Proceed;
+    };
+    if prior.operation != operation || prior.input_digest.as_deref() != Some(digest.as_str()) {
+        return IdempotencyDecision::Proceed;
+    }
+    match prior.execution_id.as_deref() {
+        Some(execution_id) => check_idempotency(
+            state,
+            Some(execution_id),
+            capability,
+            operation,
+            scope,
+            Some(&digest),
+            None,
+        ),
+        // Legacy row without attribution: the identity match
+        // itself proves the replay; judge by terminality.
+        None => {
+            if crate::effect_store::is_terminal_effect_status(&prior.status) {
+                IdempotencyDecision::Replay(prior.clone())
+            } else {
+                IdempotencyDecision::Blocked(prior.clone())
+            }
+        }
+    }
+}
+
 /// Phase 2 management-plane Effect helper: connector and vault
 /// writes carry no approval, so the digest commits to the
 /// operation and the affected id in the unified Q5 shape, and the
@@ -10601,6 +10910,291 @@ pub(crate) fn execution_for_task(state: &AppState, task_id: &str) -> Option<Stri
         .map(|r| r.execution_id.clone())
 }
 
+/// E2-A §2.2: Task status → Execution status. Terminal Task
+/// words mirror to the Execution terminal (Q2 mapping):
+/// completed→completed, failed/rejected→failed (Execution has
+/// no `rejected` word; the in-repo precedent
+/// `map_legacy_status_to_new` in effect_store.rs folds
+/// "failed"|"rejected" to `failed`), cancelled→cancelled.
+/// Non-terminal words (created/running/draft_ready/
+/// interrupted) map to `running`: the attempt is still live.
+/// A `rejected` Task is terminal, so its Execution closes as
+/// `failed`, never as a still-running shell.
+pub(crate) fn task_status_to_execution(task_status: &str) -> &'static str {
+    match task_status {
+        "completed" => "completed",
+        "failed" | "rejected" => "failed",
+        "cancelled" => "cancelled",
+        _ => "running",
+    }
+}
+
+/// E2-A §2.2: Loop status → Execution status. Completed→
+/// completed, Failed→failed, Cancelled→cancelled,
+/// NeedsReview→needs_review (Execution `needs_review` is a
+/// non-terminal recoverable word while Loop `NeedsReview` ends
+/// the round — the words are not equated, only mapped).
+/// Created/Running/AwaitingApproval map to `running`.
+/// Interrupted maps to `running` but is NEVER used to close an
+/// Execution: a Loop Interrupted closes no Execution (the Task
+/// stays resumable); only an explicit cancel path closes it.
+/// The coupling helper only consults this for terminal Loop
+/// statuses, so the Interrupted arm is a statement of that
+/// rule, not a transition source.
+/// (The plan's reverse display mapping — Execution status →
+/// Task/Loop display word — has no gateway consumer: the
+/// forward maps are many-to-one, so the reverse is only a
+/// display hint, and the web UI reads Execution.status
+/// directly. It is deferred rather than added as dead code.)
+pub(crate) fn loop_status_to_execution(loop_status: &crate::loop_engine::LoopStatus) -> &'static str {
+    use crate::loop_engine::LoopStatus;
+    match loop_status {
+        LoopStatus::Completed => "completed",
+        LoopStatus::Failed => "failed",
+        LoopStatus::Cancelled => "cancelled",
+        LoopStatus::NeedsReview => "needs_review",
+        _ => "running",
+    }
+}
+
+/// E2-A §2.3: close one Execution to a terminal (or
+/// `needs_review`) status, in both backends. In SQLite mode
+/// the close runs `sqlite_store::transition_execution`
+/// (validates the edge and sets the driving Assignment done
+/// on terminal landing), then refreshes the in-memory map
+/// and exports the audit. In JSONL/Shadow mode it validates
+/// the edge against `valid_execution_transition`, updates
+/// the map record and appends the line. A missing Execution,
+/// an already-terminal one, or an illegal edge is a no-op
+/// (the caller already decided the source is terminal;
+/// closing twice must not error). Returns the new status
+/// when a transition landed.
+pub(crate) fn close_execution(state: &AppState, execution_id: &str, to: &str) -> Option<String> {
+    close_execution_inner(state, execution_id, to, false)
+}
+
+/// E2-A §2.3 + P3-C §5.4: like `close_execution`, but the
+/// close opens no Inbox row. Only the Worker driver uses it,
+/// for a test run (a test result is a result, not something
+/// to review). In JSONL/Shadow modes there is no Inbox side
+/// effect to suppress; the flag only threads the SQLite path.
+pub(crate) fn close_execution_no_inbox(
+    state: &AppState,
+    execution_id: &str,
+    to: &str,
+) -> Option<String> {
+    close_execution_inner(state, execution_id, to, true)
+}
+
+fn close_execution_inner(
+    state: &AppState,
+    execution_id: &str,
+    to: &str,
+    suppress_inbox: bool,
+) -> Option<String> {
+    if state.sqlite_mode() == StateBackend::Sqlite {
+        if state.sqlite_is_broken() {
+            return None;
+        }
+        let Some(sqlite) = &state.sqlite else {
+            return None;
+        };
+        let result = {
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            if suppress_inbox {
+                sqlite_store::transition_execution_no_inbox(&mut conn, execution_id, to)
+            } else {
+                sqlite_store::transition_execution(&mut conn, execution_id, to)
+            }
+        };
+        match result {
+            Ok(record) => {
+                state
+                    .executions
+                    .lock()
+                    .expect("execution lock")
+                    .insert(record.execution_id.clone(), record.clone());
+                refresh_executions_export(state);
+                Some(record.status)
+            }
+            Err(sqlite_store::ExecutionTransitionError::NotFound)
+            | Err(sqlite_store::ExecutionTransitionError::Illegal) => None,
+            Err(sqlite_store::ExecutionTransitionError::Internal(detail)) => {
+                *state.sqlite_broken.lock().expect("sqlite broken lock") = true;
+                eprintln!("warning: E2-A execution close failed: {detail}");
+                None
+            }
+        }
+    } else {
+        let mut executions = state.executions.lock().expect("execution lock");
+        let record = executions.get_mut(execution_id)?;
+        if !crate::execution_store::valid_execution_transition(&record.status, to) {
+            return None;
+        }
+        record.status = to.to_string();
+        let updated = record.clone();
+        drop(executions);
+        persist_execution_with_snapshot(state, &updated, None);
+        Some(updated.status)
+    }
+}
+
+/// E2-A §2.3: mirror a terminal Task status onto its
+/// Execution. Non-terminal Task words are no-ops.
+pub(crate) fn close_execution_for_task(state: &AppState, task_id: &str, task_status: &str) {
+    if !matches!(task_status, "completed" | "failed" | "rejected" | "cancelled") {
+        return;
+    }
+    let Some(execution_id) = execution_for_task(state, task_id) else {
+        return;
+    };
+    close_execution(state, &execution_id, task_status_to_execution(task_status));
+}
+
+/// E2-A §2.3: mirror a terminal Loop status onto its
+/// Execution. Interrupted never closes (see
+/// `loop_status_to_execution`); non-terminal words are no-ops.
+pub(crate) fn close_execution_for_loop(
+    state: &AppState,
+    loop_id: &str,
+    loop_status: &crate::loop_engine::LoopStatus,
+) {
+    use crate::loop_engine::LoopStatus;
+    if !matches!(
+        loop_status,
+        LoopStatus::Completed | LoopStatus::NeedsReview | LoopStatus::Failed | LoopStatus::Cancelled
+    ) {
+        return;
+    }
+    let Some(execution_id) = execution_for_loop(state, loop_id) else {
+        return;
+    };
+    close_execution(state, &execution_id, loop_status_to_execution(loop_status));
+}
+
+/// E2-A §2.3: re-run supersede. When a Task run/resume
+/// creates a fresh Execution, cancel every OTHER still-
+/// `"running"` Execution of that Task (a stale attempt left
+/// running by a crash/restart, or by a manual status reset).
+/// The new Execution is the current attempt; the
+/// `execution_for_task` latest-wins read semantics are
+/// unchanged.
+pub(crate) fn supersede_old_task_executions(
+    state: &AppState,
+    task_id: &str,
+    keep_execution_id: &str,
+) {
+    let Some(records) = executions_snapshot(state) else {
+        return;
+    };
+    for record in records {
+        if record.task_id.as_deref() != Some(task_id) {
+            continue;
+        }
+        if record.execution_id == keep_execution_id {
+            continue;
+        }
+        if record.status != "running" {
+            continue;
+        }
+        close_execution(state, &record.execution_id, "cancelled");
+    }
+}
+
+/// E2-A §2.8: one-time reconciliation of historical stranded
+/// "running" Executions (their Task/Loop/Worker already
+/// terminal). Applies the §2.3 mapping as transitions, one
+/// `execution.reconciled` audit event per row in SQLite mode
+/// — never a silent rewrite. Idempotent: after the first run
+/// there are no stranded rows left, and the §2.3 coupling
+/// prevents new ones, so later startups reconcile zero rows.
+/// A Task/Loop/Worker that is itself still non-terminal leaves
+/// its Execution running; an adapter Execution with no source
+/// is left alone (nothing to map from); a superseded Worker's
+/// Execution belongs to the takeover owner and is not touched.
+/// Returns the reconciled count (logged when non-zero).
+fn reconcile_stranded_executions(state: &AppState) -> usize {
+    let executions = match executions_snapshot(state) {
+        Some(records) => records,
+        None => return 0,
+    };
+    let runs: Vec<crate::worker::WorkerRunRow> =
+        if state.sqlite_mode() == StateBackend::Sqlite {
+            match &state.sqlite {
+                Some(sqlite) => {
+                    let conn = sqlite.lock().expect("sqlite lock");
+                    sqlite_store::list_worker_runs(&conn, None, None).unwrap_or_default()
+                }
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+    let mut reconciled = 0usize;
+    for exec in executions {
+        if exec.status != "running" {
+            continue;
+        }
+        let target: Option<&'static str> = if let Some(task_id) = &exec.task_id {
+            state
+                .tasks
+                .lock()
+                .expect("task lock")
+                .get(task_id)
+                .map(|t| task_status_to_execution(&t.status))
+                .filter(|s| *s != "running")
+        } else if let Some(loop_id) = &exec.loop_id {
+            state
+                .loops
+                .get(loop_id)
+                .ok()
+                .map(|v| loop_status_to_execution(&v.record.status))
+                .filter(|s| *s != "running")
+        } else {
+            runs.iter()
+                .find(|r| r.execution_id.as_deref() == Some(exec.execution_id.as_str()))
+                .and_then(|r| crate::worker::run_status_to_execution(&r.status))
+        };
+        let Some(target) = target else {
+            continue;
+        };
+        // SQLite mode: reconcile_execution (audit event
+        // `execution.reconciled`); other modes: close_execution
+        // (the appended JSONL line is the audit).
+        let landed = if state.sqlite_mode() == StateBackend::Sqlite {
+            let Some(sqlite) = &state.sqlite else {
+                continue;
+            };
+            if state.sqlite_is_broken() {
+                continue;
+            }
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            match sqlite_store::reconcile_execution(&mut conn, &exec.execution_id, target) {
+                Ok(record) => {
+                    drop(conn);
+                    state
+                        .executions
+                        .lock()
+                        .expect("execution lock")
+                        .insert(record.execution_id.clone(), record.clone());
+                    refresh_executions_export(state);
+                    true
+                }
+                Err(_) => false,
+            }
+        } else {
+            close_execution(state, &exec.execution_id, target).is_some()
+        };
+        if landed {
+            reconciled += 1;
+        }
+    }
+    if reconciled > 0 {
+        eprintln!("E2-A §2.8: reconciled {reconciled} stranded running executions");
+    }
+    reconciled
+}
+
 /// P0-B adapter: a minimal Execution for a write with no task or
 /// loop attempt of its own (direct REST writes, connector/vault
 /// management writes). One per write: the write IS the attempt.
@@ -10725,8 +11319,8 @@ async fn tasks_run(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
             .into_response();
     };
-    if record.status != "created" {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not runnable" })))
+    if !crate::task_store::valid_task_status_transition(&record.status, "running") {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task_status_transition_invalid" })))
             .into_response();
     }
     record.status = "running".to_string();
@@ -10735,7 +11329,10 @@ async fn tasks_run(
     persist_task(&state, &updated);
     drop(tasks);
     // P0 phase 1: the runner attempt gets its Execution shell record.
-    create_execution(&state, Some(req.task_id.clone()), None);
+    // E2-A §2.3: a fresh attempt supersedes any still-running
+    // Execution a crashed earlier attempt left behind.
+    let execution = create_execution(&state, Some(req.task_id.clone()), None);
+    supersede_old_task_executions(&state, &req.task_id, &execution.execution_id);
     tokio::spawn(crate::task_runner::run_task(state.clone(), req.task_id));
     Json(updated).into_response()
 }
@@ -10782,8 +11379,8 @@ async fn tasks_execute(
         )
             .into_response();
     };
-    if record.status != "draft_ready" {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not executable" })))
+    if !crate::task_store::valid_task_status_transition(&record.status, "completed") {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task_status_transition_invalid" })))
             .into_response();
     }
     // E2 slice, scheme A (P3-C plan §2.3): a stated worktree
@@ -10859,6 +11456,15 @@ async fn tasks_execute(
     // one refuses. Otherwise the approval is consumed bound to
     // the planned Effect and the Effect is driven forward.
     let task_execution = execution_for_task(&state, &req.task_id);
+    // E2-A §2.4: a task with no Execution has no key to check
+    // — refuse with 409, not the store-broken 500 below.
+    if idempotency_key_missing(task_execution.as_deref(), Some(&digest)) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "effect_idempotency_unavailable" })),
+        )
+            .into_response();
+    }
     match check_idempotency(
         &state,
         task_execution.as_deref(),
@@ -10962,6 +11568,8 @@ async fn tasks_execute(
         current.clone()
     };
     persist_task(&state, &updated);
+    // E2-A §2.3: the terminal Task closes its Execution.
+    close_execution_for_task(&state, &req.task_id, "completed");
     // P0-C: a successful task write drives the planned
     // Effect to `succeeded`. The digest is the artifact
     // write digest the approval gate consumed; the
@@ -10981,8 +11589,8 @@ async fn tasks_reject(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
             .into_response();
     };
-    if record.status != "draft_ready" {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not rejectable" })))
+    if !crate::task_store::valid_task_status_transition(&record.status, "rejected") {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task_status_transition_invalid" })))
             .into_response();
     }
     let Some(approval_id) = record.approval_id.clone() else {
@@ -11009,6 +11617,10 @@ async fn tasks_reject(
         current.status = "rejected".to_string();
         let updated = current.clone();
         persist_task(&state, &updated);
+        drop(tasks);
+        // E2-A §2.3: the terminal Task closes its Execution
+        // (as `failed`: Execution has no `rejected` word).
+        close_execution_for_task(&state, &req.task_id, "rejected");
         return Json(updated).into_response();
     }
     (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" }))).into_response()
@@ -11024,8 +11636,8 @@ async fn tasks_resume(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
             .into_response();
     };
-    if record.status != "interrupted" {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not resumable" })))
+    if !crate::task_store::valid_task_status_transition(&record.status, "running") {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task_status_transition_invalid" })))
             .into_response();
     }
     // Contract: resume is accepted, not completed. The returned
@@ -11036,7 +11648,10 @@ async fn tasks_resume(
     // state, and blocking here would stall on a model call.
     // P0 phase 1: a resume spawns a fresh runner attempt, so it
     // gets a fresh Execution shell record.
-    create_execution(&state, Some(req.task_id.clone()), None);
+    // E2-A §2.3: a fresh attempt supersedes any still-running
+    // Execution a crashed earlier attempt left behind.
+    let execution = create_execution(&state, Some(req.task_id.clone()), None);
+    supersede_old_task_executions(&state, &req.task_id, &execution.execution_id);
     tokio::spawn(crate::task_runner::run_task(state.clone(), req.task_id));
     Json(record).into_response()
 }
@@ -11051,6 +11666,14 @@ async fn tasks_cancel(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
             .into_response();
     };
+    // E2-A §2.2: the lifecycle entries enforce the edge table;
+    // anything else is 409 `task_status_transition_invalid`.
+    // (The manual /tasks/update override keeps its own
+    // word-whitelist contract and is not governed by it.)
+    if !crate::task_store::valid_task_status_transition(&record.status, "cancelled") {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task_status_transition_invalid" })))
+            .into_response();
+    }
     match record.status.as_str() {
         "running" => {
             // The runner observes the flip at its next checkpoint
@@ -11065,6 +11688,9 @@ async fn tasks_cancel(
                 current.status = "cancelled".to_string();
                 let updated = current.clone();
                 persist_task(&state, &updated);
+                drop(tasks);
+                // E2-A §2.3: the terminal Task closes its Execution.
+                close_execution_for_task(&state, &req.task_id, "cancelled");
                 return Json(updated).into_response();
             }
             (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
@@ -11095,6 +11721,9 @@ async fn tasks_cancel(
                 current.status = "cancelled".to_string();
                 let updated = current.clone();
                 persist_task(&state, &updated);
+                drop(tasks);
+                // E2-A §2.3: the terminal Task closes its Execution.
+                close_execution_for_task(&state, &req.task_id, "cancelled");
                 return Json(updated).into_response();
             }
             (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
@@ -12030,6 +12659,20 @@ pub(crate) async fn create_worker_run_internal(
             ));
         }
     };
+    // E2-A §2.7: mirror the same-tx writeback into the
+    // in-memory map (the HTTP read side in SQLite mode reads
+    // SQLite, but the gate paths read the map). No persist
+    // call: the SQLite row is already updated by the insert
+    // transaction, and a persist would write a spurious
+    // `approval.decided` event for a field-only change.
+    if let (Some(approval_id), Some(worker_session_id)) =
+        (&row.approval_id, &row.worker_session_id)
+    {
+        let mut approvals = state.approvals.lock().expect("approval lock");
+        if let Some(approval) = approvals.get_mut(approval_id) {
+            approval.consumed_by_worker_session_id = Some(worker_session_id.clone());
+        }
+    }
     tokio::spawn(crate::worker::drive_worker_run(
         state.clone(),
         row.run_id.clone(),
@@ -13311,37 +13954,57 @@ async fn device_set(
             _ => {}
         }
     }
-    match check_idempotency(
-        &state,
-        action_execution.as_deref(),
-        "device",
-        "reminders.set_completed",
-        &reminder_id,
-        Some(&digest),
-        action_effect_for_gate.as_deref(),
-    ) {
-        IdempotencyDecision::Proceed => {}
-        IdempotencyDecision::Replay(other) => {
+    // E2-A §2.4: the idempotency gate applies only when the
+    // action carries an Execution. A pre-P0-B action has
+    // none BY DESIGN (P0-B never fabricates a historical
+    // association for it; locked by
+    // `old_rows_read_unchanged_and_unattributed` in
+    // p0b_adapters): its set proceeds and records a new row
+    // with a null execution, as before — the gate is skipped,
+    // not failed. The 409 `effect_idempotency_unavailable`
+    // below is for the current shape, where the action DOES
+    // carry an Execution but the digest is missing (a key
+    // that is owed and absent, not one that never existed).
+    if action_execution.is_some() {
+        if idempotency_key_missing(action_execution.as_deref(), Some(&digest)) {
             return (
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({ "error": "effect_idempotency_replay", "effect_id": other.effect_id, "status": other.status })),
+                Json(serde_json::json!({ "error": "effect_idempotency_unavailable" })),
             )
                 .into_response();
         }
-        IdempotencyDecision::Blocked(other) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
-            )
-                .into_response();
-        }
-        // P0-D: broken migrated-domain store fails closed.
-        IdempotencyDecision::Unavailable => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "sqlite_unavailable" })),
-            )
-                .into_response();
+        match check_idempotency(
+            &state,
+            action_execution.as_deref(),
+            "device",
+            "reminders.set_completed",
+            &reminder_id,
+            Some(&digest),
+            action_effect_for_gate.as_deref(),
+        ) {
+            IdempotencyDecision::Proceed => {}
+            IdempotencyDecision::Replay(other) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "effect_idempotency_replay", "effect_id": other.effect_id, "status": other.status })),
+                )
+                    .into_response();
+            }
+            IdempotencyDecision::Blocked(other) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
+                )
+                    .into_response();
+            }
+            // P0-D: broken migrated-domain store fails closed.
+            IdempotencyDecision::Unavailable => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "sqlite_unavailable" })),
+                )
+                    .into_response();
+            }
         }
     }
     if let Err(response) = consume_device_approval_for_effect(
@@ -13710,7 +14373,12 @@ async fn loop_resume(
     // driver; a stopping view needs no driver. Frontend copy
     // says "run to next stopping point", not "step once".
     if let Ok(view) = &result {
-        if !view.record.status.terminal() && view.record.status != LoopStatus::AwaitingApproval {
+        if view.record.status.terminal() {
+            // E2-A §2.3: the manual resume ended the loop;
+            // close its Execution (the driver never runs for
+            // a stopping view, so this route owns the close).
+            close_execution_for_loop(&state, &view.record.loop_id, &view.record.status);
+        } else if view.record.status != LoopStatus::AwaitingApproval {
             spawn_driver(&state, &view.record.loop_id);
         }
     }
@@ -13720,7 +14388,14 @@ async fn loop_cancel(
     State(state): State<AppState>,
     Json(req): Json<LoopIdDto>,
 ) -> axum::response::Response {
-    loop_response(&state, state.loops.cancel(&req.loop_id))
+    let result = state.loops.cancel(&req.loop_id);
+    // E2-A §2.3: a cancelled loop closes its Execution.
+    if let Ok(view) = &result {
+        if view.record.status.terminal() {
+            close_execution_for_loop(&state, &view.record.loop_id, &view.record.status);
+        }
+    }
+    loop_response(&state, result)
 }
 async fn loops_list(State(state): State<AppState>) -> Json<Vec<LoopView>> {
     let mut views = state.loops.list();

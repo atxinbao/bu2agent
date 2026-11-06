@@ -211,6 +211,8 @@ async fn p0d_import_switch_restart_and_export_equivalence() {
             // P3-C field; this fixture models a pre-P3-C row,
             // which carries no Worker command spec.
             command: None,
+            // E2-A field; this fixture models a pre-E2-A row.
+            consumed_by_worker_session_id: None,
         },
     )
     .expect("append approval");
