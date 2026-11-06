@@ -6,8 +6,8 @@
 //!
 //! HTTP routes only, plus `sqlite_store` reads after the
 //! fact (never to fake a production step). Real git for the
-//! read path; a fake `git` script (test fixture, never a
-//! production execution path) for the slow/timeout/cancel
+//! read path; a native fake `git` executable (test fixture,
+//! never a production execution path) for slow/timeout/cancel
 //! paths, selected through the plan's own `MOCK_GIT_PATH`
 //! mechanism via `AppState::with_git_path`. "Restart" is a
 //! new AppState on the same database (p0e T2 in-process
@@ -64,38 +64,42 @@ fn init_repo(dir: &Path) -> PathBuf {
     repo
 }
 
-/// Fake git executable (test fixture): `sleep 60` in the
-/// foreground plus a background `sleep 60` grandchild whose
-/// pid lands in `<dir>/grandchild.pid`. The driver must kill
-/// the whole group, not just the script.
-fn fake_git_sleeping(dir: &Path) -> PathBuf {
-    let script = dir.join("fake-git.sh");
-    std::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nsleep 60 &\necho $! > {}\nsleep 60\n",
-            dir.join("grandchild.pid").display()
-        ),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    script
+/// 使用本机可执行夹具，避免 Windows 将 .sh 当作 Win32 程序启动。
+/// 每个测试复制同一份编译产物并使用自己的配置和 PID 标记。
+fn fake_git(dir: &Path, secs: u64, tree: bool) -> PathBuf {
+    static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let binary = BINARY.get_or_init(|| {
+        let build = temp_dir("native-fixture");
+        let output = build.join(format!("worker-fixture{}", std::env::consts::EXE_SUFFIX));
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/worker_process.rs");
+        let result = std::process::Command::new(
+            std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
+        )
+        .arg(source)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("compile native worker fixture");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        output
+    });
+    let executable = dir.join(format!("fake-git{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(binary, &executable).unwrap();
+    std::fs::write(executable.with_extension("config"), format!("{secs} {tree}")).unwrap();
+    executable
 }
 
-/// Fake git executable: sleeps N seconds, exits 0.
+fn fake_git_sleeping(dir: &Path) -> PathBuf {
+    fake_git(dir, 60, true)
+}
+
 fn fake_git_slow(dir: &Path, secs: u64) -> PathBuf {
-    let script = dir.join("fake-git-slow.sh");
-    std::fs::write(&script, format!("#!/bin/sh\nsleep {secs}\n")).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    script
+    fake_git(dir, secs, false)
 }
 
 /// `git` is always an explicit override: `Some(path)` pins

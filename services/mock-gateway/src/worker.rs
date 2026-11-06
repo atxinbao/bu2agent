@@ -135,6 +135,21 @@ pub fn resolve_git_path() -> Option<PathBuf> {
 /// as alive would "orphan" a process that is already gone
 /// (Linux reads `/proc/<pid>/stat` for the Z state).
 pub fn process_alive(pid: i64) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // macOS 没有 /proc；kill -0 会把尚未回收的僵尸误判为存活。
+        // 只读取状态列，避免将已经退出的进程送入恢复/终止流程。
+        std::process::Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .is_some_and(|out| {
+                let state = String::from_utf8_lossy(&out.stdout);
+                let state = state.trim();
+                !state.is_empty() && !state.starts_with('Z') && !state.starts_with('X')
+            })
+    }
     #[cfg(target_os = "linux")]
     {
         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
@@ -149,7 +164,7 @@ pub fn process_alive(pid: i64) -> bool {
         // No /proc entry (or unreadable): fall through to
         // kill -0 below.
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         std::process::Command::new("kill")
             .arg("-0")
@@ -1155,6 +1170,25 @@ mod tests {
         assert_eq!(small, "hi");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exited_unreaped_child_is_not_alive() {
+        // 故意延迟 wait，确认僵尸不会被恢复扫描误判为活进程。
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i64;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let alive_before_reap = process_alive(pid);
+        child.wait().unwrap();
+        assert!(!alive_before_reap, "exited child reported alive before wait");
+        assert!(!process_alive(pid));
+    }
+
     #[test]
     fn kill_process_group_kills_grandchildren() {
         // Test-only process tree (a shell script is the
@@ -1209,10 +1243,12 @@ mod tests {
             while (process_alive(pid) || process_alive(grandchild))
                 && std::time::Instant::now() < deadline
             {
+                // 及时回收直属子进程；进程可能在探测和发信号之间正常退出。
+                let _ = child.try_wait();
                 std::thread::sleep(Duration::from_millis(50));
             }
             if process_alive(pid) || process_alive(grandchild) {
-                assert!(kill_process_group(pid, "KILL"));
+                let _ = kill_process_group(pid, "KILL");
             }
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             while (process_alive(pid) || process_alive(grandchild))
