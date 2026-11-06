@@ -1602,6 +1602,19 @@ pub fn export_effects(conn: &Connection, path: &Path) -> Result<(), String> {
     export_lines(path, &lines)
 }
 
+/// E2-C §4.5: same shape as `export_effects` — one JSON line
+/// per Evidence row, written by the Evidence write points.
+/// The rows are serialized as stored; `observed_json` already
+/// holds only hashes, lengths, kinds, and flags (never file
+/// bytes, credential values, or session text).
+pub fn export_evidence(conn: &Connection, path: &Path) -> Result<(), String> {
+    let lines: Vec<String> = list_evidence(conn)?
+        .iter()
+        .map(|r| serde_json::to_string(r).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    export_lines(path, &lines)
+}
+
 pub fn export_approvals(conn: &Connection, path: &Path) -> Result<(), String> {
     let lines: Vec<String> = list_approvals(conn)?
         .iter()

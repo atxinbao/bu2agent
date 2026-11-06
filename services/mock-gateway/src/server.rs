@@ -375,6 +375,12 @@ pub struct AppState {
     pub(crate) effects: Arc<Mutex<HashMap<String, EffectFileRecord>>>,
     next_effect_id: Arc<Mutex<u64>>,
     effects_path: Option<PathBuf>,
+    /// E2-C §4.5: the Evidence audit export path
+    /// (evidence.jsonl). A derived audit copy only — Evidence
+    /// lives in SQLite and has no in-memory map; the export
+    /// route reads SQLite directly, and the file is regenerated
+    /// at every Evidence write point.
+    evidence_path: Option<PathBuf>,
     /// P0-D SQLite connection, when configured. `None` means
     /// pure JSONL behaviour. The in-memory maps above stay as a
     /// write-through cache in SQLite mode (every persist updates
@@ -572,6 +578,14 @@ impl AppState {
         if let Ok(effects_path) = std::env::var("MOCK_EFFECTS_PATH") {
             state = state.with_effects_path(PathBuf::from(effects_path));
         }
+        // E2-C §4.5: the Evidence audit export path. (The
+        // packaged-app shell does not wire this env yet — see
+        // the with_evidence_path note — so the file is only
+        // written when the variable is set; the export route
+        // reads SQLite and does not depend on the file.)
+        if let Ok(evidence_path) = std::env::var("MOCK_EVIDENCE_PATH") {
+            state = state.with_evidence_path(PathBuf::from(evidence_path));
+        }
         // P0-D: MOCK_SQLITE_PATH opens the unified-plane SQLite
         // database; when it opens in shadow mode the explicit
         // D4 switch (import + read-path switch) runs here, so a
@@ -734,6 +748,7 @@ impl AppState {
             effects: Arc::new(Mutex::new(HashMap::new())),
             next_effect_id: Arc::new(Mutex::new(1)),
             effects_path: None,
+            evidence_path: None,
             sqlite: None,
             sqlite_path: None,
             sqlite_backend: Arc::new(Mutex::new(StateBackend::Jsonl)),
@@ -1061,20 +1076,33 @@ impl AppState {
                 return;
             }
         }
+        // E2-C §4.2: the unbound fallback (no bound Effect for
+        // this approval — a legacy dispatch, or a proposal whose
+        // plan step recorded nothing) also goes through the
+        // shared ledger entry: plan + gate, then the terminal
+        // transition. A Replay/Blocked answer means an
+        // identical row already covers this write — a duplicate
+        // proposal of the same tool call — so nothing more is
+        // recorded (a second row would collide on the UNIQUE
+        // idempotency key and mark the store broken).
         let execution_id =
             binding.as_ref().and_then(|b| execution_for_loop(self, &b.loop_id));
-        record_effect(
+        if let LedgerEntryDecision::Entered(entry) = ledger_entry(
             self,
-            NewEffect {
-                execution_id,
-                capability: capability.to_string(),
-                operation: operation.to_string(),
-                scope,
-                input_digest: Some(crate::loop_engine::args_digest(tool, args)),
-                approval_id: approval_id.clone(),
-                status: terminal.to_string(),
-            },
-        );
+            execution_id,
+            capability,
+            operation,
+            &scope,
+            Some(crate::loop_engine::args_digest(tool, args)),
+            approval_id.clone(),
+        ) {
+            let outcome = match terminal {
+                "succeeded" => LedgerOutcome::Succeeded,
+                "failed" => LedgerOutcome::Failed,
+                _ => LedgerOutcome::Unknown,
+            };
+            let _ = ledger_entry_finish(self, &entry.effect.effect_id, outcome);
+        }
     }
 
     /// P3-C: the digest the approval gate checks for a loop
@@ -1308,8 +1336,18 @@ impl AppState {
             // mirrors into an Effect (including Unknown and
             // AwaitingAuthorization, which are terminal reports,
             // not refusals to attempt).
+            // E2-C §4.2: one Device budget only — the loop path
+            // used 8s while the direct route used
+            // DEVICE_TIMEOUT_SECS (10s); both now use the
+            // constant, so a slow backend reports the same
+            // outcome on either path.
             let outcome = match tokio::task::spawn_blocking(move || {
-                execute_set(&device_backend, &id, completed, Duration::from_secs(8))
+                execute_set(
+                    &device_backend,
+                    &id,
+                    completed,
+                    Duration::from_secs(DEVICE_TIMEOUT_SECS),
+                )
             })
             .await
             {
@@ -1794,6 +1832,23 @@ impl AppState {
         self.next_effect_id = Arc::new(Mutex::new(next_effect_number(&records)));
         self.effects = Arc::new(Mutex::new(effects));
         self.effects_path = Some(path);
+        self
+    }
+
+    /// E2-C §4.5: the Evidence audit export path
+    /// (evidence.jsonl). Unlike `with_effects_path` this loads
+    /// nothing: Evidence lives only in SQLite and has no
+    /// in-memory map to resume; the file is a derived audit
+    /// copy, regenerated at every Evidence write point, and the
+    /// export route reads SQLite directly. Production reads
+    /// MOCK_EVIDENCE_PATH. The packaged-app shell
+    /// (`gateway_home.rs`) does not wire this variable yet — it
+    /// wires only the record files the app needs for restart
+    /// persistence — so until that follow-up lands, the file is
+    /// written only when the variable is set explicitly; no
+    /// behaviour is lost, because the route never reads the file.
+    pub fn with_evidence_path(mut self, path: PathBuf) -> Self {
+        self.evidence_path = Some(path);
         self
     }
 
@@ -4982,7 +5037,7 @@ async fn connectors_accounts_link(
         .insert(account.account_id.clone(), account.clone());
     persist_connector_line(&state, &ConnectorStateLine::Account(account.clone()));
     // Phase 2: a successful link mirrors into an Effect.
-    record_connector_effect(&state, "connectors", "link", &account.account_id);
+    record_connector_effect(&state, None, "connectors", "link", &account.account_id);
     Json(account_view(&account)).into_response()
 }
 
@@ -5047,7 +5102,7 @@ async fn connectors_accounts_unlink(
     drop(accounts);
     // Phase 2: a successful unlink mirrors into an Effect, even
     // when idempotent (the tombstone line was still appended).
-    record_connector_effect(&state, "connectors", "unlink", &updated.account_id);
+    record_connector_effect(&state, None, "connectors", "unlink", &updated.account_id);
     Json(account_view(&updated)).into_response()
 }
 
@@ -5122,7 +5177,7 @@ async fn connectors_connect(
         }),
     );
     // Phase 2: a successful connect mirrors into an Effect.
-    record_connector_effect(&state, "connectors", "connect", &id);
+    record_connector_effect(&state, None, "connectors", "connect", &id);
     Json(connector_view(&state, entry)).into_response()
 }
 
@@ -5172,7 +5227,7 @@ async fn connectors_disconnect(
         }),
     );
     // Phase 2: a successful disconnect mirrors into an Effect.
-    record_connector_effect(&state, "connectors", "disconnect", &id);
+    record_connector_effect(&state, None, "connectors", "disconnect", &id);
     Json(connector_view(&state, entry)).into_response()
 }
 
@@ -5350,7 +5405,7 @@ async fn vault_custom_register(
     drop(custom);
     // Phase 2: a successful custom-connector registration mirrors
     // into an Effect.
-    record_connector_effect(&state, "custom-connectors", "register", &def.id);
+    record_connector_effect(&state, None, "custom-connectors", "register", &def.id);
     Json(custom_connector_view(&def)).into_response()
 }
 
@@ -5391,7 +5446,7 @@ async fn vault_custom_delete(
     drop(custom);
     // Phase 2: a successful custom-connector delete mirrors into
     // an Effect.
-    record_connector_effect(&state, "custom-connectors", "delete", &req.id);
+    record_connector_effect(&state, None, "custom-connectors", "delete", &req.id);
     Json(custom_connector_view(&updated)).into_response()
 }
 
@@ -5436,7 +5491,7 @@ async fn vault_credentials_register(
     // an Effect. The incidental catalog ensure above is not a
     // second Effect: one call, one Effect. No secret material ever
     // enters an Effect — only the handle.
-    record_connector_effect(&state, "credentials", "register", &slot.handle);
+    record_connector_effect(&state, None, "credentials", "register", &slot.handle);
     Json(credential_view(&state, &slot)).into_response()
 }
 
@@ -5482,7 +5537,7 @@ async fn vault_credentials_delete(
     drop(slots);
     // Phase 2: a successful credential delete (real backend
     // erasure + tombstone) mirrors into an Effect.
-    record_connector_effect(&state, "credentials", "delete", &req.handle);
+    record_connector_effect(&state, None, "credentials", "delete", &req.handle);
     Json(credential_view(&state, &updated)).into_response()
 }
 
@@ -5517,7 +5572,7 @@ async fn vault_credentials_capture(
     drop(slots);
     // Phase 2: a successful credential capture (secret rotation)
     // mirrors into an Effect; the secret itself never does.
-    record_connector_effect(&state, "credentials", "capture", &req.handle);
+    record_connector_effect(&state, None, "credentials", "capture", &req.handle);
     Json(credential_view(&state, &updated)).into_response()
 }
 
@@ -5620,7 +5675,7 @@ async fn vault_capture_fulfill(
     // Effect for the materialized credential. The ticket request
     // itself is not an Effect: it mints an ephemeral exchange
     // token, and its durable outcome is this fulfill.
-    record_connector_effect(&state, "credentials", "fulfill", &ticket.handle);
+    record_connector_effect(&state, None, "credentials", "fulfill", &ticket.handle);
     Json(credential_view(&state, &updated)).into_response()
 }
 
@@ -5690,7 +5745,7 @@ async fn vault_catalog_update(
     // write-time Evidence hook re-locks the catalog map).
     drop(catalog);
     // Phase 2: a successful catalog update mirrors into an Effect.
-    record_connector_effect(&state, "catalog", "update", &req.id);
+    record_connector_effect(&state, None, "catalog", "update", &req.id);
     Json(catalog_view(&updated)).into_response()
 }
 
@@ -5717,7 +5772,7 @@ async fn vault_catalog_delete(
     // write-time Evidence hook re-locks the catalog map).
     drop(catalog);
     // Phase 2: a successful catalog delete mirrors into an Effect.
-    record_connector_effect(&state, "catalog", "delete", &req.id);
+    record_connector_effect(&state, None, "catalog", "delete", &req.id);
     Json(catalog_view(&updated)).into_response()
 }
 
@@ -9361,6 +9416,11 @@ pub(crate) fn record_write_time_evidence(state: &AppState, record: &EffectFileRe
 /// broken-marking, never counted as a shadow failure (Evidence
 /// is derived, not authoritative state). No-op without a
 /// configured SQLite connection.
+///
+/// E2-C §4.5: a successful insert also regenerates the
+/// Evidence audit export (evidence.jsonl) when an export path
+/// is configured — same best-effort contract as the insert
+/// itself; an export failure only warns.
 pub(crate) fn record_evidence_best_effort(state: &AppState, draft: &crate::evidence::OwnedEvidence) {
     let Some(sqlite) = &state.sqlite else {
         return;
@@ -9371,6 +9431,21 @@ pub(crate) fn record_evidence_best_effort(state: &AppState, draft: &crate::evide
     };
     if let Err(detail) = crate::sqlite_store::insert_evidence(&mut conn, &draft.as_draft()) {
         eprintln!("warning: evidence insert failed: {detail}");
+        return;
+    }
+    export_evidence_best_effort(state, &conn);
+}
+
+/// E2-C §4.5: regenerate the Evidence audit export
+/// (evidence.jsonl) from the connection the caller already
+/// holds, when an export path is configured. Best-effort,
+/// warn-only — an export failure never changes the caller's
+/// response.
+fn export_evidence_best_effort(state: &AppState, conn: &Connection) {
+    if let Some(path) = &state.evidence_path {
+        if let Err(detail) = crate::sqlite_store::export_evidence(conn, path) {
+            eprintln!("warning: evidence export failed: {detail}");
+        }
     }
 }
 
@@ -10531,18 +10606,26 @@ pub(crate) fn plan_loop_effect(
         ),
         _ => return None,
     };
-    let record = record_effect(
+    // E2-C §4.2: the proposal-time plan step goes through the
+    // shared ledger entry. A Replay/Blocked answer means this
+    // exact call was already proposed in this loop — the
+    // existing row is the audit trail — so no second planned
+    // row is recorded (a second row would collide on the
+    // UNIQUE idempotency key) and the approval proceeds
+    // unbound; the dispatch gate and the record_loop_effect
+    // fallback still apply.
+    let record = match ledger_entry(
         state,
-        NewEffect {
-            execution_id: execution_for_loop(state, &binding.loop_id),
-            capability: capability.to_string(),
-            operation: operation.to_string(),
-            scope,
-            input_digest: Some(crate::loop_engine::args_digest(&binding.tool, args)),
-            approval_id: Some(approval_id.to_string()),
-            status: "planned".to_string(),
-        },
-    );
+        execution_for_loop(state, &binding.loop_id),
+        capability,
+        operation,
+        &scope,
+        Some(crate::loop_engine::args_digest(&binding.tool, args)),
+        Some(approval_id.to_string()),
+    ) {
+        LedgerEntryDecision::Entered(entry) => entry.effect,
+        LedgerEntryDecision::Replay(_) | LedgerEntryDecision::Blocked(_) => return None,
+    };
     let mut approvals = state.approvals.lock().expect("approval lock");
     if let Some(approval) = approvals.get_mut(approval_id) {
         approval.effect_binding = Some(record.effect_id.clone());
@@ -10956,8 +11039,29 @@ pub(crate) fn check_connector_write(
 /// operation and the affected id in the unified Q5 shape, and the
 /// status is always `completed` (these handlers only return
 /// success after the mutation persisted).
-pub(crate) fn record_connector_effect(
+///
+/// E2-C §4.3: the helper goes through the shared ledger entry.
+/// A caller-provided Execution (a task/loop that triggered the
+/// write) is reused, so the Effect is attributed to the attempt
+/// that caused it; with no caller Execution — every direct route
+/// today — the adapter Execution fallback is kept. The lifecycle
+/// chain is unchanged: it still runs through the single
+/// transition enforcement point (`transition_effect_chain`,
+/// inside `ledger_entry_finish`), compressed planned →
+/// authorized → started → succeeded as before. The idempotency
+/// gate inside `ledger_entry` can only fire with a reused
+/// Execution (a fresh adapter Execution makes the key unique);
+/// the direct routes keep their route-level
+/// `check_connector_write` replay guard (E2-A §2.4). A
+/// Replay/Blocked answer records no second row.
+///
+/// `pub` (not `pub(crate)`) so the E2-C integration test can
+/// drive the reuse path directly: no task/loop path performs a
+/// connector write yet, so no HTTP route can supply a caller
+/// Execution today.
+pub fn record_connector_effect(
     state: &AppState,
+    execution_id: Option<String>,
     capability: &str,
     operation: &str,
     scope: &str,
@@ -10974,25 +11078,17 @@ pub(crate) fn record_connector_effect(
     // request, authorized by the request itself, started, then
     // succeeded. The single in-memory row ends at `succeeded`;
     // the JSONL history holds the chain, last line wins.
-    let record = record_effect(
+    if let LedgerEntryDecision::Entered(entry) = ledger_entry(
         state,
-        NewEffect {
-            // P0-B: a management-plane write is its own attempt,
-            // so it gets a minimal Execution and a non-null key.
-            execution_id: Some(adapter_execution(state)),
-            capability: capability.to_string(),
-            operation: operation.to_string(),
-            scope: scope.to_string(),
-            input_digest: Some(digest),
-            approval_id: None,
-            status: "planned".to_string(),
-        },
-    );
-    let _ = transition_effect_chain(
-        state,
-        &record.effect_id,
-        &["authorized", "started", "succeeded"],
-    );
+        execution_id,
+        capability,
+        operation,
+        scope,
+        Some(digest),
+        None,
+    ) {
+        let _ = ledger_entry_finish(state, &entry.effect.effect_id, LedgerOutcome::Succeeded);
+    }
 }
 
 /// Execution of the attempt a loop belongs to. Phase 1 creates
@@ -12538,6 +12634,149 @@ fn validate_worker_approval(
     Ok(Some(id.clone()))
 }
 
+/// E2-C §4.1: the shared ledger entry for every synchronous
+/// write (Device direct + loop, Connector). Only the ENTRY
+/// bookkeeping is shared — resolve or build the Execution,
+/// record the planned Effect, run the idempotency gate, drive
+/// the row to its terminal status — and the drivers stay as
+/// they are: nothing here spawns, queues, or runs a Worker,
+/// and execution stays synchronous in the caller.
+///
+/// Shape note (deviation from the plan sketch, forced by the
+/// code): the sketch shows one callback-shaped function
+/// (plan → gate → execute → terminal). Every current caller
+/// is two-phase — the planned row is created in one request
+/// (actions_create / plan_loop_effect / the connector
+/// handler) and executed in a later one, after an approval
+/// is decided — and the Device execution is
+/// `spawn_blocking` + await, which a synchronous closure
+/// cannot hold. A literal callback parameter would therefore
+/// have no caller, and an uncalled `pub(crate)` generic
+/// function fails clippy's dead_code lint under `-D
+/// warnings`. So the entry is split in two: `ledger_entry`
+/// (plan + gate) and `ledger_entry_finish` (terminal
+/// transition), and the caller's synchronous execution runs
+/// between them. The "no spawn, no queue" discipline is
+/// preserved: neither function spawns or queues.
+///
+/// Gate ordering (deliberate): the gate runs BEFORE the
+/// planned row is recorded, so a Replay/Blocked refusal
+/// leaves no stray planned row behind.
+///
+/// Device recovery semantics (§4.2): a Device write has no
+/// worker_runs row for the recovery scan to claim. It either
+/// completes inside the call — the Effect reaching a terminal
+/// status through `ledger_entry_finish` — or the caller gets
+/// an error and a failed/unknown Effect is recorded (the
+/// timeout arm in `device_set` / the loop tool, and the
+/// fallback terminal record in `device_set`).
+pub(crate) enum LedgerOutcome {
+    Succeeded,
+    Failed,
+    Unknown,
+}
+
+pub(crate) struct LedgerEntry {
+    pub execution_id: String,
+    pub effect: EffectFileRecord,
+}
+
+pub(crate) enum LedgerEntryDecision {
+    Entered(LedgerEntry),
+    Replay(EffectFileRecord),
+    Blocked(EffectFileRecord),
+}
+
+/// E2-C §4.1 plan step: resolve the Execution (reuse the
+/// caller's when given, else build a minimal one — exactly
+/// `adapter_execution`) and record the planned Effect, after
+/// the idempotency gate. A Replay/Blocked decision means the
+/// caller must NOT execute: an identical write is already
+/// settled (Replay) or still unsettled (Blocked), and the
+/// existing row is the audit trail. `Unavailable` (broken
+/// store, no snapshot to dedupe against) proceeds: recording
+/// itself is best-effort and warns the same way.
+pub(crate) fn ledger_entry(
+    state: &AppState,
+    execution_id: Option<String>,
+    capability: &str,
+    operation: &str,
+    scope: &str,
+    input_digest: Option<String>,
+    approval_id: Option<String>,
+) -> LedgerEntryDecision {
+    let execution_id = execution_id.unwrap_or_else(|| adapter_execution(state));
+    if let Some(digest) = &input_digest {
+        match check_idempotency(
+            state,
+            Some(&execution_id),
+            capability,
+            operation,
+            scope,
+            Some(digest),
+            None,
+        ) {
+            IdempotencyDecision::Proceed => {}
+            IdempotencyDecision::Replay(other) => return LedgerEntryDecision::Replay(other),
+            IdempotencyDecision::Blocked(other) => return LedgerEntryDecision::Blocked(other),
+            IdempotencyDecision::Unavailable => {}
+        }
+    }
+    let effect = record_effect(
+        state,
+        NewEffect {
+            execution_id: Some(execution_id.clone()),
+            capability: capability.to_string(),
+            operation: operation.to_string(),
+            scope: scope.to_string(),
+            input_digest,
+            approval_id,
+            status: "planned".to_string(),
+        },
+    );
+    LedgerEntryDecision::Entered(LedgerEntry {
+        execution_id,
+        effect,
+    })
+}
+
+/// E2-C §4.1 finish step: drive a planned/authorized/
+/// started Effect to its terminal status through the single
+/// transition enforcement point (`transition_effect_chain`).
+/// The chain is built from the row's current status, so a
+/// caller that already drove the row part-way (approval
+/// consume → authorized) lands on the same terminal path.
+/// An already-terminal row with the same word is returned
+/// unchanged (idempotent finish); a different terminal word
+/// is a 409, and a missing row is a 404.
+pub(crate) fn ledger_entry_finish(
+    state: &AppState,
+    effect_id: &str,
+    outcome: LedgerOutcome,
+) -> Result<EffectFileRecord, u16> {
+    let terminal = match outcome {
+        LedgerOutcome::Succeeded => "succeeded",
+        LedgerOutcome::Failed => "failed",
+        LedgerOutcome::Unknown => "unknown",
+    };
+    let Some(current) = effect_by_id(state, effect_id) else {
+        return Err(404);
+    };
+    if current.status == terminal {
+        return Ok(current);
+    }
+    if crate::effect_store::is_terminal_effect_status(&current.status) {
+        return Err(409);
+    }
+    let steps: &[&str] = match current.status.as_str() {
+        "planned" => &["authorized", "started", terminal],
+        "authorized" => &["started", terminal],
+        "started" => &[terminal],
+        _ => return Err(409),
+    };
+    transition_effect_chain(state, effect_id, steps)
+}
+
 /// P3-C: the shared run-creation path (the HTTP route and the
 /// loop `worker.run` arm). Validates the binding, resolves
 /// the command, checks the worktree-add preconditions,
@@ -13285,7 +13524,12 @@ async fn effects_verify(
     };
     let mut conn = sqlite.lock().expect("sqlite lock");
     match crate::sqlite_store::record_verification(&mut conn, &draft.as_draft()) {
-        Ok(row) => Json(row).into_response(),
+        Ok(row) => {
+            // E2-C §4.5: a verify writes Evidence too — the
+            // export regenerates here as well.
+            export_evidence_best_effort(&state, &conn);
+            Json(row).into_response()
+        }
         Err(_) => sqlite_error_response(),
     }
 }
@@ -13389,12 +13633,22 @@ async fn patches_apply(
         req.expected_old_sha256.as_deref(),
         &req.approval_id,
     ) {
-        Ok((patch_file, effect, replayed)) => Json(serde_json::json!({
-            "patch_file": patch_file,
-            "effect": effect,
-            "replayed": replayed,
-        }))
-        .into_response(),
+        Ok((patch_file, effect, replayed)) => {
+            // E2-C §4.5: a fresh apply writes Evidence in-tx
+            // (the export regenerates from SQLite, so on a
+            // replay this is a no-op rewrite of the same rows).
+            if let Some(sqlite) = &state.sqlite {
+                if let Ok(conn) = sqlite.lock() {
+                    export_evidence_best_effort(&state, &conn);
+                }
+            }
+            Json(serde_json::json!({
+                "patch_file": patch_file,
+                "effect": effect,
+                "replayed": replayed,
+            }))
+            .into_response()
+        }
         Err(response) => *response,
     }
 }
@@ -13508,6 +13762,50 @@ async fn evidence_get(
             Json(serde_json::json!({ "error": "unknown evidence" })),
         )
             .into_response(),
+        Err(_) => sqlite_error_response(),
+    }
+}
+
+/// E2-C §4.5: return the Evidence audit export as JSONL — one
+/// line per Evidence row, the same rows `evidence_list`
+/// returns, generated from SQLite on every call (the single
+/// source of truth; the audit FILE written at Evidence write
+/// points holds the same content). Same guards as the list/get
+/// reads: 500 without a configured SQLite database, 500 on a
+/// broken one. Generating live — rather than serving the file —
+/// keeps the export consistent with list/get even where the
+/// audit file is not wired (the packaged app does not set
+/// MOCK_EVIDENCE_PATH yet).
+async fn evidence_export(State(state): State<AppState>) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite && state.sqlite_mode() != StateBackend::Shadow {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    match crate::sqlite_store::list_evidence(&conn) {
+        Ok(rows) => {
+            let body = rows
+                .iter()
+                .filter_map(|r| serde_json::to_string(r).ok())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let body = if body.is_empty() {
+                body
+            } else {
+                format!("{body}\n")
+            };
+            (
+                StatusCode::OK,
+                [("content-type", "application/jsonl")],
+                body,
+            )
+                .into_response()
+        }
         Err(_) => sqlite_error_response(),
     }
 }
@@ -14047,25 +14345,42 @@ async fn actions_create(
     // Execution is created here and carried on the action record;
     // device_set attaches its Effect to it. The pin check above
     // already passed, so a rejected creation leaves no orphan.
-    let execution_id = create_execution(&state, None, None).execution_id;
+    // (E2-C §4.2: the Execution is built inside `ledger_entry`
+    // below, not here.)
     // P0-C: the action is planned here. Its Effect is created
     // as `planned` (contract triple, Q5 digest) and carried on
     // the action record; device_set drives it forward instead
     // of recording a fresh row. A never-executed action leaves
     // its planned row planned: recorded, never authorized.
+    // E2-C §4.2: the plan step goes through the shared ledger
+    // entry (the gate cannot fire on a fresh Execution, but
+    // the decision is handled, not ignored).
     let digest = device_effect_digest(&req.reminder_id, req.target_completed);
-    let planned = record_effect(
+    let (execution_id, planned) = match ledger_entry(
         &state,
-        NewEffect {
-            execution_id: Some(execution_id.clone()),
-            capability: "device".to_string(),
-            operation: "reminders.set_completed".to_string(),
-            scope: req.reminder_id.clone(),
-            input_digest: Some(digest),
-            approval_id: None,
-            status: "planned".to_string(),
-        },
-    );
+        None,
+        "device",
+        "reminders.set_completed",
+        &req.reminder_id,
+        Some(digest),
+        None,
+    ) {
+        LedgerEntryDecision::Entered(entry) => (entry.execution_id, entry.effect),
+        LedgerEntryDecision::Replay(other) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "effect_idempotency_replay", "effect_id": other.effect_id, "status": other.status })),
+            )
+                .into_response();
+        }
+        LedgerEntryDecision::Blocked(other) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
+            )
+                .into_response();
+        }
+    };
     let record = DeviceActionRecord {
         action_id: id,
         device: DEVICE_ID.to_string(),
@@ -14286,6 +14601,11 @@ async fn device_set(
         _ => None,
     };
     if let Some(terminal) = terminal {
+        let outcome = match terminal {
+            "succeeded" => LedgerOutcome::Succeeded,
+            "failed" => LedgerOutcome::Failed,
+            _ => LedgerOutcome::Unknown,
+        };
         // Drive the planned Effect when it exists in this run;
         // a fallback run (planned row lost across restart, or a
         // legacy action with no planned row) records a fresh
@@ -14296,22 +14616,56 @@ async fn device_set(
             .filter(|id| effect_by_id(&state, id).is_some());
         match drive {
             Some(effect_id) => {
-                let _ = transition_effect_chain(&state, effect_id, &["started", terminal]);
+                // E2-C §4.2: the terminal transition goes through
+                // the shared ledger finish step. The chain is
+                // built from the row's current status, so the
+                // authorized row takes started → terminal exactly
+                // as before.
+                let _ = ledger_entry_finish(&state, effect_id, outcome);
             }
-            None => {
-                record_effect(
-                    &state,
-                    NewEffect {
-                        execution_id: updated.execution_id.clone(),
-                        capability: "device".to_string(),
-                        operation: "reminders.set_completed".to_string(),
-                        scope: updated.reminder_id.clone(),
-                        input_digest: Some(digest.clone()),
-                        approval_id: req.tool_call_id.clone(),
-                        status: terminal.to_string(),
-                    },
-                );
-            }
+            None => match &updated.execution_id {
+                Some(execution_id) => {
+                    // E2-C §4.2: the fallback row also goes
+                    // through the shared ledger entry (plan +
+                    // finish) on the action's own Execution. The
+                    // gate cannot fire here — the planned row is
+                    // gone and the Execution belongs to this
+                    // action alone — and a Replay/Blocked answer
+                    // would mean an identical row already covers
+                    // the audit, so it is skipped, not recorded
+                    // a second time.
+                    if let LedgerEntryDecision::Entered(entry) = ledger_entry(
+                        &state,
+                        Some(execution_id.clone()),
+                        "device",
+                        "reminders.set_completed",
+                        &updated.reminder_id,
+                        Some(digest.clone()),
+                        req.tool_call_id.clone(),
+                    ) {
+                        let _ =
+                            ledger_entry_finish(&state, &entry.effect.effect_id, outcome);
+                    }
+                }
+                None => {
+                    // Legacy action with no Execution: the direct
+                    // terminal record stays, as before (E2-A:
+                    // legacy device_set actions are exempt from
+                    // the gate).
+                    record_effect(
+                        &state,
+                        NewEffect {
+                            execution_id: updated.execution_id.clone(),
+                            capability: "device".to_string(),
+                            operation: "reminders.set_completed".to_string(),
+                            scope: updated.reminder_id.clone(),
+                            input_digest: Some(digest.clone()),
+                            approval_id: req.tool_call_id.clone(),
+                            status: terminal.to_string(),
+                        },
+                    );
+                }
+            },
         }
     }
     Json(updated).into_response()
@@ -14804,6 +15158,7 @@ pub fn app(state: AppState) -> Router {
         .route("/effects/verify", post(effects_verify))
         .route("/evidence/list", get(evidence_list))
         .route("/evidence/get", get(evidence_get))
+        .route("/evidence/export", get(evidence_export))
         .route("/inbox/list", get(inbox_list))
         .route("/inbox/get", get(inbox_get))
         .route("/inbox/ack", post(inbox_ack))
