@@ -553,8 +553,19 @@ async fn start_fake_loop_model(
                         header_end = Some(pos + 4);
                         let head = String::from_utf8_lossy(&buf[..pos]).into_owned();
                         for line in head.lines() {
-                            if let Some(v) = line.strip_prefix("Content-Length:") {
-                                content_length = v.trim().parse().unwrap_or(0);
+                            // Case-insensitive: hyper writes header
+                            // names lowercase (`content-length`), so a
+                            // literal "Content-Length:" prefix never
+                            // matches and the body length stays 0 —
+                            // the fixture then answers before the
+                            // body arrives, which resets the client
+                            // when the request comes in two segments
+                            // (Windows loopback). Read the full body
+                            // by its real length before responding.
+                            if let Some((name, v)) = line.split_once(':') {
+                                if name.trim().eq_ignore_ascii_case("content-length") {
+                                    content_length = v.trim().parse().unwrap_or(0);
+                                }
                             }
                         }
                     }
