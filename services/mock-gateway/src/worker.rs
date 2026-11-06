@@ -71,6 +71,12 @@ pub struct WorkerRunRow {
     pub tail: String,
     pub truncated: bool,
     pub effect_id: Option<String>,
+    /// P3-C: the approval this run was authorized by, when
+    /// one was presented at creation (digest-bound approvals
+    /// are consumed at creation; loop-bound approvals were
+    /// already consumed by the loop). The driver copies it
+    /// onto the completion Effect for attribution.
+    pub approval_id: Option<String>,
     pub binding_location_id: Option<String>,
     pub binding_worktree_id: Option<String>,
     pub binding_root_digest: Option<String>,
@@ -91,14 +97,12 @@ fn now_ms() -> i64 {
 
 // --- git resolution (plan §3.4) ---
 
-/// Resolve the git binary once, at gateway startup:
-/// `MOCK_GIT_PATH` wins when set (a set-but-missing value
-/// fails closed to "no git", never silently falls back to
-/// PATH); otherwise the first `git` on PATH. `None` means
-/// Worker git commands fail closed with 503
-/// `git_unavailable`.
-pub fn resolve_git_path() -> Option<PathBuf> {
-    if let Ok(value) = std::env::var("MOCK_GIT_PATH") {
+/// Shared binary resolution: an env override wins when set
+/// (a set-but-missing value fails closed to "no binary",
+/// never silently falls back to PATH); otherwise the first
+/// matching name on PATH.
+fn resolve_binary(env_var: &str, names: &[&str]) -> Option<PathBuf> {
+    if let Ok(value) = std::env::var(env_var) {
         if !value.is_empty() {
             let candidate = PathBuf::from(&value);
             if candidate.is_file() {
@@ -109,7 +113,7 @@ pub fn resolve_git_path() -> Option<PathBuf> {
     }
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
-        for name in ["git", "git.exe"] {
+        for name in names {
             let candidate = dir.join(name);
             if candidate.is_file() {
                 return Some(candidate);
@@ -117,6 +121,25 @@ pub fn resolve_git_path() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Resolve the git binary once, at gateway startup:
+/// `MOCK_GIT_PATH` wins when set (a set-but-missing value
+/// fails closed to "no git", never silently falls back to
+/// PATH); otherwise the first `git` on PATH. `None` means
+/// Worker git commands fail closed with 503
+/// `git_unavailable`.
+pub fn resolve_git_path() -> Option<PathBuf> {
+    resolve_binary("MOCK_GIT_PATH", &["git", "git.exe"])
+}
+
+/// P3-C: the cargo binary, same shape as git
+/// (`MOCK_CARGO_PATH` override, else PATH). `None` means
+/// `cargo-test` runs fail closed with 503
+/// `cargo_unavailable`. Tests pin it to the native fixture
+/// through `AppState::with_cargo_path`, exactly like git.
+pub fn resolve_cargo_path() -> Option<PathBuf> {
+    resolve_binary("MOCK_CARGO_PATH", &["cargo", "cargo.exe"])
 }
 
 // --- process-group primitives ---
@@ -262,7 +285,9 @@ impl CommandError {
 /// be inert anyway; the charset check is the second layer),
 /// no absolute path, no `..` escape. The containment check
 /// against the worktree root happens in `contained_path`.
-fn validate_diff_path(path: &str) -> Result<(), CommandError> {
+/// P3-C: the loop engine reuses this for `git.read` /
+/// `worker.run` path arguments (same rule, same error).
+pub(crate) fn validate_diff_path(path: &str) -> Result<(), CommandError> {
     if path.is_empty() {
         return Err(CommandError::BadParam("invalid_path"));
     }
@@ -324,27 +349,94 @@ pub fn contained_path(cwd: &Path, relative: &str) -> Option<PathBuf> {
     Some(canonical)
 }
 
-/// Resolve a caller command to argv. Only the two read
-/// templates exist in the slice; anything else (including
-/// the P3-C write templates) is 400 `command_not_allowlisted`.
-/// `params` is the raw JSON object from the request: status
-/// takes none, diff takes an optional `path`.
+/// Validate a worktree branch name (plan §3.3): ASCII
+/// letters, digits, `.`, `_`, `-` only, no slash, non-empty.
+/// The plan's charset is the whole rule; the length bound
+/// keeps the argv bounded.
+fn validate_branch_name(branch: &str) -> Result<(), CommandError> {
+    if branch.is_empty() || branch.len() > 200 {
+        return Err(CommandError::BadParam("invalid_branch"));
+    }
+    if !branch
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(CommandError::BadParam("invalid_branch"));
+    }
+    Ok(())
+}
+
+/// Validate a cargo package name (plan §3.3): ASCII letters,
+/// digits, `_`, `-` only, non-empty. Same bound as branches.
+fn validate_package_name(package: &str) -> Result<(), CommandError> {
+    if package.is_empty() || package.len() > 200 {
+        return Err(CommandError::BadParam("invalid_package"));
+    }
+    if !package
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+    {
+        return Err(CommandError::BadParam("invalid_package"));
+    }
+    Ok(())
+}
+
+/// Extra environment for a template (plan §3.4): cargo test
+/// runs offline, so no network is ever attempted. The driver
+/// rebuilds this from the run's template (the run row stores
+/// argv only), so this is the single source for the rule.
+pub(crate) fn extra_env_for_command(template: &str) -> Vec<(String, String)> {
+    match template {
+        "cargo-test" => vec![("CARGO_NET_OFFLINE".to_string(), "true".to_string())],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a template produces an Effect at completion
+/// (P3-C §4/§5): the write and test templates. Reads never
+/// do (their terminal outcome is a known result, no Effect).
+pub(crate) fn is_effect_command(template: &str) -> bool {
+    matches!(
+        template,
+        "git-worktree-add" | "git-commit" | "cargo-test"
+    )
+}
+
+/// Resolve a caller command to argv. The slice's two read
+/// templates plus the P3-C write/test templates (§3.3):
+/// git-worktree-add, git-commit, cargo-test. Anything else is
+/// 400 `command_not_allowlisted`. `params` is the raw JSON
+/// object from the request; `binary` is the resolved
+/// executable for the template (git, or cargo for
+/// cargo-test); `location_root` is the Location's canonical
+/// root, used only by git-worktree-add (its path is relative
+/// to the Location root, plan §4.2 — the argv carries the
+/// absolute path because git resolves relative paths against
+/// the child's cwd, not the Location root).
 pub fn resolve_command(
     command: &str,
     params: Option<&serde_json::Value>,
-    git: &Path,
+    binary: &Path,
     cwd: &Path,
     timeout_ms: Option<u64>,
+    location_root: Option<&Path>,
 ) -> Result<ResolvedCommand, CommandError> {
+    // Per-template defaults (plan §3.3): reads 30s,
+    // worktree-add / commit 60s, cargo test 600s.
+    let default_timeout = match command {
+        "git-worktree-add" | "git-commit" => 60_000,
+        "cargo-test" => 600_000,
+        _ => WORKER_DEFAULT_TIMEOUT_MS,
+    };
     let timeout = match timeout_ms {
         Some(0) => return Err(CommandError::BadParam("invalid_timeout")),
         Some(ms) if ms > WORKER_MAX_TIMEOUT_MS => {
             return Err(CommandError::BadParam("invalid_timeout"))
         }
         Some(ms) => ms,
-        None => WORKER_DEFAULT_TIMEOUT_MS,
+        None => default_timeout,
     };
-    let git = git.to_string_lossy().into_owned();
+    let binary = binary.to_string_lossy().into_owned();
     match command {
         "git-status" => {
             if let Some(serde_json::Value::Object(map)) = params {
@@ -357,7 +449,7 @@ pub fn resolve_command(
             Ok(ResolvedCommand {
                 template: "git-status",
                 argv: vec![
-                    git,
+                    binary,
                     "status".to_string(),
                     "--porcelain=v1".to_string(),
                     "--branch".to_string(),
@@ -384,7 +476,7 @@ pub fn resolve_command(
                 return Err(CommandError::BadParam("invalid_params"));
             }
             let mut argv = vec![
-                git,
+                binary,
                 "diff".to_string(),
                 "--no-color".to_string(),
                 "--no-ext-diff".to_string(),
@@ -396,6 +488,125 @@ pub fn resolve_command(
             Ok(ResolvedCommand {
                 template: "git-diff",
                 argv,
+                timeout_ms: timeout,
+            })
+        }
+        "git-worktree-add" => {
+            let Some(location_root) = location_root else {
+                return Err(CommandError::BadParam("invalid_path"));
+            };
+            let (path, branch) = match params {
+                Some(serde_json::Value::Object(map)) => {
+                    let mut path: Option<String> = None;
+                    let mut branch: Option<String> = None;
+                    for (key, value) in map {
+                        match (key.as_str(), value) {
+                            ("path", serde_json::Value::String(p)) => {
+                                validate_diff_path(p)?;
+                                path = Some(p.clone());
+                            }
+                            ("branch", serde_json::Value::String(b)) => {
+                                validate_branch_name(b)?;
+                                branch = Some(b.clone());
+                            }
+                            _ => {
+                                return Err(CommandError::BadParam("invalid_params"));
+                            }
+                        }
+                    }
+                    match (path, branch) {
+                        (Some(path), Some(branch)) => (path, branch),
+                        _ => return Err(CommandError::BadParam("invalid_params")),
+                    }
+                }
+                _ => return Err(CommandError::BadParam("invalid_params")),
+            };
+            // The argv carries the absolute path (git resolves
+            // relative paths against the child's cwd); the
+            // Effect scope and the Worktree record keep the
+            // Location-relative path.
+            let Some(target) = contained_path(location_root, &path) else {
+                return Err(CommandError::BadParam("invalid_path"));
+            };
+            Ok(ResolvedCommand {
+                template: "git-worktree-add",
+                argv: vec![
+                    binary,
+                    "worktree".to_string(),
+                    "add".to_string(),
+                    target.to_string_lossy().into_owned(),
+                    "-b".to_string(),
+                    branch,
+                ],
+                timeout_ms: timeout,
+            })
+        }
+        "git-commit" => {
+            let message = match params {
+                Some(serde_json::Value::Object(map)) => {
+                    let mut message: Option<String> = None;
+                    for (key, value) in map {
+                        match (key.as_str(), value) {
+                            ("message", serde_json::Value::String(m)) => {
+                                message = Some(m.clone());
+                            }
+                            _ => {
+                                return Err(CommandError::BadParam("invalid_params"));
+                            }
+                        }
+                    }
+                    message
+                }
+                _ => None,
+            };
+            let Some(message) = message else {
+                return Err(CommandError::BadParam("invalid_params"));
+            };
+            if message.trim().is_empty() || message.chars().count() > 2000 {
+                return Err(CommandError::BadParam("invalid_message"));
+            }
+            Ok(ResolvedCommand {
+                template: "git-commit",
+                argv: vec![
+                    binary,
+                    "commit".to_string(),
+                    "--no-verify".to_string(),
+                    "-m".to_string(),
+                    message,
+                ],
+                timeout_ms: timeout,
+            })
+        }
+        "cargo-test" => {
+            let package = match params {
+                Some(serde_json::Value::Object(map)) => {
+                    let mut package: Option<String> = None;
+                    for (key, value) in map {
+                        match (key.as_str(), value) {
+                            ("package", serde_json::Value::String(p)) => {
+                                validate_package_name(p)?;
+                                package = Some(p.clone());
+                            }
+                            _ => {
+                                return Err(CommandError::BadParam("invalid_params"));
+                            }
+                        }
+                    }
+                    package
+                }
+                _ => None,
+            };
+            let Some(package) = package else {
+                return Err(CommandError::BadParam("invalid_params"));
+            };
+            Ok(ResolvedCommand {
+                template: "cargo-test",
+                argv: vec![
+                    binary,
+                    "test".to_string(),
+                    "-p".to_string(),
+                    package,
+                ],
                 timeout_ms: timeout,
             })
         }
@@ -485,20 +696,22 @@ async fn drain_readers(
 /// Build the child command: argv array, `env_clear` plus the
 /// minimal set {PATH, HOME, TMPDIR} (plan §3.4). Proxy
 /// variables are never set; no credential ever enters the
-/// environment. The git binary's directory leads PATH so the
+/// environment. The binary's directory leads PATH so the
 /// resolved binary is the one that runs even under a thin
-/// GUI PATH.
+/// GUI PATH. `extra_env` carries the template's additions
+/// (P3-C: `CARGO_NET_OFFLINE=true` for cargo test).
 fn build_child_command(
     state: &AppState,
     argv: &[String],
     cwd: &Path,
-    git_path: &Path,
+    binary_path: &Path,
+    extra_env: &[(String, String)],
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     cmd.env_clear();
     let mut path_value = String::new();
-    if let Some(dir) = git_path.parent() {
+    if let Some(dir) = binary_path.parent() {
         path_value.push_str(&dir.to_string_lossy());
         // PATH separator, not the file separator.
         path_value.push(if cfg!(windows) { ';' } else { ':' });
@@ -518,6 +731,9 @@ fn build_child_command(
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     cmd.env("TMPDIR", tmpdir);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
     cmd.current_dir(cwd);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -529,6 +745,248 @@ fn build_child_command(
         cmd.process_group(0);
     }
     cmd
+}
+
+/// Synchronous short command run (P3-C): the `git.read` loop
+/// tool and the Evidence observe path run read-only git
+/// commands synchronously. Same argv/env rules as the async
+/// driver, with a wall-clock cap: on timeout the child is
+/// killed and the outcome reports `timed_out`. No shell, no
+/// credential, no retry. The caller decides what an exit code
+/// or a timeout means for its class.
+pub(crate) struct SyncRunOutput {
+    pub exit_code: Option<i64>,
+    pub stdout: String,
+    pub timed_out: bool,
+}
+
+pub(crate) fn run_command_sync(
+    state: &AppState,
+    argv: &[String],
+    cwd: &Path,
+    binary_path: &Path,
+    timeout: Duration,
+) -> SyncRunOutput {
+    let mut cmd = build_child_command(state, argv, cwd, binary_path, &[]);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(detail) => {
+            eprintln!("warning: sync command spawn failed: {detail}");
+            return SyncRunOutput {
+                exit_code: None,
+                stdout: String::new(),
+                timed_out: false,
+            };
+        }
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    let exit = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => break None,
+        }
+    };
+    // The child is dead (or killed): its pipes hold a finite
+    // amount, so reading to EOF cannot block. Read-only git
+    // commands spawn no grandchildren that hold the pipes.
+    let stdout = child
+        .stdout
+        .take()
+        .map(|mut pipe| {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+        .unwrap_or_default();
+    // stderr is drained (never stored) so a chatty child
+    // cannot block on a full pipe; the callers only need
+    // stdout + the exit code for read-only commands.
+    let _ = child
+        .stderr
+        .take()
+        .map(|mut pipe| {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+        });
+    SyncRunOutput {
+        exit_code: exit.and_then(|status| status.code()).map(|c| c as i64),
+        stdout,
+        timed_out: exit.is_none(),
+    }
+}
+
+/// Run a read-only git command synchronously and return its
+/// trimmed stdout on exit 0, else None. The Evidence observe
+/// path uses this (10s cap); a failure reads as "cannot
+/// observe", never as a fabricated state.
+pub(crate) fn git_read_sync(
+    state: &AppState,
+    git: &Path,
+    args: &[&str],
+    cwd: &Path,
+) -> Option<String> {
+    let argv: Vec<String> = std::iter::once(git.to_string_lossy().into_owned())
+        .chain(args.iter().map(|a| a.to_string()))
+        .collect();
+    let out = run_command_sync(state, &argv, cwd, git, Duration::from_secs(10));
+    if out.timed_out || out.exit_code != Some(0) {
+        return None;
+    }
+    Some(out.stdout.trim().to_string())
+}
+
+/// Parsed `cargo test` summary (plan §5.1/§5.2): counts
+/// summed over every `test result:` line in the tail, failed
+/// test names (from the `failures:` section) as sha256 only —
+/// names never leave the gateway in plaintext (the
+/// observed_json rule: hashes, lengths, kinds, flags only).
+/// A tail with no parseable summary line keeps counts null
+/// (the exit code is ground truth; numbers are never
+/// fabricated).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TestRunSummary {
+    pub passed: Option<u64>,
+    pub failed: Option<u64>,
+    pub failed_sha256: Vec<String>,
+}
+
+fn parse_test_count(segment: &str, word: &str) -> Option<u64> {
+    let rest = segment.trim().strip_suffix(word)?.trim();
+    rest.split_whitespace().last()?.parse::<u64>().ok()
+}
+
+pub fn parse_test_output(tail: &str) -> TestRunSummary {
+    let mut passed: Option<u64> = None;
+    let mut failed: Option<u64> = None;
+    let mut failed_names: Vec<String> = Vec::new();
+    let mut in_failures = false;
+    for line in tail.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("test result:") {
+            in_failures = false;
+            let rest = trimmed.trim_start_matches("test result:");
+            for segment in rest.split(';') {
+                if let Some(n) = parse_test_count(segment, "passed") {
+                    passed = Some(passed.unwrap_or(0) + n);
+                }
+                if let Some(n) = parse_test_count(segment, "failed") {
+                    failed = Some(failed.unwrap_or(0) + n);
+                }
+            }
+            continue;
+        }
+        if trimmed == "failures:" {
+            in_failures = true;
+            continue;
+        }
+        if in_failures {
+            if trimmed.is_empty() {
+                in_failures = false;
+            } else {
+                failed_names.push(trimmed.to_string());
+            }
+        }
+    }
+    TestRunSummary {
+        passed,
+        failed,
+        failed_sha256: failed_names
+            .iter()
+            .map(|name| crate::sqlite_store::sha256_hex(name.as_bytes()))
+            .collect(),
+    }
+}
+
+/// Relativize an absolute path against a canonical root:
+/// `Some(relative)` when contained, else None. The path
+/// itself need not exist (the worktree may not have been
+/// created yet); containment is checked on the canonical
+/// longest existing prefix, like `contained_path`.
+fn relativize_to_root(root: &Path, absolute: &str) -> Option<String> {
+    let root_canonical = root.canonicalize().ok()?;
+    let path = Path::new(absolute);
+    let mut existing = path;
+    let mut remainder: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        match existing.parent() {
+            Some(parent) if parent != existing => {
+                if let Some(name) = existing.file_name() {
+                    remainder.push(name.to_os_string());
+                }
+                existing = parent;
+            }
+            _ => return None,
+        }
+    }
+    let mut canonical = existing.canonicalize().ok()?;
+    for part in remainder.iter().rev() {
+        canonical.push(part);
+    }
+    let relative = canonical.strip_prefix(&root_canonical).ok()?;
+    Some(relative.to_string_lossy().into_owned())
+}
+
+/// P3-C Effect identity for an unknown run (timeout / cancel /
+/// orphaned / lost): the template's vocabulary, not the
+/// template name. Reads keep the slice shape (the slice's
+/// unknown read Effects are already in the wild as
+/// ("git", "git-status" / "git-diff", cwd)); writes and tests
+/// use the P3-C vocabulary (§4.4/Q5). `location_root` is the
+/// run's Location canonical root when the caller can resolve
+/// it (the driver); the recovery scan passes None and the
+/// scope falls back to the absolute path (the Location root
+/// is not in SQLite). The scope is display/identity only:
+/// observe re-derives the absolute path from the run row.
+pub(crate) fn unknown_effect_identity(
+    run: &WorkerRunRow,
+    location_root: Option<&Path>,
+) -> (String, String, String) {
+    let argv: Vec<String> = serde_json::from_str(&run.argv_json).unwrap_or_default();
+    match run.command.as_str() {
+        "git-worktree-add" => {
+            let absolute = argv.get(3).cloned().unwrap_or_else(|| run.cwd.clone());
+            let scope = match location_root {
+                Some(root) => {
+                    relativize_to_root(root, &absolute).unwrap_or(absolute)
+                }
+                None => absolute,
+            };
+            (
+                "git".to_string(),
+                "worktree-add".to_string(),
+                scope,
+            )
+        }
+        "git-commit" => {
+            let scope = match location_root {
+                Some(root) => {
+                    relativize_to_root(root, &run.cwd).unwrap_or_else(|| run.cwd.clone())
+                }
+                None => run.cwd.clone(),
+            };
+            ("git".to_string(), "commit".to_string(), scope)
+        }
+        "cargo-test" => (
+            "test".to_string(),
+            "run".to_string(),
+            "cargo-test".to_string(),
+        ),
+        _ => (
+            "git".to_string(),
+            run.command.clone(),
+            run.cwd.clone(),
+        ),
+    }
 }
 
 /// The one Worker driver (plan §3.1): one `tokio::spawn`
@@ -620,22 +1078,6 @@ pub async fn drive_worker_run(state: AppState, run_id: String) {
         }
     }
 
-    let Some(git_path) = state.git_path.clone() else {
-        // Resolved at creation time; a missing binary here
-        // (path deleted after creation) fails the run, never
-        // spawns a fallback.
-        let (tail, truncated) = truncate_tail(b"git_unavailable");
-        let finished = sqlite_store::RunFinish {
-            status: "failed".to_string(),
-            exit_code: None,
-            tail,
-            truncated,
-            effect_id: None,
-        };
-        let mut conn = sqlite.lock().expect("sqlite lock");
-        let _ = sqlite_store::finish_worker_run(&mut conn, &run_id, &finished);
-        return;
-    };
     let argv: Vec<String> = match serde_json::from_str(&run.argv_json) {
         Ok(argv) => argv,
         Err(_) => {
@@ -655,8 +1097,34 @@ pub async fn drive_worker_run(state: AppState, run_id: String) {
     if argv.is_empty() {
         return;
     }
+    // The binary is the one resolved at creation (argv[0]):
+    // a path deleted after creation fails the run, never
+    // spawns a fallback. The 503 at creation already
+    // distinguished git_unavailable / cargo_unavailable; the
+    // tail here names the template's binary the same way.
+    // No Effect: the command never ran, so nothing landed.
+    let binary_path = PathBuf::from(&argv[0]);
+    if !binary_path.is_file() {
+        let code = if run.command == "cargo-test" {
+            "cargo_unavailable"
+        } else {
+            "git_unavailable"
+        };
+        let (tail, truncated) = truncate_tail(code.as_bytes());
+        let finished = sqlite_store::RunFinish {
+            status: "failed".to_string(),
+            exit_code: None,
+            tail,
+            truncated,
+            effect_id: None,
+        };
+        let mut conn = sqlite.lock().expect("sqlite lock");
+        let _ = sqlite_store::finish_worker_run(&mut conn, &run_id, &finished);
+        return;
+    }
     let cwd = PathBuf::from(&run.cwd);
-    let std_cmd = build_child_command(&state, &argv, &cwd, &git_path);
+    let extra_env = extra_env_for_command(&run.command);
+    let std_cmd = build_child_command(&state, &argv, &cwd, &binary_path, &extra_env);
     let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.kill_on_drop(true);
     let mut child = match cmd.spawn() {
@@ -805,12 +1273,14 @@ pub async fn drive_worker_run(state: AppState, run_id: String) {
             let exit = status.expect("wait returned without status");
             let code = exit.code().map(|c| c as i64);
             if exit.success() {
-                finish_terminal(&state, &run, "succeeded", code, tail, truncated).await;
+                finish_terminal(&state, &run, "succeeded", code, tail, truncated, started).await;
             } else {
-                // A non-zero exit from a read command is a
-                // known result (e.g. not a git repo), not an
-                // unknown one: no Effect, no Inbox.
-                finish_terminal(&state, &run, "failed", code, tail, truncated).await;
+                // A non-zero exit is a known result (e.g. not
+                // a git repo, a failing test, a rejected
+                // commit), not an unknown one: no Inbox. Reads
+                // write no Effect; writes and tests record a
+                // `failed` Effect (+ Test Evidence for tests).
+                finish_terminal(&state, &run, "failed", code, tail, truncated, started).await;
             }
         }
     }
@@ -835,8 +1305,263 @@ async fn assignment_still_active(state: &AppState, run: &WorkerRunRow) -> bool {
         .is_some_and(|row| row.status == "active")
 }
 
-/// Known terminal outcome (exit code): run row +
-/// plan_position checkpoint, no Effect.
+/// Run-specific digest (slice formula): commits the argv,
+/// command, cwd and run id, so each run owns its unknown /
+/// test Effect row and no two runs share an idempotency key.
+pub(crate) fn run_digest(run: &WorkerRunRow) -> String {
+    crate::sqlite_store::sha256_hex(
+        crate::sqlite_store::canonical_json(&serde_json::json!({
+            "argv": run.argv_json,
+            "command": run.command,
+            "cwd": run.cwd,
+            "run_id": run.run_id,
+        }))
+        .as_bytes(),
+    )
+}
+
+/// P3-C completion Effect + Evidence for a write/test run
+/// (§4.2/§4.4/§5.2). Returns the Effect id and the Evidence
+/// rows to insert. The Effect is recorded first (its id goes
+/// on the run row); the caller inserts the Evidence rows only
+/// when the run-row write applied (a scan-finalized run gets
+/// no Evidence). Reads return nothing: their terminal outcome
+/// is a known result, no Effect.
+///
+/// - git-worktree-add, exit 0: Effect (git, worktree-add,
+///   scope) succeeded + write-time Evidence (new worktree
+///   HEAD) + the Worktree record (§4.2, after command
+///   success; a record failure only warns — the git worktree
+///   exists and the user can register it via the API).
+///   Non-zero: failed Effect, no Evidence, no record.
+/// - git-commit, exit 0: Effect (git, commit, scope)
+///   succeeded + write-time Evidence (commit/parent/tree).
+///   Non-zero: failed Effect, no Evidence.
+/// - cargo-test: Effect (test, run, "cargo-test") succeeded
+///   (exit 0) / failed (non-zero) + Test Evidence (source
+///   "test", reason test_passed/test_failed, closed observed
+///   set). No Patch change, no Inbox row (§5.4).
+///
+/// A git read that fails degrades the digest / drops the
+/// baseline (empty-string hash, no Evidence row); the Effect
+/// status itself follows the exit code, which is ground
+/// truth. A failed read never fabricates a hash.
+async fn completion_effect(
+    state: &AppState,
+    run: &WorkerRunRow,
+    status: &str,
+    exit_code: Option<i64>,
+    tail: &str,
+    started_ms: i64,
+) -> (Option<String>, Vec<crate::evidence::OwnedEvidence>) {
+    if !is_effect_command(&run.command) {
+        return (None, Vec::new());
+    }
+    let argv: Vec<String> = serde_json::from_str(&run.argv_json).unwrap_or_default();
+    let git = argv.first().map(PathBuf::from);
+    let location_root = run
+        .binding_location_id
+        .as_deref()
+        .and_then(|id| crate::server::location_root_for_id(state, id));
+    let succeeded = status == "succeeded";
+    // Each arm yields (capability, operation, scope, digest,
+    // write-time baseline observed JSON, test observed JSON).
+    // Only one of the two observed values is ever set.
+    let (capability, operation, scope, digest, baseline, test_observed): (
+        &str,
+        &str,
+        String,
+        String,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+    ) = match run.command.as_str() {
+        "git-worktree-add" => {
+            let absolute = argv.get(3).cloned().unwrap_or_else(|| run.cwd.clone());
+            let branch = argv.get(5).cloned().unwrap_or_default();
+            let scope = location_root
+                .as_deref()
+                .and_then(|root| relativize_to_root(root, &absolute))
+                .unwrap_or(absolute.clone());
+            let cwd = Path::new(&run.cwd);
+            let parent_head = git
+                .as_ref()
+                .and_then(|g| {
+                    git_read_sync(state, g, &["-C", &run.cwd, "rev-parse", "HEAD"], cwd)
+                })
+                .unwrap_or_default();
+            let params = std::collections::BTreeMap::from([
+                ("path".to_string(), scope.clone()),
+                ("branch".to_string(), branch.clone()),
+                ("parent_head_sha".to_string(), parent_head),
+            ]);
+            let digest =
+                crate::operation_binding::operation_digest("git.worktree-add", None, &params);
+            let baseline = if succeeded {
+                git.as_ref()
+                    .and_then(|g| {
+                        git_read_sync(
+                            state,
+                            g,
+                            &["-C", &absolute, "rev-parse", "HEAD"],
+                            Path::new(&absolute),
+                        )
+                    })
+                    .map(|head_sha| {
+                        serde_json::json!({"kind": "worktree", "head_sha": head_sha})
+                    })
+            } else {
+                None
+            };
+            (
+                "git",
+                "worktree-add",
+                scope,
+                digest,
+                baseline,
+                None,
+            )
+        }
+        "git-commit" => {
+            let scope = location_root
+                .as_deref()
+                .and_then(|root| relativize_to_root(root, &run.cwd))
+                .unwrap_or_else(|| run.cwd.clone());
+            let cwd = Path::new(&run.cwd);
+            let message = argv.get(4).cloned().unwrap_or_default();
+            let head = git
+                .as_ref()
+                .and_then(|g| git_read_sync(state, g, &["-C", &run.cwd, "rev-parse", "HEAD"], cwd))
+                .unwrap_or_default();
+            let parent = git
+                .as_ref()
+                .and_then(|g| {
+                    git_read_sync(state, g, &["-C", &run.cwd, "rev-parse", "HEAD~1"], cwd)
+                })
+                .unwrap_or_default();
+            let tree = git
+                .as_ref()
+                .and_then(|g| {
+                    git_read_sync(
+                        state,
+                        g,
+                        &["-C", &run.cwd, "rev-parse", "HEAD^{tree}"],
+                        cwd,
+                    )
+                })
+                .unwrap_or_default();
+            let params = std::collections::BTreeMap::from([
+                ("parent_head_sha".to_string(), parent.clone()),
+                ("tree_sha256".to_string(), tree.clone()),
+                (
+                    "message_sha256".to_string(),
+                    crate::sqlite_store::sha256_hex(message.as_bytes()),
+                ),
+            ]);
+            let digest =
+                crate::operation_binding::operation_digest("git.commit", None, &params);
+            let baseline = if succeeded && !head.is_empty() {
+                Some(serde_json::json!({
+                    "kind": "commit",
+                    "sha256": head,
+                    "parent_sha256": parent,
+                    "tree_sha256": tree,
+                }))
+            } else {
+                None
+            };
+            ("git", "commit", scope, digest, baseline, None)
+        }
+        "cargo-test" => {
+            let summary = parse_test_output(tail);
+            let duration_ms = (now_ms() - started_ms).max(0) as u64;
+            let observed = serde_json::json!({
+                "kind": "test-run",
+                "passed": summary.passed,
+                "failed": summary.failed,
+                "duration_ms": duration_ms,
+                "exit_code": exit_code,
+                "failed_sha256": summary.failed_sha256,
+            });
+            (
+                "test",
+                "run",
+                "cargo-test".to_string(),
+                run_digest(run),
+                None,
+                Some(observed),
+            )
+        }
+        _ => return (None, Vec::new()),
+    };
+    let effect = crate::server::record_effect(
+        state,
+        crate::effect_store::NewEffect {
+            execution_id: run.execution_id.clone(),
+            capability: capability.to_string(),
+            operation: operation.to_string(),
+            scope: scope.clone(),
+            input_digest: Some(digest),
+            approval_id: run.approval_id.clone(),
+            status: status.to_string(),
+        },
+    );
+    let mut evidence = Vec::new();
+    if let Some(observed) = baseline {
+        evidence.push(crate::evidence::OwnedEvidence {
+            effect_id: effect.effect_id.clone(),
+            execution_id: run.execution_id.clone(),
+            source: "write".to_string(),
+            verdict: "verified".to_string(),
+            reason: "written".to_string(),
+            observed_json: serde_json::to_string(&observed)
+                .unwrap_or_else(|_| "{}".to_string()),
+            checked_ms: now_ms(),
+            origin_device_id: state.origin_device_id.clone(),
+            schema_version: 1,
+        });
+    }
+    if let Some(observed) = test_observed {
+        let (verdict, reason) = if succeeded {
+            ("verified", "test_passed")
+        } else {
+            ("mismatch", "test_failed")
+        };
+        evidence.push(crate::evidence::OwnedEvidence {
+            effect_id: effect.effect_id.clone(),
+            execution_id: run.execution_id.clone(),
+            source: "test".to_string(),
+            verdict: verdict.to_string(),
+            reason: reason.to_string(),
+            observed_json: serde_json::to_string(&observed)
+                .unwrap_or_else(|_| "{}".to_string()),
+            checked_ms: now_ms(),
+            origin_device_id: state.origin_device_id.clone(),
+            schema_version: 1,
+        });
+    }
+    // §4.2: the Worktree record is created after the command
+    // succeeds. A failure here only warns: the git worktree
+    // exists, and the record can be registered via the API.
+    if succeeded && run.command == "git-worktree-add" {
+        let branch = argv.get(5).cloned().unwrap_or_default();
+        if let Some(location_id) = &run.binding_location_id {
+            if let Err(detail) = crate::server::create_worktree_record(
+                state,
+                location_id.clone(),
+                scope.clone(),
+                branch,
+                None,
+            ) {
+                eprintln!("warning: P3-C worktree record creation failed: {detail}");
+            }
+        }
+    }
+    (Some(effect.effect_id), evidence)
+}
+
+/// Known terminal outcome (exit code): run row + (for
+/// write/test templates) the completion Effect and Evidence
+/// + plan_position checkpoint. Reads write no Effect.
 async fn finish_terminal(
     state: &AppState,
     run: &WorkerRunRow,
@@ -844,6 +1569,7 @@ async fn finish_terminal(
     exit_code: Option<i64>,
     tail: String,
     truncated: bool,
+    started_ms: i64,
 ) {
     if !assignment_still_active(state, run).await {
         finish_superseded(state, run).await;
@@ -852,12 +1578,14 @@ async fn finish_terminal(
     let Some(sqlite) = state.sqlite.clone() else {
         return;
     };
+    let (effect_id, evidence) =
+        completion_effect(state, run, status, exit_code, &tail, started_ms).await;
     let finished = sqlite_store::RunFinish {
         status: status.to_string(),
         exit_code,
         tail,
         truncated,
-        effect_id: None,
+        effect_id,
     };
     let applied = {
         let mut conn = sqlite.lock().expect("sqlite lock");
@@ -866,6 +1594,9 @@ async fn finish_terminal(
             .unwrap_or(false)
     };
     if applied {
+        for draft in &evidence {
+            crate::server::record_evidence_best_effort(state, draft);
+        }
         if let Some(execution_id) = &run.execution_id {
             let mut conn = sqlite.lock().expect("sqlite lock");
             let _ = sqlite_store::write_plan_position_checkpoint(
@@ -894,24 +1625,21 @@ async fn finish_unknown(
         finish_superseded(state, run).await;
         return;
     }
-    let digest = sqlite_store::sha256_hex(
-        sqlite_store::canonical_json(&serde_json::json!({
-            "argv": run.argv_json,
-            "command": run.command,
-            "cwd": run.cwd,
-            "run_id": run.run_id,
-        }))
-        .as_bytes(),
-    );
+    let location_root = run
+        .binding_location_id
+        .as_deref()
+        .and_then(|id| crate::server::location_root_for_id(state, id));
+    let (capability, operation, scope) =
+        unknown_effect_identity(run, location_root.as_deref());
     let effect = crate::server::record_effect(
         state,
         crate::effect_store::NewEffect {
             execution_id: run.execution_id.clone(),
-            capability: "git".to_string(),
-            operation: run.command.clone(),
-            scope: run.cwd.clone(),
-            input_digest: Some(digest),
-            approval_id: None,
+            capability,
+            operation,
+            scope,
+            input_digest: Some(run_digest(run)),
+            approval_id: run.approval_id.clone(),
             status: "unknown".to_string(),
         },
     );
@@ -961,24 +1689,21 @@ async fn finish_cancelled(
         finish_superseded(state, run).await;
         return;
     }
-    let digest = sqlite_store::sha256_hex(
-        sqlite_store::canonical_json(&serde_json::json!({
-            "argv": run.argv_json,
-            "command": run.command,
-            "cwd": run.cwd,
-            "run_id": run.run_id,
-        }))
-        .as_bytes(),
-    );
+    let location_root = run
+        .binding_location_id
+        .as_deref()
+        .and_then(|id| crate::server::location_root_for_id(state, id));
+    let (capability, operation, scope) =
+        unknown_effect_identity(run, location_root.as_deref());
     let effect = crate::server::record_effect(
         state,
         crate::effect_store::NewEffect {
             execution_id: run.execution_id.clone(),
-            capability: "git".to_string(),
-            operation: run.command.clone(),
-            scope: run.cwd.clone(),
-            input_digest: Some(digest),
-            approval_id: None,
+            capability,
+            operation,
+            scope,
+            input_digest: Some(run_digest(run)),
+            approval_id: run.approval_id.clone(),
             status: "unknown".to_string(),
         },
     );
@@ -1046,7 +1771,7 @@ mod tests {
             "",
         ] {
             assert_eq!(
-                resolve_command(command, None, git, &cwd, None),
+                resolve_command(command, None, git, &cwd, None, None),
                 Err(CommandError::NotAllowlisted),
                 "{command}"
             );
@@ -1057,7 +1782,7 @@ mod tests {
     fn resolve_status_and_diff_argv() {
         let git = Path::new("/usr/bin/git");
         let cwd = std::env::temp_dir();
-        let status = resolve_command("git-status", None, git, &cwd, None).expect("status");
+        let status = resolve_command("git-status", None, git, &cwd, None, None).expect("status");
         assert_eq!(status.template, "git-status");
         assert_eq!(status.timeout_ms, WORKER_DEFAULT_TIMEOUT_MS);
         assert_eq!(
@@ -1070,6 +1795,7 @@ mod tests {
             git,
             &cwd,
             Some(5_000),
+            None,
         )
         .expect("diff");
         assert_eq!(
@@ -1085,7 +1811,7 @@ mod tests {
         );
         assert_eq!(diff.timeout_ms, 5_000);
         let diff_no_path =
-            resolve_command("git-diff", None, git, &cwd, None).expect("diff no path");
+            resolve_command("git-diff", None, git, &cwd, None, None).expect("diff no path");
         assert!(!diff_no_path.argv.contains(&"--".to_string()));
     }
 
@@ -1104,7 +1830,7 @@ mod tests {
             serde_json::json!({"other": "x"}),
         ] {
             assert!(
-                resolve_command("git-diff", Some(&bad), git, &cwd, None).is_err(),
+                resolve_command("git-diff", Some(&bad), git, &cwd, None, None).is_err(),
                 "{bad}"
             );
         }
@@ -1113,17 +1839,19 @@ mod tests {
             Some(&serde_json::json!({"path": 1})),
             git,
             &cwd,
-            None
+            None,
+            None,
         )
         .is_err());
         // Timeout bounds.
-        assert!(resolve_command("git-status", None, git, &cwd, Some(0)).is_err());
+        assert!(resolve_command("git-status", None, git, &cwd, Some(0), None).is_err());
         assert!(resolve_command(
             "git-status",
             None,
             git,
             &cwd,
-            Some(WORKER_MAX_TIMEOUT_MS + 1)
+            Some(WORKER_MAX_TIMEOUT_MS + 1),
+            None,
         )
         .is_err());
         // Status takes no params.
@@ -1132,7 +1860,8 @@ mod tests {
             Some(&serde_json::json!({"path": "a.txt"})),
             git,
             &cwd,
-            None
+            None,
+            None,
         )
         .is_err());
     }
@@ -1187,6 +1916,156 @@ mod tests {
         child.wait().unwrap();
         assert!(!alive_before_reap, "exited child reported alive before wait");
         assert!(!process_alive(pid));
+    }
+
+    #[test]
+    fn resolve_worktree_add_commit_and_cargo_test_argv() {
+        let git = Path::new("/usr/bin/git");
+        let cargo = Path::new("/usr/bin/cargo");
+        let cwd = std::env::temp_dir();
+        let root = std::env::temp_dir();
+        // worktree-add: absolute argv path, Location-relative
+        // containment, 60s default.
+        let add = resolve_command(
+            "git-worktree-add",
+            Some(&serde_json::json!({"path": "wt-1", "branch": "scratch-1"})),
+            git,
+            &cwd,
+            None,
+            Some(&root),
+        )
+        .expect("worktree add");
+        assert_eq!(add.template, "git-worktree-add");
+        assert_eq!(add.timeout_ms, 60_000);
+        assert_eq!(add.argv[1], "worktree");
+        assert_eq!(add.argv[2], "add");
+        assert_eq!(add.argv[4], "-b");
+        assert_eq!(add.argv[5], "scratch-1");
+        assert!(Path::new(&add.argv[3]).is_absolute());
+        // commit: message in argv, 60s default.
+        let commit = resolve_command(
+            "git-commit",
+            Some(&serde_json::json!({"message": "wip"})),
+            git,
+            &cwd,
+            None,
+            None,
+        )
+        .expect("commit");
+        assert_eq!(commit.template, "git-commit");
+        assert_eq!(commit.timeout_ms, 60_000);
+        assert_eq!(
+            commit.argv,
+            vec!["/usr/bin/git", "commit", "--no-verify", "-m", "wip"]
+        );
+        // cargo-test: -p package, 600s default, cargo binary.
+        let test = resolve_command(
+            "cargo-test",
+            Some(&serde_json::json!({"package": "mock-gateway"})),
+            cargo,
+            &cwd,
+            None,
+            None,
+        )
+        .expect("cargo test");
+        assert_eq!(test.template, "cargo-test");
+        assert_eq!(test.timeout_ms, 600_000);
+        assert_eq!(
+            test.argv,
+            vec!["/usr/bin/cargo", "test", "-p", "mock-gateway"]
+        );
+    }
+
+    #[test]
+    fn resolve_write_templates_reject_bad_params() {
+        let git = Path::new("/usr/bin/git");
+        let cargo = Path::new("/usr/bin/cargo");
+        let cwd = std::env::temp_dir();
+        let root = std::env::temp_dir();
+        // worktree-add: missing/escaping path, bad branch, no
+        // location root.
+        for bad in [
+            serde_json::json!({"path": "wt-1"}),
+            serde_json::json!({"branch": "b"}),
+            serde_json::json!({"path": "../wt", "branch": "b"}),
+            serde_json::json!({"path": "wt", "branch": "a/b"}),
+            serde_json::json!({"path": "wt", "branch": "a b"}),
+            serde_json::json!({"path": "wt", "branch": ""}),
+            serde_json::json!({"path": "wt", "branch": "b", "extra": 1}),
+        ] {
+            assert!(
+                resolve_command("git-worktree-add", Some(&bad), git, &cwd, None, Some(&root))
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        assert!(resolve_command(
+            "git-worktree-add",
+            Some(&serde_json::json!({"path": "wt", "branch": "b"})),
+            git,
+            &cwd,
+            None,
+            None
+        )
+        .is_err());
+        // commit: missing/empty/overlong message.
+        assert!(resolve_command("git-commit", None, git, &cwd, None, None).is_err());
+        assert!(resolve_command(
+            "git-commit",
+            Some(&serde_json::json!({"message": ""})),
+            git,
+            &cwd,
+            None,
+            None
+        )
+        .is_err());
+        assert!(resolve_command(
+            "git-commit",
+            Some(&serde_json::json!({"message": "x".repeat(2001)})),
+            git,
+            &cwd,
+            None,
+            None
+        )
+        .is_err());
+        // cargo-test: missing/bad package.
+        assert!(resolve_command("cargo-test", None, cargo, &cwd, None, None).is_err());
+        assert!(resolve_command(
+            "cargo-test",
+            Some(&serde_json::json!({"package": "a/b"})),
+            cargo,
+            &cwd,
+            None,
+            None
+        )
+        .is_err());
+        assert!(resolve_command(
+            "cargo-test",
+            Some(&serde_json::json!({"package": ""})),
+            cargo,
+            &cwd,
+            None,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parse_test_output_sums_suites_and_hashes_failures() {
+        let tail = "running 3 tests\ntest a::one ... ok\ntest a::two ... FAILED\ntest a::three ... ok\n\nfailures:\n    a::two\n\ntest result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\nrunning 1 test\ntest b::one ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let summary = parse_test_output(tail);
+        assert_eq!(summary.passed, Some(3));
+        assert_eq!(summary.failed, Some(1));
+        assert_eq!(summary.failed_sha256.len(), 1);
+        assert_eq!(
+            summary.failed_sha256[0],
+            crate::sqlite_store::sha256_hex(b"a::two")
+        );
+        // No summary line: counts stay null, never fabricated.
+        let empty = parse_test_output("compiling foo\nerror: could not compile\n");
+        assert_eq!(empty.passed, None);
+        assert_eq!(empty.failed, None);
+        assert!(empty.failed_sha256.is_empty());
     }
 
     #[test]

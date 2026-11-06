@@ -77,6 +77,21 @@ pub fn operation_digest(
     sha256_hex(payload.as_bytes())
 }
 
+/// Digest for a Worker command (P3-C §7): the resolved argv,
+/// the working directory and the effective timeout, serialized
+/// as one JSON tuple and hashed. The loop planning branch and
+/// the run route both compute this from the resolved command,
+/// never from a client hash — so an approval for one command
+/// can never authorize a different argv, cwd or timeout. The
+/// commit message is committed by the argv hash (argv contains
+/// `-m <message>`); it appears in plaintext nowhere in the
+/// approval record, only as `message_sha256` in the commit
+/// Effect's digest inputs (§4.4).
+pub fn command_digest(argv: &[String], cwd: &str, timeout_ms: u64) -> String {
+    let payload = serde_json::to_string(&(argv, cwd, timeout_ms)).expect("command digest");
+    sha256_hex(payload.as_bytes())
+}
+
 /// Digest for a file write, computed from the normalized path, the
 /// SHA-256 of the decoded content bytes, and the write mode. The
 /// mode is part of the digest so an overwrite approval can never be

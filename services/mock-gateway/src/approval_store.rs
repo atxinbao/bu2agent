@@ -47,6 +47,13 @@ pub struct ApprovalFileRecord {
     pub effect_binding: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// P3-C (§7): the resolved Worker command this approval
+    /// authorizes (loop and digest-bound worker approvals).
+    /// `argv_sha256` commits the exact argv (the commit
+    /// message is inside it, hashed, never plaintext). None
+    /// for every other tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<crate::server::CommandSpec>,
 }
 
 /// Read every well-formed record from `path`, in file order.
@@ -129,6 +136,7 @@ mod tests {
             action_binding: None,
             effect_binding: None,
             message: None,
+            command: None,
         }
     }
 

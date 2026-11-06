@@ -5,13 +5,17 @@ import type {
   EngineeringGateway,
   Location,
   Project,
+  WorkerRun,
   Worktree,
 } from "../domain/engineering_client";
 import type { LoopGateway } from "../domain/loop_client";
 
-// P3-A 工程视图（基线 P3）：绑定与记录的只读管理面，只做 UI。
-// 本页不写任何文件、不建 Patch、不跑任何命令（子进程、git、
-// 测试一律没有，见方案 §8 排除清单）；P3-A 全程只读搜索。
+// P3-C 工程视图：绑定与记录的管理面 + Worker 运行（命令执行）。
+// P3-A 的只读约束已解除：本页可以排队执行白名单命令
+// （git-status、git-diff、git-worktree-add、git-commit、
+// cargo-test），只在临时 Worktree 上写、只在临时分支上提交，
+// 绝不推送到远端；每次执行都是一条 Worker run，有 Effect
+// 与 Evidence，可在运行列表里看状态、尾部输出与 Effect。
 // Location 只是目录绑定，没有 git 语义；Worktree 的
 // branch_label 只是展示字符串，不代表已连接 git 分支或
 // 真实工作树——文案不得让用户误以为已连接 git 仓库。
@@ -24,6 +28,17 @@ import type { LoopGateway } from "../domain/loop_client";
 
 const LOOP_MAX_CALLS = 5;
 const LOOP_BUDGET_MS = 120000;
+
+// Worker run 的终态（与网关 worker.rs 的终态词一致）：
+const RUN_TERMINAL = new Set([
+  "succeeded",
+  "failed",
+  "timeout",
+  "cancelled",
+  "lost",
+  "orphaned",
+  "superseded",
+]);
 
 interface EngineeringViewProps {
   engineering: EngineeringGateway;
@@ -65,6 +80,30 @@ export function EngineeringView({
   // code.search 入口。
   const [searchQuery, setSearchQuery] = useState("");
   const [searchWorktreeId, setSearchWorktreeId] = useState("");
+  // P3-C：Worker 运行列表与详情。
+  const [runs, setRuns] = useState<WorkerRun[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState("");
+  const [selectedRun, setSelectedRun] = useState<WorkerRun | null>(null);
+  // P3-C：运行命令表单（UI 直接点击即授权，不另行审批）。
+  const [runWorktreeId, setRunWorktreeId] = useState("");
+  const [runCommand, setRunCommand] = useState("git-status");
+  const [runPath, setRunPath] = useState("");
+  const [runBranch, setRunBranch] = useState("");
+  const [runMessage, setRunMessage] = useState("");
+  const [runPackage, setRunPackage] = useState("");
+
+  async function refreshRuns() {
+    try {
+      const nextRuns = await engineering.workerRunList();
+      setRuns(nextRuns);
+      if (selectedRunId !== "") {
+        const found = nextRuns.find((run) => run.runId === selectedRunId);
+        if (found) setSelectedRun(found);
+      }
+    } catch (e) {
+      setError(`运行列表读取失败：${errText(e)}`);
+    }
+  }
 
   async function refreshAll() {
     try {
@@ -82,12 +121,24 @@ export function EngineeringView({
     } catch (e) {
       setError(`工程记录读取失败：${errText(e)}`);
     }
+    await refreshRuns();
   }
 
   useEffect(() => {
     void refreshAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 有运行中的 run 时每 2 秒刷新一次列表（与 Tasks 页同频），
+  // 终态后停止轮询；无运行中的 run 时不轮询。
+  useEffect(() => {
+    if (!runs.some((run) => !RUN_TERMINAL.has(run.status))) return;
+    const timer = window.setInterval(() => {
+      void refreshRuns();
+    }, 2000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runs]);
 
   function projectName(projectId: string | null): string {
     if (projectId === null) return "（未关联 Project）";
@@ -259,13 +310,98 @@ export function EngineeringView({
     }
   }
 
+  // P3-C：运行一条白名单命令。UI 直接点击即授权，不另行
+  // 审批（与 /files/write 的直接点击一致）；循环提议的
+  // worker.run 仍需审批（模型不能自授权）。写命令只在
+  // 临时 Worktree 上写、只在临时分支上提交，绝不推送。
+  async function handleRunCreate() {
+    if (runWorktreeId === "") {
+      setError("运行命令需要先选一个 Worktree。");
+      return;
+    }
+    const params: Record<string, string> = {};
+    if (runCommand === "git-diff" && runPath.trim() !== "") {
+      params.path = runPath.trim();
+    }
+    if (runCommand === "git-worktree-add") {
+      if (runPath.trim() === "" || runBranch.trim() === "") {
+        setError("新建 Worktree 需要填相对目录与分支名。");
+        return;
+      }
+      params.path = runPath.trim();
+      params.branch = runBranch.trim();
+    }
+    if (runCommand === "git-commit") {
+      if (runMessage.trim() === "") {
+        setError("提交需要填提交信息。");
+        return;
+      }
+      params.message = runMessage;
+    }
+    if (runCommand === "cargo-test") {
+      if (runPackage.trim() === "") {
+        setError("运行测试需要填包名。");
+        return;
+      }
+      params.package = runPackage.trim();
+    }
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      const run = await engineering.workerRunCreate(
+        runWorktreeId,
+        runCommand,
+        params,
+      );
+      setSelectedRunId(run.runId);
+      setSelectedRun(run);
+      await refreshRuns();
+      setMessage(`已排队运行 ${run.runId}（${runCommand}）。`);
+    } catch (e) {
+      setError(`运行命令失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSelectRun(runId: string) {
+    setSelectedRunId(runId);
+    setError("");
+    try {
+      const run = await engineering.workerRunGet(runId);
+      setSelectedRun(run);
+    } catch (e) {
+      setError(`运行详情读取失败：${errText(e)}`);
+    }
+  }
+
+  async function handleCancelRun(runId: string) {
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      const run = await engineering.workerRunCancel(runId);
+      setSelectedRun(run);
+      await refreshRuns();
+      setMessage(`已取消运行 ${run.runId}。`);
+    } catch (e) {
+      setError(`取消运行失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <section>
       <h2>工程</h2>
       <p className="note">
-        绑定与记录的只读管理面：绑定仓库、建 Location / Worktree、
-        用 code.search 读代码。P3-A 全程只读，不写任何文件，不建
-        Patch，不跑任何命令。Location 只是目录绑定，没有 git 语义；
+        绑定与记录的管理面 + Worker 运行：绑定仓库、建 Location /
+        Worktree、用 code.search 读代码，还可以排队执行白名单命令
+        （git-status、git-diff、git-worktree-add、git-commit、
+        cargo-test）。写命令只在临时 Worktree 上写、只在临时分支
+        上提交，绝不推送到远端；每次执行都是一条 Worker run，有
+        Effect 与 Evidence。Location 只是目录绑定，没有 git 语义；
         Worktree 的分支标签只是展示字符串，不代表已连接 git 分支
         或真实工作树。
       </p>
@@ -522,6 +658,146 @@ export function EngineeringView({
           搜索
         </button>
       </div>
+
+      <h3>运行命令（Worker runs）</h3>
+      <p className="note">
+        排队执行一条白名单命令：git-status、git-diff 只读；git-worktree-add
+        在 Location 根下新建目录与临时分支；git-commit 在选定 Worktree
+        上提交（--no-verify）；cargo-test 离线跑指定包的测试。UI 直接
+        点击即授权，不另行审批；循环提议的 worker.run 仍需审批。
+        写命令只在临时 Worktree 上写、只在临时分支上提交，绝不推送。
+      </p>
+      <div className="row">
+        <label>
+          Worktree
+          <select
+            value={runWorktreeId}
+            onChange={(event) => setRunWorktreeId(event.target.value)}
+          >
+            <option value="">（请选择）</option>
+            {worktrees
+              .filter((worktree) => worktree.status === "active")
+              .map((worktree) => (
+                <option key={worktree.worktreeId} value={worktree.worktreeId}>
+                  {worktree.worktreeId}
+                  {worktree.directoryRelative === ""
+                    ? "（Location 根目录）"
+                    : `（${worktree.directoryRelative}）`}
+                </option>
+              ))}
+          </select>
+        </label>
+        <label>
+          命令
+          <select
+            value={runCommand}
+            onChange={(event) => setRunCommand(event.target.value)}
+          >
+            <option value="git-status">git-status</option>
+            <option value="git-diff">git-diff</option>
+            <option value="git-worktree-add">git-worktree-add</option>
+            <option value="git-commit">git-commit</option>
+            <option value="cargo-test">cargo-test</option>
+          </select>
+        </label>
+        {(runCommand === "git-diff" || runCommand === "git-worktree-add") && (
+          <label>
+            相对目录 / 路径
+            <input
+              type="text"
+              value={runPath}
+              onChange={(event) => setRunPath(event.target.value)}
+              placeholder={runCommand === "git-worktree-add" ? "如 scratch/feat-x" : "留空即整个 Worktree"}
+            />
+          </label>
+        )}
+        {runCommand === "git-worktree-add" && (
+          <label>
+            分支名
+            <input
+              type="text"
+              value={runBranch}
+              onChange={(event) => setRunBranch(event.target.value)}
+              placeholder="如 scratch/feat-x"
+            />
+          </label>
+        )}
+        {runCommand === "git-commit" && (
+          <label>
+            提交信息
+            <input
+              type="text"
+              value={runMessage}
+              onChange={(event) => setRunMessage(event.target.value)}
+              placeholder="如 WIP: scratch checkpoint"
+            />
+          </label>
+        )}
+        {runCommand === "cargo-test" && (
+          <label>
+            包名
+            <input
+              type="text"
+              value={runPackage}
+              onChange={(event) => setRunPackage(event.target.value)}
+              placeholder="如 mock-gateway"
+            />
+          </label>
+        )}
+        <button type="button" onClick={() => void handleRunCreate()} disabled={busy}>
+          排队运行
+        </button>
+      </div>
+      {runs.length === 0 && <p className="empty">暂无运行。</p>}
+      <ul>
+        {runs.map((run) => (
+          <li key={run.runId}>
+            <p>
+              {run.runId} · {run.command} · {run.status}
+              {run.exitCode !== null ? ` · 退出码 ${run.exitCode}` : ""}
+              {run.effectId !== null ? ` · Effect ${run.effectId}` : ""}
+            </p>
+            <p>
+              Worktree：{run.bindingWorktreeId ?? "（未绑定）"} · 超时：
+              {run.timeoutMs} ms
+            </p>
+            <button
+              type="button"
+              onClick={() => void handleSelectRun(run.runId)}
+              disabled={busy}
+            >
+              详情
+            </button>
+            {!RUN_TERMINAL.has(run.status) && (
+              <button
+                type="button"
+                onClick={() => void handleCancelRun(run.runId)}
+                disabled={busy}
+              >
+                取消
+              </button>
+            )}
+          </li>
+        ))}
+      </ul>
+      {selectedRun !== null && (
+        <div>
+          <h4>运行详情 {selectedRun.runId}</h4>
+          <p>
+            {selectedRun.command} · {selectedRun.status}
+            {selectedRun.exitCode !== null
+              ? ` · 退出码 ${selectedRun.exitCode}`
+              : ""}
+            {selectedRun.effectId !== null
+              ? ` · Effect ${selectedRun.effectId}`
+              : ""}
+          </p>
+          <p>cwd：{selectedRun.cwd}</p>
+          <p>argv：{selectedRun.argvJson}</p>
+          <pre>{selectedRun.tail === "" ? "（无输出）" : selectedRun.tail}</pre>
+          {selectedRun.truncated && <p className="note">输出已截断（仅保留最后 4096 字节）。</p>}
+        </div>
+      )}
     </section>
   );
 }

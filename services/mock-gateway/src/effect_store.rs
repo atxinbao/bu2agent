@@ -23,7 +23,9 @@
 //!   normalized path); task writes use (`tasks`, `execute`, task
 //!   id); connector writes use (`connectors`/`custom-connectors`/
 //!   `credentials`/`catalog`, the management operation, the
-//!   connector/account/credential/catalog id).
+//!   connector/account/credential/catalog id); Worker runs use
+//!   (`git`, worktree-add/commit/status/diff, the worktree's
+//!   Location-relative path) and (`test`, run, "cargo-test").
 //! - `input_digest`: the Q5 unified digest
 //!   (`operation_binding::operation_digest`), i.e. the same value
 //!   the approval gate consumed, for approval-bound operations.

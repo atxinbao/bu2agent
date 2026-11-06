@@ -494,11 +494,14 @@ fn millis(d: Duration) -> u64 {
 
 /// 参数只接受现有文件工具模式；写入仅覆盖，不默默接受额外字段。
 pub fn loop_tool_requires_approval(tool: &str) -> bool {
-    matches!(tool, "fs.write" | "reminders.set_completed")
+    matches!(
+        tool,
+        "fs.write" | "reminders.set_completed" | "worker.run"
+    )
 }
 
 pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, ErrorCode> {
-    if !matches!(tool, "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "code.search") {
+    if !matches!(tool, "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "code.search" | "git.read" | "worker.run") {
         return Err(ErrorCode::InvalidTool);
     }
     let object = args.as_object().ok_or(ErrorCode::InvalidArguments)?;
@@ -547,6 +550,170 @@ pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, E
             .filter(|id| !id.trim().is_empty() && id.len() <= 4096)
             .ok_or(ErrorCode::InvalidArguments)?;
         return Ok(BTreeMap::from([("id".into(), id.to_string())]));
+    }
+    if tool == "git.read" {
+        // P3-C: read-only git status/diff. operation is
+        // required (status | diff); worktree_id and path are
+        // optional (path is a worktree-relative diff path, ""
+        // = whole worktree). No Effect, no approval. The path
+        // charset is the allowlist's rule; the allowlist
+        // re-validates + containment-checks it at dispatch.
+        if object
+            .keys()
+            .any(|k| !matches!(k.as_str(), "operation" | "worktree_id" | "path"))
+        {
+            return Err(ErrorCode::InvalidArguments);
+        }
+        let operation = object
+            .get("operation")
+            .and_then(Value::as_str)
+            .filter(|op| matches!(*op, "status" | "diff"))
+            .ok_or(ErrorCode::InvalidArguments)?;
+        let worktree_id = match object.get("worktree_id") {
+            None => String::new(),
+            Some(Value::String(id)) if !id.trim().is_empty() && id.len() <= 4096 => {
+                id.to_string()
+            }
+            Some(_) => return Err(ErrorCode::InvalidArguments),
+        };
+        let path = match object.get("path") {
+            None => String::new(),
+            Some(Value::String(p)) if p.is_empty() => String::new(),
+            Some(Value::String(p)) => {
+                crate::worker::validate_diff_path(p)
+                    .map_err(|_| ErrorCode::InvalidArguments)?;
+                p.to_string()
+            }
+            Some(_) => return Err(ErrorCode::InvalidArguments),
+        };
+        return Ok(BTreeMap::from([
+            ("operation".into(), operation.to_string()),
+            ("worktree_id".into(), worktree_id),
+            ("path".into(), path),
+        ]));
+    }
+    if tool == "worker.run" {
+        // P3-C: enqueue a Worker command (git-status /
+        // git-diff / git-worktree-add / git-commit /
+        // cargo-test). command + worktree_id are required;
+        // timeout_ms is optional (1..=3600000); the
+        // template's params are flat string keys (path,
+        // branch, message, package). The digest that binds
+        // the approval is the command digest, computed at
+        // planning time (resume()); the proposal-time digest
+        // (args_digest) commits only the normalized args.
+        if object.keys().any(|k| {
+            !matches!(
+                k.as_str(),
+                "command"
+                    | "worktree_id"
+                    | "timeout_ms"
+                    | "path"
+                    | "branch"
+                    | "message"
+                    | "package"
+            )
+        }) {
+            return Err(ErrorCode::InvalidArguments);
+        }
+        let command = object
+            .get("command")
+            .and_then(Value::as_str)
+            .filter(|c| {
+                matches!(
+                    *c,
+                    "git-status"
+                        | "git-diff"
+                        | "git-worktree-add"
+                        | "git-commit"
+                        | "cargo-test"
+                )
+            })
+            .ok_or(ErrorCode::InvalidArguments)?;
+        let worktree_id = object
+            .get("worktree_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty() && id.len() <= 4096)
+            .ok_or(ErrorCode::InvalidArguments)?;
+        let timeout_ms = match object.get("timeout_ms") {
+            None => None,
+            Some(Value::Number(n)) => {
+                let v = n.as_u64().ok_or(ErrorCode::InvalidArguments)?;
+                if v == 0 || v > crate::worker::WORKER_MAX_TIMEOUT_MS {
+                    return Err(ErrorCode::InvalidArguments);
+                }
+                Some(v.to_string())
+            }
+            Some(_) => return Err(ErrorCode::InvalidArguments),
+        };
+        // No stray keys for the template (a path on a commit,
+        // a branch on a test, ...).
+        let allowed: &[&str] = match command {
+            "git-diff" => &["path"],
+            "git-worktree-add" => &["path", "branch"],
+            "git-commit" => &["message"],
+            "cargo-test" => &["package"],
+            _ => &[],
+        };
+        if object.keys().any(|k| {
+            matches!(k.as_str(), "path" | "branch" | "message" | "package")
+                && !allowed.contains(&k.as_str())
+        }) {
+            return Err(ErrorCode::InvalidArguments);
+        }
+        let mut out = BTreeMap::from([
+            ("command".into(), command.to_string()),
+            ("worktree_id".into(), worktree_id.to_string()),
+        ]);
+        if let Some(t) = timeout_ms {
+            out.insert("timeout_ms".into(), t);
+        }
+        // Per-template params, by shape here; the allowlist
+        // re-validates (charset) + containment-checks them.
+        match command {
+            "git-diff" => {
+                if let Some(Value::String(p)) = object.get("path") {
+                    if !p.is_empty() {
+                        crate::worker::validate_diff_path(p)
+                            .map_err(|_| ErrorCode::InvalidArguments)?;
+                        out.insert("path".into(), p.clone());
+                    }
+                }
+            }
+            "git-worktree-add" => {
+                let path = object
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or(ErrorCode::InvalidArguments)?;
+                crate::worker::validate_diff_path(path)
+                    .map_err(|_| ErrorCode::InvalidArguments)?;
+                let branch = object
+                    .get("branch")
+                    .and_then(Value::as_str)
+                    .filter(|b| !b.is_empty() && b.len() <= 200)
+                    .ok_or(ErrorCode::InvalidArguments)?;
+                out.insert("path".into(), path.to_string());
+                out.insert("branch".into(), branch.to_string());
+            }
+            "git-commit" => {
+                let message = object
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .filter(|m| !m.trim().is_empty() && m.chars().count() <= 2000)
+                    .ok_or(ErrorCode::InvalidArguments)?;
+                out.insert("message".into(), message.to_string());
+            }
+            "cargo-test" => {
+                let package = object
+                    .get("package")
+                    .and_then(Value::as_str)
+                    .filter(|p| !p.is_empty() && p.len() <= 200)
+                    .ok_or(ErrorCode::InvalidArguments)?;
+                out.insert("package".into(), package.to_string());
+            }
+            _ => {}
+        }
+        return Ok(out);
     }
     if tool == "code.search" {
         // P3-A: read-only content search. query is required and
@@ -684,6 +851,15 @@ pub fn args_digest(tool: &str, args: &BTreeMap<String, String>) -> String {
             ("path".to_string(), args.get("path").cloned().unwrap_or_default()),
         ]);
         return crate::operation_binding::operation_digest("fs.write", Some("overwrite"), &params);
+    }
+    if tool == "worker.run" {
+        // P3-C: the proposal-time digest commits the normalized
+        // args only (command, worktree, params, timeout). The
+        // command digest — argv + cwd + timeout, which needs
+        // AppState to resolve the worktree + binary — overwrites
+        // this at planning time in resume(), before the approval
+        // is requested. Duplicate detection uses this digest.
+        return crate::operation_binding::operation_digest(tool, None, args);
     }
     let mode = if tool == "reminders.set_completed" {
         "set_completed"
@@ -1062,6 +1238,36 @@ impl LoopEngine {
                         // planning call is added.
                         let planned_args =
                             live.arguments[index].clone().expect("validated arguments");
+                        // P3-C: worker.run's approval digest is
+                        // the command digest (argv + cwd +
+                        // timeout), computed here — complete_work
+                        // has no AppState, so the proposal-time
+                        // digest is only the normalized-args
+                        // digest. A resolution failure (unknown
+                        // worktree, unallowlisted command,
+                        // branch already exists, ...) fails the
+                        // call: the model proposed a command that
+                        // cannot run as stated.
+                        let mut command_spec = None;
+                        if live.record.calls[index].tool == "worker.run" {
+                            match crate::server::worker_command_digest(&app, &planned_args) {
+                                Ok((digest, spec)) => {
+                                    live.record.calls[index].args_sha256 = digest;
+                                    command_spec = Some(spec);
+                                }
+                                Err(_) => {
+                                    live.deliver(
+                                        index,
+                                        ToolMessage::from_outcome(ToolOutcome::failed(
+                                            ErrorCode::InvalidArguments,
+                                        )),
+                                        None,
+                                    );
+                                    self.save(live)?;
+                                    return Ok(live.view());
+                                }
+                            }
+                        }
                         let call = &mut live.record.calls[index];
                         let binding = ApprovalBinding {
                             loop_id: live.record.loop_id.clone(),
@@ -1069,8 +1275,11 @@ impl LoopEngine {
                             tool: call.tool.clone(),
                             args_sha256: call.args_sha256.clone(),
                         };
-                        let approval_id = app
-                            .request_loop_approval(binding.clone(), call.args_sha256.clone())?;
+                        let approval_id = app.request_loop_approval(
+                            binding.clone(),
+                            call.args_sha256.clone(),
+                            command_spec,
+                        )?;
                         crate::server::plan_loop_effect(
                             &app,
                             &approval_id,

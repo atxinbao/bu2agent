@@ -151,6 +151,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     action_binding TEXT,
     effect_binding TEXT,
     message TEXT,
+    command_json TEXT,
     origin_device_id TEXT NOT NULL,
     schema_version INTEGER NOT NULL,
     created_ms INTEGER,
@@ -329,6 +330,7 @@ CREATE TABLE IF NOT EXISTS worker_runs (
     tail TEXT NOT NULL,
     truncated INTEGER NOT NULL,
     effect_id TEXT,
+    approval_id TEXT,
     binding_location_id TEXT,
     binding_worktree_id TEXT,
     binding_root_digest TEXT,
@@ -338,6 +340,7 @@ CREATE TABLE IF NOT EXISTS worker_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_worker_runs_execution ON worker_runs(execution_id);
 CREATE INDEX IF NOT EXISTS idx_worker_runs_status ON worker_runs(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_runs_approval ON worker_runs(approval_id);
 ";
 
 fn err(e: rusqlite::Error) -> String {
@@ -450,6 +453,19 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     ] {
         backfill_column(&tx, "workspace_snapshots", column)?;
     }
+    // P3-C additive column + index: databases migrated by
+    // the E2 slice have no worker_runs.approval_id. Nullable,
+    // idempotent, schema version stays 4 (column backfill,
+    // not a v5 migration). The UNIQUE index enforces the
+    // single-use rule for loop-bound approvals atomically:
+    // SQLite UNIQUE treats NULLs as distinct, so runs without
+    // an approval are unaffected.
+    backfill_column(&tx, "worker_runs", "approval_id")?;
+    ensure_unique_index(&tx, "worker_runs", "idx_worker_runs_approval", "approval_id")?;
+    // P3-C: the approval CommandSpec (JSON, like binding_json).
+    // Databases migrated before P3-C have no approvals
+    // .command_json; same backfill precedent, version stays 4.
+    backfill_column(&tx, "approvals", "command_json")?;
     tx.commit().map_err(err)?;
     Ok(())
 }
@@ -497,6 +513,35 @@ fn backfill_column_typed(
         )
         .map_err(err)?;
     }
+    Ok(())
+}
+
+/// Create a UNIQUE index when the table exists and the index
+/// is missing. Idempotent; a missing table is a no-op (same
+/// partial-fixture rule as `backfill_column`: CREATE INDEX on
+/// a missing table would fail the whole migration).
+fn ensure_unique_index(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    index: &str,
+    column: &str,
+) -> Result<(), String> {
+    let table_exists: bool = tx
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(err)
+        .map(|count| count > 0)?;
+    if !table_exists {
+        return Ok(());
+    }
+    tx.execute(
+        &format!("CREATE UNIQUE INDEX IF NOT EXISTS {index} ON {table}({column})"),
+        [],
+    )
+    .map_err(err)?;
     Ok(())
 }
 
@@ -827,15 +872,24 @@ fn upsert_effect_tx(
     )?;
     let source = format!("event-{event_id}");
     match record.status.as_str() {
-        "failed" => insert_inbox(
-            tx,
-            "failed",
-            record.execution_id.as_deref(),
-            Some(&record.effect_id),
-            None,
-            &source,
-            now,
-        )?,
+        "failed" => {
+            // P3-C (§5.4): a failed test run opens no Inbox
+            // row — a test failure is a known result (the
+            // suite's verdict), not something to review.
+            // Every other failed Effect opens a `failed` row
+            // as before.
+            if !(record.capability == "test" && record.operation == "run") {
+                insert_inbox(
+                    tx,
+                    "failed",
+                    record.execution_id.as_deref(),
+                    Some(&record.effect_id),
+                    None,
+                    &source,
+                    now,
+                )?;
+            }
+        }
         "unknown" => insert_inbox(
             tx,
             "unknown_requires_reconciliation",
@@ -922,14 +976,19 @@ fn upsert_approval_tx(
         Some(b) => Some(serde_json::to_string(b).map_err(|e| format!("sqlite: cannot encode binding: {e}"))?),
         None => None,
     };
+    let command_json = match &record.command {
+        Some(c) => Some(serde_json::to_string(c).map_err(|e| format!("sqlite: cannot encode command: {e}"))?),
+        None => None,
+    };
     tx.execute(
-        "INSERT INTO approvals (seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, origin_device_id, schema_version, created_ms, updated_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "INSERT INTO approvals (seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json, origin_device_id, schema_version, created_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(approval_id) DO UPDATE SET
            seq = excluded.seq, tool = excluded.tool, status = excluded.status,
            binding_json = excluded.binding_json, consumed = excluded.consumed,
            operation_digest = excluded.operation_digest, action_binding = excluded.action_binding,
            effect_binding = excluded.effect_binding, message = excluded.message,
+           command_json = excluded.command_json,
            origin_device_id = excluded.origin_device_id, schema_version = excluded.schema_version,
            created_ms = excluded.created_ms, updated_at_ms = excluded.updated_at_ms",
         params![
@@ -943,6 +1002,7 @@ fn upsert_approval_tx(
             record.action_binding,
             record.effect_binding,
             record.message,
+            command_json,
             // Approvals predate the P0-A origin field in the
             // file record; new server rows carry "unknown" here
             // only when the caller did not stamp one. The file
@@ -1102,6 +1162,11 @@ fn approval_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalFileRe
         Some(json) => Some(serde_json::from_str(&json).map_err(|_| rusqlite::Error::InvalidQuery)?),
         None => None,
     };
+    let command_json: Option<String> = row.get(10)?;
+    let command = match command_json {
+        Some(json) => Some(serde_json::from_str(&json).map_err(|_| rusqlite::Error::InvalidQuery)?),
+        None => None,
+    };
     Ok(ApprovalFileRecord {
         tool_call_id: row.get(1)?,
         tool: row.get(2)?,
@@ -1112,12 +1177,13 @@ fn approval_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalFileRe
         action_binding: row.get(7)?,
         effect_binding: row.get(8)?,
         message: row.get(9)?,
+        command,
     })
 }
 
 pub fn list_approvals(conn: &Connection) -> Result<Vec<ApprovalFileRecord>, String> {
     let mut stmt = conn
-        .prepare("SELECT seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message FROM approvals ORDER BY seq ASC, approval_id ASC")
+        .prepare("SELECT seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json FROM approvals ORDER BY seq ASC, approval_id ASC")
         .map_err(err)?;
     let rows = stmt
         .query_map([], approval_from_row)
@@ -1129,7 +1195,7 @@ pub fn list_approvals(conn: &Connection) -> Result<Vec<ApprovalFileRecord>, Stri
 
 pub fn get_approval(conn: &Connection, approval_id: &str) -> Result<Option<ApprovalFileRecord>, String> {
     conn.query_row(
-        "SELECT seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message FROM approvals WHERE approval_id = ?1",
+        "SELECT seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json FROM approvals WHERE approval_id = ?1",
         params![approval_id],
         approval_from_row,
     )
@@ -2246,6 +2312,24 @@ pub fn latest_evidence_for_effect(
     .map_err(err)
 }
 
+/// Latest Evidence for an effect with a given source (P3-C:
+/// the test verify path reads the source-`test` row; the
+/// write-time baseline stays source `write`). Same
+/// newest-first rule as the other latest-* helpers.
+pub fn latest_evidence_for_effect_by_source(
+    conn: &Connection,
+    effect_id: &str,
+    source: &str,
+) -> Result<Option<EvidenceRow>, String> {
+    conn.query_row(
+        "SELECT seq, evidence_id, effect_id, execution_id, source, verdict, reason, observed_json, checked_ms, origin_device_id, schema_version, created_ms FROM evidence WHERE effect_id = ?1 AND source = ?2 ORDER BY seq DESC LIMIT 1",
+        params![effect_id, source],
+        evidence_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
 /// Latest write-time Evidence (source `write`) for an effect.
 /// Verify compares against this baseline, never against a later
 /// verify/reconcile row: a drifted file verified once as
@@ -3319,32 +3403,32 @@ pub fn recovery_scan(conn: &mut Connection, origin_device_id: &str) -> Result<St
                 }
             }
         }
-        let digest = sha256_hex(
-            canonical_json(&serde_json::json!({
-                "argv": run.argv_json,
-                "command": run.command,
-                "cwd": run.cwd,
-                "run_id": run.run_id,
-            }))
-            .as_bytes(),
-        );
+        // P3-C: the unknown Effect uses the template's
+        // vocabulary (the driver's `unknown_effect_identity`,
+        // with no Location root — SQLite has no Location
+        // records, so a worktree-add scope falls back to the
+        // absolute path). The digest is the run-specific
+        // formula, shared with the driver.
+        let (capability, operation, scope) =
+            crate::worker::unknown_effect_identity(run, None);
+        let digest = crate::worker::run_digest(run);
         let idempotency_key = run.execution_id.as_ref().map(|execution_id| {
             crate::effect_store::idempotency_key(
                 execution_id,
-                "git",
-                &run.command,
-                &run.cwd,
+                &capability,
+                &operation,
+                &scope,
                 &digest,
             )
         });
         let effect = EffectFileRecord {
             effect_id: next_prefixed_id(&tx, "effects", "effect_id", "effect-")?,
             execution_id: run.execution_id.clone(),
-            capability: "git".to_string(),
-            operation: run.command.clone(),
-            scope: run.cwd.clone(),
+            capability,
+            operation,
+            scope,
             input_digest: Some(digest),
-            approval_id: None,
+            approval_id: run.approval_id.clone(),
             status: "unknown".to_string(),
             idempotency_key,
             origin_device_id: origin_device_id.to_string(),
@@ -3715,7 +3799,7 @@ pub fn transition_execution(
 
 pub use crate::worker::WorkerRunRow;
 
-const WORKER_RUN_COLS: &str = "run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version";
+const WORKER_RUN_COLS: &str = "run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, approval_id";
 
 fn worker_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRunRow> {
     Ok(WorkerRunRow {
@@ -3739,6 +3823,7 @@ fn worker_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRunRow
         binding_worktree_id: row.get(17)?,
         binding_root_digest: row.get(18)?,
         schema_version: row.get(19)?,
+        approval_id: row.get(20)?,
     })
 }
 
@@ -3765,24 +3850,75 @@ pub fn create_worker_run(
             return Err("execution_has_running_worker".to_string());
         }
     }
+    // P3-C: a presented approval authorizes at most one run.
+    // The UNIQUE index is the atomic guard; this check in the
+    // same transaction turns a concurrent replay into a clean
+    // `approval_already_used` instead of a constraint error.
+    if let Some(approval_id) = &row.approval_id {
+        let used: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM worker_runs WHERE approval_id = ?1",
+                params![approval_id],
+                |r| r.get(0),
+            )
+            .map_err(err)?;
+        if used > 0 {
+            return Err("approval_already_used".to_string());
+        }
+    }
     let mut inserted = row.clone();
     inserted.run_id = next_prefixed_id(&tx, "worker_runs", "run_id", "run-")?;
     let seq = tx_seq(&tx, "worker_runs", &inserted.run_id)?;
     let now = now_ms() as i64;
     tx.execute(
-        "INSERT INTO worker_runs (seq, run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, created_ms, updated_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22)",
-        params![seq, inserted.run_id, inserted.execution_id, inserted.assignment_id, inserted.worker_session_id, inserted.command, inserted.argv_json, inserted.cwd, inserted.timeout_ms, inserted.status, inserted.exit_code, inserted.pid, inserted.started_ms, inserted.finished_ms, inserted.tail, inserted.truncated as i64, inserted.effect_id, inserted.binding_location_id, inserted.binding_worktree_id, inserted.binding_root_digest, inserted.schema_version, now],
+        "INSERT INTO worker_runs (seq, run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, created_ms, updated_at_ms, approval_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22, ?23)",
+        params![seq, inserted.run_id, inserted.execution_id, inserted.assignment_id, inserted.worker_session_id, inserted.command, inserted.argv_json, inserted.cwd, inserted.timeout_ms, inserted.status, inserted.exit_code, inserted.pid, inserted.started_ms, inserted.finished_ms, inserted.tail, inserted.truncated as i64, inserted.effect_id, inserted.binding_location_id, inserted.binding_worktree_id, inserted.binding_root_digest, inserted.schema_version, now, inserted.approval_id],
     )
     .map_err(err)?;
     tx.commit().map_err(err)?;
     Ok(inserted)
 }
 
+/// Whether any run row already carries an approval id
+/// (P3-C: the route's fast-path replay check for loop-bound
+/// approvals, before an Execution is created; the atomic
+/// guard is the UNIQUE index, checked in `create_worker_run`).
+pub fn worker_run_exists_for_approval(
+    conn: &Connection,
+    approval_id: &str,
+) -> Result<bool, String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM worker_runs WHERE approval_id = ?1",
+            params![approval_id],
+            |row| row.get(0),
+        )
+        .map_err(err)?;
+    Ok(count > 0)
+}
+
 pub fn get_worker_run(conn: &Connection, run_id: &str) -> Result<Option<WorkerRunRow>, String> {
     conn.query_row(
         &format!("SELECT {WORKER_RUN_COLS} FROM worker_runs WHERE run_id = ?1"),
         params![run_id],
+        worker_run_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// The run that produced an Effect, by the run row's
+/// `effect_id` (P3-C: the Evidence observe path re-derives
+/// the run's argv/cwd from it). None for Effects no run
+/// produced (legacy / hand-made rows).
+pub fn get_worker_run_by_effect_id(
+    conn: &Connection,
+    effect_id: &str,
+) -> Result<Option<WorkerRunRow>, String> {
+    conn.query_row(
+        &format!("SELECT {WORKER_RUN_COLS} FROM worker_runs WHERE effect_id = ?1"),
+        params![effect_id],
         worker_run_from_row,
     )
     .optional()
@@ -4012,6 +4148,7 @@ mod tests {
             action_binding: None,
             effect_binding: Some("effect-1".to_string()),
             message: Some("please write".to_string()),
+            command: None,
         }
     }
 

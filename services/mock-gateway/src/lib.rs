@@ -107,8 +107,8 @@ pub fn start_stream(stream_id: &str, turn_id: &str, text: &str) -> Vec<Subscript
 /// (never a real tool). `None` means the tool is unknown.
 pub fn tool_requires_approval(name: &str) -> Option<bool> {
     match name {
-        "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" | "email.threads" | "email.message" | "code.search" => Some(false),
-        "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "fs.export" | "notes.create" | "mail.send" | "reminders.set_completed" => Some(true),
+        "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" | "email.threads" | "email.message" | "code.search" | "git.read" => Some(false),
+        "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "fs.export" | "notes.create" | "mail.send" | "reminders.set_completed" | "worker.run" => Some(true),
         _ => None,
     }
 }

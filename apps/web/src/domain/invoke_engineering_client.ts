@@ -12,6 +12,7 @@ import type {
   PatchDetail,
   PatchFile,
   Project,
+  WorkerRun,
   Worktree,
 } from "./engineering_client";
 
@@ -174,6 +175,59 @@ function toWorktree(server: ServerWorktree): Worktree {
     branchLabel: server.branch_label,
     projectId: server.project_id ?? null,
     status: server.status,
+  };
+}
+
+// The Rust WorkerRun DTO serializes snake_case (C1:
+// field-identical with the HTTP routes); the domain shape
+// is camelCase, so the mapping lives here, not in the view.
+interface ServerWorkerRun {
+  run_id: string;
+  execution_id?: string | null;
+  assignment_id?: string | null;
+  worker_session_id?: string | null;
+  command: string;
+  argv_json: string;
+  cwd: string;
+  timeout_ms: number;
+  status: string;
+  exit_code?: number | null;
+  pid?: number | null;
+  started_ms?: number | null;
+  finished_ms?: number | null;
+  tail: string;
+  truncated: boolean;
+  effect_id?: string | null;
+  approval_id?: string | null;
+  binding_location_id?: string | null;
+  binding_worktree_id?: string | null;
+  binding_root_digest?: string | null;
+  schema_version: number;
+}
+
+function toWorkerRun(server: ServerWorkerRun): WorkerRun {
+  return {
+    runId: server.run_id,
+    executionId: server.execution_id ?? null,
+    assignmentId: server.assignment_id ?? null,
+    workerSessionId: server.worker_session_id ?? null,
+    command: server.command,
+    argvJson: server.argv_json,
+    cwd: server.cwd,
+    timeoutMs: server.timeout_ms,
+    status: server.status,
+    exitCode: server.exit_code ?? null,
+    pid: server.pid ?? null,
+    startedMs: server.started_ms ?? null,
+    finishedMs: server.finished_ms ?? null,
+    tail: server.tail,
+    truncated: server.truncated,
+    effectId: server.effect_id ?? null,
+    approvalId: server.approval_id ?? null,
+    bindingLocationId: server.binding_location_id ?? null,
+    bindingWorktreeId: server.binding_worktree_id ?? null,
+    bindingRootDigest: server.binding_root_digest ?? null,
+    schemaVersion: server.schema_version,
   };
 }
 
@@ -343,5 +397,47 @@ export class InvokeEngineeringClient implements EngineeringGateway {
       patch_id: patchId,
     });
     return toPatchDetail(detail);
+  }
+
+  async workerRunCreate(
+    worktreeId: string,
+    command: string,
+    params?: Record<string, string> | null,
+    timeoutMs?: number | null,
+    approvalId?: string | null,
+  ): Promise<WorkerRun> {
+    const run = await invoke<ServerWorkerRun>("engineering_worker_run_create", {
+      worktree_id: worktreeId,
+      command,
+      params: params ?? null,
+      timeout_ms: timeoutMs ?? null,
+      approval_id: approvalId ?? null,
+    });
+    return toWorkerRun(run);
+  }
+
+  async workerRunList(
+    executionId?: string | null,
+    status?: string | null,
+  ): Promise<WorkerRun[]> {
+    const runs = await invoke<ServerWorkerRun[]>("engineering_worker_run_list", {
+      execution_id: executionId ?? null,
+      status: status ?? null,
+    });
+    return runs.map(toWorkerRun);
+  }
+
+  async workerRunGet(runId: string): Promise<WorkerRun> {
+    const run = await invoke<ServerWorkerRun>("engineering_worker_run_get", {
+      run_id: runId,
+    });
+    return toWorkerRun(run);
+  }
+
+  async workerRunCancel(runId: string): Promise<WorkerRun> {
+    const run = await invoke<ServerWorkerRun>("engineering_worker_run_cancel", {
+      run_id: runId,
+    });
+    return toWorkerRun(run);
   }
 }

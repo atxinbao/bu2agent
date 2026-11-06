@@ -114,6 +114,50 @@ pub struct Worktree {
     pub updated_ms: u64,
 }
 
+/// One Worker run row (P3-C, plan §3.6). Field names are
+/// the gateway's snake_case JSON names, verbatim. The run
+/// is the unit of Worker execution: one allowlisted command
+/// in one worktree, driven by the slice's Worker driver.
+/// `tail` is the last 4096 bytes of combined output;
+/// `effect_id` is set at completion (the driver records the
+/// completion Effect then).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerRun {
+    pub run_id: String,
+    #[serde(default)]
+    pub execution_id: Option<String>,
+    #[serde(default)]
+    pub assignment_id: Option<String>,
+    #[serde(default)]
+    pub worker_session_id: Option<String>,
+    pub command: String,
+    pub argv_json: String,
+    pub cwd: String,
+    pub timeout_ms: i64,
+    pub status: String,
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    #[serde(default)]
+    pub pid: Option<i64>,
+    #[serde(default)]
+    pub started_ms: Option<i64>,
+    #[serde(default)]
+    pub finished_ms: Option<i64>,
+    pub tail: String,
+    pub truncated: bool,
+    #[serde(default)]
+    pub effect_id: Option<String>,
+    #[serde(default)]
+    pub approval_id: Option<String>,
+    #[serde(default)]
+    pub binding_location_id: Option<String>,
+    #[serde(default)]
+    pub binding_worktree_id: Option<String>,
+    #[serde(default)]
+    pub binding_root_digest: Option<String>,
+    pub schema_version: i64,
+}
+
 /// `base_url` must look like `http://127.0.0.1:3001`.
 #[derive(Debug, Clone)]
 pub struct EngineeringClient {
@@ -269,5 +313,61 @@ impl EngineeringClient {
     pub fn reject_patch(&self, patch_id: &str) -> Result<PatchDetail> {
         self.http
             .post_json(&format!("/patches/{patch_id}/reject"), "{}")
+    }
+
+    /// P3-C: enqueue a Worker run. `params` is the template's
+    /// raw JSON object (path/branch/message/package); the
+    /// gateway resolves the worktree + binary + allowlist and
+    /// computes the digest server-side. `approval_id` is the
+    /// authorizing approval, when one was presented (a UI
+    /// direct click carries none — the click is the
+    /// authorization; a loop `worker.run` carries its
+    /// approval, already consumed by the loop).
+    pub fn create_worker_run(
+        &self,
+        worktree_id: &str,
+        command: &str,
+        params: Option<serde_json::Value>,
+        timeout_ms: Option<u64>,
+        approval_id: Option<&str>,
+    ) -> Result<WorkerRun> {
+        let body = serde_json::to_string(&serde_json::json!({
+            "worktree_id": worktree_id,
+            "command": command,
+            "params": params,
+            "timeout_ms": timeout_ms,
+            "approval_id": approval_id,
+        }))
+        .map_err(|_| transport_error("cannot encode worker run create request"))?;
+        self.http.post_json("/worker/runs", &body)
+    }
+
+    pub fn list_worker_runs(
+        &self,
+        execution_id: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Vec<WorkerRun>> {
+        let mut path = "/worker/runs/list".to_string();
+        let mut first = true;
+        for (key, value) in [
+            ("execution_id", execution_id),
+            ("status", status),
+        ] {
+            if let Some(value) = value.filter(|v| !v.is_empty()) {
+                path.push_str(if first { "?" } else { "&" });
+                path.push_str(&format!("{key}={value}"));
+                first = false;
+            }
+        }
+        self.http.get_json(&path)
+    }
+
+    pub fn get_worker_run(&self, run_id: &str) -> Result<WorkerRun> {
+        self.http.get_json(&format!("/worker/runs/{run_id}"))
+    }
+
+    pub fn cancel_worker_run(&self, run_id: &str) -> Result<WorkerRun> {
+        self.http
+            .post_json(&format!("/worker/runs/{run_id}/cancel"), "{}")
     }
 }

@@ -91,6 +91,87 @@ export interface PatchApplyResult {
   replayed: boolean;
 }
 
+// One Worker run row (P3-C, plan §3.6). One allowlisted
+// command in one worktree, driven by the slice's Worker
+// driver. `tail` is the last 4096 bytes of combined output;
+// `effectId` is set at completion (the driver records the
+// completion Effect then). Status words are the gateway's
+// stored words, verbatim: queued | running | succeeded |
+// failed | timeout | cancelled | lost | orphaned | superseded.
+export interface WorkerRun {
+  runId: string;
+  executionId: string | null;
+  assignmentId: string | null;
+  workerSessionId: string | null;
+  command: string;
+  argvJson: string;
+  cwd: string;
+  timeoutMs: number;
+  status: string;
+  exitCode: number | null;
+  pid: number | null;
+  startedMs: number | null;
+  finishedMs: number | null;
+  tail: string;
+  truncated: boolean;
+  effectId: string | null;
+  approvalId: string | null;
+  bindingLocationId: string | null;
+  bindingWorktreeId: string | null;
+  bindingRootDigest: string | null;
+  schemaVersion: number;
+}
+
+interface ServerWorkerRun {
+  run_id: string;
+  execution_id?: string | null;
+  assignment_id?: string | null;
+  worker_session_id?: string | null;
+  command: string;
+  argv_json: string;
+  cwd: string;
+  timeout_ms: number;
+  status: string;
+  exit_code?: number | null;
+  pid?: number | null;
+  started_ms?: number | null;
+  finished_ms?: number | null;
+  tail: string;
+  truncated: boolean;
+  effect_id?: string | null;
+  approval_id?: string | null;
+  binding_location_id?: string | null;
+  binding_worktree_id?: string | null;
+  binding_root_digest?: string | null;
+  schema_version: number;
+}
+
+function toWorkerRun(server: ServerWorkerRun): WorkerRun {
+  return {
+    runId: server.run_id,
+    executionId: server.execution_id ?? null,
+    assignmentId: server.assignment_id ?? null,
+    workerSessionId: server.worker_session_id ?? null,
+    command: server.command,
+    argvJson: server.argv_json,
+    cwd: server.cwd,
+    timeoutMs: server.timeout_ms,
+    status: server.status,
+    exitCode: server.exit_code ?? null,
+    pid: server.pid ?? null,
+    startedMs: server.started_ms ?? null,
+    finishedMs: server.finished_ms ?? null,
+    tail: server.tail,
+    truncated: server.truncated,
+    effectId: server.effect_id ?? null,
+    approvalId: server.approval_id ?? null,
+    bindingLocationId: server.binding_location_id ?? null,
+    bindingWorktreeId: server.binding_worktree_id ?? null,
+    bindingRootDigest: server.binding_root_digest ?? null,
+    schemaVersion: server.schema_version,
+  };
+}
+
 interface ServerPatch {
   patch_id: string;
   execution_id: string;
@@ -295,6 +376,24 @@ export interface EngineeringGateway {
     approvalId: string,
   ): Promise<PatchApplyResult>;
   patchReject(patchId: string): Promise<PatchDetail>;
+  // Worker runs (P3-C): enqueue one allowlisted command in
+  // a worktree, list (optional execution/status filters),
+  // get one run, cancel a queued/running run. A UI direct
+  // click carries no approvalId — the click is the
+  // authorization; a loop `worker.run` carries its approval.
+  workerRunCreate(
+    worktreeId: string,
+    command: string,
+    params?: Record<string, string> | null,
+    timeoutMs?: number | null,
+    approvalId?: string | null,
+  ): Promise<WorkerRun>;
+  workerRunList(
+    executionId?: string | null,
+    status?: string | null,
+  ): Promise<WorkerRun[]>;
+  workerRunGet(runId: string): Promise<WorkerRun>;
+  workerRunCancel(runId: string): Promise<WorkerRun>;
 }
 
 export class EngineeringClient implements EngineeringGateway {
@@ -487,5 +586,51 @@ export class EngineeringClient implements EngineeringGateway {
       {},
     );
     return toPatchDetail(detail);
+  }
+
+  async workerRunCreate(
+    worktreeId: string,
+    command: string,
+    params?: Record<string, string> | null,
+    timeoutMs?: number | null,
+    approvalId?: string | null,
+  ): Promise<WorkerRun> {
+    const run = await this.post<ServerWorkerRun>("/worker/runs", {
+      worktree_id: worktreeId,
+      command,
+      params: params ?? null,
+      timeout_ms: timeoutMs ?? null,
+      approval_id: approvalId ?? null,
+    });
+    return toWorkerRun(run);
+  }
+
+  async workerRunList(
+    executionId?: string | null,
+    status?: string | null,
+  ): Promise<WorkerRun[]> {
+    const query = new URLSearchParams();
+    if (executionId) query.set("execution_id", executionId);
+    if (status) query.set("status", status);
+    const suffix = query.toString();
+    const runs = await this.request<ServerWorkerRun[]>(
+      suffix === "" ? "/worker/runs/list" : `/worker/runs/list?${suffix}`,
+    );
+    return runs.map(toWorkerRun);
+  }
+
+  async workerRunGet(runId: string): Promise<WorkerRun> {
+    const run = await this.request<ServerWorkerRun>(
+      `/worker/runs/${encodeURIComponent(runId)}`,
+    );
+    return toWorkerRun(run);
+  }
+
+  async workerRunCancel(runId: string): Promise<WorkerRun> {
+    const run = await this.post<ServerWorkerRun>(
+      `/worker/runs/${encodeURIComponent(runId)}/cancel`,
+      {},
+    );
+    return toWorkerRun(run);
   }
 }

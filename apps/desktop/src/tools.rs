@@ -50,6 +50,10 @@ impl ToolRegistry {
         registry.tools.push(ToolSpec { name: "email.message".to_string(), requires_approval: false, capability: "mail".to_string() });
         // P3-A: read-only code search, no approval.
         registry.tools.push(ToolSpec { name: "code.search".to_string(), requires_approval: false, capability: "code".to_string() });
+        // P3-C: read-only git status/diff, no approval;
+        // enqueue-only Worker commands, approval-gated.
+        registry.tools.push(ToolSpec { name: "git.read".to_string(), requires_approval: false, capability: "git".to_string() });
+        registry.tools.push(ToolSpec { name: "worker.run".to_string(), requires_approval: true, capability: "worker".to_string() });
         registry
     }
 

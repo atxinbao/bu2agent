@@ -42,7 +42,7 @@ use agent_desktop::chat_records_client::{
 };
 use agent_desktop::node_client::{Node, NodeClient};
 use agent_desktop::engineering_client::{
-    EngineeringClient, Location, Patch, PatchApplyResult, PatchDetail, Project,
+    EngineeringClient, Location, Patch, PatchApplyResult, PatchDetail, Project, WorkerRun,
     Worktree, WorkspaceBinding,
 };
 use tauri::AppHandle;
@@ -1227,6 +1227,55 @@ pub fn engineering_patch_apply(
 #[tauri::command(rename_all = "snake_case")]
 pub fn engineering_patch_reject(patch_id: String) -> Result<PatchDetail, String> {
     engineering_client()?.reject_patch(&patch_id).map_err(|e| err_string(&e))
+}
+
+/// P3-C: Worker run commands. `params` is the template's
+/// raw JSON object (path/branch/message/package); the
+/// gateway resolves the worktree + binary + allowlist and
+/// computes the digest server-side. A UI direct click
+/// carries no approval_id — the click is the
+/// authorization; a loop `worker.run` carries its approval.
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_worker_run_create(
+    worktree_id: String,
+    command: String,
+    params: Option<serde_json::Value>,
+    timeout_ms: Option<u64>,
+    approval_id: Option<String>,
+) -> Result<WorkerRun, String> {
+    engineering_client()?
+        .create_worker_run(
+            &worktree_id,
+            &command,
+            params,
+            timeout_ms,
+            approval_id.as_deref(),
+        )
+        .map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_worker_run_list(
+    execution_id: Option<String>,
+    status: Option<String>,
+) -> Result<Vec<WorkerRun>, String> {
+    engineering_client()?
+        .list_worker_runs(execution_id.as_deref(), status.as_deref())
+        .map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_worker_run_get(run_id: String) -> Result<WorkerRun, String> {
+    engineering_client()?
+        .get_worker_run(&run_id)
+        .map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn engineering_worker_run_cancel(run_id: String) -> Result<WorkerRun, String> {
+    engineering_client()?
+        .cancel_worker_run(&run_id)
+        .map_err(|e| err_string(&e))
 }
 
 /// P3-A: directory picker shell command for the

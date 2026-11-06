@@ -9,6 +9,7 @@ import type {
   Patch,
   PatchDetail,
   PatchFile,
+  WorkerRun,
 } from "../domain/engineering_client";
 import type { EvidenceGateway, EvidenceRow } from "../domain/evidence_client";
 import type { InboxGateway, InboxRow } from "../domain/inbox_client";
@@ -93,6 +94,51 @@ export function PatchesView({
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // P3-C：每 Patch 的测试包名与最近一次测试运行。测试失败
+  // 是已知结果，只展示在 Patch 上，不改动 Patch 状态。
+  const [testPackageByPatch, setTestPackageByPatch] = useState<
+    Record<string, string>
+  >({});
+  const [testRuns, setTestRuns] = useState<Record<string, WorkerRun>>({});
+
+  // 有运行中的测试时每 2 秒刷新一次（与 Tasks 页同频），
+  // 终态后停止轮询。
+  useEffect(() => {
+    const pending = Object.entries(testRuns).filter(
+      ([, run]) =>
+        ![
+          "succeeded",
+          "failed",
+          "timeout",
+          "cancelled",
+          "lost",
+          "orphaned",
+          "superseded",
+        ].includes(run.status),
+    );
+    if (pending.length === 0) return;
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const refreshed = await Promise.all(
+            pending.map(async ([patchId, run]) => {
+              const next = await engineering.workerRunGet(run.runId);
+              return [patchId, next] as const;
+            }),
+          );
+          setTestRuns((prev) => {
+            const next = { ...prev };
+            for (const [patchId, run] of refreshed) next[patchId] = run;
+            return next;
+          });
+        } catch (e) {
+          setError(`测试运行读取失败：${errText(e)}`);
+        }
+      })();
+    }, 2000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [testRuns]);
 
   async function refreshPatches() {
     try {
@@ -244,6 +290,33 @@ export function PatchesView({
     }
   }
 
+  // P3-C：在 Patch 的 Worktree 里离线跑 `cargo test -p
+  // <package>`。UI 直接点击即授权，不另行审批；结果展示
+  // 在 Patch 上，测试失败是已知结果，不改动 Patch 状态。
+  async function handleRunTests(patch: Patch) {
+    const packageName = (testPackageByPatch[patch.patchId] ?? "").trim();
+    if (packageName === "") {
+      setError("运行测试需要先填包名（如 mock-gateway）。");
+      return;
+    }
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      const run = await engineering.workerRunCreate(
+        patch.worktreeId,
+        "cargo-test",
+        { package: packageName },
+      );
+      setTestRuns((prev) => ({ ...prev, [patch.patchId]: run }));
+      setMessage(`已排队测试运行 ${run.runId}（cargo test -p ${packageName}）。`);
+    } catch (e) {
+      setError(`运行测试失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <section>
       <h2>补丁</h2>
@@ -308,6 +381,54 @@ export function PatchesView({
               >
                 拒绝整个 Patch
               </button>
+            )}
+            <span>
+              <label>
+                测试包名
+                <input
+                  type="text"
+                  value={testPackageByPatch[patch.patchId] ?? ""}
+                  onChange={(event) =>
+                    setTestPackageByPatch((prev) => ({
+                      ...prev,
+                      [patch.patchId]: event.target.value,
+                    }))
+                  }
+                  placeholder="如 mock-gateway"
+                />
+              </label>
+              <button
+                type="button"
+                onClick={() => void handleRunTests(patch)}
+                disabled={busy}
+              >
+                运行测试
+              </button>
+            </span>
+            {testRuns[patch.patchId] && (
+              <div>
+                <p>
+                  测试运行 {testRuns[patch.patchId].runId} ·{" "}
+                  {testRuns[patch.patchId].status}
+                  {testRuns[patch.patchId].exitCode !== null
+                    ? ` · 退出码 ${testRuns[patch.patchId].exitCode}`
+                    : ""}
+                  {testRuns[patch.patchId].effectId !== null
+                    ? ` · Effect ${testRuns[patch.patchId].effectId}`
+                    : ""}
+                </p>
+                <pre>
+                  {testRuns[patch.patchId].tail === ""
+                    ? "（无输出）"
+                    : testRuns[patch.patchId].tail}
+                </pre>
+                {testRuns[patch.patchId].status === "failed" && (
+                  <p className="note">
+                    测试失败是已知结果，不改动 Patch 状态；失败的
+                    测试名只以 sha256 形式记在 Test Evidence 里。
+                  </p>
+                )}
+              </div>
             )}
             {selected?.patch.patchId === patch.patchId && (
               <ul>

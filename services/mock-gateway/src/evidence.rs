@@ -104,6 +104,23 @@ pub enum Current {
         source: Box<Current>,
         target: Box<Current>,
     },
+    /// P3-C: a worktree-add observation — whether the new
+    /// worktree directory exists (as its HEAD hash), and
+    /// whether the branch ref exists in the parent repo.
+    GitWorktree {
+        head_sha: Option<String>,
+        branch_exists: bool,
+    },
+    /// P3-C: a commit observation — the recorded commit sha
+    /// (found by exact message, when the Effect carries no
+    /// baseline), and the worktree's current HEAD.
+    GitCommit {
+        found_sha: Option<String>,
+        head_sha: Option<String>,
+    },
+    /// P3-C: a test-run observation — the stored Test Evidence
+    /// summary (source `test`), when one exists.
+    TestRun { summary: Option<Value> },
 }
 
 impl Current {
@@ -129,6 +146,26 @@ impl Current {
                 "kind": "rename",
                 "source": source.to_json(),
                 "target": target.to_json(),
+            }),
+            Current::GitWorktree {
+                head_sha,
+                branch_exists,
+            } => json!({
+                "kind": "worktree",
+                "head_sha": head_sha,
+                "branch_exists": branch_exists,
+            }),
+            Current::GitCommit {
+                found_sha,
+                head_sha,
+            } => json!({
+                "kind": "commit",
+                "sha256": found_sha,
+                "head_sha": head_sha,
+            }),
+            Current::TestRun { summary } => json!({
+                "kind": "test-run",
+                "summary": summary,
             }),
         }
     }
@@ -190,6 +227,230 @@ fn baseline_field(evidence: &EvidenceRow, field: &str) -> Option<Value> {
         .ok()?
         .get(field)
         .cloned()
+}
+
+/// P3-C: the Worker run that produced one Effect, when the
+/// Effect came from a run (git/test classes). Effect rows
+/// carry no cwd/argv, so the run is the only source of the
+/// repo path + command that made the Effect. None when the
+/// run is gone (JSONL mode, or the row predates P3-C).
+fn run_for_effect(state: &AppState, effect_id: &str) -> Option<crate::worker::WorkerRunRow> {
+    let sqlite = state.sqlite.as_ref()?;
+    let conn = sqlite.lock().expect("sqlite lock");
+    crate::sqlite_store::get_worker_run_by_effect_id(&conn, effect_id)
+        .ok()
+        .flatten()
+}
+
+/// P3-C: the argv of a run, parsed from its stored JSON.
+/// Empty on a corrupt row (the caller treats it as
+/// unobservable, never invents a command).
+fn run_argv(run: &crate::worker::WorkerRunRow) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(&run.argv_json).unwrap_or_default()
+}
+
+/// P3-C: the message of a git-commit run (the `-m` argument),
+/// when the run was a commit. The commit message is the only
+/// identity an unknown commit Effect carries: its digest
+/// has no parent/tree, so reconcile matches by exact
+/// message + reachability from HEAD.
+fn commit_message(run: &crate::worker::WorkerRunRow) -> Option<String> {
+    if run.command != "git-commit" {
+        return None;
+    }
+    let argv = run_argv(run);
+    argv.windows(2)
+        .find(|w| w[0] == "-m")
+        .map(|w| w[1].clone())
+}
+
+/// P3-C: find a commit with this exact full message among
+/// the newest 200 commits reachable from HEAD. Returns the
+/// sha, or None when no such commit exists (or git fails).
+/// The message is matched as a whole (trimmed on both
+/// sides); duplicate messages across runs can confuse the
+/// match — tests and window validation use unique messages.
+fn commit_by_message(
+    state: &AppState,
+    git: &std::path::Path,
+    cwd: &std::path::Path,
+    message: &str,
+) -> Option<String> {
+    let out = crate::worker::run_command_sync(
+        state,
+        &[
+            git.to_string_lossy().into_owned(),
+            "-C".to_string(),
+            cwd.to_string_lossy().into_owned(),
+            "log".to_string(),
+            "--format=%H%x00%B%x1e".to_string(),
+            "-n".to_string(),
+            "200".to_string(),
+            "HEAD".to_string(),
+        ],
+        cwd,
+        git,
+        std::time::Duration::from_secs(10),
+    );
+    if out.timed_out || out.exit_code != Some(0) {
+        return None;
+    }
+    let wanted = message.trim();
+    for record in out.stdout.split('\u{1e}') {
+        let Some((sha, body)) = record.trim_start().split_once('\0') else {
+            continue;
+        };
+        if body.trim() == wanted && !sha.trim().is_empty() {
+            return Some(sha.trim().to_string());
+        }
+    }
+    None
+}
+
+/// P3-C: does this ref exist in the repo at `cwd`?
+/// (`git show-ref --verify` exits 0 only when it does.)
+fn branch_exists(state: &AppState, git: &std::path::Path, cwd: &std::path::Path, branch: &str) -> bool {
+    let out = crate::worker::run_command_sync(
+        state,
+        &[
+            git.to_string_lossy().into_owned(),
+            "-C".to_string(),
+            cwd.to_string_lossy().into_owned(),
+            "show-ref".to_string(),
+            "--verify".to_string(),
+            format!("refs/heads/{branch}"),
+        ],
+        cwd,
+        git,
+        std::time::Duration::from_secs(10),
+    );
+    !out.timed_out && out.exit_code == Some(0)
+}
+
+/// P3-C: is this sha a commit object in the repo at `cwd`?
+fn commit_exists(state: &AppState, git: &std::path::Path, cwd: &std::path::Path, sha: &str) -> bool {
+    let out = crate::worker::run_command_sync(
+        state,
+        &[
+            git.to_string_lossy().into_owned(),
+            "-C".to_string(),
+            cwd.to_string_lossy().into_owned(),
+            "cat-file".to_string(),
+            "-t".to_string(),
+            sha.to_string(),
+        ],
+        cwd,
+        git,
+        std::time::Duration::from_secs(10),
+    );
+    !out.timed_out && out.exit_code == Some(0) && out.stdout.trim() == "commit"
+}
+
+/// P3-C: is `sha` an ancestor of (or equal to) HEAD in the
+/// repo at `cwd`? (`git merge-base --is-ancestor`.)
+fn commit_is_ancestor(
+    state: &AppState,
+    git: &std::path::Path,
+    cwd: &std::path::Path,
+    sha: &str,
+) -> bool {
+    let out = crate::worker::run_command_sync(
+        state,
+        &[
+            git.to_string_lossy().into_owned(),
+            "-C".to_string(),
+            cwd.to_string_lossy().into_owned(),
+            "merge-base".to_string(),
+            "--is-ancestor".to_string(),
+            sha.to_string(),
+            "HEAD".to_string(),
+        ],
+        cwd,
+        git,
+        std::time::Duration::from_secs(10),
+    );
+    !out.timed_out && out.exit_code == Some(0)
+}
+
+/// P3-C: observe the git classes. The run row gives the
+/// repo path + command; a missing run or a missing git
+/// binary reads as Unreadable (reconcile maps it to
+/// Inconclusive, never to a false mismatch).
+fn observe_git(
+    state: &AppState,
+    effect: &EffectFileRecord,
+) -> Result<Current, ObserveError> {
+    let Some(run) = run_for_effect(state, &effect.effect_id) else {
+        return Ok(Current::Unreadable);
+    };
+    let Some(git) = state.git_path.clone() else {
+        return Ok(Current::Unreadable);
+    };
+    let cwd = std::path::Path::new(&run.cwd);
+    match effect.operation.as_str() {
+        "worktree-add" => {
+            // The Effect scope is the worktree's
+            // Location-relative path; the run row carries the
+            // absolute path (argv[3]: `git worktree add
+            // <path> -b <branch>`). The parent repo is the
+            // run's cwd (the Location root); the branch is
+            // argv[5].
+            let new_path = run_argv(&run).get(3).cloned();
+            let head_sha = new_path.as_ref().and_then(|p| {
+                crate::worker::git_read_sync(state, &git, &["-C", p, "rev-parse", "HEAD"], std::path::Path::new(p))
+            });
+            let branch = run_argv(&run)
+                .windows(2)
+                .find(|w| w[0] == "-b")
+                .map(|w| w[1].clone());
+            let branch_exists = branch
+                .as_deref()
+                .is_some_and(|b| branch_exists(state, &git, cwd, b));
+            Ok(Current::GitWorktree {
+                head_sha,
+                branch_exists,
+            })
+        }
+        "commit" => {
+            // The recorded commit is found by exact message
+            // (the unknown Effect's only identity); HEAD is
+            // read fresh. A baseline sha (succeeded rows) is
+            // compared by the caller, not here.
+            let head_sha = crate::worker::git_read_sync(
+                state,
+                &git,
+                &["-C", &run.cwd, "rev-parse", "HEAD"],
+                cwd,
+            );
+            let found_sha = commit_message(&run)
+                .and_then(|m| commit_by_message(state, &git, cwd, &m));
+            Ok(Current::GitCommit {
+                found_sha,
+                head_sha,
+            })
+        }
+        // Reads land nothing: the repo is readable (HEAD
+        // resolves) or it is not. Reconcile maps both to
+        // Inconclusive; the branch exists so reconcile does
+        // not 409 `effect_no_readback`.
+        "status" | "diff" => {
+            let head_sha = crate::worker::git_read_sync(
+                state,
+                &git,
+                &["-C", &run.cwd, "rev-parse", "HEAD"],
+                cwd,
+            );
+            if head_sha.is_some() {
+                Ok(Current::GitCommit {
+                    found_sha: None,
+                    head_sha,
+                })
+            } else {
+                Ok(Current::Unreadable)
+            }
+        }
+        _ => Err(ObserveError::NoMethod),
+    }
 }
 
 /// Whether a connector/vault operation expects the subject to
@@ -357,6 +618,21 @@ pub fn observe_current(
                 &effect.scope,
             ))
         }
+        // P3-C: git observe (closes the slice's known gap —
+        // its timeout/cancel/orphan Effects use capability
+        // `git` but had no readback until this branch landed).
+        // The run row is the repo path + command source.
+        ("git", _) => observe_git(state, effect),
+        // P3-C: a test run's only observation is its stored
+        // Test Evidence (source `test`); the caller loads it
+        // by source (see latest_evidence_for_effect). No
+        // Test Evidence row means no observation yet.
+        ("test", "run") => {
+            let summary = evidence.and_then(|e| {
+                serde_json::from_str::<Value>(&e.observed_json).ok()
+            });
+            Ok(Current::TestRun { summary })
+        }
         _ => Err(ObserveError::NoMethod),
     }
 }
@@ -391,6 +667,18 @@ pub fn reconcile_outcome(
     effect: &EffectFileRecord,
     evidence: Option<&EvidenceRow>,
 ) -> Result<ReconcileOutcome, ObserveError> {
+    // P3-C: a test run's landing cannot be observed post-hoc
+    // (re-running the suite is a new execution, not a
+    // readback). Its stored Test Evidence is trusted by
+    // verify only; reconcile always returns Inconclusive.
+    if effect.capability == "test" && effect.operation == "run" {
+        let summary = evidence
+            .and_then(|e| serde_json::from_str::<Value>(&e.observed_json).ok());
+        return Ok(ReconcileOutcome::Inconclusive {
+            observed: json!({"kind": "test-run", "summary": summary}),
+            reason: "state_unclear",
+        });
+    }
     let current = observe_current(state, effect, evidence)?;
     let outcome = match (effect.capability.as_str(), effect.operation.as_str()) {
         ("fs", "write") => {
@@ -550,6 +838,34 @@ pub fn reconcile_outcome(
                 _ => inconclusive(&current),
             }
         }
+        // P3-C: git reconcile. A worktree-add lands when the
+        // new worktree exists (HEAD readable) and the branch
+        // ref exists in the parent repo. A commit lands when
+        // a commit with the run's exact message is reachable
+        // from HEAD (the unknown Effect's only identity).
+        // Reads land nothing — always Inconclusive. Anything
+        // else is Inconclusive, never a false mismatch.
+        ("git", "worktree-add") => match &current {
+            Current::GitWorktree {
+                head_sha: Some(_),
+                branch_exists: true,
+            } => ReconcileOutcome::Landed {
+                observed: current.to_json(),
+                reason: "hash_match",
+            },
+            _ => inconclusive(&current),
+        },
+        ("git", "commit") => match &current {
+            Current::GitCommit {
+                found_sha: Some(_),
+                ..
+            } => ReconcileOutcome::Landed {
+                observed: current.to_json(),
+                reason: "hash_match",
+            },
+            _ => inconclusive(&current),
+        },
+        ("git", _) => inconclusive(&current),
         _ => return Err(ObserveError::NoMethod),
     };
     Ok(outcome)
@@ -876,6 +1192,95 @@ pub fn verify_outcome(
             };
             record_vs_expected(&current, expected)
         }
+        // P3-C: git verify. A worktree-add verifies when the
+        // current HEAD equals the baseline head (the dir
+        // missing is target_missing, a different HEAD is
+        // hash_mismatch). A commit verifies when the baseline
+        // sha exists AND is HEAD or an ancestor of HEAD (a
+        // later commit on the same branch does not invalidate
+        // it). No baseline is MissingEvidence, never a guess.
+        ("git", "worktree-add") => {
+            let Some(evidence) = write_evidence else {
+                return Err(ObserveError::MissingEvidence);
+            };
+            let Some(Value::String(sha)) = baseline_field(evidence, "head_sha") else {
+                return Err(ObserveError::MissingEvidence);
+            };
+            match &current {
+                Current::GitWorktree {
+                    head_sha: Some(current_sha),
+                    ..
+                } if current_sha == &sha => VerifyOutcome::Verified {
+                    observed: current.to_json(),
+                    reason: "hash_match",
+                },
+                Current::GitWorktree {
+                    head_sha: None, ..
+                } => VerifyOutcome::Mismatch {
+                    observed: current.to_json(),
+                    reason: "target_missing",
+                },
+                Current::GitWorktree { .. } => VerifyOutcome::Mismatch {
+                    observed: current.to_json(),
+                    reason: "hash_mismatch",
+                },
+                _ => verify_inconclusive(&current),
+            }
+        }
+        ("git", "commit") => {
+            let Some(evidence) = write_evidence else {
+                return Err(ObserveError::MissingEvidence);
+            };
+            let Some(Value::String(sha)) = baseline_field(evidence, "sha256") else {
+                return Err(ObserveError::MissingEvidence);
+            };
+            let run = run_for_effect(state, &effect.effect_id);
+            let git = state.git_path.clone();
+            match (run, git) {
+                (Some(run), Some(git)) => {
+                    let cwd = std::path::Path::new(&run.cwd);
+                    if !commit_exists(state, &git, cwd, &sha) {
+                        VerifyOutcome::Mismatch {
+                            observed: current.to_json(),
+                            reason: "target_missing",
+                        }
+                    } else if commit_is_ancestor(state, &git, cwd, &sha) {
+                        VerifyOutcome::Verified {
+                            observed: current.to_json(),
+                            reason: "hash_match",
+                        }
+                    } else {
+                        VerifyOutcome::Mismatch {
+                            observed: current.to_json(),
+                            reason: "hash_mismatch",
+                        }
+                    }
+                }
+                _ => verify_inconclusive(&current),
+            }
+        }
+        // Reads have no landable state: verify is always
+        // Inconclusive (the observe branch exists so verify
+        // does not 409 `effect_no_readback`).
+        ("git", "status") | ("git", "diff") => verify_inconclusive(&current),
+        // P3-C: a test run verifies by trusting its stored
+        // Test Evidence only — never by re-running the suite
+        // (a re-run is a new execution). A summary present
+        // means the run happened as recorded; absent means
+        // MissingEvidence. (Only `succeeded` rows reach
+        // verify at all, so a present summary is a pass.)
+        ("test", "run") => match &current {
+            Current::TestRun {
+                summary: Some(summary),
+            } => VerifyOutcome::Verified {
+                observed: summary.clone(),
+                reason: "test_passed",
+            },
+            Current::TestRun { summary: None } => {
+                return Err(ObserveError::MissingEvidence);
+            }
+            _ => verify_inconclusive(&current),
+        },
         _ => return Err(ObserveError::NoMethod),
     };
     Ok(outcome)

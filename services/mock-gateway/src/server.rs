@@ -257,6 +257,20 @@ struct StreamState {
     last_applied: u64,
 }
 
+/// P3-C (§7): the resolved Worker command an approval
+/// authorizes. `argv_sha256` commits the exact argv (the
+/// commit message is inside it, hashed, never plaintext);
+/// `cwd` and `timeout_ms` are part of the binding too — the
+/// run route recomputes all three from the resolved command
+/// and rejects a presented spec that does not match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandSpec {
+    pub argv_template: String,
+    pub argv_sha256: String,
+    pub cwd: String,
+    pub timeout_ms: u64,
+}
+
 #[derive(Clone)]
 pub(crate) struct ApprovalState {
     tool: String,
@@ -278,6 +292,9 @@ pub(crate) struct ApprovalState {
     /// issued before P0-C, which keep their old gate.
     effect_binding: Option<String>,
     message: Option<String>,
+    /// P3-C (§7): the resolved Worker command this approval
+    /// authorizes. None for every other tool.
+    command: Option<CommandSpec>,
 }
 
 impl ApprovalState {
@@ -292,7 +309,7 @@ impl ApprovalState {
         consumed: bool,
         operation_digest: Option<String>,
     ) -> Self {
-        ApprovalState { tool, status, binding, consumed, operation_digest, action_binding: None, effect_binding: None, message: None }
+        ApprovalState { tool, status, binding, consumed, operation_digest, action_binding: None, effect_binding: None, message: None, command: None }
     }
 
     fn is_bound(&self) -> bool {
@@ -461,6 +478,11 @@ pub struct AppState {
     /// None means Worker git commands fail closed with 503
     /// `git_unavailable`.
     pub(crate) git_path: Option<PathBuf>,
+    /// P3-C: cargo binary resolved once at startup (PATH
+    /// search + optional MOCK_CARGO_PATH override, §3.4).
+    /// None means `cargo-test` runs fail closed with 503
+    /// `cargo_unavailable`.
+    pub(crate) cargo_path: Option<PathBuf>,
     /// E2 slice: run ids a cancel request has claimed. The
     /// driver checks this before spawning and after the
     /// child exits; the set is the cancel signal, the kill
@@ -662,7 +684,7 @@ impl AppState {
                     Some(status) => {
                         approvals.insert(
                             record.tool_call_id.clone(),
-                            ApprovalState { tool: record.tool.clone(), status, binding: record.binding.clone(), consumed: record.consumed, operation_digest: record.operation_digest.clone(), action_binding: record.action_binding.clone(), effect_binding: record.effect_binding.clone(), message: record.message.clone() },
+                            ApprovalState { tool: record.tool.clone(), status, binding: record.binding.clone(), consumed: record.consumed, operation_digest: record.operation_digest.clone(), action_binding: record.action_binding.clone(), effect_binding: record.effect_binding.clone(), message: record.message.clone(), command: record.command.clone() },
                         );
                     }
                     None => {
@@ -783,6 +805,7 @@ impl AppState {
             voice_state_path: None,
             mail_source: Arc::new(UnavailableMailSource),
             git_path: crate::worker::resolve_git_path(),
+            cargo_path: crate::worker::resolve_cargo_path(),
             worker_cancelled: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
@@ -850,6 +873,7 @@ impl AppState {
         &self,
         binding: ApprovalBinding,
         digest: String,
+        command: Option<CommandSpec>,
     ) -> Result<String, LoopError> {
         let mut next = self.next_approval_id.lock().unwrap();
         let id = format!("approval-{}", *next);
@@ -866,6 +890,9 @@ impl AppState {
             action_binding: None,
             effect_binding: None,
             message: None,
+            // P3-C: a worker.run approval also carries the
+            // resolved command spec (argv digest, cwd, timeout).
+            command,
         };
         let mut approvals = self.approvals.lock().unwrap();
         persist_approval(self, &id, &record)
@@ -1026,6 +1053,24 @@ impl AppState {
         );
     }
 
+    /// P3-C: the digest the approval gate checks for a loop
+    /// tool call. worker.run's gate digest is the command
+    /// digest (argv + cwd + timeout, resolved with AppState);
+    /// every other tool uses the pure args digest. None when
+    /// the command cannot be resolved (the gate fails closed).
+    fn loop_gate_digest(
+        &self,
+        tool: &str,
+        args: &std::collections::BTreeMap<String, String>,
+    ) -> Option<String> {
+        if tool == "worker.run" {
+            return worker_command_digest(self, args)
+                .ok()
+                .map(|(digest, _)| digest);
+        }
+        Some(crate::loop_engine::args_digest(tool, args))
+    }
+
     /// 循环与 POST /agent/tool/call 共用服务端分派。绑定凭据不能从公共端点重放。
     pub(crate) async fn execute_loop_tool(
         &self,
@@ -1036,6 +1081,9 @@ impl AppState {
         backend: Option<Arc<dyn LoopTools>>,
     ) -> ToolOutcome {
         if loop_tool_requires_approval(&tool) {
+            let Some(digest) = self.loop_gate_digest(&tool, &args) else {
+                return ToolOutcome::failed(ErrorCode::InvalidArguments);
+            };
             let valid = {
                 let approvals = self.approvals.lock().unwrap();
                 approval_id
@@ -1055,7 +1103,7 @@ impl AppState {
                                     .as_ref()
                                     .is_some_and(|given| crate::loop_engine::binding_ref_matches(b, given)))
                             && record.operation_digest.as_deref()
-                                == Some(crate::loop_engine::args_digest(&tool, &args).as_str())
+                                == Some(digest.as_str())
                     })
             };
             if !valid {
@@ -1127,19 +1175,28 @@ impl AppState {
             // Effect with the same key in this execution (the
             // bound Effect itself is handled above).
             if let (Some(binding), Some(approval_id)) = (&binding, &approval_id) {
-                let (capability, operation, scope) = match tool.as_str() {
-                    "fs.write" => (
+                let triple = match tool.as_str() {
+                    "fs.write" => Some((
                         "fs",
                         "write",
                         args.get("path").cloned().unwrap_or_default(),
-                    ),
-                    "reminders.set_completed" => (
+                    )),
+                    "reminders.set_completed" => Some((
                         "reminders",
                         "set_completed",
                         args.get("id").cloned().unwrap_or_default(),
-                    ),
+                    )),
+                    // P3-C: worker.run has no planned Effect
+                    // (digest-only approval); the run's own
+                    // idempotency key + the approval single-use
+                    // + execution_has_running_worker are the
+                    // dedup gates. Skipping the check is not a
+                    // hole: a replayed approval cannot create a
+                    // second run (UNIQUE index on approval_id).
+                    "worker.run" => None,
                     _ => return ToolOutcome::failed(ErrorCode::InvalidArguments),
                 };
+                if let Some((capability, operation, scope)) = triple {
                 let bound_id = effect_for_approval(self, approval_id, Some(&digest))
                     .map(|e| e.effect_id);
                 match check_idempotency(
@@ -1178,6 +1235,7 @@ impl AppState {
                             _ => ToolOutcome::unknown(),
                         };
                     }
+                }
                 }
             }
         }
@@ -1386,6 +1444,132 @@ impl AppState {
                 ),
                 Ok(Err(_)) => ToolOutcome::failed(ErrorCode::InvalidArguments),
                 Err(_) => ToolOutcome::unknown(),
+            };
+        }
+        if tool == "git.read" {
+            // P3-C (§6): read-only git status/diff. No Effect,
+            // no approval. The root resolves like code.search
+            // (explicit worktree wins, else the loop's binding,
+            // else files_root); a root that is not a git
+            // worktree fails the command (ToolFailed), never
+            // invents output. Synchronous, 10s budget, 4096 B
+            // truncation with a flag.
+            let operation = args.get("operation").cloned().unwrap_or_default();
+            let root = match resolve_code_search_root(
+                self,
+                args.get("worktree_id")
+                    .filter(|id| !id.is_empty())
+                    .map(String::as_str),
+                binding.as_ref(),
+            ) {
+                Ok(root) => root,
+                Err(_) => return ToolOutcome::failed(ErrorCode::InvalidArguments),
+            };
+            let command = if operation == "diff" {
+                "git-diff"
+            } else {
+                "git-status"
+            };
+            let binary = match worker_binary_for_command(self, command) {
+                Ok(path) => path,
+                Err(_) => return ToolOutcome::failed(ErrorCode::ToolFailed),
+            };
+            let params = match args.get("path") {
+                Some(p) if !p.is_empty() => Some(serde_json::json!({ "path": p })),
+                _ => None,
+            };
+            let resolved = match crate::worker::resolve_command(
+                command,
+                params.as_ref(),
+                &binary,
+                &root,
+                Some(10_000),
+                None,
+            ) {
+                Ok(resolved) => resolved,
+                Err(_) => return ToolOutcome::failed(ErrorCode::InvalidArguments),
+            };
+            let state = self.clone();
+            let argv = resolved.argv.clone();
+            let output = tokio::task::spawn_blocking(move || {
+                crate::worker::run_command_sync(
+                    &state,
+                    &argv,
+                    &root,
+                    &binary,
+                    std::time::Duration::from_millis(10_000),
+                )
+            })
+            .await;
+            let output = match output {
+                Ok(output) => output,
+                Err(_) => return ToolOutcome::unknown(),
+            };
+            if output.timed_out {
+                return ToolOutcome::unknown();
+            }
+            if output.exit_code != Some(0) {
+                // Not a git worktree, or git failed: the tool
+                // fails, never invents output.
+                return ToolOutcome::failed(ErrorCode::ToolFailed);
+            }
+            let mut output_text = output.stdout.clone();
+            let mut truncated = false;
+            if output_text.len() > 4096 {
+                let mut end = 4096;
+                while !output_text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                output_text.truncate(end);
+                truncated = true;
+            }
+            return ToolOutcome::success(
+                serde_json::to_string(&serde_json::json!({
+                    "command": command,
+                    "output": output_text,
+                    "truncated": truncated,
+                    "exit_code": 0,
+                }))
+                .unwrap_or_default(),
+            );
+        }
+        if tool == "worker.run" {
+            // P3-C (§6): enqueue-only. The approval was already
+            // enforced by the gate above (loop-bound approvals
+            // were consumed by the loop; the run row's UNIQUE
+            // index on approval_id makes the enqueue single-use).
+            // The run completes asynchronously; the Effect is
+            // recorded by the driver at completion, never here.
+            let dto = WorkerRunCreateDto {
+                worktree_id: args.get("worktree_id").cloned().unwrap_or_default(),
+                command: args.get("command").cloned().unwrap_or_default(),
+                params: Some(worker_run_params_from_args(&args)),
+                timeout_ms: args.get("timeout_ms").and_then(|s| s.parse::<u64>().ok()),
+                execution_id: binding
+                    .as_ref()
+                    .and_then(|b| execution_for_loop(self, &b.loop_id)),
+                approval_id: approval_id.clone(),
+            };
+            return match create_worker_run_internal(self, dto).await {
+                Ok(run) => ToolOutcome::success(
+                    serde_json::to_string(&serde_json::json!({
+                        "run_id": run.run_id,
+                        "status": "queued",
+                        "execution_id": run.execution_id,
+                    }))
+                    .unwrap_or_default(),
+                ),
+                Err(err) => match err.status {
+                    StatusCode::BAD_REQUEST => {
+                        ToolOutcome::failed(ErrorCode::InvalidArguments)
+                    }
+                    StatusCode::NOT_FOUND
+                    | StatusCode::CONFLICT
+                    | StatusCode::SERVICE_UNAVAILABLE => {
+                        ToolOutcome::failed(ErrorCode::ToolFailed)
+                    }
+                    _ => ToolOutcome::unknown(),
+                },
             };
         }
         if let Some(backend) = backend {
@@ -1660,6 +1844,7 @@ impl AppState {
                                             action_binding: row.action_binding.clone(),
                                             effect_binding: row.effect_binding.clone(),
                                             message: row.message.clone(),
+                                            command: row.command.clone(),
                                         },
                                     );
                                 }
@@ -1728,6 +1913,14 @@ impl AppState {
     /// `git_unavailable` path). Production never calls this.
     pub fn with_git_path(mut self, path: Option<PathBuf>) -> Self {
         self.git_path = path;
+        self
+    }
+
+    /// P3-C: override the startup-resolved cargo binary
+    /// (tests: force a fake cargo, or None for the
+    /// `cargo_unavailable` path). Same seam as git.
+    pub fn with_cargo_path(mut self, path: Option<PathBuf>) -> Self {
+        self.cargo_path = path;
         self
     }
 
@@ -1889,6 +2082,7 @@ impl AppState {
                             action_binding: row.action_binding.clone(),
                             effect_binding: row.effect_binding.clone(),
                             message: row.message.clone(),
+                            command: row.command.clone(),
                         },
                     );
                 }
@@ -3096,6 +3290,17 @@ struct ApprovalRequestDto {
     content_base64: Option<String>,
     append: Option<bool>,
     message: Option<String>,
+    /// P3-C (§7): a client-presented Worker command spec.
+    /// Never trusted: the handler recomputes the spec from
+    /// the raw presentation below and rejects a mismatch.
+    command: Option<CommandSpec>,
+    /// P3-C (§7): raw Worker command presentation (the
+    /// server resolves the worktree + binary + allowlist and
+    /// computes the digest + spec from these).
+    worktree_id: Option<String>,
+    command_template: Option<String>,
+    params: Option<serde_json::Value>,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3141,6 +3346,11 @@ async fn approval_request(
     // bind the approval to it; the digest is computed here from the
     // parameters the client presented, never from a client hash.
     // Connector tools keep tool-only requests and stay unbound.
+    // P3-C: a worker.run approval binds the resolved command
+    // (argv + cwd + timeout); the presented CommandSpec, when
+    // present, is a claim verified against the server-computed
+    // spec, never trusted.
+    let mut command_spec: Option<CommandSpec> = None;
     let operation_digest = match req.tool.as_str() {
         "fs.write" => {
             let (Some(path), Some(content_base64)) = (req.path.as_deref(), req.content_base64.as_deref()) else {
@@ -3190,12 +3400,53 @@ async fn approval_request(
                 None => return bad_request("invalid export path"),
             }
         }
+        "worker.run" => {
+            let (Some(worktree_id), Some(command_template)) =
+                (req.worktree_id.as_deref(), req.command_template.as_deref())
+            else {
+                return bad_request(
+                    "worker.run approval requires worktree_id and command_template",
+                );
+            };
+            // Flat args for the shared resolver: the raw
+            // presentation, never a client hash.
+            let mut flat = std::collections::BTreeMap::new();
+            flat.insert("worktree_id".to_string(), worktree_id.to_string());
+            flat.insert("command".to_string(), command_template.to_string());
+            if let Some(timeout) = req.timeout_ms {
+                flat.insert("timeout_ms".to_string(), timeout.to_string());
+            }
+            if let Some(serde_json::Value::Object(map)) = req.params.as_ref() {
+                for (key, value) in map {
+                    if let serde_json::Value::String(s) = value {
+                        flat.insert(key.clone(), s.clone());
+                    }
+                }
+            }
+            let (digest, spec) = match worker_command_digest(&state, &flat) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    return (
+                        err.status,
+                        Json(serde_json::json!({ "error": err.code })),
+                    )
+                        .into_response();
+                }
+            };
+            if let Some(presented) = &req.command {
+                if presented != &spec {
+                    return bad_request("command_mismatch");
+                }
+            }
+            command_spec = Some(spec);
+            Some(digest)
+        }
         _ => None,
     };
     let mut next = state.next_approval_id.lock().expect("approval id lock");
     let id = format!("approval-{}", *next);
     *next += 1;
-    let record = ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending, binding: None, consumed: false, operation_digest: operation_digest.clone(), action_binding: None, effect_binding: None, message: req.message.clone() };
+    let record = ApprovalState { tool: req.tool.clone(), status: ApprovalStatus::Pending, binding: None, consumed: false, operation_digest: operation_digest.clone(), action_binding: None, effect_binding: None, message: req.message.clone(), command: command_spec };
     let mut approvals = state.approvals.lock().expect("approval lock");
     if let Err(detail) = persist_approval(&state, &id, &record) {
         // Bound records fail closed like loop approvals: an id whose
@@ -3256,6 +3507,10 @@ async fn approval_request(
                 crate::operation_binding::normalize_path(p)
                     .map(|scope| ("fs", "export", scope))
             }),
+            // P3-C: worker.run is digest-only — no planned
+            // Effect. The driver records the completion Effect
+            // fresh at run completion (its digest needs
+            // post-command observations that do not exist yet).
             _ => None,
         };
         if let Some((capability, operation, scope)) = planned {
@@ -3583,6 +3838,7 @@ pub(crate) fn persist_approval(state: &AppState, tool_call_id: &str, approval: &
         action_binding: approval.action_binding.clone(),
         effect_binding: approval.effect_binding.clone(),
         message: approval.message.clone(),
+        command: approval.command.clone(),
     };
     match state.sqlite_mode() {
         StateBackend::Sqlite => {
@@ -7006,38 +7262,44 @@ struct WorktreeCreateDto {
     project_id: Option<String>,
 }
 
-async fn worktrees_create(
-    State(state): State<AppState>,
-    Json(req): Json<WorktreeCreateDto>,
-) -> impl IntoResponse {
-    let Some(location_id) = req.location_id.filter(|l| !l.trim().is_empty()) else {
-        return bad_request("location_id is required");
-    };
-    let directory_relative = req.directory_relative.unwrap_or_default();
-    let branch_label = req.branch_label.unwrap_or_default();
+/// Create a Worktree record (P3-A records, P3-C driver):
+/// validates the Location (exists, active), normalizes the
+/// relative directory, requires the directory to already
+/// exist inside the Location root, then allocates the id and
+/// persists. Returns the record or a short error code (the
+/// HTTP route maps it to 400; the driver only warns). P3-A
+/// creates no directories and runs no `git worktree add` —
+/// the P3-C driver calls this after the command created it.
+pub(crate) fn create_worktree_record(
+    state: &AppState,
+    location_id: String,
+    directory_relative: String,
+    branch_label: String,
+    project_id: Option<String>,
+) -> Result<Worktree, &'static str> {
     if branch_label.len() > 4096 {
-        return bad_request("branch_label is too long");
+        return Err("branch_label is too long");
     }
     // The location must exist and be active.
     let canonical_root = {
         let locations = state.locations.lock().expect("location lock");
         let Some(location) = locations.get(&location_id) else {
-            return bad_request("unknown location");
+            return Err("unknown location");
         };
         if location.status != LOCATION_ACTIVE {
-            return bad_request("location is archived");
+            return Err("location is archived");
         }
         match location_canonical_root(location) {
             Some(root) => root,
-            None => return bad_request("location directory is unavailable"),
+            None => return Err("location directory is unavailable"),
         }
     };
     // A stated project must exist (an archived project may
     // still be referenced; it reads back with its status).
-    if let Some(project_id) = &req.project_id {
+    if let Some(project_id) = &project_id {
         let projects = state.projects.lock().expect("project lock");
         if !projects.contains_key(project_id) {
-            return bad_request("unknown project");
+            return Err("unknown project");
         }
     }
     // `directory_relative` is lexically normalized (`..` and
@@ -7047,16 +7309,15 @@ async fn worktrees_create(
     } else {
         match crate::operation_binding::normalize_path(&directory_relative) {
             Some(normalized) => normalized,
-            None => return bad_request("directory escapes the location"),
+            None => return Err("directory escapes the location"),
         }
     };
     // Join, canonicalize, and containment-check back inside
-    // the root; the directory must already exist (P3-A creates
-    // no directories and runs no `git worktree add`).
+    // the root; the directory must already exist.
     let Some(_target) =
         crate::code_search::worktree_canonical_dir(&canonical_root, &relative)
     else {
-        return bad_request("directory does not exist or escapes the location");
+        return Err("directory does not exist or escapes the location");
     };
     let mut next = state.next_worktree_id.lock().expect("worktree id lock");
     let id = format!("worktree-{}", *next);
@@ -7068,7 +7329,7 @@ async fn worktrees_create(
         location_id,
         directory_relative: relative,
         branch_label,
-        project_id: req.project_id,
+        project_id,
         status: WORKTREE_ACTIVE.to_string(),
         created_ms: now,
         updated_ms: now,
@@ -7078,8 +7339,27 @@ async fn worktrees_create(
         .lock()
         .expect("worktree lock")
         .insert(record.worktree_id.clone(), record.clone());
-    persist_worktree(&state, &record);
-    Json(record).into_response()
+    persist_worktree(state, &record);
+    Ok(record)
+}
+
+async fn worktrees_create(
+    State(state): State<AppState>,
+    Json(req): Json<WorktreeCreateDto>,
+) -> impl IntoResponse {
+    let Some(location_id) = req.location_id.filter(|l| !l.trim().is_empty()) else {
+        return bad_request("location_id is required");
+    };
+    match create_worktree_record(
+        &state,
+        location_id,
+        req.directory_relative.unwrap_or_default(),
+        req.branch_label.unwrap_or_default(),
+        req.project_id,
+    ) {
+        Ok(record) => Json(record).into_response(),
+        Err(code) => bad_request(code),
+    }
 }
 
 async fn worktrees_list(State(state): State<AppState>) -> Json<Vec<Worktree>> {
@@ -8482,6 +8762,19 @@ pub(crate) fn worktree_canonical_root(state: &AppState, worktree: &Worktree) -> 
 /// checks. The stored `canonical_root` was canonicalized at
 /// creation; re-canonicalizing here keeps the check honest
 /// if the directory was replaced by a symlink since.
+/// Canonical root of a Location, by id (P3-C: the driver
+/// and the observe path relativize run paths against it).
+/// None when the Location is missing, archived, or its
+/// directory is unavailable.
+pub(crate) fn location_root_for_id(state: &AppState, location_id: &str) -> Option<PathBuf> {
+    let locations = state.locations.lock().expect("location lock");
+    let location = locations.get(location_id)?;
+    if location.status != LOCATION_ACTIVE {
+        return None;
+    }
+    location_canonical_root(location)
+}
+
 fn location_canonical_root(location: &Location) -> Option<PathBuf> {
     let canonical = Path::new(&location.canonical_root).canonicalize().ok()?;
     if !canonical.is_dir() {
@@ -9994,6 +10287,36 @@ pub(crate) fn reconcile_device_effect_with_outcome(
 }
 
 /// P0-R generalized reconciliation driver, used by
+/// P3-C: the Evidence a verify/reconcile needs for one
+/// Effect. fs classes use the write-time baseline (source
+/// `write`); a test run's only Evidence is source `test`
+/// (the driver inserts it at completion). A failed lookup
+/// degrades to None (the legacy path, which can only verify,
+/// never falsely mismatch).
+fn latest_evidence_for_effect(
+    state: &AppState,
+    effect: &EffectFileRecord,
+) -> Option<crate::sqlite_store::EvidenceRow> {
+    let source = if effect.capability == "test" && effect.operation == "run" {
+        "test"
+    } else {
+        "write"
+    };
+    let sqlite = state.sqlite.as_ref()?;
+    let conn = sqlite.lock().expect("sqlite lock");
+    match crate::sqlite_store::latest_evidence_for_effect_by_source(
+        &conn,
+        &effect.effect_id,
+        source,
+    ) {
+        Ok(row) => row,
+        Err(detail) => {
+            eprintln!("warning: evidence lookup failed: {detail}");
+            None
+        }
+    }
+}
+
 /// `/effects/reconcile`. First half is the device path,
 /// unchanged: status checks, move to `reconciling`, conclusion
 /// write-back, failure constraints. Every other class goes
@@ -10045,23 +10368,11 @@ pub(crate) fn reconcile_effect(
     };
     let outcome = if device_action.is_none() {
         // Write-time baseline for classes that need it (export,
-        // rename). Absent in JSONL mode and for legacy rows; a
-        // failed lookup degrades to the legacy path (which stays
+        // rename); test runs load their Test Evidence instead.
+        // Absent in JSONL mode and for legacy rows; a failed
+        // lookup degrades to the legacy path (which stays
         // honest: it can only verify, never falsely mismatch).
-        let write_evidence = match &state.sqlite {
-            Some(sqlite) => {
-                let conn = sqlite.lock().expect("sqlite lock");
-                match crate::sqlite_store::latest_write_evidence_for_effect(&conn, &effect.effect_id)
-                {
-                    Ok(row) => row,
-                    Err(detail) => {
-                        eprintln!("warning: evidence lookup failed: {detail}");
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
+        let write_evidence = latest_evidence_for_effect(state, effect);
         match crate::evidence::reconcile_outcome(state, effect, write_evidence.as_ref()) {
             Ok(outcome) => Some(outcome),
             Err(crate::evidence::ObserveError::NoMethod) => {
@@ -11113,7 +11424,7 @@ async fn executions_transition(
 // produced on success.
 
 #[derive(Debug, Deserialize)]
-struct WorkerRunCreateDto {
+pub(crate) struct WorkerRunCreateDto {
     worktree_id: String,
     command: String,
     #[serde(default)]
@@ -11122,48 +11433,326 @@ struct WorkerRunCreateDto {
     timeout_ms: Option<u64>,
     #[serde(default)]
     execution_id: Option<String>,
-    /// Accepted for the P3-C shape; read commands need no
-    /// approval and the slice stores nothing for it. Write
-    /// commands (P3-C) will validate it at run start.
+    /// P3-C: the approval authorizing this run, when one was
+    /// presented. Reads need none; writes and tests carry one
+    /// from the loop (already consumed there) or from a
+    /// digest-bound /approval/request (consumed at creation).
+    /// Stored on the run row for Effect attribution.
     #[serde(default)]
     approval_id: Option<String>,
 }
 
-fn worker_binding_error(detail: &str) -> axum::response::Response {
-    let code = match detail {
+/// P3-C run-creation failure: an HTTP status + a short
+/// error code. The route renders it as JSON; the loop
+/// `worker.run` arm maps it to a ToolOutcome.
+pub(crate) struct WorkerCreateError {
+    pub status: StatusCode,
+    pub code: &'static str,
+}
+
+fn worker_create_error(status: StatusCode, code: &'static str) -> WorkerCreateError {
+    WorkerCreateError { status, code }
+}
+
+fn worker_binding_code(detail: &'static str) -> &'static str {
+    match detail {
         "unknown worktree" => "unknown_worktree",
         "worktree is archived" => "worktree_archived",
         "unknown location" => "unknown_location",
         "location is archived" => "location_archived",
         other => other,
-    };
-    bad_request(code)
+    }
 }
 
-async fn worker_runs_create(
-    State(state): State<AppState>,
-    Json(req): Json<WorkerRunCreateDto>,
-) -> impl IntoResponse {
-    let _ = req.approval_id.as_ref();
+/// P3-C: the binary for a template. git templates use the
+/// startup-resolved git; cargo-test uses cargo. None fails
+/// closed with the template's 503 code.
+fn worker_binary_for_command(
+    state: &AppState,
+    command: &str,
+) -> Result<PathBuf, WorkerCreateError> {
+    if command == "cargo-test" {
+        state.cargo_path.clone().ok_or_else(|| {
+            worker_create_error(StatusCode::SERVICE_UNAVAILABLE, "cargo_unavailable")
+        })
+    } else {
+        state.git_path.clone().ok_or_else(|| {
+            worker_create_error(StatusCode::SERVICE_UNAVAILABLE, "git_unavailable")
+        })
+    }
+}
+
+/// P3-C (§4.2): the worktree-add preconditions, checked
+/// before the run is created (branch must not exist, target
+/// path must be free, parent must exist). These are
+/// best-effort gates, not guarantees: a concurrent creation
+/// still fails the git command itself (exit != 0 → failed
+/// run, known result). The branch check reads the repo
+/// (`git show-ref` in the parent worktree); the path check
+/// reads the filesystem under the Location root.
+fn check_worktree_add_preconditions(
+    state: &AppState,
+    git: &Path,
+    location_root: &Path,
+    repo_root: &Path,
+    path: &str,
+    branch: &str,
+) -> Result<(), WorkerCreateError> {
+    let target = crate::worker::contained_path(location_root, path)
+        .ok_or_else(|| worker_create_error(StatusCode::BAD_REQUEST, "invalid_path"))?;
+    if target.exists() {
+        return Err(worker_create_error(
+            StatusCode::CONFLICT,
+            "worktree_path_exists",
+        ));
+    }
+    if let Some(parent) = target.parent() {
+        if !parent.is_dir() {
+            return Err(worker_create_error(StatusCode::BAD_REQUEST, "invalid_path"));
+        }
+    }
+    let refname = format!("refs/heads/{branch}");
+    let out = crate::worker::run_command_sync(
+        state,
+        &[
+            git.to_string_lossy().into_owned(),
+            "show-ref".to_string(),
+            "--verify".to_string(),
+            "--quiet".to_string(),
+            refname,
+        ],
+        repo_root,
+        git,
+        std::time::Duration::from_secs(10),
+    );
+    if !out.timed_out && out.exit_code == Some(0) {
+        return Err(worker_create_error(
+            StatusCode::CONFLICT,
+            "worktree_branch_exists",
+        ));
+    }
+    Ok(())
+}
+
+/// Rebuild the run-route params JSON from flat loop-normalized
+/// args (P3-C): the loop stores each parameter as its own
+/// string key; the allowlist takes a JSON object. Only the
+/// template's own keys are copied.
+pub(crate) fn worker_run_params_from_args(
+    args: &std::collections::BTreeMap<String, String>,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for key in ["path", "branch", "message", "package"] {
+        if let Some(value) = args.get(key) {
+            map.insert(
+                key.to_string(),
+                serde_json::Value::String(value.clone()),
+            );
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+/// P3-C (§7): the command digest for a loop `worker.run`
+/// proposal, computed from the resolved command (never from
+/// a client hash). Resolves the worktree (binding + Location
+/// root), the binary, and the allowlisted command, then
+/// returns the digest + the CommandSpec the approval carries.
+/// The loop planning branch calls this — `complete_work` has
+/// no AppState, so the proposal-time digest is only the
+/// normalized-args digest, overwritten here.
+pub(crate) fn worker_command_digest(
+    state: &AppState,
+    args: &std::collections::BTreeMap<String, String>,
+) -> Result<(String, CommandSpec), WorkerCreateError> {
+    let worktree_id = args
+        .get("worktree_id")
+        .ok_or_else(|| worker_create_error(StatusCode::BAD_REQUEST, "missing worktree_id"))?;
+    let command = args
+        .get("command")
+        .ok_or_else(|| worker_create_error(StatusCode::BAD_REQUEST, "missing command"))?;
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(|s| s.parse::<u64>().ok());
+    let params = worker_run_params_from_args(args);
+    let binding = resolve_worktree_binding(state, worktree_id)
+        .map_err(|detail| worker_create_error(StatusCode::BAD_REQUEST, worker_binding_code(detail)))?;
+    let worktree = {
+        let worktrees = state.worktrees.lock().expect("worktree lock");
+        worktrees
+            .get(worktree_id)
+            .cloned()
+            .ok_or_else(|| worker_create_error(StatusCode::BAD_REQUEST, "unknown_worktree"))?
+    };
+    let cwd = worktree_canonical_root(state, &worktree)
+        .ok_or_else(|| worker_create_error(StatusCode::BAD_REQUEST, "worktree_directory_missing"))?;
+    let location_root = location_root_for_id(state, &binding.location_id)
+        .ok_or_else(|| worker_create_error(StatusCode::BAD_REQUEST, "unknown_location"))?;
+    let binary = worker_binary_for_command(state, command)?;
+    let resolved = crate::worker::resolve_command(
+        command,
+        Some(&params),
+        &binary,
+        &cwd,
+        timeout_ms,
+        Some(&location_root),
+    )
+    .map_err(|error| worker_create_error(StatusCode::BAD_REQUEST, error.code()))?;
+    if command == "git-worktree-add" {
+        // The preconditions are 409s on the route; here a
+        // failure fails the loop call (the model proposed a
+        // command that cannot run as stated).
+        let (path, branch) = match (args.get("path"), args.get("branch")) {
+            (Some(p), Some(b)) => (p.as_str(), b.as_str()),
+            _ => {
+                return Err(worker_create_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_params",
+                ));
+            }
+        };
+        check_worktree_add_preconditions(
+            state,
+            &binary,
+            &location_root,
+            &cwd,
+            path,
+            branch,
+        )?;
+    }
+    let cwd_str = cwd.to_string_lossy().into_owned();
+    let argv_sha256 = crate::operation_binding::sha256_hex(
+        serde_json::to_string(&resolved.argv)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    let spec = CommandSpec {
+        argv_template: command.clone(),
+        argv_sha256,
+        cwd: cwd_str.clone(),
+        timeout_ms: resolved.timeout_ms,
+    };
+    let digest = crate::operation_binding::command_digest(
+        &resolved.argv,
+        &cwd_str,
+        resolved.timeout_ms,
+    );
+    Ok((digest, spec))
+}
+
+/// P3-C (§7): validate a presented approval_id for a run
+/// creation. Digest-bound approvals (from /approval/request)
+/// are consumed here, under the approvals lock (tool +
+/// approved + unconsumed + digest match, single-use); a
+/// second presentation fails (already consumed).
+/// Loop-bound approvals (from a loop's worker.run call,
+/// already consumed by the loop in resume()) are verified
+/// here: approved + consumed + the same tool + the same
+/// digest. Their single-use rule is the run row's UNIQUE
+/// index on approval_id (checked atomically at insert, and
+/// fast-pathed by the caller before an Execution is made).
+/// A missing approval, a wrong tool, or a digest mismatch
+/// fails closed. Returns the approval id to store on the run
+/// row (None when no approval was presented).
+fn validate_worker_approval(
+    state: &AppState,
+    approval_id: &Option<String>,
+    digest: &str,
+) -> Result<Option<String>, WorkerCreateError> {
+    let Some(id) = approval_id else {
+        return Ok(None);
+    };
+    let is_loop_bound = {
+        let approvals = state.approvals.lock().expect("approval lock");
+        let Some(record) = approvals.get(id) else {
+            return Err(worker_create_error(
+                StatusCode::NOT_FOUND,
+                "unknown_approval",
+            ));
+        };
+        if record.tool != "worker.run" {
+            return Err(worker_create_error(
+                StatusCode::FORBIDDEN,
+                "approval_required",
+            ));
+        }
+        if record.status == ApprovalStatus::Rejected {
+            return Err(worker_create_error(
+                StatusCode::FORBIDDEN,
+                "approval_rejected",
+            ));
+        }
+        if record.status != ApprovalStatus::Approved {
+            return Err(worker_create_error(
+                StatusCode::FORBIDDEN,
+                "approval_required",
+            ));
+        }
+        if record.binding.is_some() {
+            if !record.consumed
+                || record.operation_digest.as_deref() != Some(digest)
+            {
+                return Err(worker_create_error(
+                    StatusCode::FORBIDDEN,
+                    "approval_binding_mismatch",
+                ));
+            }
+            true
+        } else {
+            false
+        }
+    };
+    if is_loop_bound {
+        return Ok(Some(id.clone()));
+    }
+    // Digest-bound: consume atomically (the check above
+    // already failed closed on status; the consume re-checks
+    // tool + digest + unconsumed under the same lock).
+    consume_bound_approval(state, "worker.run", approval_id, digest).map_err(|_| {
+        worker_create_error(StatusCode::FORBIDDEN, "approval_binding_mismatch")
+    })?;
+    Ok(Some(id.clone()))
+}
+
+/// P3-C: the shared run-creation path (the HTTP route and the
+/// loop `worker.run` arm). Validates the binding, resolves
+/// the command, checks the worktree-add preconditions,
+/// validates + consumes a presented approval, creates (or
+/// reuses) the Execution, sets the deadline, inserts the run
+/// row, and spawns the driver. The loop arm uses the same
+/// helper, so a loop-proposed command and a direct route call
+/// can never drift apart.
+pub(crate) async fn create_worker_run_internal(
+    state: &AppState,
+    req: WorkerRunCreateDto,
+) -> Result<crate::worker::WorkerRunRow, WorkerCreateError> {
     if state.sqlite_is_broken() {
-        return sqlite_error_response();
+        return Err(worker_create_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "sqlite_unavailable",
+        ));
     }
     let Some(sqlite) = &state.sqlite else {
-        return sqlite_not_configured();
+        return Err(worker_create_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "sqlite_not_configured",
+        ));
     };
     if state.sqlite_mode() != StateBackend::Sqlite {
-        return sqlite_not_configured();
+        return Err(worker_create_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "sqlite_not_configured",
+        ));
     }
-    let Some(git_path) = state.git_path.clone() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "git_unavailable" })),
-        )
-            .into_response();
-    };
-    let binding = match resolve_worktree_binding(&state, &req.worktree_id) {
+    let binary = worker_binary_for_command(state, &req.command)?;
+    let binding = match resolve_worktree_binding(state, &req.worktree_id) {
         Ok(binding) => binding,
-        Err(detail) => return worker_binding_error(detail),
+        Err(detail) => {
+            return Err(worker_create_error(
+                StatusCode::BAD_REQUEST,
+                worker_binding_code(detail),
+            ));
+        }
     };
     let worktree = match state
         .worktrees
@@ -11173,23 +11762,104 @@ async fn worker_runs_create(
         .cloned()
     {
         Some(worktree) => worktree,
-        None => return bad_request("unknown_worktree"),
+        None => {
+            return Err(worker_create_error(
+                StatusCode::BAD_REQUEST,
+                "unknown_worktree",
+            ));
+        }
     };
-    let Some(cwd) = worktree_canonical_root(&state, &worktree) else {
-        return bad_request("worktree_directory_missing");
+    let Some(cwd) = worktree_canonical_root(state, &worktree) else {
+        return Err(worker_create_error(
+            StatusCode::BAD_REQUEST,
+            "worktree_directory_missing",
+        ));
     };
+    let location_root = location_root_for_id(state, &binding.location_id);
     let resolved = match crate::worker::resolve_command(
         &req.command,
         req.params.as_ref(),
-        &git_path,
+        &binary,
         &cwd,
         req.timeout_ms,
+        location_root.as_deref(),
     ) {
         Ok(resolved) => resolved,
         Err(error) => {
-            return bad_request(error.code());
+            return Err(worker_create_error(
+                StatusCode::BAD_REQUEST,
+                error.code(),
+            ));
         }
     };
+    if req.command == "git-worktree-add" {
+        let (path, branch) = match req.params.as_ref() {
+            Some(serde_json::Value::Object(map)) => {
+                let path = map
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let branch = map
+                    .get("branch")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                (path, branch)
+            }
+            _ => ("", ""),
+        };
+        let Some(location_root) = &location_root else {
+            return Err(worker_create_error(
+                StatusCode::BAD_REQUEST,
+                "unknown_location",
+            ));
+        };
+        check_worktree_add_preconditions(
+            state,
+            &binary,
+            location_root,
+            &cwd,
+            path,
+            branch,
+        )?;
+    }
+    // The approval gate (§7): the digest commits the exact
+    // resolved argv + cwd + timeout. A digest-bound approval
+    // is consumed here; a loop-bound approval was already
+    // consumed by the loop and is verified here. The gate
+    // runs before any Execution is created, so a rejected
+    // approval never leaves a stray Execution behind.
+    let cwd_str = cwd.to_string_lossy().into_owned();
+    let digest = crate::operation_binding::command_digest(
+        &resolved.argv,
+        &cwd_str,
+        resolved.timeout_ms,
+    );
+    let approval_id = validate_worker_approval(state, &req.approval_id, &digest)?;
+    // Loop-bound replay fast-path (before an Execution is
+    // created; the atomic guard is the UNIQUE index at
+    // insert).
+    if let Some(id) = &approval_id {
+        let exists = {
+            let conn = sqlite.lock().expect("sqlite lock");
+            sqlite_store::worker_run_exists_for_approval(&conn, id)
+        };
+        match exists {
+            Ok(true) => {
+                return Err(worker_create_error(
+                    StatusCode::CONFLICT,
+                    "approval_already_used",
+                ));
+            }
+            Ok(false) => {}
+            Err(detail) => {
+                eprintln!("warning: E2 worker run approval check failed: {detail}");
+                return Err(worker_create_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "sqlite_unavailable",
+                ));
+            }
+        }
+    }
     // A named Execution must exist, be non-terminal, and —
     // when its snapshot carries a binding — agree with the
     // requested worktree. An unnamed run gets a minimal
@@ -11203,24 +11873,25 @@ async fn worker_runs_create(
             let execution = match execution {
                 Ok(Some(execution)) => execution,
                 Ok(None) => {
-                    return (
+                    return Err(worker_create_error(
                         StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({ "error": "unknown_execution" })),
-                    )
-                        .into_response();
+                        "unknown_execution",
+                    ));
                 }
                 Err(detail) => {
                     eprintln!("warning: E2 worker run execution read failed: {detail}");
-                    return sqlite_error_response();
+                    return Err(worker_create_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "sqlite_unavailable",
+                    ));
                 }
             };
             if crate::execution_store::execution_status_group(&execution.status) == Some("terminal")
             {
-                return (
+                return Err(worker_create_error(
                     StatusCode::CONFLICT,
-                    Json(serde_json::json!({ "error": "execution_terminal" })),
-                )
-                    .into_response();
+                    "execution_terminal",
+                ));
             }
             if let Some(snapshot_id) = &execution.workspace_snapshot_id {
                 let snapshot = {
@@ -11230,11 +11901,10 @@ async fn worker_runs_create(
                 if let Ok(Some(snapshot)) = snapshot {
                     if let Some(bound) = snapshot.binding_worktree_id {
                         if bound != req.worktree_id {
-                            return (
+                            return Err(worker_create_error(
                                 StatusCode::CONFLICT,
-                                Json(serde_json::json!({ "error": "execution_binding_mismatch" })),
-                            )
-                                .into_response();
+                                "execution_binding_mismatch",
+                            ));
                         }
                     }
                 }
@@ -11249,23 +11919,25 @@ async fn worker_runs_create(
                         .iter()
                         .any(|row| matches!(row.status.as_str(), "queued" | "running")) =>
                 {
-                    return (
+                    return Err(worker_create_error(
                         StatusCode::CONFLICT,
-                        Json(serde_json::json!({ "error": "execution_has_running_worker" })),
-                    )
-                        .into_response();
+                        "execution_has_running_worker",
+                    ));
                 }
                 Ok(_) => {}
                 Err(detail) => {
                     eprintln!("warning: E2 worker run busy check failed: {detail}");
-                    return sqlite_error_response();
+                    return Err(worker_create_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "sqlite_unavailable",
+                    ));
                 }
             }
             execution_id.clone()
         }
         None => {
             create_execution_with_binding(
-                &state,
+                state,
                 None,
                 None,
                 Some(SnapshotBinding {
@@ -11303,7 +11975,10 @@ async fn worker_runs_create(
             now + resolved.timeout_ms as i64,
         ) {
             eprintln!("warning: E2 worker run deadline write failed: {detail}");
-            return sqlite_error_response();
+            return Err(worker_create_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sqlite_unavailable",
+            ));
         }
     }
     let row = crate::worker::WorkerRunRow {
@@ -11323,6 +11998,7 @@ async fn worker_runs_create(
         tail: String::new(),
         truncated: false,
         effect_id: None,
+        approval_id,
         binding_location_id: Some(binding.location_id),
         binding_worktree_id: Some(binding.worktree_id),
         binding_root_digest: Some(binding.root_digest),
@@ -11335,22 +12011,44 @@ async fn worker_runs_create(
     let row = match row {
         Ok(row) => row,
         Err(detail) if detail == "execution_has_running_worker" => {
-            return (
+            return Err(worker_create_error(
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({ "error": detail })),
-            )
-                .into_response();
+                "execution_has_running_worker",
+            ));
+        }
+        Err(detail) if detail == "approval_already_used" => {
+            return Err(worker_create_error(
+                StatusCode::CONFLICT,
+                "approval_already_used",
+            ));
         }
         Err(detail) => {
             eprintln!("warning: E2 worker run create failed: {detail}");
-            return sqlite_error_response();
+            return Err(worker_create_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sqlite_unavailable",
+            ));
         }
     };
     tokio::spawn(crate::worker::drive_worker_run(
         state.clone(),
         row.run_id.clone(),
     ));
-    (StatusCode::CREATED, Json(row)).into_response()
+    Ok(row)
+}
+
+async fn worker_runs_create(
+    State(state): State<AppState>,
+    Json(req): Json<WorkerRunCreateDto>,
+) -> impl IntoResponse {
+    match create_worker_run_internal(&state, req).await {
+        Ok(row) => (StatusCode::CREATED, Json(row)).into_response(),
+        Err(err) => (
+            err.status,
+            Json(serde_json::json!({ "error": err.code })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -11706,16 +12404,7 @@ async fn effects_verify(
             &action.reminder_id,
         )
     } else {
-        let write_evidence = {
-            let conn = sqlite.lock().expect("sqlite lock");
-            match crate::sqlite_store::latest_write_evidence_for_effect(&conn, &effect.effect_id) {
-                Ok(row) => row,
-                Err(detail) => {
-                    eprintln!("warning: evidence lookup failed: {detail}");
-                    None
-                }
-            }
-        };
+        let write_evidence = latest_evidence_for_effect(&state, &effect);
         match crate::evidence::verify_outcome(&state, &effect, write_evidence.as_ref()) {
             Ok(outcome) => outcome,
             Err(crate::evidence::ObserveError::NoMethod) => {

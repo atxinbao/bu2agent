@@ -148,6 +148,9 @@ fn approval_record(id: &str, tool: &str, status: &str) -> ApprovalFileRecord {
         // which carry no Effect binding.
         effect_binding: None,
         message: None,
+        // P3-C field; snapshot fixtures model pre-P3-C rows,
+        // which carry no Worker command spec.
+        command: None,
     }
 }
 

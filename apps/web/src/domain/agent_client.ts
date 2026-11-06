@@ -74,10 +74,12 @@ function requiresApproval(tool: string): boolean | undefined {
     case "fs.read":
     case "echo":
     case "code.search":
+    case "git.read":
       return false;
     case "fs.write":
     case "fs.delete":
     case "reminders.set_completed":
+    case "worker.run":
       return true;
     default:
       return undefined;
