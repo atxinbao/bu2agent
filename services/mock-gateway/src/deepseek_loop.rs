@@ -79,9 +79,32 @@ impl LoopModel for DeepSeekLoopModel {
         messages: Vec<Message>,
         timeout: Duration,
     ) -> BackendFuture<Result<ModelReply, ModelError>> {
+        self.complete_with_rules(None, messages, timeout)
+    }
+
+    /// E2-B §3.4: the deny check runs against the frozen
+    /// rules when the engine resolved them (an Execution's
+    /// snapshot rules); None falls back to the live handle
+    /// exactly as `complete` did before.
+    fn complete_with_rules(
+        &self,
+        rules: Option<Vec<crate::policy_store::NetworkRule>>,
+        messages: Vec<Message>,
+        timeout: Duration,
+    ) -> BackendFuture<Result<ModelReply, ModelError>> {
         let this = self.clone();
         Box::pin(async move {
-            if let Some(pattern) = this.denied_pattern() {
+            let denied = match &rules {
+                Some(frozen) => {
+                    let url = format!(
+                        "{}/chat/completions",
+                        this.config.base_url.trim_end_matches('/')
+                    );
+                    crate::policy_store::denied_rule(frozen, &url)
+                }
+                None => this.denied_pattern(),
+            };
+            if let Some(pattern) = denied {
                 return Err(ModelError::Denied(pattern));
             }
             let request = json!({

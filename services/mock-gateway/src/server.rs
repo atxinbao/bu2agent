@@ -434,6 +434,20 @@ pub struct AppState {
     policy_overrides: Arc<Mutex<Option<PolicyOverrides>>>,
     policy_connectors: Arc<Mutex<HashMap<String, ConnectorPolicy>>>,
     policy_rules: Arc<Mutex<Option<Vec<NetworkRule>>>>,
+    /// E2-B §3.4 (snapshot gate): network rules versions
+    /// retained by their snapshot digest,
+    /// `sha256(canonical_json(rules))`, so an Execution's
+    /// frozen snapshot can resolve to the rules list that
+    /// was live at its creation. Every set/load inserts the
+    /// new version and keeps the old ones (policy changes
+    /// are rare operator actions; the map grows by one entry
+    /// per change). The initial empty list is present from
+    /// construction, so an Execution created before any rule
+    /// was ever set still resolves. A digest that does not
+    /// resolve (a version predating this process that was
+    /// never persisted) falls back to live rules at the call
+    /// site — the gate degrades, it never refuses.
+    policy_rule_versions: Arc<Mutex<HashMap<String, Vec<NetworkRule>>>>,
     policy_scopes: Arc<Mutex<HashMap<String, ScopeRecord>>>,
     policy_state_path: Option<PathBuf>,
     model_staged: Arc<Mutex<Option<StagedModel>>>,
@@ -758,6 +772,10 @@ impl AppState {
             policy_overrides: Arc::new(Mutex::new(None)),
             policy_connectors: Arc::new(Mutex::new(HashMap::new())),
             policy_rules: Arc::new(Mutex::new(None)),
+            policy_rule_versions: Arc::new(Mutex::new(HashMap::from([(
+                crate::policy_store::network_rules_digest(&[]),
+                Vec::new(),
+            )]))),
             policy_scopes: Arc::new(Mutex::new(HashMap::new())),
             policy_state_path: None,
             model_staged: Arc::new(Mutex::new(None)),
@@ -2018,10 +2036,55 @@ impl AppState {
     /// probe outcome is stamped as the row's detail right
     /// after recording (the stamp re-persists the row, which
     /// the §2.6 Inbox guard makes safe).
+    /// E2-B §3.3, Reader 2: the recovery scan reads
+    /// `latest_plan_position` when finalizing a stale run and
+    /// writes the position into the unknown Effect's
+    /// reconciliation hint (its `detail`, alongside the probe
+    /// outcome the scan already stamps there), for a human or
+    /// Agent to reference when resuming. The hint is a
+    /// reference, not a reconciliation: the Effect stays
+    /// `unknown` and the Inbox row stays open. No checkpoint
+    /// → the detail is unchanged.
+    fn recovery_resume_hint(&self, execution_id: &str) -> Option<String> {
+        let sqlite = self.sqlite.as_ref()?;
+        if self.sqlite_is_broken() {
+            return None;
+        }
+        let conn = sqlite.lock().expect("sqlite lock");
+        let checkpoint = sqlite_store::latest_plan_position(&conn, execution_id).ok()??;
+        let payload: serde_json::Value =
+            serde_json::from_str(&checkpoint.payload_json).ok()?;
+        let next = payload.get("next_effect_key").and_then(|v| v.as_str());
+        let completed = payload
+            .get("completed_keys")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        Some(match next {
+            Some(key) => format!("resume at next_effect_key={key} ({completed} completed)"),
+            None => format!("resume at end ({completed} completed, none pending)"),
+        })
+    }
+
     fn recovery_scan_effect(&self, stale: &sqlite_store::StaleWorkerRun) -> String {
         let (capability, operation, scope) =
             crate::worker::unknown_effect_identity(&stale.run, None);
         let digest = crate::worker::run_digest(&stale.run);
+        // E2-B §3.3 Reader 2: the resume hint, appended to
+        // the probe detail when the scan creates the Effect
+        // row. A re-scanned run reuses its row (early return
+        // below), which already carries the hint from its
+        // first scan. Appended once: a detail that already
+        // carries a hint is left alone.
+        let hinted_detail = match &stale.run.execution_id {
+            Some(execution_id) => match self.recovery_resume_hint(execution_id) {
+                Some(hint) if !stale.detail.contains("resume at") => {
+                    format!("{} | {hint}", stale.detail)
+                }
+                _ => stale.detail.clone(),
+            },
+            None => stale.detail.clone(),
+        };
         if let Some(execution_id) = &stale.run.execution_id {
             let key = crate::effect_store::idempotency_key(
                 execution_id,
@@ -2051,7 +2114,7 @@ impl AppState {
                 status: "unknown".to_string(),
             },
         );
-        stamp_effect_detail(self, &record.effect_id, &stale.detail);
+        stamp_effect_detail(self, &record.effect_id, &hinted_detail);
         record.effect_id
     }
 
@@ -2075,6 +2138,56 @@ impl AppState {
         if let Err(detail) = sqlite_store::shutdown_cleanup(&mut conn) {
             eprintln!("warning: P0-E shutdown cleanup failed ({detail}); next startup scan will close the worker");
         }
+    }
+
+    /// E2-B §3.2 (sweeper): one pass over heartbeat-expired
+    /// still-active assignments. Each expired assignment goes
+    /// to the same lost terminal state as `shutdown_cleanup`
+    /// (detail "heartbeat expired"), its Execution to
+    /// `needs_review` with the recovery-scan Inbox shape
+    /// (`review_required` + `unknown_requires_reconciliation`),
+    /// in one transaction per assignment (see
+    /// `sqlite_store::sweep_expired_assignment`). The sweeper
+    /// never touches `worker_runs` rows — leftover runs are
+    /// only collected by the next startup scan — and records
+    /// no Effect (expiry is a liveness observation, not a
+    /// side effect). Assignments with no lease (never
+    /// heartbeated, e.g. takeover-held) are never expired.
+    /// SQLite mode only; JSONL/shadow mode sweeps nothing.
+    /// Returns how many assignments were lost. Failures are
+    /// logged per assignment and never abort the pass.
+    pub fn sweep_expired_assignments(&self) -> usize {
+        if self.sqlite_mode() != StateBackend::Sqlite || self.sqlite_is_broken() {
+            return 0;
+        }
+        let Some(sqlite) = &self.sqlite else {
+            return 0;
+        };
+        let expired = {
+            let conn = sqlite.lock().expect("sqlite lock");
+            match sqlite_store::expired_active_assignments(&conn, sqlite_store::now_ms() as i64) {
+                Ok(rows) => rows,
+                Err(detail) => {
+                    eprintln!("warning: E2-B assignment sweep list failed: {detail}");
+                    return 0;
+                }
+            }
+        };
+        let mut swept = 0;
+        for row in expired {
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            match sqlite_store::sweep_expired_assignment(&mut conn, &row.assignment_id) {
+                Ok(outcome) if outcome.assignment_lost => swept += 1,
+                Ok(_) => {}
+                Err(detail) => {
+                    eprintln!(
+                        "warning: E2-B assignment sweep failed for {}: {detail}",
+                        row.assignment_id
+                    );
+                }
+            }
+        }
+        swept
     }
 
     pub(crate) fn sqlite_mode(&self) -> StateBackend {
@@ -2484,7 +2597,8 @@ impl AppState {
     /// JSONL file, mirroring with_vault_state_path. Production
     /// state reads MOCK_POLICY_STATE_PATH.
     pub fn with_policy_state_path(mut self, path: PathBuf) -> Self {
-        let (defaults, overrides, connectors, rules, scopes) = load_policy_state(&path);
+        let (defaults, overrides, connectors, rules, scopes, rules_history) =
+            load_policy_state(&path);
         let mut connector_map = HashMap::new();
         for record in &connectors {
             connector_map.insert(record.connector_id.clone(), record.clone());
@@ -2501,6 +2615,17 @@ impl AppState {
         // hold this exact Arc, and replacing it would
         // silently unplug enforcement.
         *self.policy_rules.lock().expect("policy rules lock") = rules;
+        // E2-B §3.4: retain the loaded version and every
+        // historical version, so snapshots created before
+        // this restart still resolve to their frozen rules.
+        if let Some(loaded) = self.policy_rules.lock().expect("policy rules lock").clone() {
+            retain_policy_rules_version(&self, &loaded);
+        } else {
+            retain_policy_rules_version(&self, &[]);
+        }
+        for version in &rules_history {
+            retain_policy_rules_version(&self, version);
+        }
         self.policy_scopes = Arc::new(Mutex::new(scope_map));
         self.policy_state_path = Some(path);
         self
@@ -5954,6 +6079,7 @@ async fn policy_network_rules_update(
             .into_response();
     }
     *state.policy_rules.lock().expect("policy rules lock") = Some(req.rules.clone());
+    retain_policy_rules_version(&state, &req.rules);
     persist_policy_line(&state, &PolicyStateLine::NetworkRules { rules: req.rules.clone() });
     Json(req.rules).into_response()
 }
@@ -5963,6 +6089,7 @@ async fn policy_reset(State(state): State<AppState>) -> Json<PolicyView> {
     store_policy_defaults(&state, PolicyDefaults { updated_ms: now, ..Default::default() });
     store_policy_overrides(&state, PolicyOverrides { updated_ms: now, ..Default::default() });
     *state.policy_rules.lock().expect("policy rules lock") = Some(Vec::new());
+    retain_policy_rules_version(&state, &[]);
     persist_policy_line(&state, &PolicyStateLine::NetworkRules { rules: Vec::new() });
     let mut connectors = state.policy_connectors.lock().expect("policy connectors lock");
     for record in connectors.values_mut().filter(|r| !r.deleted) {
@@ -8849,13 +8976,62 @@ fn execution_number(execution_id: &str) -> u64 {
 /// rule list; `permissions` is the effective policy.
 fn policy_digests(state: &AppState) -> (String, String) {
     let rules = state.policy_rules.lock().expect("policy rules lock").clone().unwrap_or_default();
-    let rules_json = serde_json::to_value(&rules).expect("network rules serialize");
-    let rules_digest = sqlite_store::sha256_hex(sqlite_store::canonical_json(&rules_json).as_bytes());
+    let rules_digest = crate::policy_store::network_rules_digest(&rules);
     let effective = policy_effective(state);
     let effective_json = serde_json::to_value(&effective).expect("effective policy serialize");
     let permissions_digest =
         sqlite_store::sha256_hex(sqlite_store::canonical_json(&effective_json).as_bytes());
     (rules_digest, permissions_digest)
+}
+
+/// E2-B §3.4: retain one network rules version under its
+/// snapshot digest, so an Execution created while these rules
+/// were live keeps resolving to them after a later change.
+/// Old versions are never evicted (see the field doc).
+fn retain_policy_rules_version(state: &AppState, rules: &[NetworkRule]) {
+    let digest = crate::policy_store::network_rules_digest(rules);
+    state
+        .policy_rule_versions
+        .lock()
+        .expect("policy rule versions lock")
+        .insert(digest, rules.to_vec());
+}
+
+/// E2-B §3.4 (snapshot gate): the network rules an
+/// Execution was created under, resolved from its frozen
+/// snapshot digest — NOT live policy. Returns None when the
+/// Execution has no snapshot (JSONL mode), the snapshot
+/// carries no network-rules digest, or the version is not
+/// retained; the caller falls back to live rules then. Only
+/// the network-rules component is gated: it is the only
+/// policy enforced at execution time (the model deny check);
+/// the snapshot's `permissions` digest has no execution-time
+/// enforcement point to gate — its readers are config routes
+/// and creation-time snapshots.
+pub(crate) fn frozen_network_rules_for_execution(
+    state: &AppState,
+    execution_id: &str,
+) -> Option<Vec<NetworkRule>> {
+    let sqlite = state.sqlite.as_ref()?;
+    if state.sqlite_is_broken() {
+        return None;
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    let execution = sqlite_store::get_execution(&conn, execution_id).ok()??;
+    let snapshot_id = execution.workspace_snapshot_id?;
+    let snapshot = sqlite_store::get_snapshot(&conn, &snapshot_id).ok()??;
+    let ids: Vec<String> = serde_json::from_str(&snapshot.policy_binding_ids_json).ok()?;
+    let digest = ids.iter().find_map(|entry| {
+        entry
+            .strip_prefix("network-rules:sha256:")
+            .map(|hex| hex.to_string())
+    })?;
+    state
+        .policy_rule_versions
+        .lock()
+        .expect("policy rule versions lock")
+        .get(&digest)
+        .cloned()
 }
 
 /// P3-A: the binding's single policy digest, frozen at
@@ -14656,6 +14832,21 @@ pub fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// E2-B §3.2: the background assignment sweeper. One task,
+/// one pass every 10 s, forever; it spawns no commands and
+/// records no Effect (see `AppState::sweep_expired_assignments`).
+/// Started by `serve` at gateway startup, at the same level as
+/// the recovery scan. The caller aborts the handle on shutdown;
+/// a pass already in flight finishes under the SQLite lock.
+pub fn spawn_assignment_sweeper(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            state.sweep_expired_assignments();
+        }
+    })
+}
+
 pub async fn serve(
     listener: tokio::net::TcpListener,
     state: AppState,
@@ -14666,9 +14857,13 @@ pub async fn serve(
         let _ = tokio::signal::ctrl_c().await;
         println!("mock-gateway shutting down");
     };
+    // E2-B §3.2: the assignment sweeper runs for the life of
+    // the server; abort it once the listener stops.
+    let sweeper = spawn_assignment_sweeper(state.clone());
     let result = axum::serve(listener, app(state.clone()))
         .with_graceful_shutdown(shutdown)
         .await;
+    sweeper.abort();
     // P0-E clean-shutdown hook: this is the ONE normal-exit
     // path (Ctrl-C graceful shutdown). The cleanup runs after
     // the listener stops, best-effort, and never changes the

@@ -3088,7 +3088,7 @@ fn append_assignment_event(
     tx: &rusqlite::Transaction<'_>,
     event_type: &str,
     row: &AssignmentRow,
-) -> Result<(), String> {
+) -> Result<i64, String> {
     let payload =
         serde_json::to_string(row).map_err(|e| format!("sqlite: cannot encode assignment: {e}"))?;
     append_event(
@@ -3100,8 +3100,7 @@ fn append_assignment_event(
         &row.origin_device_id,
         now_ms() as i64,
         row.schema_version,
-    )?;
-    Ok(())
+    )
 }
 
 fn execution_row_tx(
@@ -3112,6 +3111,19 @@ fn execution_row_tx(
         &format!("SELECT {EXECUTION_COLS} FROM executions WHERE execution_id = ?1"),
         params![execution_id],
         execution_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+fn assignment_row_tx(
+    tx: &rusqlite::Transaction<'_>,
+    assignment_id: &str,
+) -> Result<Option<AssignmentRow>, String> {
+    tx.query_row(
+        &format!("SELECT {ASSIGNMENT_COLS} FROM assignments WHERE assignment_id = ?1"),
+        params![assignment_id],
+        assignment_from_row,
     )
     .optional()
     .map_err(err)
@@ -3199,7 +3211,7 @@ fn mark_assignment_tx(
     status: &str,
     detail: &str,
     event_type: Option<&str>,
-) -> Result<AssignmentRow, String> {
+) -> Result<(AssignmentRow, i64), String> {
     let now = now_ms() as i64;
     let mut updated = row.clone();
     updated.status = status.to_string();
@@ -3209,10 +3221,14 @@ fn mark_assignment_tx(
         params![status, detail, now, row.assignment_id],
     )
     .map_err(err)?;
-    if let Some(event_type) = event_type {
-        append_assignment_event(tx, event_type, &updated)?;
-    }
-    Ok(updated)
+    // E2-B: the appended event's id is the Inbox source for
+    // rows opened off this transition (the sweeper's unknown
+    // row); `event-0` when no event is appended.
+    let event_id = match event_type {
+        Some(event_type) => append_assignment_event(tx, event_type, &updated)?,
+        None => 0,
+    };
+    Ok((updated, event_id))
 }
 
 // --- P0-E reads (connection-level, for routes and tests) ---
@@ -3249,6 +3265,128 @@ pub fn get_assignment(conn: &Connection, assignment_id: &str) -> Result<Option<A
     )
     .optional()
     .map_err(err)
+}
+
+/// E2-B §3.1: the driving worker's heartbeat. `lease_expires_ms`
+/// is always the heartbeat + 30 s (WORKER_LEASE_TTL_MS in
+/// worker.rs); the driver calls this every 5 s while a run is
+/// in flight. A failed write must never kill a run — the
+/// driver logs it and carries on (a heartbeat is a liveness
+/// signal, not a side effect).
+pub fn update_assignment_heartbeat(
+    conn: &Connection,
+    assignment_id: &str,
+    heartbeat_ms: i64,
+    lease_expires_ms: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE assignments SET heartbeat_ms = ?1, lease_expires_ms = ?2, updated_at_ms = ?1 WHERE assignment_id = ?3",
+        params![heartbeat_ms, lease_expires_ms, assignment_id],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// E2-B §3.2: still-driving assignments whose lease has
+/// passed. A row with no lease (never heartbeated, e.g.
+/// takeover-held) is never expired.
+pub fn expired_active_assignments(
+    conn: &Connection,
+    now_ms: i64,
+) -> Result<Vec<AssignmentRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ASSIGNMENT_COLS} FROM assignments WHERE status IN ('assigned', 'active') AND lease_expires_ms IS NOT NULL AND lease_expires_ms <= ?1 ORDER BY seq ASC, assignment_id ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![now_ms], assignment_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+/// Outcome of sweeping one expired assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepOutcome {
+    /// The assignment was marked lost.
+    pub assignment_lost: bool,
+    /// Its Execution went to `needs_review` (false when the
+    /// Execution was already terminal or missing: the
+    /// assignment is still lost, there is just nothing to
+    /// review).
+    pub execution_transitioned: bool,
+}
+
+/// E2-B §3.2: sweep one expired assignment, one transaction.
+/// The assignment goes to the same lost terminal state as
+/// `shutdown_cleanup` (detail "heartbeat expired"), and — when
+/// its Execution is still non-terminal — the Execution goes to
+/// `needs_review` with the recovery-scan Inbox shape: a
+/// `review_required` row (opened by the transition, same as
+/// any status write) plus an `unknown_requires_reconciliation`
+/// row sourced from the `assignment.lost` event, with no
+/// Effect row (expiry records no Effect; see the sweeper in
+/// server.rs). The lease is re-checked inside the transaction:
+/// a heartbeat that landed after the list was read wins and
+/// the assignment is left alone. Never touches `worker_runs`.
+pub fn sweep_expired_assignment(
+    conn: &mut Connection,
+    assignment_id: &str,
+) -> Result<SweepOutcome, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let outcome = (|| -> Result<SweepOutcome, String> {
+        let Some(row) = assignment_row_tx(&tx, assignment_id)? else {
+            return Ok(SweepOutcome { assignment_lost: false, execution_transitioned: false });
+        };
+        if !matches!(row.status.as_str(), "assigned" | "active") {
+            return Ok(SweepOutcome { assignment_lost: false, execution_transitioned: false });
+        }
+        let expired = match row.lease_expires_ms {
+            Some(lease) => lease <= now_ms() as i64,
+            None => false,
+        };
+        if !expired {
+            return Ok(SweepOutcome { assignment_lost: false, execution_transitioned: false });
+        }
+        let (_, event_id) = mark_assignment_tx(
+            &tx,
+            &row,
+            "lost",
+            "heartbeat expired",
+            Some("assignment.lost"),
+        )?;
+        let Some(execution_id) = row.execution_id.clone() else {
+            return Ok(SweepOutcome { assignment_lost: true, execution_transitioned: false });
+        };
+        let Some(mut execution) = execution_row_tx(&tx, &execution_id)? else {
+            return Ok(SweepOutcome { assignment_lost: true, execution_transitioned: false });
+        };
+        if !crate::execution_store::valid_execution_transition(&execution.status, "needs_review")
+        {
+            return Ok(SweepOutcome { assignment_lost: true, execution_transitioned: false });
+        }
+        execution.status = "needs_review".to_string();
+        upsert_execution_tx(&tx, &execution, "execution.transitioned", false)?;
+        insert_inbox(
+            &tx,
+            "unknown_requires_reconciliation",
+            Some(&execution_id),
+            None,
+            None,
+            &format!("event-{event_id}"),
+            now_ms() as i64,
+        )?;
+        Ok(SweepOutcome { assignment_lost: true, execution_transitioned: true })
+    })();
+    match outcome {
+        Ok(result) => {
+            tx.commit().map_err(err)?;
+            Ok(result)
+        }
+        Err(detail) => Err(detail),
+    }
 }
 
 pub fn list_worker_sessions(conn: &Connection) -> Result<Vec<WorkerSessionRow>, String> {
@@ -3667,14 +3805,30 @@ pub fn takeover_assignment(
         // already refused on any driving row.
         let mut superseded = Vec::new();
         for row in &active {
-            superseded.push(takeover_internal(mark_assignment_tx(
+            let (lost, _) = takeover_internal(mark_assignment_tx(
                 &tx,
                 row,
                 "lost",
                 "superseded by takeover",
                 Some("assignment.lost"),
-            ))?);
+            ))?;
+            superseded.push(lost);
         }
+        // E2-B §3.3, Reader 1: the takeover reads
+        // `latest_plan_position` and writes the resume point
+        // into the takeover event — here, the new assignment's
+        // `detail`, which the `assignment.created` event
+        // carries in its payload (the `execution.reassigned`
+        // event must keep the full execution record for the
+        // fold, so it cannot carry the point). The value is
+        // the previous checkpoint's raw payload
+        // (`{"next_effect_key","completed_keys"}`), or None
+        // when no checkpoint exists yet. Audit only: the
+        // fresh checkpoint written below already subsumes the
+        // previous position (Effects are append-only).
+        let resume_point =
+            takeover_internal(latest_plan_position(&tx, execution_id))?
+                .map(|row| row.payload_json);
         let assignment = AssignmentRow {
             assignment_id: takeover_internal(next_prefixed_id(
                 &tx,
@@ -3686,7 +3840,7 @@ pub fn takeover_assignment(
             worker_session_id: Some(worker_id.clone()),
             origin_device_id: origin_device_id.to_string(),
             status: "active".to_string(),
-            detail: None,
+            detail: resume_point,
             lease_expires_ms: None,
             heartbeat_ms: None,
             schema_version: 1,

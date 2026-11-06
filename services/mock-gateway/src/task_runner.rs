@@ -362,7 +362,18 @@ async fn generate_body(state: AppState, record: TaskFileRecord) {
         parts.push(format!("## {path}\n{text}"));
     }
     let prompt = format!("{PROMPT_PREFIX}{}", parts.join("\n\n"));
-    let draft = match state.deepseek.reply(&prompt).await {
+    // E2-B §3.4 (snapshot gate): the model call for this
+    // task's Execution is denied by the rules frozen in the
+    // Execution's snapshot at creation, not by live policy —
+    // a mid-flight policy change must not change an in-flight
+    // execution's permissions. No frozen rules resolve (no
+    // Execution yet, JSONL mode, or an unretained version) →
+    // live policy, exactly as before.
+    let frozen_rules = crate::server::execution_for_task(&state, &task_id)
+        .and_then(|execution_id| {
+            crate::server::frozen_network_rules_for_execution(&state, &execution_id)
+        });
+    let draft = match state.deepseek.reply_with_rules(frozen_rules, &prompt).await {
         DeepseekOutcome::Disabled => {
             fail(&state, &task_id, "模型未配置");
             return;

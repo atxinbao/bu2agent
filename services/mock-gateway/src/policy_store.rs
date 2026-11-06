@@ -171,14 +171,34 @@ pub enum PolicyStateLine {
     Scope(ScopeRecord),
 }
 
+/// E2-B §3.4: the digest a snapshot freezes for a network
+/// rules list: `sha256(canonical_json(rules))`. This is the
+/// exact formula `policy_digests` uses in server.rs, so a
+/// digest resolved from a snapshot always matches the key
+/// under which that version was retained. Keep the two in
+/// sync: if the snapshot formula ever changes, change this
+/// one with it.
+pub fn network_rules_digest(rules: &[NetworkRule]) -> String {
+    let rules_json = serde_json::to_value(rules).expect("network rules serialize");
+    crate::sqlite_store::sha256_hex(
+        crate::sqlite_store::canonical_json(&rules_json).as_bytes(),
+    )
+}
+
 /// Loaded policy state: defaults, overrides, connector
 /// policies, network rules, and scopes, in that order.
+/// The sixth element is the E2-B §3.4 version history: every
+/// NetworkRules line in file order, so a restart can retain
+/// the frozen rules versions snapshots point at (the live
+/// list alone would lose every version a policy change
+/// superseded).
 pub type PolicyStateData = (
     Option<PolicyDefaults>,
     Option<PolicyOverrides>,
     Vec<ConnectorPolicy>,
     Option<Vec<NetworkRule>>,
     Vec<ScopeRecord>,
+    Vec<Vec<NetworkRule>>,
 );
 
 /// Load policy state; malformed lines are skipped with a
@@ -186,12 +206,13 @@ pub type PolicyStateData = (
 /// keep their last snapshot; maps fold with last-write-wins.
 pub fn load_policy_state(path: &Path) -> PolicyStateData {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return (None, None, Vec::new(), None, Vec::new());
+        return (None, None, Vec::new(), None, Vec::new(), Vec::new());
     };
     let mut defaults = None;
     let mut overrides = None;
     let mut connectors = Vec::new();
     let mut rules = None;
+    let mut rules_history = Vec::new();
     let mut scopes = Vec::new();
     for line in text.lines() {
         if line.trim().is_empty() {
@@ -201,12 +222,15 @@ pub fn load_policy_state(path: &Path) -> PolicyStateData {
             Ok(PolicyStateLine::Defaults(record)) => defaults = Some(record),
             Ok(PolicyStateLine::Overrides(record)) => overrides = Some(record),
             Ok(PolicyStateLine::ConnectorPolicy(record)) => connectors.push(record),
-            Ok(PolicyStateLine::NetworkRules { rules: record }) => rules = Some(record),
+            Ok(PolicyStateLine::NetworkRules { rules: record }) => {
+                rules_history.push(record.clone());
+                rules = Some(record);
+            }
             Ok(PolicyStateLine::Scope(record)) => scopes.push(record),
             Err(_) => eprintln!("warning: skipping malformed policy state line in {}", path.display()),
         }
     }
-    (defaults, overrides, connectors, rules, scopes)
+    (defaults, overrides, connectors, rules, scopes, rules_history)
 }
 
 /// Append one state snapshot; failures are stderr warnings only,

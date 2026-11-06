@@ -161,7 +161,16 @@ impl DeepSeekClient {
         let rules = self.network_rules.as_ref()?;
         let guard = rules.lock().ok()?;
         let rules = guard.clone().unwrap_or_default();
-        crate::policy_store::denied_rule(&rules, &self.config.completions_url())
+        Self::denied_pattern_for(&rules, &self.config.completions_url())
+    }
+
+    /// E2-B §3.4: the same deny check against caller-supplied
+    /// rules — the frozen rules an Execution was created under,
+    /// resolved by the caller from the snapshot (see
+    /// `frozen_network_rules_for_execution`). The live handle
+    /// above is the fallback when no frozen rules resolve.
+    fn denied_pattern_for(rules: &[NetworkRule], url: &str) -> Option<String> {
+        crate::policy_store::denied_rule(rules, url)
     }
 
     pub fn config(&self) -> &DeepSeekConfig {
@@ -172,6 +181,18 @@ impl DeepSeekClient {
         self.reply_with_history(&[], user_text).await
     }
 
+    /// E2-B §3.4: like `reply`, but the deny check runs
+    /// against the given frozen rules when present (an
+    /// Execution's snapshot rules); None falls back to the
+    /// live handle exactly as `reply` does.
+    pub async fn reply_with_rules(
+        &self,
+        rules: Option<Vec<NetworkRule>>,
+        user_text: &str,
+    ) -> DeepseekOutcome {
+        self.reply_with_history_with_rules(rules, &[], user_text).await
+    }
+
     /// Session send: prior complete turns first, then the current
     /// user message. The caller owns trimming; this only sends
     /// what it is given, in order.
@@ -180,10 +201,25 @@ impl DeepSeekClient {
         history: &[(String, String)],
         user_text: &str,
     ) -> DeepseekOutcome {
+        self.reply_with_history_with_rules(None, history, user_text).await
+    }
+
+    /// E2-B §3.4: like `reply_with_history`, with frozen
+    /// rules for the deny check (see `reply_with_rules`).
+    pub async fn reply_with_history_with_rules(
+        &self,
+        rules: Option<Vec<NetworkRule>>,
+        history: &[(String, String)],
+        user_text: &str,
+    ) -> DeepseekOutcome {
         let Some(key) = &self.config.api_key else {
             return DeepseekOutcome::Disabled;
         };
-        if let Some(pattern) = self.denied_pattern() {
+        let denied = match &rules {
+            Some(frozen) => Self::denied_pattern_for(frozen, &self.config.completions_url()),
+            None => self.denied_pattern(),
+        };
+        if let Some(pattern) = denied {
             return DeepseekOutcome::Denied(pattern);
         }
         let mut messages: Vec<ChatMessage> = history

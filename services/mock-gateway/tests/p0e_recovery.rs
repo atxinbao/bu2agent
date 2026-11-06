@@ -870,10 +870,29 @@ fn wait_child(mut child: std::process::Child, secs: u64) -> std::process::ExitSt
     }
 }
 
-// Unix 的 kill -INT 只用于验证 POSIX 下的优雅退出；Windows 没有等价的
-// `kill` 命令，强杀也不会触发同一条 graceful-shutdown 路径，因此该测试
-// 在 Windows 跳过，避免把平台信号差异误报成恢复逻辑失败。
-#[cfg(unix)]
+/// E2-B §3.5 (Q12): unix-only. The clean-shutdown path is
+/// driven by a SIGINT delivered with the external `kill`
+/// command, which has no Windows equivalent, and there is no
+/// simple Windows-native way to deliver Ctrl-C to another
+/// process (`GenerateConsoleCtrlEvent` targets console groups,
+/// not pids, and would hit the test process itself). The same
+/// shutdown-cleanup logic is covered on all platforms, Windows
+/// included, by the portable equivalent `e2b_windows_t1`
+/// (tests/e2b_durability.rs), which calls
+/// `sqlite_shutdown_cleanup` in-process and asserts the same
+/// post-shutdown state; the crash path is covered everywhere
+/// by `p0e_binary_kill9_keeps_state_and_scan_closes_workers`.
+///
+/// NOTE (2026-11-06, pre-push reconciliation): the remote already
+/// carried `#[cfg(unix)]` on this test AND on `wait_child` since
+/// P3-A; the E2-B plan §3.5 and the implementer's step-1
+/// characterization were written from a stale local base that
+/// lacked both gates, so the "passes on Windows via Git for
+/// Windows kill" story was wrong — T1 never ran on Windows in
+/// recent CI, it was gated out. This merged version keeps both
+/// remote gates; `wait_child` has a single caller (this test),
+/// so dropping its gate would leave it unused on Windows.
+///#[cfg(unix)]
 #[tokio::test]
 async fn p0e_binary_clean_shutdown_ends_workers_and_loses_assignments() {
     let bin = std::env::var("CARGO_BIN_EXE_mock-gateway").expect("mock-gateway test binary");

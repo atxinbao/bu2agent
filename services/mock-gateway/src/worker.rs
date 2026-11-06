@@ -42,6 +42,16 @@ pub const WORKER_MAX_TIMEOUT_MS: u64 = 3_600_000;
 /// confirmed dead, not merely unwatched.
 pub const WORKER_KILL_GRACE_MS: u64 = 2_000;
 
+/// E2-B §3.1 (lease/heartbeat, plan §13 numbers): the driver
+/// writes a heartbeat every 5 s while a run is in flight;
+/// the lease is the heartbeat + 30 s. Expiry never kills the
+/// process and never retries — it only changes the visible
+/// state of the assignment and its Execution (the sweeper,
+/// server.rs). A failed heartbeat write is log-only: it must
+/// not kill the run and must not record an Effect.
+pub const WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+pub const WORKER_LEASE_TTL_MS: i64 = 30_000;
+
 /// How long the driver waits for inherited-pipe readers to
 /// drain after the child exits before giving up on the tail
 /// (a grandchild holding stdout open must not stall the
@@ -1242,9 +1252,19 @@ pub async fn drive_worker_run(state: AppState, run_id: String) {
     // unnoticed after a cancel, because nothing would ever
     // wake the driver again.
     let wait_started = std::time::Instant::now();
+    // E2-B §3.1: hold the lease from the moment the driver
+    // starts driving (first heartbeat now), then every 5 s
+    // at the top of the poll loop. A failed write is log-only
+    // (see write_heartbeat).
+    write_heartbeat(&state, &run);
+    let mut last_heartbeat = std::time::Instant::now();
     let mut outcome: Option<&'static str> = None;
     let mut status: Option<std::process::ExitStatus> = None;
     loop {
+        if last_heartbeat.elapsed() >= WORKER_HEARTBEAT_INTERVAL {
+            write_heartbeat(&state, &run);
+            last_heartbeat = std::time::Instant::now();
+        }
         match tokio::time::timeout(Duration::from_millis(200), child.wait()).await {
             Ok(Ok(exit)) => {
                 status = Some(exit);
@@ -1348,6 +1368,45 @@ pub async fn drive_worker_run(state: AppState, run_id: String) {
                 finish_terminal(&state, &run, "failed", code, output, started).await;
             }
         }
+    }
+}
+
+/// E2-B §3.1: one heartbeat write for the run's driving
+/// assignment (`lease = heartbeat + WORKER_LEASE_TTL_MS`).
+/// Log-only on failure — a heartbeat is a liveness signal,
+/// not a side effect, so a failed write must not kill the run
+/// and must not record an Effect. No assignment (an unbound
+/// run) → nothing to hold, silently skipped.
+fn write_heartbeat(state: &AppState, run: &WorkerRunRow) {
+    let Some(assignment_id) = &run.assignment_id else {
+        return;
+    };
+    let Some(sqlite) = &state.sqlite else {
+        return;
+    };
+    let now = now_ms();
+    let conn = sqlite.lock().expect("sqlite lock");
+    // Best-effort hold: once the assignment is no longer
+    // driving (swept lost, superseded, done), the lease is
+    // no longer this driver's to hold, so stop writing. The
+    // check-then-write is racy by design — a sweep landing
+    // between the two still leaves a lost row whose heartbeat
+    // advanced once, which no consumer reads — but the
+    // steady state is a frozen heartbeat on a lost row.
+    let still_driving = sqlite_store::get_assignment(&conn, assignment_id)
+        .ok()
+        .flatten()
+        .is_some_and(|row| matches!(row.status.as_str(), "assigned" | "active"));
+    if !still_driving {
+        return;
+    }
+    if let Err(detail) = sqlite_store::update_assignment_heartbeat(
+        &conn,
+        assignment_id,
+        now,
+        now + WORKER_LEASE_TTL_MS,
+    ) {
+        eprintln!("warning: E2-B worker heartbeat write failed for {assignment_id}: {detail}");
     }
 }
 

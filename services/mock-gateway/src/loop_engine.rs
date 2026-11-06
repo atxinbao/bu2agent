@@ -301,6 +301,22 @@ pub trait LoopModel: Send + Sync {
         messages: Vec<Message>,
         timeout: Duration,
     ) -> BackendFuture<Result<ModelReply, ModelError>>;
+
+    /// E2-B §3.4 (snapshot gate): like `complete`, but the
+    /// deny check runs against the given frozen rules when
+    /// present (an Execution's snapshot rules, resolved by
+    /// the engine from `frozen_network_rules_for_execution`);
+    /// None falls back to the model's live rules exactly as
+    /// `complete` does. The default delegates to `complete`,
+    /// so scripted/fake models are unaffected.
+    fn complete_with_rules(
+        &self,
+        _rules: Option<Vec<crate::policy_store::NetworkRule>>,
+        messages: Vec<Message>,
+        timeout: Duration,
+    ) -> BackendFuture<Result<ModelReply, ModelError>> {
+        self.complete(messages, timeout)
+    }
 }
 
 pub trait LoopTools: Send + Sync {
@@ -1370,9 +1386,19 @@ impl LoopEngine {
             Work::Model { messages, .. } => {
                 let model = self.model.clone().expect("configured model");
                 let messages = messages.clone();
-                tokio::spawn(
-                    async move { WorkResult::Model(model.complete(messages, limit).await) },
-                )
+                // E2-B §3.4 (snapshot gate): the model call for
+                // this loop's Execution is denied by the rules
+                // frozen in the Execution's snapshot at
+                // creation, not by live policy. No frozen rules
+                // resolve → the model falls back to its live
+                // rules exactly as before.
+                let frozen_rules =
+                    crate::server::execution_for_loop(&app, &id).and_then(|execution_id| {
+                        crate::server::frozen_network_rules_for_execution(&app, &execution_id)
+                    });
+                tokio::spawn(async move {
+                    WorkResult::Model(model.complete_with_rules(frozen_rules, messages, limit).await)
+                })
             }
             Work::Tool {
                 tool,
