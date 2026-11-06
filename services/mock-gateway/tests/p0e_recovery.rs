@@ -892,7 +892,7 @@ fn wait_child(mut child: std::process::Child, secs: u64) -> std::process::ExitSt
 /// recent CI, it was gated out. This merged version keeps both
 /// remote gates; `wait_child` has a single caller (this test),
 /// so dropping its gate would leave it unused on Windows.
-///#[cfg(unix)]
+#[cfg(unix)]
 #[tokio::test]
 async fn p0e_binary_clean_shutdown_ends_workers_and_loses_assignments() {
     let bin = std::env::var("CARGO_BIN_EXE_mock-gateway").expect("mock-gateway test binary");
