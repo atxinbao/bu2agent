@@ -50,7 +50,7 @@ use crate::execution_store::ExecutionFileRecord;
 /// Row-level `schema_version` fields are a separate concept
 /// (the record contract version, still 1 for P0-A+ rows) and
 /// are untouched.
-pub const DB_SCHEMA_VERSION: i64 = 3;
+pub const DB_SCHEMA_VERSION: i64 = 4;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -299,13 +299,54 @@ CREATE INDEX IF NOT EXISTS idx_patch_files_patch ON patch_files(patch_id);
 CREATE INDEX IF NOT EXISTS idx_patch_files_effect ON patch_files(effect_id);
 ";
 
+/// E2 prerequisite slice v4 migration: the `worker_runs`
+/// table only, plus the `executions.deadline_ms` column
+/// backfill in the same step (P0-E column-backfill
+/// precedent: the column is added here, no version beyond
+/// v4). No FKs (same convention as v1–v3), no changes to
+/// existing rows: old executions read `deadline_ms` as NULL
+/// (no deadline), and worker runs exist only for runs
+/// created after this slice. `tail` is the stdout+stderr
+/// tail, ≤4096 bytes; `truncated` says whether it was cut.
+/// The three `binding_*` columns freeze the run's
+/// Workspace/Worktree binding at run start (plan §2.3).
+const SCHEMA_V4: &str = "
+CREATE TABLE IF NOT EXISTS worker_runs (
+    seq INTEGER NOT NULL,
+    run_id TEXT PRIMARY KEY,
+    execution_id TEXT,
+    assignment_id TEXT,
+    worker_session_id TEXT,
+    command TEXT NOT NULL,
+    argv_json TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    timeout_ms INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    exit_code INTEGER,
+    pid INTEGER,
+    started_ms INTEGER,
+    finished_ms INTEGER,
+    tail TEXT NOT NULL,
+    truncated INTEGER NOT NULL,
+    effect_id TEXT,
+    binding_location_id TEXT,
+    binding_worktree_id TEXT,
+    binding_root_digest TEXT,
+    schema_version INTEGER NOT NULL,
+    created_ms INTEGER,
+    updated_at_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_worker_runs_execution ON worker_runs(execution_id);
+CREATE INDEX IF NOT EXISTS idx_worker_runs_status ON worker_runs(status);
+";
+
 fn err(e: rusqlite::Error) -> String {
     format!("sqlite: {e}")
 }
 
 /// Open (creating parent directories) and migrate a database
 /// file. Idempotent: re-opening an already-migrated file is a
-/// no-op, and the schema version ends at 2 either way.
+/// no-op, and the schema version ends at 4 either way.
 pub fn open_db(path: &Path) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -367,6 +408,20 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     if version < 3 {
         tx.execute_batch(SCHEMA_V3).map_err(err)?;
         tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '3')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // E2-slice v4 step: worker_runs table only, plus the
+    // executions.deadline_ms column backfill in the same
+    // step. The version is advanced to 4 (DB_SCHEMA_VERSION)
+    // only after both succeed.
+    if version < 4 {
+        tx.execute_batch(SCHEMA_V4).map_err(err)?;
+        backfill_column_typed(&tx, "executions", "deadline_ms", "INTEGER")?;
+        tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![DB_SCHEMA_VERSION.to_string()],
@@ -402,6 +457,17 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
 /// Add a nullable TEXT column when the table exists and the
 /// column is missing. Idempotent; a missing table is a no-op.
 fn backfill_column(tx: &rusqlite::Transaction<'_>, table: &str, column: &str) -> Result<(), String> {
+    backfill_column_typed(tx, table, column, "TEXT")
+}
+
+/// Typed variant of `backfill_column`: the E2-slice
+/// `executions.deadline_ms` backfill is INTEGER, not TEXT.
+fn backfill_column_typed(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+    sql_type: &str,
+) -> Result<(), String> {
     let table_exists: bool = tx
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -425,8 +491,11 @@ fn backfill_column(tx: &rusqlite::Transaction<'_>, table: &str, column: &str) ->
         names.iter().any(|name| name == column)
     };
     if !has_column {
-        tx.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])
-            .map_err(err)?;
+        tx.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {sql_type}"),
+            [],
+        )
+        .map_err(err)?;
     }
     Ok(())
 }
@@ -3209,6 +3278,87 @@ pub fn recovery_scan(conn: &mut Connection, origin_device_id: &str) -> Result<St
             mark_assignment_tx(&tx, &row, "lost", "worker stopped", Some("assignment.lost"))?;
         }
     }
+    // E2 slice: close `worker_runs` rows the dead gateway
+    // left behind (plan §2.2). A row with a live pid is an
+    // orphan — the process survived its parent — so it is
+    // marked `orphaned` and its process group is killed; a
+    // row with a dead or missing pid is `lost`. Both get an
+    // `unknown` Effect (which opens the Inbox row through
+    // the normal upsert trigger) and never an automatic
+    // retry: whether the command landed is unknown, and a
+    // retried write could land twice. The scan runs before
+    // the new worker session is created, so a run finalized
+    // here can never be re-driven by this process.
+    let stale_runs: Vec<WorkerRunRow> = {
+        let mut stmt = tx
+            .prepare(&format!(
+                "SELECT {WORKER_RUN_COLS} FROM worker_runs WHERE status IN ('queued', 'running') ORDER BY seq ASC"
+            ))
+            .map_err(err)?;
+        let rows = stmt
+            .query_map([], worker_run_from_row)
+            .map_err(err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(err)?;
+        rows
+    };
+    for run in &stale_runs {
+        let (status, detail) = match run.pid {
+            None => ("lost", "worker run never started"),
+            Some(pid) if crate::worker::process_alive(pid) => {
+                ("orphaned", "worker process survived gateway")
+            }
+            Some(_) => ("lost", "worker process ended with gateway"),
+        };
+        if status == "orphaned" {
+            if let Some(pid) = run.pid {
+                crate::worker::kill_process_group(pid, "TERM");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if crate::worker::process_alive(pid) {
+                    crate::worker::kill_process_group(pid, "KILL");
+                }
+            }
+        }
+        let digest = sha256_hex(
+            canonical_json(&serde_json::json!({
+                "argv": run.argv_json,
+                "command": run.command,
+                "cwd": run.cwd,
+                "run_id": run.run_id,
+            }))
+            .as_bytes(),
+        );
+        let idempotency_key = run.execution_id.as_ref().map(|execution_id| {
+            crate::effect_store::idempotency_key(
+                execution_id,
+                "git",
+                &run.command,
+                &run.cwd,
+                &digest,
+            )
+        });
+        let effect = EffectFileRecord {
+            effect_id: next_prefixed_id(&tx, "effects", "effect_id", "effect-")?,
+            execution_id: run.execution_id.clone(),
+            capability: "git".to_string(),
+            operation: run.command.clone(),
+            scope: run.cwd.clone(),
+            input_digest: Some(digest),
+            approval_id: None,
+            status: "unknown".to_string(),
+            idempotency_key,
+            origin_device_id: origin_device_id.to_string(),
+            schema_version: 1,
+            reconciliation: None,
+            detail: Some(detail.to_string()),
+        };
+        upsert_effect_tx(&tx, &effect)?;
+        tx.execute(
+            "UPDATE worker_runs SET status = ?1, finished_ms = ?2, effect_id = ?3, updated_at_ms = ?2 WHERE run_id = ?4",
+            params![status, now, effect.effect_id, run.run_id],
+        )
+        .map_err(err)?;
+    }
     let new_id = next_prefixed_id(&tx, "worker_sessions", "worker_session_id", "worker-")?;
     insert_worker_session_tx(
         &tx,
@@ -3553,6 +3703,253 @@ pub fn transition_execution(
     }
 }
 
+// --- E2 slice: worker_runs, execution deadlines, run
+// checkpoints ---
+//
+// One writer (the single SQLite connection mutex) and one
+// driver (worker.rs): there is no second Worker anywhere.
+// Every run-row write that moves a run forward is
+// conditional on the row still being `queued` / `running`,
+// so a recovery scan that already finalized the row wins
+// over a late driver write.
+
+pub use crate::worker::WorkerRunRow;
+
+const WORKER_RUN_COLS: &str = "run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version";
+
+fn worker_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRunRow> {
+    Ok(WorkerRunRow {
+        run_id: row.get(0)?,
+        execution_id: row.get(1)?,
+        assignment_id: row.get(2)?,
+        worker_session_id: row.get(3)?,
+        command: row.get(4)?,
+        argv_json: row.get(5)?,
+        cwd: row.get(6)?,
+        timeout_ms: row.get(7)?,
+        status: row.get(8)?,
+        exit_code: row.get(9)?,
+        pid: row.get(10)?,
+        started_ms: row.get(11)?,
+        finished_ms: row.get(12)?,
+        tail: row.get(13)?,
+        truncated: row.get::<_, i64>(14)? != 0,
+        effect_id: row.get(15)?,
+        binding_location_id: row.get(16)?,
+        binding_worktree_id: row.get(17)?,
+        binding_root_digest: row.get(18)?,
+        schema_version: row.get(19)?,
+    })
+}
+
+/// Create a run row, one transaction: a second running run
+/// for the same Execution refuses with
+/// `execution_has_running_worker` (plan §3.1). The run id
+/// is assigned here, from the table max, so a restart can
+/// never reuse a counter (C20). The caller's `run_id` is
+/// ignored.
+pub fn create_worker_run(
+    conn: &mut Connection,
+    row: &WorkerRunRow,
+) -> Result<WorkerRunRow, String> {
+    let tx = conn.transaction().map_err(err)?;
+    if let Some(execution_id) = &row.execution_id {
+        let running: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM worker_runs WHERE execution_id = ?1 AND status IN ('queued', 'running')",
+                params![execution_id],
+                |r| r.get(0),
+            )
+            .map_err(err)?;
+        if running > 0 {
+            return Err("execution_has_running_worker".to_string());
+        }
+    }
+    let mut inserted = row.clone();
+    inserted.run_id = next_prefixed_id(&tx, "worker_runs", "run_id", "run-")?;
+    let seq = tx_seq(&tx, "worker_runs", &inserted.run_id)?;
+    let now = now_ms() as i64;
+    tx.execute(
+        "INSERT INTO worker_runs (seq, run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, created_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22)",
+        params![seq, inserted.run_id, inserted.execution_id, inserted.assignment_id, inserted.worker_session_id, inserted.command, inserted.argv_json, inserted.cwd, inserted.timeout_ms, inserted.status, inserted.exit_code, inserted.pid, inserted.started_ms, inserted.finished_ms, inserted.tail, inserted.truncated as i64, inserted.effect_id, inserted.binding_location_id, inserted.binding_worktree_id, inserted.binding_root_digest, inserted.schema_version, now],
+    )
+    .map_err(err)?;
+    tx.commit().map_err(err)?;
+    Ok(inserted)
+}
+
+pub fn get_worker_run(conn: &Connection, run_id: &str) -> Result<Option<WorkerRunRow>, String> {
+    conn.query_row(
+        &format!("SELECT {WORKER_RUN_COLS} FROM worker_runs WHERE run_id = ?1"),
+        params![run_id],
+        worker_run_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+pub fn list_worker_runs(
+    conn: &Connection,
+    execution_id: Option<&str>,
+    status: Option<&str>,
+) -> Result<Vec<WorkerRunRow>, String> {
+    let mut sql = format!("SELECT {WORKER_RUN_COLS} FROM worker_runs");
+    let mut clauses: Vec<String> = Vec::new();
+    if execution_id.is_some() {
+        clauses.push("execution_id = ?1".to_string());
+    }
+    if status.is_some() {
+        clauses.push(format!("status = ?{}", clauses.len() + 1));
+    }
+    if !clauses.is_empty() {
+        sql.push_str(&format!(" WHERE {}", clauses.join(" AND ")));
+    }
+    sql.push_str(" ORDER BY seq ASC, run_id ASC");
+    let mut stmt = conn.prepare(&sql).map_err(err)?;
+    let rows = match (execution_id, status) {
+        (Some(execution), Some(status)) => stmt
+            .query_map(params![execution, status], worker_run_from_row)
+            .map_err(err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(err)?,
+        (Some(execution), None) => stmt
+            .query_map(params![execution], worker_run_from_row)
+            .map_err(err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(err)?,
+        (None, Some(status)) => stmt
+            .query_map(params![status], worker_run_from_row)
+            .map_err(err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(err)?,
+        (None, None) => stmt
+            .query_map([], worker_run_from_row)
+            .map_err(err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(err)?,
+    };
+    Ok(rows)
+}
+
+/// Claim a queued run as running (pid + start time). Only
+/// a `queued` row moves: `false` means the scan (or a
+/// cancel that already finalized it) owns the run now.
+pub fn mark_worker_run_running(
+    conn: &mut Connection,
+    run_id: &str,
+    pid: Option<i64>,
+    started_ms: i64,
+) -> Result<bool, String> {
+    let changed = conn
+        .execute(
+            "UPDATE worker_runs SET status = 'running', pid = ?1, started_ms = ?2, updated_at_ms = ?2 WHERE run_id = ?3 AND status = 'queued'",
+            params![pid, started_ms, run_id],
+        )
+        .map_err(err)?;
+    Ok(changed > 0)
+}
+
+/// Terminal write for a run. Only a `queued` / `running`
+/// row moves: `false` means the row was already finalized
+/// (recovery scan) and the caller must write nothing else.
+#[derive(Debug, Clone)]
+pub struct RunFinish {
+    pub status: String,
+    pub exit_code: Option<i64>,
+    pub tail: String,
+    pub truncated: bool,
+    pub effect_id: Option<String>,
+}
+
+pub fn finish_worker_run(
+    conn: &mut Connection,
+    run_id: &str,
+    finish: &RunFinish,
+) -> Result<bool, String> {
+    let now = now_ms() as i64;
+    let changed = conn
+        .execute(
+            "UPDATE worker_runs SET status = ?1, exit_code = ?2, finished_ms = ?3, tail = ?4, truncated = ?5, effect_id = ?6, updated_at_ms = ?3 WHERE run_id = ?7 AND status IN ('queued', 'running')",
+            params![finish.status, finish.exit_code, now, finish.tail, finish.truncated as i64, finish.effect_id, run_id],
+        )
+        .map_err(err)?;
+    Ok(changed > 0)
+}
+
+/// Execution deadline (plan §2.4): NULL means no
+/// deadline. `set` keeps the earlier of the stored value
+/// and the new one — a later run must never extend an
+/// Execution's budget.
+pub fn get_execution_deadline(
+    conn: &Connection,
+    execution_id: &str,
+) -> Result<Option<i64>, String> {
+    conn.query_row(
+        "SELECT deadline_ms FROM executions WHERE execution_id = ?1",
+        params![execution_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .optional()
+    .map_err(err)
+    .map(|row| row.flatten())
+}
+
+pub fn set_execution_deadline(
+    conn: &mut Connection,
+    execution_id: &str,
+    deadline_ms: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE executions SET deadline_ms = min(COALESCE(deadline_ms, ?1), ?1) WHERE execution_id = ?2",
+        params![deadline_ms, execution_id],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// Write one `execution.plan_position` checkpoint for an
+/// Execution (plan §3.7): the completed-keys / next-key
+/// payload is recomputed from the current Effect list,
+/// exactly as takeover does. The only checkpoint kind in
+/// the system; no new kind is added (plan §2.2).
+pub fn write_plan_position_checkpoint(
+    conn: &mut Connection,
+    execution_id: &str,
+    origin_device_id: &str,
+) -> Result<CheckpointRow, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let effects = effects_for_execution_tx(&tx, execution_id)?;
+    let mut completed_keys: Vec<String> = Vec::new();
+    let mut next_effect_key: Option<String> = None;
+    for effect in &effects {
+        let terminal = crate::effect_store::is_terminal_effect_status(&effect.status);
+        match (&effect.idempotency_key, terminal) {
+            (Some(key), true) => completed_keys.push(key.clone()),
+            (Some(key), false) if next_effect_key.is_none() => {
+                next_effect_key = Some(key.clone());
+            }
+            _ => {}
+        }
+    }
+    let checkpoint = CheckpointRow {
+        checkpoint_id: next_prefixed_id(&tx, "checkpoints", "checkpoint_id", "checkpoint-")?,
+        execution_id: Some(execution_id.to_string()),
+        execution_seq: execution_seq_tx(&tx, execution_id)?,
+        kind: "execution.plan_position".to_string(),
+        payload_json: serde_json::to_string(&serde_json::json!({
+            "next_effect_key": next_effect_key,
+            "completed_keys": completed_keys,
+        }))
+        .map_err(|e| format!("sqlite: cannot encode checkpoint: {e}"))?,
+        origin_device_id: origin_device_id.to_string(),
+        schema_version: 1,
+    };
+    insert_checkpoint_tx(&tx, &checkpoint)?;
+    tx.commit().map_err(err)?;
+    Ok(checkpoint)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3647,6 +4044,7 @@ mod tests {
             "evidence",
             "patches",
             "patch_files",
+            "worker_runs",
         ] {
             assert_eq!(count_table(&conn, table).expect("count"), 0, "{table}");
         }

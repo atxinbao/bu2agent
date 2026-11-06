@@ -92,7 +92,7 @@ use crate::eventkit_backend::EventKitReminderBackend;
 use crate::device_store::{
     append_action, load_actions, next_action_number, DeviceActionRecord,
 };
-use crate::task_store::{append_task, load_tasks, next_task_number, TaskFileRecord};
+use crate::task_store::{append_task, load_tasks, next_task_number, TaskExecuteBinding, TaskFileRecord};
 use crate::execution_store::{
     append_execution, load_executions, next_execution_number, ExecutionFileRecord,
 };
@@ -456,6 +456,16 @@ pub struct AppState {
     voice_pipeline: Arc<Mutex<Option<String>>>,
     voice_state_path: Option<PathBuf>,
     mail_source: Arc<dyn MailSource>,
+    /// E2 slice: git binary resolved once at startup (PATH
+    /// search + optional MOCK_GIT_PATH override, plan §3.4).
+    /// None means Worker git commands fail closed with 503
+    /// `git_unavailable`.
+    pub(crate) git_path: Option<PathBuf>,
+    /// E2 slice: run ids a cancel request has claimed. The
+    /// driver checks this before spawning and after the
+    /// child exits; the set is the cancel signal, the kill
+    /// itself happens in the cancel route.
+    worker_cancelled: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Default for AppState {
@@ -772,6 +782,8 @@ impl AppState {
             voice_pipeline: Arc::new(Mutex::new(None)),
             voice_state_path: None,
             mail_source: Arc::new(UnavailableMailSource),
+            git_path: crate::worker::resolve_git_path(),
+            worker_cancelled: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -1709,6 +1721,32 @@ impl AppState {
     /// unaffected (they never migrated).
     pub fn sqlite_is_broken(&self) -> bool {
         *self.sqlite_broken.lock().expect("sqlite broken lock")
+    }
+
+    /// E2 slice: override the startup-resolved git binary
+    /// (tests: force a fake git, or None for the
+    /// `git_unavailable` path). Production never calls this.
+    pub fn with_git_path(mut self, path: Option<PathBuf>) -> Self {
+        self.git_path = path;
+        self
+    }
+
+    /// E2 slice: claim a run for cancellation. The driver
+    /// sees the claim before spawning and after the child
+    /// exits, and finalizes the run as `cancelled`.
+    pub(crate) fn mark_worker_cancelled(&self, run_id: &str) {
+        self.worker_cancelled
+            .lock()
+            .expect("worker cancelled lock")
+            .insert(run_id.to_string());
+    }
+
+    /// E2 slice: whether a cancel request has claimed this run.
+    pub(crate) fn is_worker_cancelled(&self, run_id: &str) -> bool {
+        self.worker_cancelled
+            .lock()
+            .expect("worker cancelled lock")
+            .contains(run_id)
     }
 
     /// P0-E: this process's current WorkerSession id, if the
@@ -8167,15 +8205,10 @@ struct TaskCreateDto {
 #[derive(Debug, Deserialize)]
 struct TaskGetQuery {
     task_id: String,
-    /// P3-A: optional bound worktree for the execute step.
-    /// Validated only: an unknown or archived worktree is a
-    /// 400. It is not frozen into the task Execution's
-    /// snapshot — that Execution was created at tasks_run,
-    /// before this step, and snapshots are immutable. The
-    /// snapshot freeze (§3.6) covers loop executions; a task
-    /// binding freeze needs its own decision (a run-time
-    /// field, or a fresh execution at execute time) and is
-    /// out of P3-A scope.
+    /// E2 slice: optional bound worktree for the execute
+    /// step. Validated, and frozen on first use (scheme A,
+    /// P3-C plan §2.3): a later execute naming a different
+    /// worktree is 409 `task_binding_frozen_mismatch`.
     #[serde(default)]
     worktree_id: Option<String>,
 }
@@ -10296,6 +10329,7 @@ async fn tasks_create(
         approval_id: None,
         draft_sha256: None,
         draft_bytes: None,
+        execute_binding: None,
     };
     state.tasks.lock().expect("task lock").insert(record.task_id.clone(), record.clone());
     persist_task(&state, &record);
@@ -10424,20 +10458,57 @@ async fn tasks_execute(
     State(state): State<AppState>,
     Json(req): Json<TaskGetQuery>,
 ) -> impl IntoResponse {
-    let Some(record) =
-        state.tasks.lock().expect("task lock").get(&req.task_id).cloned()
+    let Some(mut record) = state
+        .tasks
+        .lock()
+        .expect("task lock")
+        .get(&req.task_id)
+        .cloned()
     else {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown task" })),
+        )
             .into_response();
     };
     if record.status != "draft_ready" {
         return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not executable" })))
             .into_response();
     }
-    // P3-A: a stated worktree must exist and be active.
+    // E2 slice, scheme A (P3-C plan §2.3): a stated worktree
+    // must exist and be active, and the first execute that
+    // names one freezes the binding into the task record. A
+    // later execute naming a different worktree is 409
+    // `task_binding_frozen_mismatch` — the Worker runs the
+    // frozen binding, never a re-resolved one.
     if let Some(worktree_id) = &req.worktree_id {
-        if let Err(detail) = resolve_worktree_binding(&state, worktree_id) {
-            return bad_request(detail);
+        let binding = match resolve_worktree_binding(&state, worktree_id) {
+            Ok(binding) => binding,
+            Err(detail) => return bad_request(detail),
+        };
+        let frozen = TaskExecuteBinding {
+            location_id: binding.location_id.clone(),
+            worktree_id: binding.worktree_id.clone(),
+            root_digest: binding.root_digest.clone(),
+        };
+        match &record.execute_binding {
+            Some(existing) if *existing != frozen => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "task_binding_frozen_mismatch" })),
+                )
+                    .into_response();
+            }
+            Some(_) => {}
+            None => {
+                record.execute_binding = Some(frozen);
+                state
+                    .tasks
+                    .lock()
+                    .expect("task lock")
+                    .insert(record.task_id.clone(), record.clone());
+                persist_task(&state, &record);
+            }
         }
     }
     let Some(approval_id) = record.approval_id.clone() else {
@@ -11029,6 +11100,381 @@ async fn executions_transition(
         Err(sqlite_store::ExecutionTransitionError::Internal(detail)) => {
             *state.sqlite_broken.lock().expect("sqlite broken lock") = true;
             eprintln!("warning: P0-E execution transition failed: {detail}");
+            sqlite_error_response()
+        }
+    }
+}
+
+// --- E2 slice: Worker runs (P3-C plan §3.6) ---
+//
+// SQLite mode only, like takeover/transition: the
+// `worker_runs` table is SQLite. Read templates only in
+// this slice, so no approval is required and no Effect is
+// produced on success.
+
+#[derive(Debug, Deserialize)]
+struct WorkerRunCreateDto {
+    worktree_id: String,
+    command: String,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    execution_id: Option<String>,
+    /// Accepted for the P3-C shape; read commands need no
+    /// approval and the slice stores nothing for it. Write
+    /// commands (P3-C) will validate it at run start.
+    #[serde(default)]
+    approval_id: Option<String>,
+}
+
+fn worker_binding_error(detail: &str) -> axum::response::Response {
+    let code = match detail {
+        "unknown worktree" => "unknown_worktree",
+        "worktree is archived" => "worktree_archived",
+        "unknown location" => "unknown_location",
+        "location is archived" => "location_archived",
+        other => other,
+    };
+    bad_request(code)
+}
+
+async fn worker_runs_create(
+    State(state): State<AppState>,
+    Json(req): Json<WorkerRunCreateDto>,
+) -> impl IntoResponse {
+    let _ = req.approval_id.as_ref();
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let Some(git_path) = state.git_path.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "git_unavailable" })),
+        )
+            .into_response();
+    };
+    let binding = match resolve_worktree_binding(&state, &req.worktree_id) {
+        Ok(binding) => binding,
+        Err(detail) => return worker_binding_error(detail),
+    };
+    let worktree = match state
+        .worktrees
+        .lock()
+        .expect("worktree lock")
+        .get(&req.worktree_id)
+        .cloned()
+    {
+        Some(worktree) => worktree,
+        None => return bad_request("unknown_worktree"),
+    };
+    let Some(cwd) = worktree_canonical_root(&state, &worktree) else {
+        return bad_request("worktree_directory_missing");
+    };
+    let resolved = match crate::worker::resolve_command(
+        &req.command,
+        req.params.as_ref(),
+        &git_path,
+        &cwd,
+        req.timeout_ms,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return bad_request(error.code());
+        }
+    };
+    // A named Execution must exist, be non-terminal, and —
+    // when its snapshot carries a binding — agree with the
+    // requested worktree. An unnamed run gets a minimal
+    // Execution frozen to this binding (P0-B precedent).
+    let execution_id = match &req.execution_id {
+        Some(execution_id) => {
+            let execution = {
+                let conn = sqlite.lock().expect("sqlite lock");
+                sqlite_store::get_execution(&conn, execution_id)
+            };
+            let execution = match execution {
+                Ok(Some(execution)) => execution,
+                Ok(None) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({ "error": "unknown_execution" })),
+                    )
+                        .into_response();
+                }
+                Err(detail) => {
+                    eprintln!("warning: E2 worker run execution read failed: {detail}");
+                    return sqlite_error_response();
+                }
+            };
+            if crate::execution_store::execution_status_group(&execution.status) == Some("terminal")
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "execution_terminal" })),
+                )
+                    .into_response();
+            }
+            if let Some(snapshot_id) = &execution.workspace_snapshot_id {
+                let snapshot = {
+                    let conn = sqlite.lock().expect("sqlite lock");
+                    sqlite_store::get_snapshot(&conn, snapshot_id)
+                };
+                if let Ok(Some(snapshot)) = snapshot {
+                    if let Some(bound) = snapshot.binding_worktree_id {
+                        if bound != req.worktree_id {
+                            return (
+                                StatusCode::CONFLICT,
+                                Json(serde_json::json!({ "error": "execution_binding_mismatch" })),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+            let busy = {
+                let conn = sqlite.lock().expect("sqlite lock");
+                sqlite_store::list_worker_runs(&conn, Some(execution_id), None)
+            };
+            match busy {
+                Ok(rows)
+                    if rows
+                        .iter()
+                        .any(|row| matches!(row.status.as_str(), "queued" | "running")) =>
+                {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({ "error": "execution_has_running_worker" })),
+                    )
+                        .into_response();
+                }
+                Ok(_) => {}
+                Err(detail) => {
+                    eprintln!("warning: E2 worker run busy check failed: {detail}");
+                    return sqlite_error_response();
+                }
+            }
+            execution_id.clone()
+        }
+        None => {
+            create_execution_with_binding(
+                &state,
+                None,
+                None,
+                Some(SnapshotBinding {
+                    location_id: binding.location_id.clone(),
+                    worktree_id: binding.worktree_id.clone(),
+                    root_digest: binding.root_digest.clone(),
+                }),
+            )
+            .execution_id
+        }
+    };
+    // Attribution (plan §2.3): the driving assignment, when
+    // one exists, and this process's worker session.
+    let (assignment_id, worker_session_id) = {
+        let conn = sqlite.lock().expect("sqlite lock");
+        match sqlite_store::active_assignment_for_execution(&conn, &execution_id) {
+            Ok(Some(assignment)) => (
+                Some(assignment.assignment_id),
+                assignment
+                    .worker_session_id
+                    .or_else(|| state.current_worker_session()),
+            ),
+            _ => (None, state.current_worker_session()),
+        }
+    };
+    // Budget (plan §2.4): the Execution deadline is now +
+    // this run's timeout, or the stored (earlier) deadline —
+    // never extended by a later run.
+    let now = crate::effect_store::now_ms() as i64;
+    {
+        let mut conn = sqlite.lock().expect("sqlite lock");
+        if let Err(detail) = sqlite_store::set_execution_deadline(
+            &mut conn,
+            &execution_id,
+            now + resolved.timeout_ms as i64,
+        ) {
+            eprintln!("warning: E2 worker run deadline write failed: {detail}");
+            return sqlite_error_response();
+        }
+    }
+    let row = crate::worker::WorkerRunRow {
+        run_id: String::new(),
+        execution_id: Some(execution_id),
+        assignment_id,
+        worker_session_id,
+        command: resolved.template.to_string(),
+        argv_json: serde_json::to_string(&resolved.argv).unwrap_or_default(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        timeout_ms: resolved.timeout_ms as i64,
+        status: "queued".to_string(),
+        exit_code: None,
+        pid: None,
+        started_ms: None,
+        finished_ms: None,
+        tail: String::new(),
+        truncated: false,
+        effect_id: None,
+        binding_location_id: Some(binding.location_id),
+        binding_worktree_id: Some(binding.worktree_id),
+        binding_root_digest: Some(binding.root_digest),
+        schema_version: 1,
+    };
+    let row = {
+        let mut conn = sqlite.lock().expect("sqlite lock");
+        sqlite_store::create_worker_run(&mut conn, &row)
+    };
+    let row = match row {
+        Ok(row) => row,
+        Err(detail) if detail == "execution_has_running_worker" => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": detail })),
+            )
+                .into_response();
+        }
+        Err(detail) => {
+            eprintln!("warning: E2 worker run create failed: {detail}");
+            return sqlite_error_response();
+        }
+    };
+    tokio::spawn(crate::worker::drive_worker_run(
+        state.clone(),
+        row.run_id.clone(),
+    ));
+    (StatusCode::CREATED, Json(row)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerRunsListQuery {
+    #[serde(default)]
+    execution_id: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+async fn worker_runs_list(
+    State(state): State<AppState>,
+    Query(query): Query<WorkerRunsListQuery>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite && state.sqlite_mode() != StateBackend::Shadow {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::list_worker_runs(
+        &conn,
+        query.execution_id.as_deref(),
+        query.status.as_deref(),
+    ) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(detail) => {
+            eprintln!("warning: E2 worker runs list failed: {detail}");
+            sqlite_error_response()
+        }
+    }
+}
+
+async fn worker_run_get(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite && state.sqlite_mode() != StateBackend::Shadow {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::get_worker_run(&conn, &id) {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown_worker_run" })),
+        )
+            .into_response(),
+        Err(detail) => {
+            eprintln!("warning: E2 worker run get failed: {detail}");
+            sqlite_error_response()
+        }
+    }
+}
+
+async fn worker_run_cancel(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let row = {
+        let conn = sqlite.lock().expect("sqlite lock");
+        sqlite_store::get_worker_run(&conn, &id)
+    };
+    let row = match row {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "unknown_worker_run" })),
+            )
+                .into_response();
+        }
+        Err(detail) => {
+            eprintln!("warning: E2 worker run cancel read failed: {detail}");
+            return sqlite_error_response();
+        }
+    };
+    if crate::worker::is_terminal_run_status(&row.status) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "worker_run_terminal" })),
+        )
+            .into_response();
+    }
+    // Claim first, kill second: the driver finalizes the
+    // run as `cancelled` when it sees the claim (or when
+    // the kill wakes its wait). A queued run with no pid
+    // yet is claimed the same way and never spawns.
+    state.mark_worker_cancelled(&id);
+    if let Some(pid) = row.pid {
+        crate::worker::kill_process_group(pid, "TERM");
+    }
+    let row = {
+        let conn = sqlite.lock().expect("sqlite lock");
+        sqlite_store::get_worker_run(&conn, &id)
+    };
+    match row {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown_worker_run" })),
+        )
+            .into_response(),
+        Err(detail) => {
+            eprintln!("warning: E2 worker run cancel re-read failed: {detail}");
             sqlite_error_response()
         }
     }
@@ -12785,6 +13231,10 @@ pub fn app(state: AppState) -> Router {
         .route("/executions/list", get(executions_list))
         .route("/executions/get", get(executions_get))
         .route("/executions/transition", post(executions_transition))
+        .route("/worker/runs", post(worker_runs_create))
+        .route("/worker/runs/list", get(worker_runs_list))
+        .route("/worker/runs/{id}", get(worker_run_get))
+        .route("/worker/runs/{id}/cancel", post(worker_run_cancel))
         .route("/assignments/takeover", post(assignments_takeover))
         .route("/assignments/list", get(assignments_list))
         .route("/assignments/get", get(assignments_get))

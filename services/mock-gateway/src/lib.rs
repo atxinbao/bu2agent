@@ -43,6 +43,7 @@ pub mod binding_store;
 pub mod project_store;
 pub mod location_store;
 pub mod worktree_store;
+pub mod worker;
 pub mod code_search;
 pub mod mail_source;
 pub mod device_store;

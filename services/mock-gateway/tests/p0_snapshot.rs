@@ -114,6 +114,7 @@ fn task_record(
         approval_id: None,
         draft_sha256: None,
         draft_bytes: None,
+        execute_binding: None,
     }
 }
 

@@ -10,6 +10,18 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
+/// E2 slice, scheme A (P3-C plan §2.3): the frozen
+/// Workspace/Worktree binding of a task's execute step.
+/// Same three fields as the Execution snapshot binding
+/// (`SnapshotBinding` in server.rs); the type lives here so
+/// the task store does not import the server module.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskExecuteBinding {
+    pub location_id: String,
+    pub worktree_id: String,
+    pub root_digest: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskFileRecord {
     pub task_id: String,
@@ -33,6 +45,13 @@ pub struct TaskFileRecord {
     pub draft_sha256: Option<String>,
     #[serde(default)]
     pub draft_bytes: Option<u64>,
+    /// E2 slice: frozen execute binding, stored on the first
+    /// execute that names a worktree. A later execute naming
+    /// a different worktree is 409
+    /// `task_binding_frozen_mismatch`; old JSONL lines load
+    /// as None (unfrozen).
+    #[serde(default)]
+    pub execute_binding: Option<TaskExecuteBinding>,
 }
 
 pub fn load_tasks(path: &Path) -> Vec<TaskFileRecord> {
@@ -124,6 +143,7 @@ mod tests {
                 approval_id: None,
                 draft_sha256: None,
                 draft_bytes: None,
+                execute_binding: None,
             },
         );
         append_task(
@@ -137,6 +157,7 @@ mod tests {
                 approval_id: None,
                 draft_sha256: None,
                 draft_bytes: None,
+                execute_binding: None,
             },
         );
         let records = load_tasks(&path);
@@ -158,6 +179,7 @@ mod tests {
                 approval_id: None,
                 draft_sha256: None,
                 draft_bytes: None,
+                execute_binding: None,
             },
             TaskFileRecord {
                 task_id: "other".to_string(),
@@ -168,6 +190,7 @@ mod tests {
                 approval_id: None,
                 draft_sha256: None,
                 draft_bytes: None,
+                execute_binding: None,
             },
         ];
         assert_eq!(next_task_number(&records), 4);
