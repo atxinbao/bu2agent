@@ -627,11 +627,16 @@ pub fn truncate_tail(bytes: &[u8]) -> (String, bool) {
     }
 }
 
-fn combined_tail(stdout: &[u8], stderr: &[u8]) -> (String, bool) {
+/// Full combined output (stdout then stderr), lossy UTF-8,
+/// untruncated: the test parser reads this, not the stored
+/// tail — Cargo's trailing stderr progress would otherwise
+/// push the `test result:` summary lines out of the tail
+/// (P3-C window finding: passing runs parsed null counts).
+fn combined_output(stdout: &[u8], stderr: &[u8]) -> String {
     let mut combined = Vec::with_capacity(stdout.len() + stderr.len());
     combined.extend_from_slice(stdout);
     combined.extend_from_slice(stderr);
-    truncate_tail(&combined)
+    String::from_utf8_lossy(&combined).into_owned()
 }
 
 /// Spawn a pipe reader that appends chunks to a shared
@@ -877,11 +882,12 @@ pub(crate) fn git_read_sync(
 }
 
 /// Parsed `cargo test` summary (plan §5.1/§5.2): counts
-/// summed over every `test result:` line in the tail, failed
-/// test names (from the `failures:` section) as sha256 only —
-/// names never leave the gateway in plaintext (the
-/// observed_json rule: hashes, lengths, kinds, flags only).
-/// A tail with no parseable summary line keeps counts null
+/// summed over every `test result:` line in the full
+/// combined output, failed test names (from the `failures:`
+/// section) as sha256 only — names never leave the gateway
+/// in plaintext (the observed_json rule: hashes, lengths,
+/// kinds, flags only).
+/// An output with no parseable summary line keeps counts null
 /// (the exit code is ground truth; numbers are never
 /// fabricated).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -896,12 +902,12 @@ fn parse_test_count(segment: &str, word: &str) -> Option<u64> {
     rest.split_whitespace().last()?.parse::<u64>().ok()
 }
 
-pub fn parse_test_output(tail: &str) -> TestRunSummary {
+pub fn parse_test_output(output: &str) -> TestRunSummary {
     let mut passed: Option<u64> = None;
     let mut failed: Option<u64> = None;
     let mut failed_names: Vec<String> = Vec::new();
     let mut in_failures = false;
-    for line in tail.lines() {
+    for line in output.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("test result:") {
             in_failures = false;
@@ -1292,7 +1298,11 @@ pub async fn drive_worker_run(state: AppState, run_id: String) {
     }
     let stdout = stdout_shared.lock().map(|b| b.clone()).unwrap_or_default();
     let stderr = stderr_shared.lock().map(|b| b.clone()).unwrap_or_default();
-    let (tail, truncated) = combined_tail(&stdout, &stderr);
+    // The stored tail stays truncated at WORKER_TAIL_LIMIT;
+    // the test parser reads the full combined output (see
+    // combined_output).
+    let output = combined_output(&stdout, &stderr);
+    let (tail, truncated) = truncate_tail(output.as_bytes());
 
     // Cancel wins over any exit the kill produced: the user
     // asked for it, the run did not finish on its own.
@@ -1312,14 +1322,14 @@ pub async fn drive_worker_run(state: AppState, run_id: String) {
             let exit = status.expect("wait returned without status");
             let code = exit.code().map(|c| c as i64);
             if exit.success() {
-                finish_terminal(&state, &run, "succeeded", code, tail, truncated, started).await;
+                finish_terminal(&state, &run, "succeeded", code, output, started).await;
             } else {
                 // A non-zero exit is a known result (e.g. not
                 // a git repo, a failing test, a rejected
                 // commit), not an unknown one: no Inbox. Reads
                 // write no Effect; writes and tests record a
                 // `failed` Effect (+ Test Evidence for tests).
-                finish_terminal(&state, &run, "failed", code, tail, truncated, started).await;
+                finish_terminal(&state, &run, "failed", code, output, started).await;
             }
         }
     }
@@ -1390,7 +1400,9 @@ async fn completion_effect(
     run: &WorkerRunRow,
     status: &str,
     exit_code: Option<i64>,
-    tail: &str,
+    // Full untruncated combined output (stdout then stderr):
+    // the test parser reads this, not the stored tail.
+    output: &str,
     started_ms: i64,
 ) -> (Option<String>, Vec<crate::evidence::OwnedEvidence>) {
     if !is_effect_command(&run.command) {
@@ -1511,7 +1523,7 @@ async fn completion_effect(
             ("git", "commit", scope, digest, baseline, None)
         }
         "cargo-test" => {
-            let summary = parse_test_output(tail);
+            let summary = parse_test_output(output);
             let duration_ms = (now_ms() - started_ms).max(0) as u64;
             let observed = serde_json::json!({
                 "kind": "test-run",
@@ -1601,13 +1613,16 @@ async fn completion_effect(
 /// Known terminal outcome (exit code): run row + (for
 /// write/test templates) the completion Effect and Evidence
 /// + plan_position checkpoint. Reads write no Effect.
+///
+/// The output argument is the full untruncated combined
+/// output (the test parser reads it); the stored tail is
+/// truncated inside to WORKER_TAIL_LIMIT.
 async fn finish_terminal(
     state: &AppState,
     run: &WorkerRunRow,
     status: &str,
     exit_code: Option<i64>,
-    tail: String,
-    truncated: bool,
+    output: String,
     started_ms: i64,
 ) {
     if !assignment_still_active(state, run).await {
@@ -1617,8 +1632,9 @@ async fn finish_terminal(
     let Some(sqlite) = state.sqlite.clone() else {
         return;
     };
+    let (tail, truncated) = truncate_tail(output.as_bytes());
     let (effect_id, evidence) =
-        completion_effect(state, run, status, exit_code, &tail, started_ms).await;
+        completion_effect(state, run, status, exit_code, &output, started_ms).await;
     let finished = sqlite_store::RunFinish {
         status: status.to_string(),
         exit_code,
@@ -2142,6 +2158,36 @@ mod tests {
         assert_eq!(empty.passed, None);
         assert_eq!(empty.failed, None);
         assert!(empty.failed_sha256.is_empty());
+    }
+
+    #[test]
+    fn parse_test_output_reads_full_output_beyond_tail_limit() {
+        // P3-C window finding: a real `cargo test` run's
+        // stderr progress fills the stored tail, pushing the
+        // stdout summary lines out. The finish path parses
+        // the full combined output, so summaries followed by
+        // more than WORKER_TAIL_LIMIT bytes of trailing
+        // stderr noise must still parse (and sum across
+        // suites). If this test ever reads only the tail, the
+        // counts come back null.
+        let mut output = String::from(
+            "running 2 tests\ntest a::one ... ok\ntest a::two ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\nrunning 1 test\ntest b::one ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+        );
+        output.push_str(&"Running unittests src/lib.rs (target/debug/deps/testpkg-abc)\n".repeat(200));
+        assert!(
+            output.len() > WORKER_TAIL_LIMIT,
+            "fixture must exceed the tail limit: {}",
+            output.len()
+        );
+        // The stored tail itself contains no summary line:
+        // that is exactly the window shape.
+        let (tail, truncated) = truncate_tail(output.as_bytes());
+        assert!(truncated);
+        assert!(!tail.contains("test result:"));
+        let summary = parse_test_output(&output);
+        assert_eq!(summary.passed, Some(3));
+        assert_eq!(summary.failed, Some(0));
+        assert!(summary.failed_sha256.is_empty());
     }
 
     #[test]

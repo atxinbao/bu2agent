@@ -432,8 +432,11 @@ fn observe_git(
         // Reads land nothing: the repo is readable (HEAD
         // resolves) or it is not. Reconcile maps both to
         // Inconclusive; the branch exists so reconcile does
-        // not 409 `effect_no_readback`.
-        "status" | "diff" => {
+        // not 409 `effect_no_readback`. The operation is the
+        // command template name (`git-status`), as recorded
+        // by the driver's unknown_effect_identity — not the
+        // loop tool's `status` (no Effect ever carries that).
+        "git-status" | "git-diff" => {
             let head_sha = crate::worker::git_read_sync(
                 state,
                 &git,

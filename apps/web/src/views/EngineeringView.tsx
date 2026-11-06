@@ -8,7 +8,10 @@ import type {
   WorkerRun,
   Worktree,
 } from "../domain/engineering_client";
+import type { EffectRecord, EffectsGateway } from "../domain/effects_client";
+import type { EvidenceGateway, EvidenceRow } from "../domain/evidence_client";
 import type { LoopGateway } from "../domain/loop_client";
+import { EffectBadge, latestEvidenceFor } from "./ExecutionDetail";
 
 // P3-C 工程视图：绑定与记录的管理面 + Worker 运行（命令执行）。
 // P3-A 的只读约束已解除：本页可以排队执行白名单命令
@@ -16,6 +19,8 @@ import type { LoopGateway } from "../domain/loop_client";
 // cargo-test），只在临时 Worktree 上写、只在临时分支上提交，
 // 绝不推送到远端；每次执行都是一条 Worker run，有 Effect
 // 与 Evidence，可在运行列表里看状态、尾部输出与 Effect。
+// 选中的运行在详情里展示最新 Evidence 与验证按钮（复用
+// ExecutionDetail 的 EffectBadge，与 PatchesView 同款）。
 // Location 只是目录绑定，没有 git 语义；Worktree 的
 // branch_label 只是展示字符串，不代表已连接 git 分支或
 // 真实工作树——文案不得让用户误以为已连接 git 仓库。
@@ -45,6 +50,10 @@ interface EngineeringViewProps {
   loops: LoopGateway;
   isInvoke: boolean;
   onNavigate: (target: "loops") => void;
+  // 与 PatchesView 同款：可选的 Effect/Evidence 客户端。
+  // 未传时运行详情只显示 Effect ID 文本，不展示验证按钮。
+  effects?: EffectsGateway | null;
+  evidence?: EvidenceGateway | null;
 }
 
 function errText(e: unknown): string {
@@ -56,6 +65,8 @@ export function EngineeringView({
   loops,
   isInvoke,
   onNavigate,
+  effects: effectsClient = null,
+  evidence: evidenceClient = null,
 }: EngineeringViewProps) {
   const [bindings, setBindings] = useState<Binding[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -84,6 +95,10 @@ export function EngineeringView({
   const [runs, setRuns] = useState<WorkerRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
   const [selectedRun, setSelectedRun] = useState<WorkerRun | null>(null);
+  // 选中运行的 Effect 记录与 Evidence（与 PatchesView 同款，
+  // 供运行详情的 EffectBadge 展示最新验证与验证按钮）。
+  const [effectRows, setEffectRows] = useState<EffectRecord[]>([]);
+  const [effectEvidence, setEffectEvidence] = useState<EvidenceRow[]>([]);
   // P3-C：运行命令表单（UI 直接点击即授权，不另行审批）。
   const [runWorktreeId, setRunWorktreeId] = useState("");
   const [runCommand, setRunCommand] = useState("git-status");
@@ -91,6 +106,20 @@ export function EngineeringView({
   const [runBranch, setRunBranch] = useState("");
   const [runMessage, setRunMessage] = useState("");
   const [runPackage, setRunPackage] = useState("");
+
+  async function refreshEffectRows() {
+    if (!effectsClient || !evidenceClient) return;
+    try {
+      const [allEffects, allEvidence] = await Promise.all([
+        effectsClient.list(),
+        evidenceClient.list(),
+      ]);
+      setEffectRows(allEffects);
+      setEffectEvidence(allEvidence);
+    } catch (e) {
+      setError(`Effect 记录读取失败：${errText(e)}`);
+    }
+  }
 
   async function refreshRuns() {
     try {
@@ -103,6 +132,9 @@ export function EngineeringView({
     } catch (e) {
       setError(`运行列表读取失败：${errText(e)}`);
     }
+    // 运行终态时 Effect/Evidence 才落盘：随运行列表一起刷新，
+    // 详情里的 EffectBadge 才不会停留在旧状态。
+    await refreshEffectRows();
   }
 
   async function refreshAll() {
@@ -788,10 +820,34 @@ export function EngineeringView({
             {selectedRun.exitCode !== null
               ? ` · 退出码 ${selectedRun.exitCode}`
               : ""}
-            {selectedRun.effectId !== null
+            {selectedRun.effectId !== null && effectsClient === null
               ? ` · Effect ${selectedRun.effectId}`
               : ""}
           </p>
+          {selectedRun.effectId !== null && effectsClient !== null && (
+            <p>
+              {(() => {
+                const effect = effectRows.find(
+                  (row) => row.effectId === selectedRun.effectId,
+                );
+                if (!effect) {
+                  return `Effect ${selectedRun.effectId}（记录加载中）`;
+                }
+                return (
+                  <EffectBadge
+                    effect={effect}
+                    latestEvidence={latestEvidenceFor(
+                      effect.effectId,
+                      effectEvidence,
+                    )}
+                    effectsClient={effectsClient}
+                    onRefresh={() => void refreshRuns()}
+                    onError={(message) => setError(message)}
+                  />
+                );
+              })()}
+            </p>
+          )}
           <p>cwd：{selectedRun.cwd}</p>
           <p>argv：{selectedRun.argvJson}</p>
           <pre>{selectedRun.tail === "" ? "（无输出）" : selectedRun.tail}</pre>

@@ -136,6 +136,38 @@ fn fake_cargo_sleeping(dir: &Path) -> PathBuf {
     fake_binary(dir, "fake-cargo", 60, false)
 }
 
+/// Canned `cargo test` output (see
+/// tests/fixtures/fake_cargo_output.rs): two suites' summaries
+/// on stdout, then >4096 bytes of Cargo progress on stderr,
+/// exit 0. The summaries survive only in the full combined
+/// output, not in the stored tail.
+fn fake_cargo_output(dir: &Path) -> PathBuf {
+    static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let binary = BINARY.get_or_init(|| {
+        let build = temp_dir("native-fixture-output");
+        let output = build.join(format!("fake-cargo-output{}", std::env::consts::EXE_SUFFIX));
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fake_cargo_output.rs");
+        let result = std::process::Command::new(
+            std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
+        )
+        .arg(source)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("compile fake cargo output fixture");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        output
+    });
+    let executable = dir.join(format!("fake-cargo-output{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(binary, &executable).unwrap();
+    executable
+}
+
 /// `git` / `cargo` are always explicit overrides: `Some(path)`
 /// pins the binary (real or fake), `None` forces the
 /// unavailable path. Never inherits the ambient PATH
@@ -830,6 +862,48 @@ async fn p3c_c17_commit_unknown_reconcile_stays_unknown_without_commit() {
     assert!(inbox.iter().all(|row| row["effect_id"] == effect_id));
 }
 
+#[tokio::test]
+async fn p3c_c17_git_status_unknown_reconcile_stays_unknown() {
+    // P3-C window finding (R0): a timed-out git-status run's
+    // unknown Effect carries operation `git-status` (the
+    // template name, via unknown_effect_identity), and the
+    // observe branch must match that name — not the loop
+    // tool's `status`. HEAD resolves but a read lands
+    // nothing, so reconcile is Inconclusive and the row
+    // stays unknown with its Inbox row still open.
+    let dir = temp_dir("c17-reconcile-status");
+    let repo = init_repo(&dir);
+    let fake = fake_git_sleeping(&dir);
+    let mut h = Harness::serve(&dir, Some(fake), Some(real_cargo())).await;
+    let worktree = h.setup_worktree(&repo).await;
+    // git-status is a read: no approval needed.
+    let (status, _) = h
+        .create_run(json!({
+            "worktree_id": worktree,
+            "command": "git-status",
+            "timeout_ms": 1000,
+        }))
+        .await;
+    assert_eq!(status, 201);
+    let row = h.wait_run("run-1", 30).await;
+    assert_eq!(row["status"], "timeout", "{row}");
+    let effects = h.effects().await;
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(effects[0]["capability"], "git");
+    assert_eq!(effects[0]["operation"], "git-status");
+    assert_eq!(effects[0]["status"], "unknown");
+    let effect_id = effects[0]["effect_id"].as_str().unwrap().to_string();
+    h.git = Some(real_git());
+    h.restart().await;
+    let (status, reconciled) = h.reconcile(&effect_id).await;
+    assert_eq!(status, 200, "{reconciled}");
+    assert_eq!(reconciled["status"], "unknown");
+    assert!(reconciled["reconciliation"].is_null());
+    let inbox = h.open_inbox("unknown_requires_reconciliation").await;
+    assert!(!inbox.is_empty(), "{inbox:?}");
+    assert!(inbox.iter().all(|row| row["effect_id"] == effect_id));
+}
+
 // --- C18: cargo test ---
 
 #[tokio::test]
@@ -882,6 +956,53 @@ async fn p3c_c18_cargo_test_pass_effect_and_evidence() {
     assert_eq!(status, 200, "{verdict}");
     assert_eq!(verdict["verdict"], "verified");
     assert_eq!(verdict["reason"], "test_passed");
+}
+
+#[tokio::test]
+async fn p3c_c18_cargo_test_counts_survive_trailing_stderr() {
+    // P3-C window finding (U7-1): a real `cargo test` run's
+    // stderr progress fills the stored tail, so parsing only
+    // the tail returned null counts. The finish path now
+    // parses the full combined output: the canned fake cargo
+    // prints two suites' summaries on stdout, then >4096
+    // bytes of progress on stderr, and the Evidence must
+    // still carry the summed counts — while the stored tail
+    // stays truncated.
+    let dir = temp_dir("c18-counts-tail");
+    let repo = init_repo(&dir);
+    let h = Harness::serve(&dir, Some(real_git()), Some(fake_cargo_output(&dir))).await;
+    let worktree = h.setup_worktree(&repo).await;
+    let approval = h
+        .approve_worker_run(&worktree, "cargo-test", json!({"package": "testpkg-pass"}), None)
+        .await;
+    let (status, run) = h
+        .create_run(json!({
+            "worktree_id": worktree,
+            "command": "cargo-test",
+            "params": {"package": "testpkg-pass"},
+            "approval_id": approval,
+        }))
+        .await;
+    assert_eq!(status, 201, "{run}");
+    let row = h.wait_run("run-1", 30).await;
+    assert_eq!(row["status"], "succeeded", "{row}");
+    assert_eq!(row["exit_code"], 0);
+    assert_eq!(row["truncated"], true);
+    assert!(!row["tail"].as_str().unwrap().contains("test result:"));
+    let effects = h.effects().await;
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(effects[0]["status"], "succeeded");
+    let evidence = h.evidence().await;
+    assert_eq!(evidence.len(), 1, "{evidence:?}");
+    assert_eq!(evidence[0]["source"], "test");
+    assert_eq!(evidence[0]["reason"], "test_passed");
+    let observed: Value =
+        serde_json::from_str(evidence[0]["observed_json"].as_str().unwrap()).unwrap();
+    assert_eq!(observed["kind"], "test-run");
+    assert_eq!(observed["passed"], 3);
+    assert_eq!(observed["failed"], 0);
+    assert_eq!(observed["exit_code"], 0);
+    assert_eq!(observed["failed_sha256"], json!([]));
 }
 
 #[tokio::test]

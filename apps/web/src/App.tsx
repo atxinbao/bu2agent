@@ -619,7 +619,7 @@ export function App() {
         (clients === null ? (
           <p className="empty">Choosing transport…</p>
         ) : (
-          <EngineeringView engineering={clients.engineering} loops={clients.loops} isInvoke={isInvoke} onNavigate={(target) => setTab(target)} />
+          <EngineeringView engineering={clients.engineering} loops={clients.loops} isInvoke={isInvoke} onNavigate={(target) => setTab(target)} effects={clients.effects} evidence={clients.evidence} />
         ))}
       {tab === "patches" &&
         (clients === null ? (

@@ -178,8 +178,33 @@ export function PatchesView({
     }
   }
 
+  // P3-C 窗口发现：每 Patch 的测试运行只存在本地 state，
+  // 切到别的页再回来就消失（run 在库里还在）。随补丁列表
+  // 一起从 runs 列表重载：取该 Patch 工作区的最近一次
+  // cargo-test 运行（列表按 seq 升序，最后一条即最新）。
+  async function refreshTestRuns(latest: Patch[]) {
+    try {
+      const allRuns = await engineering.workerRunList();
+      setTestRuns((prev) => {
+        const next = { ...prev };
+        for (const patch of latest) {
+          const match = [...allRuns].reverse().find(
+            (run) =>
+              run.command === "cargo-test" &&
+              run.bindingWorktreeId === patch.worktreeId,
+          );
+          if (match) next[patch.patchId] = match;
+        }
+        return next;
+      });
+    } catch (e) {
+      setError(`测试运行读取失败：${errText(e)}`);
+    }
+  }
+
   async function refreshAll() {
-    await refreshPatches();
+    const latest = await refreshPatches();
+    if (latest) await refreshTestRuns(latest);
     await refreshEffectRows();
     await refreshMismatchRows();
   }
