@@ -505,6 +505,18 @@ fn unified_digest_loop_matches_direct_write() {
             &reminder_args
         )
     );
+    // E2-C unification (Q7): the digest is value-sensitive —
+    // the false write hashes differently from the true write,
+    // which is what lets A2 recover the target from the row.
+    let false_digest = mock_gateway::operation_binding::operation_digest(
+        "reminders.set_completed",
+        Some("set_completed"),
+        &BTreeMap::from([
+            ("id".to_string(), "reminder-1".to_string()),
+            ("completed".to_string(), "false".to_string()),
+        ]),
+    );
+    assert_ne!(false_digest, reminder_digest);
     // Path normalization is shared: the loop delegates to the same
     // function, keeping only its fs.list root allowance.
     assert_eq!(

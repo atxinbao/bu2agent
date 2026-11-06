@@ -1099,7 +1099,9 @@ async fn r11_loop_reminder_unknown_reconcile() {
 
     // Case A: the target reminder no longer exists — the only
     // class allowed a `failed` reconcile conclusion.
-    let effect_id = h.propose("reminders", "set_completed", "rem-1").await;
+    // (E2-C unification: the loop row now carries the unified
+    // device triple; reconcile assertions unchanged.)
+    let effect_id = h.propose("device", "reminders.set_completed", "rem-1").await;
     h.drive_to_unknown(&effect_id).await;
     let (status, body) = h.reconcile(&effect_id).await;
     assert_eq!(status, 200, "{body}");
@@ -1116,7 +1118,7 @@ async fn r11_loop_reminder_unknown_reconcile() {
     assert_eq!(mirrors[0]["reason"], "target_missing");
 
     // Case B: the reminder exists and is completed — landed.
-    let effect2 = h.propose("reminders", "set_completed", "rem-2").await;
+    let effect2 = h.propose("device", "reminders.set_completed", "rem-2").await;
     h.drive_to_unknown(&effect2).await;
     h.fake.add_reminder(Reminder {
         id: "rem-2".to_string(),

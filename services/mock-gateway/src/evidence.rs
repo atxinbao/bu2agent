@@ -603,13 +603,18 @@ pub fn observe_current(
                 artifact,
             })
         }
-        ("reminders", "set_completed") => match state.device_backend.get(&effect.scope) {
-            Ok(Some(r)) => Ok(Current::Reminder {
-                completed: r.completed,
-            }),
-            Ok(None) => Ok(Current::ReminderMissing),
-            Err(_) => Ok(Current::Unreadable),
-        },
+        // E2-C unification: the device triple (new loop rows
+        // and direct rows) and the legacy loop triple share
+        // this observation — it only reads current state.
+        ("reminders", "set_completed") | ("device", "reminders.set_completed") => {
+            match state.device_backend.get(&effect.scope) {
+                Ok(Some(r)) => Ok(Current::Reminder {
+                    completed: r.completed,
+                }),
+                Ok(None) => Ok(Current::ReminderMissing),
+                Err(_) => Ok(Current::Unreadable),
+            }
+        }
         ("connectors", _) | ("custom-connectors", _) | ("credentials", _) | ("catalog", _) => {
             if expects_active(&effect.capability, &effect.operation).is_none() {
                 return Err(ObserveError::NoMethod);
@@ -663,8 +668,11 @@ fn inconclusive(current: &Current) -> ReconcileOutcome {
 }
 
 /// Map a current observation to a reconcile verdict. Device
-/// classes never reach this function: the driver keeps the
-/// action-based path for them.
+/// rows with a backing action keep the action-based path in
+/// the driver; device rows without one (loop writes, which
+/// have no action record) reach this function, where the
+/// reminders arm recovers the target from the row's own
+/// digest (E2-C unification, A2).
 pub fn reconcile_outcome(
     state: &AppState,
     effect: &EffectFileRecord,
@@ -816,10 +824,19 @@ pub fn reconcile_outcome(
                 _ => inconclusive(&current),
             }
         }
-        ("reminders", "set_completed") => match &current {
-            Current::Reminder { completed: true } => ReconcileOutcome::Landed {
-                observed: current.to_json(),
-                reason: "record_match",
+        // E2-C unification: the device triple and the legacy
+        // loop triple share one target-aware arm — the target
+        // comes from the row's own digest (A2), never from a
+        // default. A current state that does not match the
+        // target stays Inconclusive (the write may still be in
+        // flight), never a failed conclusion.
+        ("device", "reminders.set_completed") | ("reminders", "set_completed") => match &current {
+            Current::Reminder { completed } => match device_target_from_digest(effect) {
+                Some(target) if *completed == target => ReconcileOutcome::Landed {
+                    observed: current.to_json(),
+                    reason: "record_match",
+                },
+                _ => inconclusive(&current),
             },
             Current::ReminderMissing => ReconcileOutcome::NotLanded {
                 observed: current.to_json(),
@@ -1174,14 +1191,25 @@ pub fn verify_outcome(
             }
             _ => verify_inconclusive(&current),
         },
-        ("reminders", "set_completed") => match &current {
-            Current::Reminder { completed: true } => VerifyOutcome::Verified {
-                observed: current.to_json(),
-                reason: "record_match",
-            },
-            Current::Reminder { completed: false } => VerifyOutcome::Mismatch {
-                observed: current.to_json(),
-                reason: "record_mismatch",
+        // E2-C unification: the device triple and the legacy
+        // loop triple share one target-aware arm — the target
+        // comes from the row's own digest (A2), never from a
+        // default. An unrecoverable target (no digest on the
+        // row) is Inconclusive, never a guess.
+        ("device", "reminders.set_completed") | ("reminders", "set_completed") => match &current {
+            Current::Reminder { completed } => match device_target_from_digest(effect) {
+                Some(target) if *completed == target => VerifyOutcome::Verified {
+                    observed: current.to_json(),
+                    reason: "record_match",
+                },
+                Some(_) => VerifyOutcome::Mismatch {
+                    observed: current.to_json(),
+                    reason: "record_mismatch",
+                },
+                None => VerifyOutcome::Inconclusive {
+                    observed: current.to_json(),
+                    reason: "state_unclear",
+                },
             },
             Current::ReminderMissing => VerifyOutcome::Mismatch {
                 observed: current.to_json(),
@@ -1287,6 +1315,39 @@ pub fn verify_outcome(
         _ => return Err(ObserveError::NoMethod),
     };
     Ok(outcome)
+}
+
+/// E2-C unification (A2): recover a device write's target
+/// flag from the row's own digest, for rows with no backing
+/// action (loop writes have none). The digest is the unified
+/// Q5 digest — `operation_digest("reminders.set_completed",
+/// Some("set_completed"), {id, completed})` — so trialling
+/// both candidate values against the stored digest recovers
+/// the target with no new column and no migration. This
+/// relies on `operation_digest` being a stable pure function
+/// with no version switching: if the digest algorithm ever
+/// changes versions, this helper needs version dispatch, and
+/// until then a miss returns `None` (the caller falls back
+/// to Inconclusive, honest, never a misjudgement).
+fn device_target_from_digest(effect: &EffectFileRecord) -> Option<bool> {
+    let digest = effect.input_digest.as_ref()?;
+    for candidate in ["true", "false"] {
+        let params = std::collections::BTreeMap::from([
+            ("id".to_string(), effect.scope.clone()),
+            ("completed".to_string(), candidate.to_string()),
+        ]);
+        let trial = crate::operation_binding::operation_digest(
+            "reminders.set_completed",
+            Some("set_completed"),
+            &params,
+        );
+        if &trial == digest {
+            // Both candidates matching is negligible under
+            // SHA-256; "true" is tried first, so it wins.
+            return Some(candidate == "true");
+        }
+    }
+    None
 }
 
 /// Verify a succeeded device row: the backing action carries

@@ -1,7 +1,10 @@
-//! E2-C entry-convergence tests (plan §4, C1–C6): the shared
+//! E2-C entry-convergence tests (plan §4, C1–C6) plus the
+//! E2-C unification tests (plan §9, U3–U7): the shared
 //! ledger entry — Device direct + loop writes, Connector
 //! reuse / adapter fallback, Evidence export, and the §4.4
-//! no-Effect positions.
+//! no-Effect positions; then the unified device triple and
+//! its target-aware verify / reconcile, including the false
+//! write and the NULL-digest fallback.
 //!
 //! HTTP routes only, except C3, which drives
 //! `record_connector_effect` directly: no task/loop path
@@ -22,8 +25,11 @@ use std::time::Duration;
 
 use agent_desktop::credential_store::MemoryCredentialStore;
 use mock_gateway::device_backend::{FakeReminderBackend, Reminder, ReminderBackend};
+use mock_gateway::effect_store::EffectFileRecord;
 use mock_gateway::loop_engine::*;
+use mock_gateway::operation_binding::operation_digest;
 use mock_gateway::server::{app, record_connector_effect, AppState};
+use mock_gateway::sqlite_store;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
@@ -282,6 +288,88 @@ impl Harness {
             .clone()
     }
 
+    async fn effect(&self, id: &str) -> Value {
+        let (status, body) = self.get(&format!("/effects/get?effect_id={id}")).await;
+        assert_eq!(status, 200, "{body}");
+        body
+    }
+
+    async fn transition(&self, effect_id: &str, status: &str) -> (u16, Value) {
+        self.post(
+            "/effects/transition",
+            json!({"effect_id": effect_id, "status": status}),
+        )
+        .await
+    }
+
+    /// Drive a succeeded Effect to `unknown` through the
+    /// legal edges, as a stuck write would leave it.
+    async fn drive_to_unknown(&self, effect_id: &str) {
+        for to in ["authorized", "started", "unknown"] {
+            let (status, _) = self.transition(effect_id, to).await;
+            assert_eq!(status, 200, "to {to}");
+        }
+        assert_eq!(self.effect(effect_id).await["status"], "unknown");
+    }
+
+    async fn reconcile(&self, effect_id: &str) -> (u16, Value) {
+        self.post("/effects/reconcile", json!({"effect_id": effect_id}))
+            .await
+    }
+
+    async fn verify(&self, effect_id: &str) -> (u16, Value) {
+        self.post("/effects/verify", json!({"effect_id": effect_id})).await
+    }
+
+    async fn evidence_for(&self, effect_id: &str) -> Vec<Value> {
+        self.evidence()
+            .await
+            .into_iter()
+            .filter(|e| e["effect_id"] == effect_id)
+            .collect()
+    }
+
+    async fn inbox(&self) -> Vec<Value> {
+        self.get_ok("/inbox/list")
+            .await
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    /// Preset a device row with no Execution — the shape a
+    /// digest-less or action-less row has in the store. There
+    /// is no HTTP sequence that produces a digest-less row
+    /// (every writer computes a digest), so the store preset
+    /// is the only honest fixture (plan §9, U5; U4's deleted
+    /// target likewise, via a scope the backend never seeded).
+    fn preset_effect(
+        &self,
+        effect_id: &str,
+        status: &str,
+        scope: &str,
+        input_digest: Option<String>,
+    ) {
+        let mut conn =
+            sqlite_store::open_db(&self.dir.join("gateway.sqlite3")).expect("open db");
+        let record = EffectFileRecord {
+            effect_id: effect_id.to_string(),
+            execution_id: None,
+            capability: "device".to_string(),
+            operation: "reminders.set_completed".to_string(),
+            scope: scope.to_string(),
+            input_digest,
+            approval_id: None,
+            status: status.to_string(),
+            idempotency_key: None,
+            origin_device_id: "test".to_string(),
+            schema_version: 1,
+            reconciliation: None,
+            detail: None,
+        };
+        sqlite_store::upsert_effect(&mut conn, &record).expect("preset");
+    }
+
     async fn start(&self) -> String {
         self.ok("/agent/loop/start", json!({"prompt": "e2c loop"}))
             .await["loop_id"]
@@ -326,6 +414,27 @@ impl Harness {
             json!({"loop_id": loop_id, "approval_id": approval, "binding": binding}),
         )
         .await
+    }
+
+    /// Step a fresh loop until its proposal waits for approval,
+    /// and return the planned Effect id for the proposal.
+    /// (Mirrors p0r's `propose`: the planned row is created at
+    /// proposal time, before any approval or execution.)
+    async fn propose(&self, scope: &str) -> String {
+        let loop_id = self.start().await;
+        let _ = self.await_approval(&loop_id).await;
+        let eff = self
+            .effects()
+            .await
+            .into_iter()
+            .find(|e| {
+                e["capability"] == "device"
+                    && e["operation"] == "reminders.set_completed"
+                    && e["scope"] == scope
+                    && e["status"] == "planned"
+            })
+            .unwrap_or_else(|| panic!("no planned device effect for {scope}"));
+        eff["effect_id"].as_str().unwrap().to_string()
     }
 
     /// Approve a direct-route tool (no loop binding).
@@ -403,13 +512,14 @@ async fn e2c_device_write_full_chain() {
     assert!(h.fake.get("reminder-1").unwrap().unwrap().completed);
 }
 
-/// C2 (§4.2): the loop Device write uses the same 10s budget
-/// as the direct route. `execute_set` runs the write and its
-/// readback inside the one budget, so a 4.5s backend delay
-/// costs 9s end to end: over the old 8s loop budget, under the
-/// unified 10s DEVICE_TIMEOUT_SECS. The set must therefore
-/// complete — and its Effect must land on the loop's
-/// Execution as a single succeeded row.
+/// C2 (§4.2, E2-C unification): the loop Device write uses
+/// the same 10s budget as the direct route. `execute_set`
+/// runs the write and its readback inside the one budget, so
+/// a 4.5s backend delay costs 9s end to end: over the old 8s
+/// loop budget, under the unified 10s DEVICE_TIMEOUT_SECS.
+/// The set must therefore complete — and its Effect must
+/// land on the loop's Execution as a single succeeded row
+/// under the unified device triple.
 #[tokio::test]
 async fn e2c_device_loop_path_same_budget() {
     let h = Harness::serve_with_delay(
@@ -433,8 +543,8 @@ async fn e2c_device_loop_path_same_budget() {
         .await
         .into_iter()
         .filter(|e| {
-            e["capability"] == "reminders"
-                && e["operation"] == "set_completed"
+            e["capability"] == "device"
+                && e["operation"] == "reminders.set_completed"
                 && e["scope"] == "reminder-1"
         })
         .collect();
@@ -690,4 +800,252 @@ async fn e2c_no_effect_positions() {
     let (status, _) = h.delete("/permissions/connectors/notes").await;
     assert_eq!(status, 200);
     assert_eq!(count().await, before, "policy DELETE wrote an Effect");
+}
+
+/// U3 (§6, §9): a loop write of `completed=false` is a real
+/// target, not a mismatch. The loop sets reminder-2 to false
+/// (it starts false — the write is a no-op in state terms,
+/// but the Effect records target=false); verify must
+/// conclude Verified/record_match with no
+/// verification_mismatch Inbox row. The old arm read
+/// `false` as a mismatch and opened a fake Inbox row.
+#[tokio::test]
+async fn e2c_unification_loop_false_write_verifies() {
+    let h = Harness::serve(vec![set_proposal("reminder-2", false), done()]).await;
+    let loop_id = h.start().await;
+    let (approval, binding) = h.await_approval(&loop_id).await;
+    let after = h.approve_and_resume(&loop_id, &approval, &binding).await;
+    assert_eq!(after["calls"][0]["status"], "succeeded", "{after}");
+    let final_view = h.step(&loop_id).await;
+    assert_eq!(final_view["status"], "completed", "{final_view}");
+    let rows: Vec<_> = h
+        .effects()
+        .await
+        .into_iter()
+        .filter(|e| {
+            e["capability"] == "device"
+                && e["operation"] == "reminders.set_completed"
+                && e["scope"] == "reminder-2"
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let effect_id = rows[0]["effect_id"].as_str().unwrap().to_string();
+    assert_eq!(rows[0]["status"], "succeeded");
+
+    let (status, body) = h.verify(&effect_id).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["source"], "verify", "{body}");
+    assert_eq!(body["verdict"], "verified", "{body}");
+    assert_eq!(body["reason"], "record_match", "{body}");
+    let mismatch: Vec<_> = h
+        .inbox()
+        .await
+        .into_iter()
+        .filter(|r| r["kind"] == "verification_mismatch" && r["effect_id"] == effect_id)
+        .collect();
+    assert!(mismatch.is_empty(), "{mismatch:?}");
+}
+
+/// U4 (§6, §9): a loop false write reconciles to Landed
+/// (reconciled/completed). The planned row is loop-produced
+/// (plan_loop_effect at proposal time); driving it to unknown
+/// and reconciling reads the real backend state against the
+/// target the row's digest records — the write itself need
+/// not have executed, exactly as in p0r's R10/R11. The
+/// deleted-target half then reconciles to reconciled/failed
+/// (target_missing) — the only honest failed conclusion for
+/// a device write. The fake backend has no remove API and
+/// `device_backend.rs` is outside the plan's file scope, so
+/// the deleted case is a store preset: an unknown device row
+/// whose scope points at a reminder the backend never
+/// seeded, with the digest the writer would have computed —
+/// the re-read genuinely finds nothing, exactly as after a
+/// deletion.
+#[tokio::test]
+async fn e2c_unification_loop_false_write_reconciles() {
+    let h = Harness::serve(vec![set_proposal("reminder-2", false), done()]).await;
+    let effect_id = h.propose("reminder-2").await;
+    h.drive_to_unknown(&effect_id).await;
+    let (status, body) = h.reconcile(&effect_id).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "reconciled", "{body}");
+    assert_eq!(body["reconciliation"]["result"], "completed", "{body}");
+
+    // Deleted target: the write provably did not land.
+    let digest = operation_digest(
+        "reminders.set_completed",
+        Some("set_completed"),
+        &std::collections::BTreeMap::from([
+            ("id".to_string(), "reminder-9".to_string()),
+            ("completed".to_string(), "false".to_string()),
+        ]),
+    );
+    h.preset_effect("effect-u4-deleted", "unknown", "reminder-9", Some(digest));
+    let (status, body) = h.reconcile("effect-u4-deleted").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "reconciled", "{body}");
+    assert_eq!(body["reconciliation"]["result"], "failed", "{body}");
+}
+
+/// U5 (§5.2, §4.3, §9): a device row with no backing action
+/// falls through to the generic path instead of 409ing, and
+/// a NULL digest is Inconclusive — never a guess, never a
+/// failed conclusion. The NULL-digest rows are store presets:
+/// no HTTP sequence produces a digest-less row.
+#[tokio::test]
+async fn e2c_unification_actionless_device_row_falls_through() {
+    // (a) Action-less row with a digest (loop write): verify
+    // reaches the generic path — without the §5.2 fall-through
+    // it would 409 `evidence_missing`. The reconcile half
+    // uses a second loop's planned row (p0r's `propose`
+    // pattern): it drives to unknown and reconciles against
+    // the state the first loop landed (true == true).
+    let h = Harness::serve(vec![
+        set_proposal("reminder-2", true),
+        done(),
+        set_proposal("reminder-2", true),
+        done(),
+    ])
+    .await;
+    let loop_id = h.start().await;
+    let (approval, binding) = h.await_approval(&loop_id).await;
+    let after = h.approve_and_resume(&loop_id, &approval, &binding).await;
+    assert_eq!(after["calls"][0]["status"], "succeeded", "{after}");
+    let final_view = h.step(&loop_id).await;
+    assert_eq!(final_view["status"], "completed", "{final_view}");
+    let effect_id = h
+        .effects()
+        .await
+        .into_iter()
+        .find(|e| {
+            e["capability"] == "device"
+                && e["operation"] == "reminders.set_completed"
+                && e["scope"] == "reminder-2"
+                && e["status"] == "succeeded"
+        })
+        .expect("loop effect")["effect_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, body) = h.verify(&effect_id).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["verdict"], "verified", "{body}");
+    assert_eq!(body["reason"], "record_match", "{body}");
+    let planned = h.propose("reminder-2").await;
+    h.drive_to_unknown(&planned).await;
+    let (status, body) = h.reconcile(&planned).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "reconciled", "{body}");
+    assert_eq!(body["reconciliation"]["result"], "completed", "{body}");
+
+    // (b) NULL digest: verify is Inconclusive/state_unclear
+    // with no fake mismatch Inbox row; reconcile leaves the
+    // row unknown.
+    h.preset_effect("effect-u5-verify", "succeeded", "reminder-1", None);
+    let (status, body) = h.verify("effect-u5-verify").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["verdict"], "inconclusive", "{body}");
+    assert_eq!(body["reason"], "state_unclear", "{body}");
+    let mismatch: Vec<_> = h
+        .inbox()
+        .await
+        .into_iter()
+        .filter(|r| r["kind"] == "verification_mismatch" && r["effect_id"] == "effect-u5-verify")
+        .collect();
+    assert!(mismatch.is_empty(), "{mismatch:?}");
+    h.preset_effect("effect-u5-reconcile", "unknown", "reminder-1", None);
+    let (status, body) = h.reconcile("effect-u5-reconcile").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "unknown", "{body}");
+    assert!(body["reconciliation"].is_null(), "{body}");
+}
+
+/// U6 (§5.3, Q4, §9): neither the loop nor the direct true
+/// write gets an automatic write-time Evidence row; after an
+/// explicit verify, exactly one `source=="verify"` row exists
+/// for the Effect.
+#[tokio::test]
+async fn e2c_unification_no_write_time_evidence_row() {
+    // Loop half.
+    let h = Harness::serve(vec![set_proposal("reminder-1", true), done()]).await;
+    let loop_id = h.start().await;
+    let (approval, binding) = h.await_approval(&loop_id).await;
+    let after = h.approve_and_resume(&loop_id, &approval, &binding).await;
+    assert_eq!(after["calls"][0]["status"], "succeeded", "{after}");
+    let final_view = h.step(&loop_id).await;
+    assert_eq!(final_view["status"], "completed", "{final_view}");
+    let effect_id = h
+        .effects()
+        .await
+        .into_iter()
+        .find(|e| {
+            e["capability"] == "device"
+                && e["operation"] == "reminders.set_completed"
+                && e["scope"] == "reminder-1"
+        })
+        .expect("loop effect")["effect_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let write_rows: Vec<_> = h
+        .evidence_for(&effect_id)
+        .await
+        .into_iter()
+        .filter(|e| e["source"] == "write")
+        .collect();
+    assert!(write_rows.is_empty(), "{write_rows:?}");
+    let (status, body) = h.verify(&effect_id).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["verdict"], "verified", "{body}");
+    let rows = h.evidence_for(&effect_id).await;
+    assert_eq!(
+        rows.iter().filter(|e| e["source"] == "write").count(),
+        0,
+        "{rows:?}"
+    );
+    assert_eq!(
+        rows.iter().filter(|e| e["source"] == "verify").count(),
+        1,
+        "{rows:?}"
+    );
+
+    // Direct half: the same attribution on the direct route.
+    let h2 = Harness::serve(Vec::new()).await;
+    let action = h2
+        .ok(
+            "/devices/actions/create",
+            json!({"reminder_id": "reminder-1", "target_completed": true}),
+        )
+        .await;
+    let action_id = action["action_id"].as_str().unwrap();
+    let effect_id = action["effect_id"].as_str().unwrap().to_string();
+    let tool_call_id = h2.approve_direct("reminders.set_completed").await;
+    let updated = h2
+        .ok(
+            "/devices/reminders/set",
+            json!({"action_id": action_id, "tool_call_id": tool_call_id}),
+        )
+        .await;
+    assert_eq!(updated["status"], "completed", "{updated}");
+    let write_rows: Vec<_> = h2
+        .evidence_for(&effect_id)
+        .await
+        .into_iter()
+        .filter(|e| e["source"] == "write")
+        .collect();
+    assert!(write_rows.is_empty(), "{write_rows:?}");
+    let (status, body) = h2.verify(&effect_id).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["verdict"], "verified", "{body}");
+    let rows = h2.evidence_for(&effect_id).await;
+    assert_eq!(
+        rows.iter().filter(|e| e["source"] == "write").count(),
+        0,
+        "{rows:?}"
+    );
+    assert_eq!(
+        rows.iter().filter(|e| e["source"] == "verify").count(),
+        1,
+        "{rows:?}"
+    );
 }

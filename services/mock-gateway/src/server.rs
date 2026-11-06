@@ -1058,9 +1058,12 @@ impl AppState {
                 "write",
                 args.get("path").cloned().unwrap_or_default(),
             ),
+            // E2-C unification: loop device writes use the
+            // contract triple (device, reminders.set_completed),
+            // the same identity the direct route records.
             "reminders.set_completed" => (
-                "reminders",
-                "set_completed",
+                "device",
+                "reminders.set_completed",
                 args.get("id").cloned().unwrap_or_default(),
             ),
             _ => return,
@@ -1233,9 +1236,11 @@ impl AppState {
                         "write",
                         args.get("path").cloned().unwrap_or_default(),
                     )),
+                    // E2-C unification: same contract triple as
+                    // plan_loop_effect / record_loop_effect.
                     "reminders.set_completed" => Some((
-                        "reminders",
-                        "set_completed",
+                        "device",
+                        "reminders.set_completed",
                         args.get("id").cloned().unwrap_or_default(),
                     )),
                     // P3-C: worker.run has no planned Effect
@@ -10599,9 +10604,12 @@ pub(crate) fn plan_loop_effect(
             "write",
             args.get("path").cloned().unwrap_or_default(),
         ),
+        // E2-C unification: loop device writes use the
+        // contract triple (device, reminders.set_completed),
+        // the same identity the direct route records.
         "reminders.set_completed" => (
-            "reminders",
-            "set_completed",
+            "device",
+            "reminders.set_completed",
             args.get("id").cloned().unwrap_or_default(),
         ),
         _ => return None,
@@ -10858,13 +10866,20 @@ pub(crate) fn reconcile_effect(
                 })
                 .cloned()
         };
-        let Some(action) = action else {
-            return Err("effect_no_readback".to_string());
-        };
-        if action.status != "unknown" {
-            return Err("effect_action_mismatch".to_string());
+        match action {
+            Some(action) => {
+                if action.status != "unknown" {
+                    return Err("effect_action_mismatch".to_string());
+                }
+                Some(action)
+            }
+            // E2-C unification: a device row without a backing
+            // action (loop writes have none) falls through to
+            // the generic reconcile path instead of 409ing —
+            // the generic path recovers the target from the
+            // row's own digest (see device_target_from_digest).
+            None => None,
         }
-        Some(action)
     } else {
         None
     };
@@ -13454,49 +13469,50 @@ async fn effects_verify(
     if state.sqlite_mode() != StateBackend::Sqlite && state.sqlite_mode() != StateBackend::Shadow {
         return sqlite_not_configured();
     }
-    let outcome = if matches!(effect.capability.as_str(), "device" | "devices") {
-        // The backing action carries the target flag the
-        // Effect row does not.
-        let action = {
-            let actions = state.actions.lock().expect("action lock");
-            actions
-                .values()
-                .find(|a| {
-                    a.effect_id.as_deref() == Some(&effect.effect_id)
-                        || (effect.execution_id.is_some()
-                            && a.execution_id == effect.execution_id)
-                })
-                .cloned()
-        };
-        let Some(action) = action else {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "error": "evidence_missing" })),
-            )
-                .into_response();
-        };
-        crate::evidence::device_verify_outcome(
+    // The backing action carries the target flag the Effect
+    // row does not — when one exists. A device row without
+    // one (loop writes have none) falls through to the
+    // generic path below (E2-C unification), where the
+    // target is recovered from the row's own digest; it must
+    // not 409 here, or unification would be a regression
+    // against the loop rows' old generic verify.
+    let action_backed = if matches!(effect.capability.as_str(), "device" | "devices") {
+        let actions = state.actions.lock().expect("action lock");
+        actions
+            .values()
+            .find(|a| {
+                a.effect_id.as_deref() == Some(&effect.effect_id)
+                    || (effect.execution_id.is_some()
+                        && a.execution_id == effect.execution_id)
+            })
+            .cloned()
+    } else {
+        None
+    };
+    let outcome = match action_backed {
+        Some(action) => crate::evidence::device_verify_outcome(
             &state,
             action.target_completed,
             &action.reminder_id,
-        )
-    } else {
-        let write_evidence = latest_evidence_for_effect(&state, &effect);
-        match crate::evidence::verify_outcome(&state, &effect, write_evidence.as_ref()) {
-            Ok(outcome) => outcome,
-            Err(crate::evidence::ObserveError::NoMethod) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({ "error": "effect_no_readback" })),
-                )
-                    .into_response();
-            }
-            Err(crate::evidence::ObserveError::MissingEvidence) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({ "error": "evidence_missing" })),
-                )
-                    .into_response();
+        ),
+        None => {
+            let write_evidence = latest_evidence_for_effect(&state, &effect);
+            match crate::evidence::verify_outcome(&state, &effect, write_evidence.as_ref()) {
+                Ok(outcome) => outcome,
+                Err(crate::evidence::ObserveError::NoMethod) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({ "error": "effect_no_readback" })),
+                    )
+                        .into_response();
+                }
+                Err(crate::evidence::ObserveError::MissingEvidence) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({ "error": "evidence_missing" })),
+                    )
+                        .into_response();
+                }
             }
         }
     };

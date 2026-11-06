@@ -120,8 +120,12 @@ pub struct EffectFileRecord {
     /// Phase-1 execution that produced this effect, when one exists.
     #[serde(default)]
     pub execution_id: Option<String>,
-    /// Resource family: `fs`, `reminders`, `devices`, `tasks`,
-    /// `connectors`, `custom-connectors`, `credentials`, `catalog`.
+    /// Resource family: `fs`, `device`, `reminders`, `devices`,
+    /// `tasks`, `connectors`, `custom-connectors`, `credentials`,
+    /// `catalog`. `device` is the contract label for device
+    /// writes (E2-C unification); `reminders` the
+    /// pre-unification loop history triple, `devices` the P0-D
+    /// import-retained label.
     pub capability: String,
     /// Operation within the capability, e.g. `write`, `set`,
     /// `execute`, `link`.
