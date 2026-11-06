@@ -964,7 +964,15 @@ fn relativize_to_root(root: &Path, absolute: &str) -> Option<String> {
         canonical.push(part);
     }
     let relative = canonical.strip_prefix(&root_canonical).ok()?;
-    Some(relative.to_string_lossy().into_owned())
+    // Effect scope 与 Worktree API 使用统一的 / 分隔格式，不能泄漏
+    // Windows 本机分隔符，否则同一目标的摘要和记录校验会不一致。
+    Some(
+        relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }
 
 /// P3-C Effect identity for an unknown run (timeout / cancel /
@@ -1947,6 +1955,32 @@ mod tests {
         child.wait().unwrap();
         assert!(!alive_before_reap, "exited child reported alive before wait");
         assert!(!process_alive(pid));
+    }
+
+    #[test]
+    fn relative_scope_uses_api_separators_before_and_after_creation() {
+        let root = std::env::temp_dir().join(format!(
+            "mock-worker-relative-scope-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("scratch").join("w1");
+        // 未落盘的目标与成功创建后的目标必须得到同一 scope/摘要输入。
+        assert_eq!(
+            relativize_to_root(&root, &target.to_string_lossy()).as_deref(),
+            Some("scratch/w1")
+        );
+        std::fs::create_dir_all(&target).unwrap();
+        assert_eq!(
+            relativize_to_root(&root, &target.to_string_lossy()).as_deref(),
+            Some("scratch/w1")
+        );
+        assert_eq!(
+            relativize_to_root(&root, &root.to_string_lossy()).as_deref(),
+            Some("")
+        );
+        assert!(relativize_to_root(&target, &root.to_string_lossy()).is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
