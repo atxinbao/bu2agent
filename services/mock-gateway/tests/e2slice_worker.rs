@@ -1069,19 +1069,25 @@ async fn e2slice_task_binding_freeze_mismatch_is_409() {
     let record = h.task(&task_id).await;
     assert_eq!(record["status"], "draft_ready");
     assert_eq!(record["execute_binding"]["worktree_id"], wt_a_id);
-    // Same worktree again: passes the freeze, then hits
-    // the idempotency gate — the first execute already
-    // recorded a planned Effect for the same digest, so the
-    // second is refused as a replay-block, NOT as a
-    // binding mismatch. That is the proof the freeze passed.
+    // Same worktree again: passes the freeze, resumes its own
+    // planned Effect (E2-A fix F-1), then fails at the approval
+    // gate again — the approval is still pending, so the
+    // execute returns 403 approval_required, NOT 409
+    // effect_idempotency_blocked. Returning 403 (and not
+    // task_binding_frozen_mismatch) is the proof the freeze
+    // passed; the planned row stays planned and the task stays
+    // draft_ready.
     let (head, body) = h
         .post(
             "/tasks/execute",
             &format!(r#"{{"task_id":"{task_id}","worktree_id":"{wt_a_id}"}}"#),
         )
         .await;
-    assert!(head.contains("409"), "same-worktree execute: {head} {body}");
-    assert_eq!(body["error"], "effect_idempotency_blocked");
+    assert!(head.contains("403"), "same-worktree execute: {head} {body}");
+    assert_eq!(body["error"], "approval_required");
+    let record = h.task(&task_id).await;
+    assert_eq!(record["status"], "draft_ready");
+    assert_eq!(record["execute_binding"]["worktree_id"], wt_a_id);
     // Different worktree: 409 task_binding_frozen_mismatch.
     let (head, body) = h
         .post(

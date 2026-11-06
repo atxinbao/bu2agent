@@ -102,7 +102,9 @@ pub fn append_task(path: &Path, record: &TaskFileRecord) {
 /// E2-A §2.2: the Task lifecycle edge table, mirroring
 /// `valid_effect_transition` (effect_store.rs). The table is
 /// the full runtime enumeration (full-repo grep, 2026-11-06):
-/// 8 status words, 13 edges. Every runtime Task status write
+/// 8 status words, 15 edges (13 at E2-A, +2 at the E2-A fix:
+/// terminal re-run is legal — `completed→running` and
+/// `failed→running`). Every runtime Task status write
 /// goes through one of these edges; the manual
 /// `POST /tasks/update` override is NOT governed by it (it is
 /// a word-whitelist free setter, locked by task_smoke /
@@ -131,6 +133,8 @@ pub fn valid_task_status_transition(from: &str, to: &str) -> bool {
             | ("draft_ready", "rejected")
             | ("draft_ready", "cancelled")
             | ("draft_ready", "failed")
+            | ("completed", "running")
+            | ("failed", "running")
     )
 }
 
@@ -234,7 +238,7 @@ mod tests {
 
     #[test]
     fn task_status_transition_table() {
-        // All thirteen runtime edges accept; everything else
+        // All fifteen runtime edges accept; everything else
         // refuses, including the manual-override jumps the
         // /tasks/update route allows (created→completed,
         // completed→rejected) and identity transitions.
@@ -252,6 +256,9 @@ mod tests {
             ("draft_ready", "rejected"),
             ("draft_ready", "cancelled"),
             ("draft_ready", "failed"),
+            // E2-A fix: terminal re-run is legal.
+            ("completed", "running"),
+            ("failed", "running"),
         ] {
             assert!(valid_task_status_transition(from, to), "{from}→{to}");
         }
@@ -259,7 +266,6 @@ mod tests {
             ("created", "completed"),
             ("created", "draft_ready"),
             ("completed", "rejected"),
-            ("completed", "running"),
             ("failed", "created"),
             ("rejected", "failed"),
             ("cancelled", "created"),

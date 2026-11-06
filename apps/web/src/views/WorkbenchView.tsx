@@ -1038,6 +1038,13 @@ export function WorkbenchView(props: WorkbenchViewProps) {
                   </button>
                 </div>
               )}
+              {(taskDetail.status === "completed" || taskDetail.status === "failed") && (
+                <div className="row">
+                  <button type="button" disabled={taskBusy} onClick={() => void runTaskAction(() => tasks.run(taskDetail.taskId))}>
+                    重新运行
+                  </button>
+                </div>
+              )}
               {taskDetail.status === "draft_ready" && taskDetail.approvalId && taskDraft && (
                 <div>
                   <h3>草稿 · 产物：{taskDetail.artifactPath ?? "report.md"}</h3>

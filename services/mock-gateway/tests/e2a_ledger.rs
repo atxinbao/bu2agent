@@ -1142,6 +1142,428 @@ async fn e2a_a13_task_status_validator_rejects_illegal_edge() {
     h.poll_task(&task2, "cancelled", 15).await;
 }
 
+// --- E2-A fix F1–F7 (V1 resume + terminal re-run) ---
+//
+// F1: execute-before-approval strands a planned Effect; the
+// post-approval retry resumes that same row (not a second row).
+// F2/F3: tasks_run re-runs a completed/failed Task. F4:
+// tasks_resume from a terminal Task regenerates (Q1a). F5:
+// draft_ready/rejected/cancelled still cannot re-run. F6: the
+// resume condition refuses other-approval and started rows
+// (store-pre-seeded: unreachable via public HTTP). F7:
+// concurrent double-execute writes exactly once.
+
+impl Harness {
+    /// Run a task to `draft_ready`; returns (task_id, approval_id).
+    async fn run_to_draft_ready(&self, directory: &str) -> (String, String) {
+        let task = self.create_task(directory).await;
+        let (status, _) = self.post("/tasks/run", json!({"task_id": task})).await;
+        assert_eq!(status, 200, "run {task}");
+        let record = self.poll_task(&task, "draft_ready", 15).await;
+        let approval = record["approval_id"].as_str().unwrap().to_string();
+        (task, approval)
+    }
+
+    async fn draft_text(&self, task_id: &str) -> String {
+        self.get_ok(&format!("/tasks/draft?task_id={task_id}"))
+            .await["draft"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// `(tasks, execute)` Effect rows for one task, in id order.
+    async fn task_execute_effects(&self, task_id: &str) -> Vec<Value> {
+        let mut rows: Vec<Value> = self
+            .effects()
+            .await
+            .into_iter()
+            .filter(|e| {
+                e["capability"] == "tasks" && e["operation"] == "execute" && e["scope"] == task_id
+            })
+            .collect();
+        rows.sort_by_key(|e| e["effect_id"].as_str().unwrap_or("").to_string());
+        rows
+    }
+
+    async fn task_executions(&self, task_id: &str) -> Vec<Value> {
+        self.executions()
+            .await
+            .into_iter()
+            .filter(|e| e["task_id"] == task_id)
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn e2a_f1_execute_retry_resumes_own_planned_effect() {
+    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
+    let notes = h.files_root().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("a.txt"), "alpha").unwrap();
+    let (task, approval) = h.run_to_draft_ready("notes").await;
+    let draft = h.draft_text(&task).await;
+    let execution_id = h.execution_for_task(&task).await["execution_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // First execute BEFORE the approval is decided: 403
+    // approval_required (consume returns `forbidden`), and the
+    // planned row is stranded. (The plan's §9.1 table says 409
+    // here; the window evidence file carries the body only, no
+    // status — the code returns 403, unchanged by this fix.)
+    let (status, body) = h.post("/tasks/execute", json!({"task_id": task})).await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"], "approval_required");
+    assert_eq!(h.task(&task).await["status"], "draft_ready");
+    assert_eq!(
+        h.execution_for_task(&task).await["status"],
+        "running",
+        "execution stays running while the task is stranded"
+    );
+    let rows = h.task_execute_effects(&task).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["status"], "planned");
+    assert_eq!(rows[0]["approval_id"], approval);
+    let effect_id = rows[0]["effect_id"].as_str().unwrap().to_string();
+
+    // Decide, then execute again: the same row is resumed.
+    h.ok(
+        "/approval/decide",
+        json!({"tool_call_id": approval, "status": "approved"}),
+    )
+    .await;
+    let (status, body) = h.post("/tasks/execute", json!({"task_id": task})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(h.task(&task).await["status"], "completed");
+    assert_eq!(h.execution_for_task(&task).await["status"], "completed");
+    let rows = h.task_execute_effects(&task).await;
+    assert_eq!(rows.len(), 1, "resume must not create a second row: {rows:?}");
+    assert_eq!(rows[0]["effect_id"], effect_id, "same row, driven forward");
+    assert_eq!(rows[0]["status"], "succeeded");
+    assert_eq!(rows[0]["execution_id"], execution_id);
+    let artifact = std::fs::read(h.files_root().join("notes/report.md")).unwrap();
+    assert_eq!(artifact, draft.as_bytes(), "artifact bytes == draft bytes");
+}
+
+#[tokio::test]
+async fn e2a_f2_rerun_from_completed() {
+    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
+    let notes = h.files_root().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("a.txt"), "alpha").unwrap();
+    let (task, approval) = h.run_to_draft_ready("notes").await;
+    h.ok(
+        "/approval/decide",
+        json!({"tool_call_id": approval, "status": "approved"}),
+    )
+    .await;
+    let (status, _) = h.post("/tasks/execute", json!({"task_id": task})).await;
+    assert_eq!(status, 200);
+    assert_eq!(h.task(&task).await["status"], "completed");
+    let old_executions = h.task_executions(&task).await;
+    assert_eq!(old_executions.len(), 1);
+    let old_execution_id = old_executions[0]["execution_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(old_executions[0]["status"], "completed");
+
+    // Re-run from completed: a fresh Execution, the old one untouched.
+    let (status, _) = h.post("/tasks/run", json!({"task_id": task})).await;
+    assert_eq!(status, 200, "completed→running must be a legal edge");
+    let record = h.poll_task(&task, "draft_ready", 15).await;
+    assert_ne!(record["approval_id"], approval, "re-run mints a fresh approval");
+    let executions = h.task_executions(&task).await;
+    assert_eq!(executions.len(), 2, "{executions:?}");
+    let new_execution = executions
+        .iter()
+        .find(|e| e["execution_id"] != old_execution_id)
+        .expect("new execution");
+    assert_eq!(new_execution["status"], "running");
+    let old = executions
+        .iter()
+        .find(|e| e["execution_id"] == old_execution_id)
+        .unwrap();
+    assert_eq!(old["status"], "completed", "supersede must not touch a terminal execution");
+    let new_approval = record["approval_id"].as_str().unwrap().to_string();
+    h.ok(
+        "/approval/decide",
+        json!({"tool_call_id": new_approval, "status": "approved"}),
+    )
+    .await;
+    let (status, body) = h.post("/tasks/execute", json!({"task_id": task})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(h.task(&task).await["status"], "completed");
+    let rows = h.task_execute_effects(&task).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(|r| r["status"] == "succeeded"));
+    assert_ne!(rows[0]["effect_id"], rows[1]["effect_id"]);
+    assert_ne!(rows[0]["execution_id"], rows[1]["execution_id"]);
+}
+
+#[tokio::test]
+async fn e2a_f3_rerun_from_failed() {
+    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
+    let empty = h.files_root().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let task = h.create_task("empty").await;
+    let (status, _) = h.post("/tasks/run", json!({"task_id": task})).await;
+    assert_eq!(status, 200);
+    let record = h.poll_task(&task, "failed", 15).await;
+    assert_eq!(record["error"], "目录下没有可读文件");
+    let old_executions = h.task_executions(&task).await;
+    assert_eq!(old_executions.len(), 1);
+    let old_execution_id = old_executions[0]["execution_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(old_executions[0]["status"], "failed");
+
+    // Fix the directory, then re-run from failed.
+    std::fs::write(empty.join("a.txt"), "alpha").unwrap();
+    let (status, _) = h.post("/tasks/run", json!({"task_id": task})).await;
+    assert_eq!(status, 200, "failed→running must be a legal edge");
+    let record = h.poll_task(&task, "draft_ready", 15).await;
+    assert!(record["approval_id"].as_str().is_some());
+    let executions = h.task_executions(&task).await;
+    assert_eq!(executions.len(), 2, "{executions:?}");
+    let old = executions
+        .iter()
+        .find(|e| e["execution_id"] == old_execution_id)
+        .unwrap();
+    assert_eq!(old["status"], "failed", "supersede must not touch a terminal execution");
+    let approval = record["approval_id"].as_str().unwrap().to_string();
+    h.ok(
+        "/approval/decide",
+        json!({"tool_call_id": approval, "status": "approved"}),
+    )
+    .await;
+    let (status, body) = h.post("/tasks/execute", json!({"task_id": task})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(h.task(&task).await["status"], "completed");
+}
+
+#[tokio::test]
+async fn e2a_f4_resume_from_completed_regenerates() {
+    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
+    let notes = h.files_root().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("a.txt"), "alpha").unwrap();
+    let (task, approval) = h.run_to_draft_ready("notes").await;
+    h.ok(
+        "/approval/decide",
+        json!({"tool_call_id": approval, "status": "approved"}),
+    )
+    .await;
+    let (status, _) = h.post("/tasks/execute", json!({"task_id": task})).await;
+    assert_eq!(status, 200);
+    assert_eq!(h.task(&task).await["status"], "completed");
+    let old_execution_id = h.task_executions(&task).await[0]["execution_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Resume from completed (Q1a): a fresh attempt that
+    // regenerates the draft and a new approval — not a silent
+    // no-op, and no stranded `running` Execution.
+    let (status, body) = h.post("/tasks/resume", json!({"task_id": task})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "completed", "resume returns the pre-run snapshot");
+    let record = h.poll_task(&task, "draft_ready", 15).await;
+    assert_ne!(record["approval_id"], approval, "resume mints a fresh approval");
+    let executions = h.task_executions(&task).await;
+    assert_eq!(executions.len(), 2, "{executions:?}");
+    let new_execution = executions
+        .iter()
+        .find(|e| e["execution_id"] != old_execution_id)
+        .expect("new execution");
+    assert_eq!(new_execution["status"], "running");
+    let old = executions
+        .iter()
+        .find(|e| e["execution_id"] == old_execution_id)
+        .unwrap();
+    assert_eq!(old["status"], "completed");
+}
+
+#[tokio::test]
+async fn e2a_f5_terminal_states_cannot_rerun() {
+    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
+    let notes = h.files_root().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("a.txt"), "alpha").unwrap();
+
+    // draft_ready cannot re-run: it must be executed first.
+    let (task, _) = h.run_to_draft_ready("notes").await;
+    for path in ["/tasks/run", "/tasks/resume"] {
+        let (status, body) = h.post(path, json!({"task_id": task})).await;
+        assert_eq!(status, 409, "{path}: {body}");
+        assert_eq!(body["error"], "task_status_transition_invalid");
+    }
+    assert_eq!(h.task(&task).await["status"], "draft_ready");
+    assert_eq!(h.task_executions(&task).await.len(), 1);
+
+    // rejected cannot re-run.
+    let (task2, _) = h.run_to_draft_ready("notes").await;
+    let (status, _) = h.post("/tasks/reject", json!({"task_id": task2})).await;
+    assert_eq!(status, 200);
+    assert_eq!(h.task(&task2).await["status"], "rejected");
+    for path in ["/tasks/run", "/tasks/resume"] {
+        let (status, body) = h.post(path, json!({"task_id": task2})).await;
+        assert_eq!(status, 409, "{path}: {body}");
+        assert_eq!(body["error"], "task_status_transition_invalid");
+    }
+    assert_eq!(h.task_executions(&task2).await.len(), 1);
+
+    // cancelled cannot re-run (approval still pending at draft_ready).
+    let (task3, _) = h.run_to_draft_ready("notes").await;
+    let (status, body) = h.post("/tasks/cancel", json!({"task_id": task3})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(h.task(&task3).await["status"], "cancelled");
+    for path in ["/tasks/run", "/tasks/resume"] {
+        let (status, body) = h.post(path, json!({"task_id": task3})).await;
+        assert_eq!(status, 409, "{path}: {body}");
+        assert_eq!(body["error"], "task_status_transition_invalid");
+    }
+    assert_eq!(h.task_executions(&task3).await.len(), 1);
+}
+
+/// F6 setup: run to draft_ready, execute once before the
+/// approval is decided (409 approval_required, planned row
+/// stranded), then return (task, approval, planned effect id).
+async fn f6_stranded(h: &Harness) -> (String, String, String) {
+    let notes = h.files_root().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("a.txt"), "alpha").unwrap();
+    let (task, approval) = h.run_to_draft_ready("notes").await;
+    let (status, body) = h.post("/tasks/execute", json!({"task_id": task})).await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"], "approval_required");
+    let rows = h.task_execute_effects(&task).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["status"], "planned");
+    let effect_id = rows[0]["effect_id"].as_str().unwrap().to_string();
+    (task, approval, effect_id)
+}
+
+#[tokio::test]
+async fn e2a_f6_resume_refuses_other_approval_planned_row() {
+    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
+    let (task, approval, effect_id) = f6_stranded(&h).await;
+    // The planned row belongs to another approval now: the
+    // retry must refuse, not drive a foreign row forward.
+    let db = h.db();
+    let changed = db
+        .execute(
+            "UPDATE effects SET approval_id = ?1 WHERE effect_id = ?2",
+            rusqlite::params!["approval-9999", effect_id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(db);
+    h.ok(
+        "/approval/decide",
+        json!({"tool_call_id": approval, "status": "approved"}),
+    )
+    .await;
+    let (status, body) = h.post("/tasks/execute", json!({"task_id": task})).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], "effect_idempotency_blocked");
+    assert_eq!(body["effect_id"], effect_id);
+    assert_eq!(h.task(&task).await["status"], "draft_ready");
+    assert!(!h.files_root().join("notes/report.md").exists(), "no write on refusal");
+    let rows = h.task_execute_effects(&task).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["status"], "planned");
+}
+
+#[tokio::test]
+async fn e2a_f6_resume_refuses_started_row() {
+    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
+    let (task, approval, effect_id) = f6_stranded(&h).await;
+    // The row already started (interrupted mid-write): the
+    // retry must refuse, not re-drive it.
+    let db = h.db();
+    let changed = db
+        .execute(
+            "UPDATE effects SET status = ?1 WHERE effect_id = ?2",
+            rusqlite::params!["started", effect_id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(db);
+    h.ok(
+        "/approval/decide",
+        json!({"tool_call_id": approval, "status": "approved"}),
+    )
+    .await;
+    let (status, body) = h.post("/tasks/execute", json!({"task_id": task})).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], "effect_idempotency_blocked");
+    assert_eq!(body["effect_id"], effect_id);
+    assert_eq!(h.task(&task).await["status"], "draft_ready");
+    assert!(!h.files_root().join("notes/report.md").exists(), "no write on refusal");
+    let rows = h.task_execute_effects(&task).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["status"], "started");
+}
+
+#[tokio::test]
+async fn e2a_f7_concurrent_double_execute_writes_once() {
+    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
+    let notes = h.files_root().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("a.txt"), "alpha").unwrap();
+    let (task, approval) = h.run_to_draft_ready("notes").await;
+    let draft = h.draft_text(&task).await;
+    h.ok(
+        "/approval/decide",
+        json!({"tool_call_id": approval, "status": "approved"}),
+    )
+    .await;
+    let (a, b) = tokio::join!(
+        h.post("/tasks/execute", json!({"task_id": task})),
+        h.post("/tasks/execute", json!({"task_id": task})),
+    );
+    let mut statuses = vec![a.0, b.0];
+    statuses.sort_unstable();
+    assert_eq!(statuses, vec![200, 409], "one winner, one refusal: {a:?} {b:?}");
+    // The loser's 409 is timing-dependent: if it enters after
+    // the winner completed the task, the entry validator refuses
+    // (task_status_transition_invalid); if it enters during the
+    // winner's execute, the consume (approval_binding_mismatch)
+    // or the idempotency gate (effect_idempotency_blocked)
+    // refuses. All three are legitimate refusals of the second
+    // write; the locked property is exactly one 200 + exactly
+    // one succeeded row + artifact == draft.
+    let loser = if a.0 == 409 { &a.1 } else { &b.1 };
+    assert!(
+        matches!(
+            loser["error"].as_str(),
+            Some("task_status_transition_invalid")
+                | Some("approval_binding_mismatch")
+                | Some("effect_idempotency_blocked")
+        ),
+        "unexpected loser error: {loser}"
+    );
+    assert_eq!(h.task(&task).await["status"], "completed");
+    let rows = h.task_execute_effects(&task).await;
+    assert_eq!(rows.len(), 1, "exactly one row: {rows:?}");
+    assert_eq!(rows[0]["status"], "succeeded");
+    let artifact = std::fs::read(h.files_root().join("notes/report.md")).unwrap();
+    assert_eq!(artifact, draft.as_bytes());
+}
+
 // --- A3: worker terminal closes Execution ---
 //
 // git-status (read) succeeds → Execution completed, no

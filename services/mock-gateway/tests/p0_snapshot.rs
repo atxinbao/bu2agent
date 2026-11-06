@@ -516,9 +516,17 @@ async fn task_restart_converts_running_to_interrupted() {
     assert!(status.contains("200"), "resume interrupted: {status} {body}");
     let resumed: serde_json::Value = serde_json::from_str(&body).expect("resume json");
     assert_eq!(resumed["status"], "interrupted");
-    // A non-interrupted task is not resumable.
-    let (status, _body) = post(addr, "/tasks/resume", r#"{"task_id":"task-2"}"#).await;
-    assert!(status.contains("409"), "resume completed must be 409: {status}");
+    // E2-A fix (Q1a): a completed task IS resumable — resume
+    // regenerates a fresh draft and approval, like a re-run.
+    // The immediate response is the pre-run snapshot, still
+    // completed.
+    let (status, body) = post(addr, "/tasks/resume", r#"{"task_id":"task-2"}"#).await;
+    assert!(status.contains("200"), "resume completed: {status} {body}");
+    let resumed: serde_json::Value = serde_json::from_str(&body).expect("resume json");
+    assert_eq!(resumed["status"], "completed");
+    // A cancelled task is still not resumable.
+    let (status, _body) = post(addr, "/tasks/resume", r#"{"task_id":"task-3"}"#).await;
+    assert!(status.contains("409"), "resume cancelled must be 409: {status}");
 
     server.abort();
     let _ = std::fs::remove_dir_all(&base);

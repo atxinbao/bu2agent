@@ -216,6 +216,27 @@ pub(crate) async fn run_task(state: AppState, task_id: String) {
             // Claimed by the run handler; drive straight on.
             generate_body(state, record).await;
         }
+        "completed" | "failed" => {
+            // E2-A fix F-3 (Q1a): a terminal task re-run (run or
+            // resume) claims `running` first, exactly like
+            // `created`, then regenerates the draft and a fresh
+            // approval. Without this arm the resume handler
+            // would accept the completed/failed→running edge and
+            // spawn a runner that silently does nothing, leaving
+            // a stranded `running` Execution behind.
+            {
+                let mut tasks = state.tasks.lock().expect("task lock");
+                if let Some(current) = tasks.get_mut(&task_id) {
+                    if current.status == "completed" || current.status == "failed" {
+                        current.status = "running".to_string();
+                        current.error = None;
+                        let updated = current.clone();
+                        persist_task(&state, &updated);
+                    }
+                }
+            }
+            generate_body(state, record).await;
+        }
         "interrupted" => {
             restore_or_regenerate(state, record).await;
         }

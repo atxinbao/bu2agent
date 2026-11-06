@@ -11453,8 +11453,11 @@ async fn tasks_execute(
     // created by the runner, not by /approval/request, so no
     // planned row exists yet). A terminal Effect for the same
     // key replays the task record without writing; an unsettled
-    // one refuses. Otherwise the approval is consumed bound to
-    // the planned Effect and the Effect is driven forward.
+    // one refuses — except the execute's own planned row from
+    // an earlier attempt (E2-A fix F-1, below): that row resumes
+    // instead of refusing. Otherwise the approval is consumed
+    // bound to the planned Effect and the Effect is driven
+    // forward.
     let task_execution = execution_for_task(&state, &req.task_id);
     // E2-A §2.4: a task with no Execution has no key to check
     // — refuse with 409, not the store-broken 500 below.
@@ -11465,7 +11468,18 @@ async fn tasks_execute(
         )
             .into_response();
     }
-    match check_idempotency(
+    // E2-A fix F-1: an execute retried after its own first
+    // attempt (approval_required before the approval was
+    // decided) finds the planned Effect that first attempt left
+    // behind. When the blocking row is that very row — status
+    // `planned` and bound to this execute's approval — resume
+    // it: reuse the existing row as `task_effect` and drive it
+    // through the same tail below (consume → start → write →
+    // completed). No second Effect row is created (a second
+    // insert would collide on the UNIQUE idempotency key).
+    // Any other unsettled row (started, authorized, or another
+    // approval's) still refuses with 409.
+    let task_effect = match check_idempotency(
         &state,
         task_execution.as_deref(),
         "tasks",
@@ -11478,11 +11492,17 @@ async fn tasks_execute(
             return Json(record).into_response();
         }
         IdempotencyDecision::Blocked(other) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
-            )
-                .into_response();
+            if other.status == "planned"
+                && other.approval_id.as_deref() == Some(approval_id.as_str())
+            {
+                other
+            } else {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
+                )
+                    .into_response();
+            }
         }
         // P0-D: broken migrated-domain store fails closed.
         IdempotencyDecision::Unavailable => {
@@ -11492,20 +11512,19 @@ async fn tasks_execute(
             )
                 .into_response();
         }
-        IdempotencyDecision::Proceed => {}
-    }
-    let task_effect = record_effect(
-        &state,
-        NewEffect {
-            execution_id: task_execution,
-            capability: "tasks".to_string(),
-            operation: "execute".to_string(),
-            scope: req.task_id.clone(),
-            input_digest: Some(digest.clone()),
-            approval_id: Some(approval_id.clone()),
-            status: "planned".to_string(),
-        },
-    );
+        IdempotencyDecision::Proceed => record_effect(
+            &state,
+            NewEffect {
+                execution_id: task_execution,
+                capability: "tasks".to_string(),
+                operation: "execute".to_string(),
+                scope: req.task_id.clone(),
+                input_digest: Some(digest.clone()),
+                approval_id: Some(approval_id.clone()),
+                status: "planned".to_string(),
+            },
+        ),
+    };
     if let Err(response) = consume_bound_approval_for_effect(
         &state,
         "fs.write",
