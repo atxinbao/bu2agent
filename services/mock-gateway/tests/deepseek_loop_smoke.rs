@@ -394,9 +394,10 @@ async fn multi_call_ids_history_schema_and_bound_write_roundtrip() {
     assert_eq!(first["messages"][1]["role"], "user");
     // P2 adds email_threads/email_message to the model-facing
     // tool list (7 tools); P3-A adds code_search (8 tools);
-    // P3-C adds git_read + worker_run (10 tools);
-    // the order matches tool_schemas().
-    assert_eq!(first["tools"].as_array().unwrap().len(), 10);
+    // P3-C adds git_read + worker_run (10 tools); E2-D adds
+    // worker_wait (11 tools); the order matches
+    // tool_schemas().
+    assert_eq!(first["tools"].as_array().unwrap().len(), 11);
     for (i, name) in [
         "fs_list",
         "fs_read",
@@ -408,6 +409,7 @@ async fn multi_call_ids_history_schema_and_bound_write_roundtrip() {
         "code_search",
         "git_read",
         "worker_run",
+        "worker_wait",
     ]
     .iter()
     .enumerate()

@@ -52,6 +52,20 @@ pub const WORKER_KILL_GRACE_MS: u64 = 2_000;
 pub const WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 pub const WORKER_LEASE_TTL_MS: i64 = 30_000;
 
+/// E2-D §5: the driver rewrites `progress_json` at most
+/// every 5 s while a run is in flight — the same beat as
+/// the heartbeat, never the 200 ms poll cadence (writing
+/// at 200 ms would be 25x write amplification). A failed
+/// write is log-only, like the heartbeat (see
+/// write_heartbeat / write_progress below).
+pub const WORKER_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// E2-D §6 (`worker.wait`): the wait budget cap, in ms.
+/// A wait only polls the run row — it never runs anything —
+/// so its budget is bounded by the loop tool timeout
+/// (10 s), not by the 1 h run cap (`WORKER_MAX_TIMEOUT_MS`).
+pub const WORKER_WAIT_MAX_TIMEOUT_MS: u64 = 10_000;
+
 /// How long the driver waits for inherited-pipe readers to
 /// drain after the child exits before giving up on the tail
 /// (a grandchild holding stdout open must not stall the
@@ -91,6 +105,15 @@ pub struct WorkerRunRow {
     pub binding_worktree_id: Option<String>,
     pub binding_root_digest: Option<String>,
     pub schema_version: i64,
+    /// E2-D §5: latest in-flight progress, as JSON text
+    /// `{"elapsed_ms": <n>, "output_bytes": <n>,
+    /// "tail_lines": <n>}` — all three fields numeric counts,
+    /// never text. Written at most every 5 s by the driver
+    /// while the run is queued/running; NULL before the first
+    /// write (and for runs that finish faster). Old rows read
+    /// NULL (column backfill, SQLite stays v4).
+    #[serde(default)]
+    pub progress_json: Option<String>,
 }
 
 /// Terminal run statuses: no further driving (plan §3.2).
@@ -1258,12 +1281,26 @@ pub async fn drive_worker_run(state: AppState, run_id: String) {
     // (see write_heartbeat).
     write_heartbeat(&state, &run);
     let mut last_heartbeat = std::time::Instant::now();
+    // E2-D §5: progress is rewritten at most every 5 s,
+    // beside the heartbeat check below — never at the
+    // 200 ms poll cadence.
+    let mut last_progress = std::time::Instant::now();
     let mut outcome: Option<&'static str> = None;
     let mut status: Option<std::process::ExitStatus> = None;
     loop {
         if last_heartbeat.elapsed() >= WORKER_HEARTBEAT_INTERVAL {
             write_heartbeat(&state, &run);
             last_heartbeat = std::time::Instant::now();
+        }
+        if last_progress.elapsed() >= WORKER_PROGRESS_INTERVAL {
+            write_progress(
+                &state,
+                &run,
+                &wait_started,
+                &stdout_shared,
+                &stderr_shared,
+            );
+            last_progress = std::time::Instant::now();
         }
         match tokio::time::timeout(Duration::from_millis(200), child.wait()).await {
             Ok(Ok(exit)) => {
@@ -1407,6 +1444,69 @@ fn write_heartbeat(state: &AppState, run: &WorkerRunRow) {
         now + WORKER_LEASE_TTL_MS,
     ) {
         eprintln!("warning: E2-B worker heartbeat write failed for {assignment_id}: {detail}");
+    }
+}
+
+/// E2-D §5: rewrite the run's `progress_json` — template-
+/// agnostic counts only, never text. `elapsed_ms` is the
+/// wall time since the driver started driving;
+/// `output_bytes` is the combined stdout+stderr bytes seen
+/// so far; `tail_lines` is the count of `\n` in the current
+/// truncated tail (the last `WORKER_TAIL_LIMIT` bytes of
+/// combined output — the same tail `finish_worker_run`
+/// stores, so the count never covers output the row cannot
+/// show). Conditional write (`WHERE status IN
+/// ('queued','running')`, same discipline as
+/// `finish_worker_run`): a recovery scan that already
+/// finalized the row wins, and this never overwrites a
+/// terminal row. Failure is log-only, like the heartbeat:
+/// it must not kill the run and must not record an Effect.
+fn write_progress(
+    state: &AppState,
+    run: &WorkerRunRow,
+    wait_started: &std::time::Instant,
+    stdout_shared: &Arc<Mutex<Vec<u8>>>,
+    stderr_shared: &Arc<Mutex<Vec<u8>>>,
+) {
+    let Some(sqlite) = &state.sqlite else {
+        return;
+    };
+    let (output_bytes, tail_lines) = {
+        let stdout = stdout_shared.lock().expect("stdout lock");
+        let stderr = stderr_shared.lock().expect("stderr lock");
+        let output_bytes = stdout.len() + stderr.len();
+        // Newlines in the last WORKER_TAIL_LIMIT bytes of
+        // stdout ++ stderr, counted from the tail end so only
+        // the stored tail is scanned.
+        let mut remaining = WORKER_TAIL_LIMIT;
+        let mut tail_lines = 0;
+        for chunk in [&stderr[..], &stdout[..]] {
+            let take = chunk.len().min(remaining);
+            tail_lines += chunk[chunk.len() - take..]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count();
+            remaining -= take;
+            if remaining == 0 {
+                break;
+            }
+        }
+        (output_bytes, tail_lines)
+    };
+    let progress = serde_json::json!({
+        "elapsed_ms": wait_started.elapsed().as_millis() as u64,
+        "output_bytes": output_bytes,
+        "tail_lines": tail_lines,
+    })
+    .to_string();
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    if let Err(detail) =
+        sqlite_store::update_worker_progress(&mut conn, &run.run_id, &progress)
+    {
+        eprintln!(
+            "warning: E2-D worker progress write failed for {}: {detail}",
+            run.run_id
+        );
     }
 }
 

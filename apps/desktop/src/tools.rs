@@ -54,6 +54,9 @@ impl ToolRegistry {
         // enqueue-only Worker commands, approval-gated.
         registry.tools.push(ToolSpec { name: "git.read".to_string(), requires_approval: false, capability: "git".to_string() });
         registry.tools.push(ToolSpec { name: "worker.run".to_string(), requires_approval: true, capability: "worker".to_string() });
+        // E2-D: poll-only wait for a run, no approval; the
+        // wait dispatches nothing and records no Effect.
+        registry.tools.push(ToolSpec { name: "worker.wait".to_string(), requires_approval: false, capability: "worker".to_string() });
         registry
     }
 

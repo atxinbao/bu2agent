@@ -517,7 +517,7 @@ pub fn loop_tool_requires_approval(tool: &str) -> bool {
 }
 
 pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, ErrorCode> {
-    if !matches!(tool, "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "code.search" | "git.read" | "worker.run") {
+    if !matches!(tool, "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "code.search" | "git.read" | "worker.run" | "worker.wait") {
         return Err(ErrorCode::InvalidTool);
     }
     let object = args.as_object().ok_or(ErrorCode::InvalidArguments)?;
@@ -731,6 +731,40 @@ pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, E
         }
         return Ok(out);
     }
+    if tool == "worker.wait" {
+        // E2-D §6: poll-only wait for a run. run_id is
+        // required; timeout_ms is optional (1..=10000) — the
+        // 10 s cap is the loop tool timeout, not the 1 h run
+        // cap: a wait never runs anything, it only polls the
+        // run row. No template params, no stray keys.
+        if object
+            .keys()
+            .any(|k| !matches!(k.as_str(), "run_id" | "timeout_ms"))
+        {
+            return Err(ErrorCode::InvalidArguments);
+        }
+        let run_id = object
+            .get("run_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty() && id.len() <= 4096)
+            .ok_or(ErrorCode::InvalidArguments)?;
+        let timeout_ms = match object.get("timeout_ms") {
+            None => None,
+            Some(Value::Number(n)) => {
+                let v = n.as_u64().ok_or(ErrorCode::InvalidArguments)?;
+                if v == 0 || v > crate::worker::WORKER_WAIT_MAX_TIMEOUT_MS {
+                    return Err(ErrorCode::InvalidArguments);
+                }
+                Some(v.to_string())
+            }
+            Some(_) => return Err(ErrorCode::InvalidArguments),
+        };
+        let mut out = BTreeMap::from([("run_id".into(), run_id.to_string())]);
+        if let Some(t) = timeout_ms {
+            out.insert("timeout_ms".into(), t);
+        }
+        return Ok(out);
+    }
     if tool == "code.search" {
         // P3-A: read-only content search. query is required and
         // non-empty; worktree_id and path are optional (path is
@@ -875,6 +909,13 @@ pub fn args_digest(tool: &str, args: &BTreeMap<String, String>) -> String {
         // AppState to resolve the worktree + binary — overwrites
         // this at planning time in resume(), before the approval
         // is requested. Duplicate detection uses this digest.
+        return crate::operation_binding::operation_digest(tool, None, args);
+    }
+    if tool == "worker.wait" {
+        // E2-D §6: the proposal-time digest commits the
+        // normalized args only (run_id, timeout), same shape
+        // as worker.run. The wait dispatches no command, so
+        // there is no command digest to overwrite this with.
         return crate::operation_binding::operation_digest(tool, None, args);
     }
     let mode = if tool == "reminders.set_completed" {
@@ -1515,9 +1556,20 @@ impl LoopEngine {
                                 let args = normal.ok();
                                 let call_id = live.record.calls.len() + 1;
                                 // 非法工具名不原样写盘，避免把模型任意文本带入审计。
+                                // E2-D: this allowlist must track
+                                // normalize()'s whitelist above —
+                                // P3-A (git.read) and P3-C
+                                // (worker.run) added tools to
+                                // normalize but not here, so their
+                                // loop proposals were recorded as
+                                // "invalid_tool" and dispatched to
+                                // the file fallthrough (which
+                                // indexes args["path"] and panics
+                                // for args without one). worker.wait
+                                // joins them here.
                                 let tool = if matches!(
                                     proposal.tool.as_str(),
-                                    "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "code.search"
+                                    "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "code.search" | "git.read" | "worker.run" | "worker.wait"
                                 ) {
                                     proposal.tool.clone()
                                 } else {

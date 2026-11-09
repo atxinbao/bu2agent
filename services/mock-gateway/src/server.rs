@@ -1127,6 +1127,14 @@ impl AppState {
     }
 
     /// 循环与 POST /agent/tool/call 共用服务端分派。绑定凭据不能从公共端点重放。
+    ///
+    /// E2-D §6 (`worker.wait`): default wait budget 10 s
+    /// (the loop tool timeout caps it — normalize rejects
+    /// anything above 10 s), polled every 500 ms against
+    /// the run row. A default-budget wait can be cut off by
+    /// the engine's 10 s tool timeout at the boundary; the
+    /// loop then sees a timed-out tool call and may wait
+    /// again next round.
     pub(crate) async fn execute_loop_tool(
         &self,
         tool: String,
@@ -1638,6 +1646,77 @@ impl AppState {
                     _ => ToolOutcome::unknown(),
                 },
             };
+        }
+        if tool == "worker.wait" {
+            // E2-D (§6): poll-only wait for a run. No Effect,
+            // no overwrite, no dispatch: the arm only reads the
+            // run row (the same read path as `worker_run_get`)
+            // until the run reaches a terminal status or the
+            // budget runs out. Terminal returns the run's
+            // terminal status + effect_id (null for read runs,
+            // which record no Effect); budget-exhausted returns
+            // "still running" + the run's current progress_json
+            // (null before the driver's first 5 s write). The
+            // loop-tool timeout (10 s) bounds the wait from
+            // outside; the default budget is that same 10 s, so
+            // a default wait can be cut off by the engine's
+            // tool timeout at the boundary — the loop then sees
+            // a timed-out tool call and may wait again next
+            // round. Unknown run_id maps to ToolFailed: loop
+            // tools carry no HTTP status, so the plan's "404"
+            // is the HTTP-route analog (the same mapping the
+            // worker.run arm uses for NOT_FOUND).
+            let run_id = args.get("run_id").cloned().unwrap_or_default();
+            let budget_ms = args
+                .get("timeout_ms")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(WORKER_WAIT_DEFAULT_TIMEOUT_MS);
+            let deadline = std::time::Instant::now() + Duration::from_millis(budget_ms);
+            loop {
+                let row = {
+                    let Some(sqlite) = &self.sqlite else {
+                        return ToolOutcome::unknown();
+                    };
+                    if self.sqlite_is_broken() {
+                        return ToolOutcome::unknown();
+                    }
+                    let conn = sqlite.lock().expect("sqlite lock");
+                    match sqlite_store::get_worker_run(&conn, &run_id) {
+                        Ok(row) => row,
+                        Err(_) => return ToolOutcome::unknown(),
+                    }
+                };
+                let Some(row) = row else {
+                    return ToolOutcome::failed(ErrorCode::ToolFailed);
+                };
+                if crate::worker::is_terminal_run_status(&row.status) {
+                    return ToolOutcome::success(
+                        serde_json::to_string(&serde_json::json!({
+                            "effect_id": row.effect_id,
+                            "run_id": row.run_id,
+                            "status": row.status,
+                        }))
+                        .unwrap_or_default(),
+                    );
+                }
+                if std::time::Instant::now() >= deadline {
+                    let progress: serde_json::Value = row
+                        .progress_json
+                        .as_deref()
+                        .and_then(|text| serde_json::from_str(text).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    return ToolOutcome::success(
+                        serde_json::to_string(&serde_json::json!({
+                            "progress": progress,
+                            "run_id": row.run_id,
+                            "status": "running",
+                        }))
+                        .unwrap_or_default(),
+                    );
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                tokio::time::sleep(remaining.min(WORKER_WAIT_POLL_INTERVAL)).await;
+            }
         }
         if let Some(backend) = backend {
             // P3-B (§10-8a): the SAME three-way stale check as
@@ -13081,6 +13160,7 @@ pub(crate) async fn create_worker_run_internal(
         binding_worktree_id: Some(binding.worktree_id),
         binding_root_digest: Some(binding.root_digest),
         schema_version: 1,
+        progress_json: None,
     };
     let row = {
         let mut conn = sqlite.lock().expect("sqlite lock");
@@ -14267,6 +14347,16 @@ async fn session_rename(State(state): State<AppState>, Json(req): Json<SessionRe
 const DEVICE_ID: &str = "mac-reminders";
 const DEVICE_ACTION: &str = "reminders.set_completed";
 const DEVICE_TIMEOUT_SECS: u64 = 10;
+
+/// E2-D §6 (`worker.wait`): default wait budget, in ms.
+/// The loop tool timeout (10 s) caps it from outside;
+/// normalize rejects a larger `timeout_ms`.
+const WORKER_WAIT_DEFAULT_TIMEOUT_MS: u64 = 10_000;
+/// E2-D §6 (`worker.wait`): row-state poll interval. The
+/// read is a cheap SQLite query; polling more often buys
+/// nothing, polling less often risks missing a terminal
+/// state inside a 10 s budget.
+const WORKER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Serialize)]
 struct ReminderDto {

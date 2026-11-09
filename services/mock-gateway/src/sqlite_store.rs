@@ -332,6 +332,7 @@ CREATE TABLE IF NOT EXISTS worker_runs (
     truncated INTEGER NOT NULL,
     effect_id TEXT,
     approval_id TEXT,
+    progress_json TEXT,
     binding_location_id TEXT,
     binding_worktree_id TEXT,
     binding_root_digest TEXT,
@@ -463,6 +464,11 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     // an approval are unaffected.
     backfill_column(&tx, "worker_runs", "approval_id")?;
     ensure_unique_index(&tx, "worker_runs", "idx_worker_runs_approval", "approval_id")?;
+    // E2-D §5 additive column: databases created before E2-D
+    // have no worker_runs.progress_json. Nullable, idempotent,
+    // schema version stays 4 (column backfill, not a v5
+    // migration). Old rows read NULL (no progress yet).
+    backfill_column(&tx, "worker_runs", "progress_json")?;
     // P3-C: the approval CommandSpec (JSON, like binding_json).
     // Databases migrated before P3-C have no approvals
     // .command_json; same backfill precedent, version stays 4.
@@ -4037,7 +4043,7 @@ fn transition_execution_with_event(
 
 pub use crate::worker::WorkerRunRow;
 
-const WORKER_RUN_COLS: &str = "run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, approval_id";
+const WORKER_RUN_COLS: &str = "run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, approval_id, progress_json";
 
 fn worker_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRunRow> {
     Ok(WorkerRunRow {
@@ -4062,6 +4068,7 @@ fn worker_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRunRow
         binding_root_digest: row.get(18)?,
         schema_version: row.get(19)?,
         approval_id: row.get(20)?,
+        progress_json: row.get(21)?,
     })
 }
 
@@ -4109,9 +4116,9 @@ pub fn create_worker_run(
     let seq = tx_seq(&tx, "worker_runs", &inserted.run_id)?;
     let now = now_ms() as i64;
     tx.execute(
-        "INSERT INTO worker_runs (seq, run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, created_ms, updated_at_ms, approval_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22, ?23)",
-        params![seq, inserted.run_id, inserted.execution_id, inserted.assignment_id, inserted.worker_session_id, inserted.command, inserted.argv_json, inserted.cwd, inserted.timeout_ms, inserted.status, inserted.exit_code, inserted.pid, inserted.started_ms, inserted.finished_ms, inserted.tail, inserted.truncated as i64, inserted.effect_id, inserted.binding_location_id, inserted.binding_worktree_id, inserted.binding_root_digest, inserted.schema_version, now, inserted.approval_id],
+        "INSERT INTO worker_runs (seq, run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, created_ms, updated_at_ms, approval_id, progress_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22, ?23, ?24)",
+        params![seq, inserted.run_id, inserted.execution_id, inserted.assignment_id, inserted.worker_session_id, inserted.command, inserted.argv_json, inserted.cwd, inserted.timeout_ms, inserted.status, inserted.exit_code, inserted.pid, inserted.started_ms, inserted.finished_ms, inserted.tail, inserted.truncated as i64, inserted.effect_id, inserted.binding_location_id, inserted.binding_worktree_id, inserted.binding_root_digest, inserted.schema_version, now, inserted.approval_id, inserted.progress_json],
     )
     .map_err(err)?;
     // E2-A §2.7: write the consuming worker session back onto
@@ -4265,6 +4272,27 @@ pub fn finish_worker_run(
         .execute(
             "UPDATE worker_runs SET status = ?1, exit_code = ?2, finished_ms = ?3, tail = ?4, truncated = ?5, effect_id = ?6, updated_at_ms = ?3 WHERE run_id = ?7 AND status IN ('queued', 'running')",
             params![finish.status, finish.exit_code, now, finish.tail, finish.truncated as i64, finish.effect_id, run_id],
+        )
+        .map_err(err)?;
+    Ok(changed > 0)
+}
+
+/// E2-D §5: rewrite a run's in-flight progress. Same
+/// conditional-write discipline as `finish_worker_run`:
+/// the update lands only while the row is still
+/// `queued`/`running`, so a recovery scan that already
+/// finalized the row (orphaned/lost) wins and a terminal
+/// row is never overwritten. Returns whether a row changed.
+pub fn update_worker_progress(
+    conn: &mut Connection,
+    run_id: &str,
+    progress_json: &str,
+) -> Result<bool, String> {
+    let now = now_ms() as i64;
+    let changed = conn
+        .execute(
+            "UPDATE worker_runs SET progress_json = ?1, updated_at_ms = ?2 WHERE run_id = ?3 AND status IN ('queued', 'running')",
+            params![progress_json, now, run_id],
         )
         .map_err(err)?;
     Ok(changed > 0)

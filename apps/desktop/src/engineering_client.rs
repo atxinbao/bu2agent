@@ -156,6 +156,11 @@ pub struct WorkerRun {
     #[serde(default)]
     pub binding_root_digest: Option<String>,
     pub schema_version: i64,
+    /// E2-D §5: latest in-flight progress JSON text
+    /// {"elapsed_ms","output_bytes","tail_lines"}, null
+    /// before the driver's first 5 s write.
+    #[serde(default)]
+    pub progress_json: Option<String>,
 }
 
 /// `base_url` must look like `http://127.0.0.1:3001`.

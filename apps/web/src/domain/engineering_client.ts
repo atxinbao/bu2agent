@@ -120,6 +120,10 @@ export interface WorkerRun {
   bindingWorktreeId: string | null;
   bindingRootDigest: string | null;
   schemaVersion: number;
+  // E2-D §5: latest in-flight progress JSON text
+  // {"elapsed_ms","output_bytes","tail_lines"}, null before
+  // the driver's first 5 s write (or for fast runs).
+  progressJson: string | null;
 }
 
 interface ServerWorkerRun {
@@ -144,6 +148,7 @@ interface ServerWorkerRun {
   binding_worktree_id?: string | null;
   binding_root_digest?: string | null;
   schema_version: number;
+  progress_json?: string | null;
 }
 
 function toWorkerRun(server: ServerWorkerRun): WorkerRun {
@@ -169,6 +174,7 @@ function toWorkerRun(server: ServerWorkerRun): WorkerRun {
     bindingWorktreeId: server.binding_worktree_id ?? null,
     bindingRootDigest: server.binding_root_digest ?? null,
     schemaVersion: server.schema_version,
+    progressJson: server.progress_json ?? null,
   };
 }
 

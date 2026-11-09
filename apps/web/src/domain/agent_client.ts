@@ -75,6 +75,7 @@ function requiresApproval(tool: string): boolean | undefined {
     case "echo":
     case "code.search":
     case "git.read":
+    case "worker.wait":
       return false;
     case "fs.write":
     case "fs.delete":

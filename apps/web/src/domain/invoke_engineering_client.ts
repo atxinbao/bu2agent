@@ -203,6 +203,7 @@ interface ServerWorkerRun {
   binding_worktree_id?: string | null;
   binding_root_digest?: string | null;
   schema_version: number;
+  progress_json?: string | null;
 }
 
 function toWorkerRun(server: ServerWorkerRun): WorkerRun {
@@ -228,6 +229,7 @@ function toWorkerRun(server: ServerWorkerRun): WorkerRun {
     bindingWorktreeId: server.binding_worktree_id ?? null,
     bindingRootDigest: server.binding_root_digest ?? null,
     schemaVersion: server.schema_version,
+    progressJson: server.progress_json ?? null,
   };
 }
 

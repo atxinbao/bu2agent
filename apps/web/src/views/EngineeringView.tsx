@@ -850,6 +850,30 @@ export function EngineeringView({
           )}
           <p>cwd：{selectedRun.cwd}</p>
           <p>argv：{selectedRun.argvJson}</p>
+          {selectedRun.progressJson !== null && (
+            <p>
+              进度：
+              {(() => {
+                try {
+                  const progress = JSON.parse(selectedRun.progressJson) as {
+                    elapsed_ms?: unknown;
+                    output_bytes?: unknown;
+                    tail_lines?: unknown;
+                  };
+                  if (
+                    typeof progress.elapsed_ms === "number" &&
+                    typeof progress.output_bytes === "number" &&
+                    typeof progress.tail_lines === "number"
+                  ) {
+                    return `已用 ${progress.elapsed_ms} ms · 输出 ${progress.output_bytes} 字节 · 尾行 ${progress.tail_lines} 行`;
+                  }
+                } catch {
+                  // 落到原文展示。
+                }
+                return selectedRun.progressJson;
+              })()}
+            </p>
+          )}
           <pre>{selectedRun.tail === "" ? "（无输出）" : selectedRun.tail}</pre>
           {selectedRun.truncated && <p className="note">输出已截断（仅保留最后 4096 字节）。</p>}
         </div>
