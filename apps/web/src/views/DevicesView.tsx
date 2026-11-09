@@ -92,6 +92,28 @@ export function DevicesView({
     return matches[0];
   }
 
+  // 该提醒的最新 Effect（P1 RemindersView 的 effectForReminder
+  // 同一规则，本页加 capability 过滤）：最新动作的 effect_id
+  // 直绑优先，否则按 scope（提醒 id）匹配最新一条
+  // device/devices 行。loop 写没有动作行时走 scope 匹配，
+  // 这正是角标缺口的修复点。
+  function effectForReminder(reminder: DeviceReminder): EffectRecord | null {
+    const mine = actionList.filter((a) => a.reminderId === reminder.id);
+    const latest = mine.length === 0 ? null : mine[mine.length - 1];
+    if (latest && latest.effectId) {
+      const direct = effectRows.find((e) => e.effectId === latest.effectId);
+      if (direct) return direct;
+    }
+    const matches = effectRows.filter(
+      (e) =>
+        (e.capability === "device" || e.capability === "devices") &&
+        e.scope === reminder.id,
+    );
+    if (matches.length === 0) return null;
+    matches.sort((a, b) => effectNumber(b.effectId) - effectNumber(a.effectId));
+    return matches[0];
+  }
+
   async function refreshEffectRows() {
     if (!effectsClient) return;
     setEffectError("");
@@ -334,14 +356,33 @@ export function DevicesView({
       </div>
       {reminders.length > 0 && (
         <ul>
-          {reminders.map((r) => (
-            <li key={r.id}>
-              <button onClick={() => setSelectedId(r.id)} disabled={busy}>
-                {r.id}
-              </button>{" "}
-              {r.title} · {r.completed ? "已完成" : "未完成"}
-            </li>
-          ))}
+          {reminders.map((r) => {
+            const eff = effectsClient ? effectForReminder(r) : null;
+            return (
+              <li key={r.id}>
+                <button onClick={() => setSelectedId(r.id)} disabled={busy}>
+                  {r.id}
+                </button>{" "}
+                {r.title} · {r.completed ? "已完成" : "未完成"}
+                {effectsClient && (
+                  <span>
+                    {" "}· Effect：
+                    {eff ? (
+                      <EffectBadge
+                        effect={eff}
+                        latestEvidence={latestEvidenceFor(eff.effectId, effectEvidence)}
+                        effectsClient={effectsClient}
+                        onRefresh={() => void refreshEffectRows()}
+                        onError={(message) => setEffectError(message)}
+                      />
+                    ) : (
+                      "暂无对应 Effect 记录。"
+                    )}
+                  </span>
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
       {selected && (
