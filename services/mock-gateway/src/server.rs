@@ -594,6 +594,21 @@ impl AppState {
         if let Ok(evidence_path) = std::env::var("MOCK_EVIDENCE_PATH") {
             state = state.with_evidence_path(PathBuf::from(evidence_path));
         }
+        // D1-2 (Q-D1-21): the JSONL policy load must run
+        // BEFORE the SQLite path is opened. The v6
+        // migration's one-time import reads
+        // `current_policy_document` from the maps (so it
+        // needs the JSONL-loaded document), and
+        // `apply_policy_versions` runs last inside
+        // with_sqlite_path / sqlite_import_and_switch so the
+        // versions table — not the JSONL file — is the fact
+        // source after v6. Loading the JSONL after SQLite
+        // overwrote the restored maps with the stale default
+        // on every restart (window: updated_ms reverted to
+        // the default-doc time).
+        if let Ok(policy_state_path) = std::env::var("MOCK_POLICY_STATE_PATH") {
+            state = state.with_policy_state_path(PathBuf::from(policy_state_path));
+        }
         // P0-D: MOCK_SQLITE_PATH opens the unified-plane SQLite
         // database; when it opens in shadow mode the explicit
         // D4 switch (import + read-path switch) runs here, so a
@@ -634,9 +649,6 @@ impl AppState {
         }
         if let Ok(vault_state_path) = std::env::var("MOCK_VAULT_STATE_PATH") {
             state = state.with_vault_state_path(PathBuf::from(vault_state_path));
-        }
-        if let Ok(policy_state_path) = std::env::var("MOCK_POLICY_STATE_PATH") {
-            state = state.with_policy_state_path(PathBuf::from(policy_state_path));
         }
         if let Ok(peer_state_path) = std::env::var("MOCK_PEER_STATE_PATH") {
             state = state.with_peer_state_path(PathBuf::from(peer_state_path));
@@ -4035,6 +4047,12 @@ struct ApprovalView {
     /// is null in JSONL/shadow views). Null for unversioned
     /// rows.
     version: Option<u64>,
+    /// D1-2 (Q-D1-24): the version this write superseded,
+    /// set only on decided/edited writes (SQLite mode
+    /// only; the in-memory map carries no version, so this
+    /// is null in JSONL/shadow views). Null when no write
+    /// has superseded anything yet.
+    supersedes_version: Option<u64>,
 }
 
 fn approval_number(approval_id: &str) -> u64 {
@@ -4055,6 +4073,9 @@ fn approval_view(approval_id: &str, record: &ApprovalState) -> ApprovalView {
         message: record.message.clone(),
         consumed_by_worker_session_id: record.consumed_by_worker_session_id.clone(),
         version: None,
+        // In-memory map carries no version chain (see
+        // `version` above); null, same as version.
+        supersedes_version: None,
     }
 }
 
@@ -4074,6 +4095,7 @@ fn approval_view_from_file(record: &ApprovalFileRecord) -> ApprovalView {
         message: record.message.clone(),
         consumed_by_worker_session_id: record.consumed_by_worker_session_id.clone(),
         version: record.version,
+        supersedes_version: record.supersedes_version,
     }
 }
 

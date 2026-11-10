@@ -613,6 +613,21 @@ async fn p3_approval_version_and_single_decision() {
     assert_eq!(payload["version"], 2);
     assert_eq!(payload["supersedes_version"], 1);
 
+    // P3-http: the HTTP views carry the supersede chain
+    // too, not just the stored event payload.
+    let history = h.ok_get("/approvals/history").await;
+    let decided_row = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["approval_id"] == id && r["status"] == "approved")
+        .unwrap_or_else(|| panic!("no decided history row for {id}: {history}"));
+    assert_eq!(decided_row["version"], 2);
+    assert_eq!(decided_row["supersedes_version"], 1);
+    let view = h.approval(&id).await;
+    assert_eq!(view["version"], 2);
+    assert_eq!(view["supersedes_version"], 1);
+
     // Re-approve is the idempotent 200 no-op (same as bound);
     // a different decision afterwards 409s.
     let (status, _) = h
@@ -726,6 +741,58 @@ async fn p5_restart_recovery_from_sqlite() {
     assert_eq!(mandates_after, mandates_before, "mandates recover value-identical");
     let active_after = h.ok_get("/permissions/active").await;
     assert_eq!(active_after, active_before, "live policy recovers value-identical");
+    let m = h
+        .ok_get(&format!("/mandates?execution_id={exec_id}"))
+        .await;
+    assert_eq!(m.as_array().unwrap().len(), 1, "{m}");
+    assert_eq!(m[0]["policy_version_id"], "policy-v2");
+}
+
+/// P5b: restart recovery with the JSONL policy file KEPT
+/// (stale default doc, hitl false) — the live policy must
+/// still recover from SQLite, value-identical, with hitl
+/// left true (differs from the JSONL default) so a JSONL
+/// overwrite on restart would be caught. P5 deletes the
+/// file; this is the discriminating case for the
+/// production startup order (JSONL before SQLite).
+#[tokio::test]
+async fn p5b_restart_recovery_with_jsonl_present() {
+    let mut h = Harness::serve_with_policy(vec![done()], POLICY_SEED).await;
+    h.ok_patch("/permissions/hitl", json!({"enabled": true})).await;
+    let versions_before = h.ok_get("/policies/versions").await;
+    assert_eq!(versions_before.as_array().unwrap().len(), 2, "{versions_before}");
+
+    let goal = h.ok("/goals/create", json!({"title": "Ship D1"})).await;
+    assert_eq!(goal["goal_id"], "goal-1");
+    let started = h
+        .ok(
+            "/agent/loop/start",
+            json!({"prompt": "p5b", "goal_id": "goal-1"}),
+        )
+        .await;
+    let loop_id = started["loop_id"].as_str().unwrap().to_string();
+    let exec = h.execution_for_loop(&loop_id).await;
+    let exec_id = exec["execution_id"].as_str().unwrap().to_string();
+    let mandates_before = h.ok_get("/mandates").await;
+    assert_eq!(mandates_before.as_array().unwrap().len(), 1, "{mandates_before}");
+    let active_before = h.ok_get("/permissions/active").await;
+    assert_eq!(active_before["hitl_enabled"], true);
+
+    // Do NOT delete the JSONL file: the stale default doc
+    // (hitl false) must not overwrite the SQLite recovery.
+    assert!(h.dir.join("policy.jsonl").exists());
+    h.restart().await;
+
+    let versions_after = h.ok_get("/policies/versions").await;
+    assert_eq!(versions_after, versions_before, "versions recover value-identical");
+    let mandates_after = h.ok_get("/mandates").await;
+    assert_eq!(mandates_after, mandates_before, "mandates recover value-identical");
+    let active_after = h.ok_get("/permissions/active").await;
+    assert_eq!(active_after, active_before, "live policy recovers value-identical");
+    assert_eq!(
+        active_after["hitl_enabled"], true,
+        "JSONL default must not win on restart"
+    );
     let m = h
         .ok_get(&format!("/mandates?execution_id={exec_id}"))
         .await;
