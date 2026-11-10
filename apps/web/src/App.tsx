@@ -42,6 +42,7 @@ import { SourceClient, type SourceGateway } from "./domain/sources_client";
 import { InvokeSourceClient } from "./domain/invoke_sources_client";
 import { SourcesView } from "./views/SourcesView";
 import { MemoryClient, type MemoryGateway } from "./domain/memories_client";
+import { InvokeMemoryClient } from "./domain/invoke_memories_client";
 import { MemoriesView } from "./views/MemoriesView";
 import { FeedClient, type FeedGateway } from "./domain/feed_client";
 import { InvokeFeedClient } from "./domain/invoke_feed_client";
@@ -159,14 +160,7 @@ interface Clients {
   spaces: SpaceGateway;
   goals: GoalGateway;
   sources: SourceGateway;
-  // D1-5: optional — only the HTTP branch sets it. There
-  // is no InvokeMemoryClient and no shell memory command
-  // in this batch (the plan names neither), and the HTTP
-  // client cannot serve the Tauri webview anyway: the
-  // gateway CORS layer allows only :5173 origins, not
-  // tauri://localhost. The Memories tab shows a note in
-  // the packaged app until a later batch wires invoke.
-  memories?: MemoryGateway;
+  memories: MemoryGateway;
   feed: FeedGateway;
   chatRecords: ChatRecordsGateway;
   nodes: NodeGateway;
@@ -269,8 +263,7 @@ export function App() {
           spaces: new InvokeSpaceClient(),
           goals: new InvokeGoalClient(),
           sources: new InvokeSourceClient(),
-          // D1-5: no InvokeMemoryClient in this batch —
-          // memories stays unset in the invoke branch.
+          memories: new InvokeMemoryClient(),
           feed: new InvokeFeedClient(),
           chatRecords: new InvokeChatRecordsClient(),
           nodes: new InvokeNodeClient(),
@@ -640,11 +633,6 @@ export function App() {
       {tab === "memories" &&
         (clients === null ? (
           <p className="empty">Choosing transport…</p>
-        ) : clients.memories === undefined ? (
-          <p className="note">
-            Memories need a shell client in the packaged app — not wired in
-            this batch. They work in browser preview over HTTP.
-          </p>
         ) : (
           <MemoriesView client={clients.memories} />
         ))}

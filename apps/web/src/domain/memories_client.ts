@@ -76,10 +76,8 @@ export interface MemoryListFilter {
 }
 
 // Transport-neutral surface used by the Memories view.
-// Only the HTTP client implements it in this batch:
-// there is no InvokeMemoryClient and no shell memory
-// command (the plan names neither for D1-5), so the
-// invoke branch leaves the field unset — see App.tsx.
+// Both the HTTP client and the invoke client implement
+// it; the view works unchanged against either one.
 export interface MemoryGateway {
   saveMemory(input: MemorySaveInput): Promise<Memory>;
   listMemories(filter?: MemoryListFilter): Promise<Memory[]>;

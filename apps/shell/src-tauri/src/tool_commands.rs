@@ -37,6 +37,7 @@ use agent_desktop::peer_client::{Peer, PeerClient, PeerInboxMessage, PeerInvite,
 use agent_desktop::space_client::{Space, SpaceClient, SpaceItem};
 use agent_desktop::goals_client::{Goal, GoalClient};
 use agent_desktop::sources_client::{Source, SourceClient};
+use agent_desktop::memories_client::{Memory, MemoryClient, MemoryScope, MemorySource};
 use agent_desktop::feed_client::{FeedClient, FeedSeenResult, FeedStatus, FeedUnit};
 use agent_desktop::chat_records_client::{
     ChatRecordsClient, ChatThemes, ChatTurnView, HistoryWindow, SearchMatch, SeenResult,
@@ -789,6 +790,60 @@ pub fn source_get(source_id: String) -> Result<Source, String> {
 pub fn source_disconnect(source_id: String) -> Result<Source, String> {
     source_client()?
         .disconnect_source(&source_id)
+        .map_err(agent_err_string)
+}
+
+// --- Memories surface (D1-5, minimal save/list/detail/delete) ---
+//
+// All commands carry rename_all = "snake_case" (Task 9
+// lesson): the invoke client sends snake_case params.
+// The scope triple and the provenance record arrive as
+// plain snake_case structs, the same shape the gateway
+// expects, so they pass through unchanged.
+
+fn memory_client() -> Result<MemoryClient, String> {
+    MemoryClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn memory_save(
+    layer: String,
+    content: String,
+    scope: MemoryScope,
+    current_scope: MemoryScope,
+    source: MemorySource,
+) -> Result<Memory, String> {
+    memory_client()?
+        .save_memory(&layer, &content, &scope, &current_scope, &source)
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn memory_list(
+    workspace_id: Option<String>,
+    project_id: Option<String>,
+    session_id: Option<String>,
+    layer: Option<String>,
+) -> Result<Vec<Memory>, String> {
+    memory_client()?
+        .list_memories(
+            workspace_id.as_deref(),
+            project_id.as_deref(),
+            session_id.as_deref(),
+            layer.as_deref(),
+        )
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn memory_get(memory_id: String) -> Result<Memory, String> {
+    memory_client()?.get_memory(&memory_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn memory_delete(memory_id: String) -> Result<Memory, String> {
+    memory_client()?
+        .delete_memory(&memory_id)
         .map_err(agent_err_string)
 }
 
