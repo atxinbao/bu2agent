@@ -26,6 +26,7 @@ pub mod config_client;
 pub mod peer_client;
 pub mod space_client;
 pub mod goals_client;
+pub mod sources_client;
 pub mod feed_client;
 pub mod chat_records_client;
 pub mod node_client;

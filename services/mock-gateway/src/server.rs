@@ -487,6 +487,18 @@ pub struct AppState {
     // goals); the counter is the id allocator, seeded from
     // the mandates table on restart.
     next_mandate_id: Arc<Mutex<u64>>,
+    // D1-4: the Source Registry read cache (the SQLite
+    // `sources` table is the fact source; this map is
+    // rebuilt from it at startup). Empty until a SQLite
+    // path is opened and seeded.
+    pub(crate) source_registry: crate::source_registry::SourceRegistry,
+    // D1-4: the last tree `files_subscribe` observed per
+    // subscribed path (in-memory diff cache only — the
+    // durable record is the `file.changed` events +
+    // the `files-watcher` cursor in SQLite). A restart
+    // clears it, so the first post-restart subscribe
+    // re-establishes the baseline instead of replaying.
+    files_last_tree: Arc<Mutex<HashMap<String, Vec<FileEntryDto>>>>,
     locations: Arc<Mutex<HashMap<String, Location>>>,
     next_location_id: Arc<Mutex<u64>>,
     location_state_path: Option<PathBuf>,
@@ -609,6 +621,15 @@ impl AppState {
         if let Ok(policy_state_path) = std::env::var("MOCK_POLICY_STATE_PATH") {
             state = state.with_policy_state_path(PathBuf::from(policy_state_path));
         }
+        // D1-4 (Q-D1-41): the connector JSONL load must run
+        // BEFORE the SQLite path is opened, same as the
+        // D1-2 policy load (F-1). The v8 seed reads the
+        // linked accounts from the in-memory map, so
+        // loading the JSONL after SQLite would seed a
+        // registry with no account rows on first boot.
+        if let Ok(connector_state_path) = std::env::var("MOCK_CONNECTOR_STATE_PATH") {
+            state = state.with_connector_state_path(PathBuf::from(connector_state_path));
+        }
         // P0-D: MOCK_SQLITE_PATH opens the unified-plane SQLite
         // database; when it opens in shadow mode the explicit
         // D4 switch (import + read-path switch) runs here, so a
@@ -643,9 +664,6 @@ impl AppState {
         }
         if let Ok(actions_path) = std::env::var("MOCK_DEVICE_ACTIONS_PATH") {
             state = state.with_actions_path(PathBuf::from(actions_path));
-        }
-        if let Ok(connector_state_path) = std::env::var("MOCK_CONNECTOR_STATE_PATH") {
-            state = state.with_connector_state_path(PathBuf::from(connector_state_path));
         }
         if let Ok(vault_state_path) = std::env::var("MOCK_VAULT_STATE_PATH") {
             state = state.with_vault_state_path(PathBuf::from(vault_state_path));
@@ -839,6 +857,8 @@ impl AppState {
             next_project_id: Arc::new(Mutex::new(1)),
             next_goal_id: Arc::new(Mutex::new(1)),
             next_mandate_id: Arc::new(Mutex::new(1)),
+            source_registry: crate::source_registry::SourceRegistry::new(),
+            files_last_tree: Arc::new(Mutex::new(HashMap::new())),
             project_state_path: None,
             locations: Arc::new(Mutex::new(HashMap::new())),
             next_location_id: Arc::new(Mutex::new(1)),
@@ -2056,6 +2076,13 @@ impl AppState {
                     let policy_versions =
                         sqlite_store::list_policy_versions(&conn).unwrap_or_default();
                     apply_policy_versions(&self, &policy_versions);
+                    // D1-4 (Q-D1-41): seed the Source
+                    // Registry from existing state (the
+                    // v8 one-time import) and rebuild the
+                    // read cache. First-write-wins, so a
+                    // restart is a no-op for existing rows.
+                    let seed_inputs = snapshot_seed_inputs(&self);
+                    seed_sources_from(&self, &mut conn, &seed_inputs);
                 }
                 self.sqlite = Some(Arc::new(Mutex::new(conn)));
                 self.sqlite_path = Some(path);
@@ -2426,6 +2453,9 @@ impl AppState {
         // lock (map locks first, never under the SQLite
         // lock — see the comment below).
         let policy_document = current_policy_document(self);
+        // D1-4: snapshot the seed inputs BEFORE taking
+        // the SQLite lock (D1-2 policy-import rule).
+        let seed_inputs = snapshot_seed_inputs(self);
         let mut guard = sqlite.lock().expect("sqlite lock");
         let conn = &mut *guard;
         let executions = match &self.executions_path {
@@ -2453,6 +2483,10 @@ impl AppState {
         if let Err(detail) = import_policy_version_once(self, &mut *conn, &policy_document) {
             eprintln!("warning: D1-2 policy import failed: {detail}");
         }
+        // D1-4 (Q-D1-41): one-time Source Registry seed
+        // from existing state (same pattern as the Policy
+        // import above).
+        seed_sources_from(self, &mut *conn, &seed_inputs);
         // Reload the write-through cache from SQLite while the
         // connection is still in hand, then release it before
         // touching any map lock (persist call sites take the
@@ -2914,7 +2948,7 @@ fn default_device_backend() -> Arc<dyn ReminderBackend> {
 
 // --- File endpoints (Phase 2) ---
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct FileEntryDto {
     name: String,
     path: String,
@@ -3202,12 +3236,96 @@ async fn files_raw(State(state): State<AppState>, Query(query): Query<RawQuery>)
 }
 
 fn tree_cursor(entries: &[FileEntryDto]) -> String { crate::operation_binding::sha256_hex(serde_json::to_string(entries).unwrap_or_default().as_bytes()) }
+
+/// Paths added, removed, or size-changed between two
+/// tree snapshots. Entries carry no mtime or content
+/// hash, so a same-size rewrite is invisible to this
+/// diff — the same limitation as the tree cursor itself
+/// (a hash of these same entries).
+fn diff_trees(old: &[FileEntryDto], new: &[FileEntryDto]) -> Vec<String> {
+    use std::collections::HashMap;
+    let old_map: HashMap<&str, u64> = old.iter().map(|e| (e.path.as_str(), e.size_bytes)).collect();
+    let new_map: HashMap<&str, u64> = new.iter().map(|e| (e.path.as_str(), e.size_bytes)).collect();
+    let mut out: Vec<String> = Vec::new();
+    for (path, size) in &new_map {
+        match old_map.get(path) {
+            None => out.push((*path).to_string()),
+            Some(old_size) if old_size != size => out.push((*path).to_string()),
+            _ => {}
+        }
+    }
+    for path in old_map.keys() {
+        if !new_map.contains_key(path) {
+            out.push((*path).to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// D1-4 (Q-D1-44): what `files_subscribe` observed, made
+/// durable. The in-memory last tree is the diff baseline;
+/// the durable record is one `file.changed` event per
+/// changed path (path hash + old/new cursor, never file
+/// content) plus the `files-watcher` cursor advance — all
+/// in one SQLite transaction (see
+/// `record_file_changes`). The first observation for a
+/// path only establishes the baseline (no events), so a
+/// restart re-establishes it instead of replaying. The
+/// file source row's `cursor` tracks the root tree only;
+/// subtree observations still emit events and advance the
+/// `files-watcher` cursor. Best-effort when SQLite is
+/// absent or broken: the subscribe response is unaffected.
+fn note_tree_observation(state: &AppState, path: &str, entries: &[FileEntryDto], cursor: &str) {
+    let old_entries = {
+        let mut last = state.files_last_tree.lock().expect("files last tree lock");
+        let old = last.get(path).cloned();
+        last.insert(path.to_string(), entries.to_vec());
+        old
+    };
+    let Some(old) = old_entries else {
+        if path.is_empty() {
+            if let Some(sqlite) = &state.sqlite {
+                if let Ok(mut conn) = sqlite.lock() {
+                    let _ = sqlite_store::update_source_cursor(&mut conn, "files-root", cursor);
+                }
+            }
+        }
+        return;
+    };
+    let old_cursor = tree_cursor(&old);
+    if old_cursor == cursor {
+        return;
+    }
+    let changed_paths = diff_trees(&old, entries);
+    if changed_paths.is_empty() {
+        return;
+    }
+    let Some(sqlite) = &state.sqlite else { return };
+    let Ok(mut conn) = sqlite.lock() else { return };
+    let hashes: Vec<String> = changed_paths
+        .iter()
+        .map(|p| sqlite_store::sha256_hex(p.as_bytes()))
+        .collect();
+    if let Err(detail) = sqlite_store::record_file_changes(
+        &mut conn,
+        "files-root",
+        &hashes,
+        &old_cursor,
+        cursor,
+        &state.origin_device_id,
+    ) {
+        eprintln!("warning: D1-4 file change recording failed: {detail}");
+    }
+}
+
 async fn files_subscribe(State(state): State<AppState>, Json(req): Json<SubscribeRequestDto>) -> impl IntoResponse {
     let path = req.path.as_deref().unwrap_or("");
     let wait = req.wait_ms.unwrap_or(0).min(25_000);
     let mut entries = collect_tree(&state.files_root, path, 32).unwrap_or_default();
     let mut cursor = tree_cursor(&entries);
-    if req.cursor.as_deref() != Some(cursor.as_str()) || wait == 0 { return Json(SubscribeResponseDto { changed: req.cursor.as_deref() != Some(cursor.as_str()), cursor, entries: Some(entries) }).into_response(); }
+    if req.cursor.as_deref() != Some(cursor.as_str()) || wait == 0 { note_tree_observation(&state, path, &entries, &cursor); return Json(SubscribeResponseDto { changed: req.cursor.as_deref() != Some(cursor.as_str()), cursor, entries: Some(entries) }).into_response(); }
     let deadline = tokio::time::Instant::now() + Duration::from_millis(wait);
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3216,6 +3334,7 @@ async fn files_subscribe(State(state): State<AppState>, Json(req): Json<Subscrib
         if req.cursor.as_deref() != Some(cursor.as_str()) || tokio::time::Instant::now() >= deadline { break; }
     }
     let changed = req.cursor.as_deref() != Some(cursor.as_str());
+    note_tree_observation(&state, path, &entries, &cursor);
     Json(SubscribeResponseDto { changed, cursor, entries: if changed { Some(entries) } else { None } }).into_response()
 }
 
@@ -6230,6 +6349,62 @@ fn apply_policy_versions(state: &AppState, versions: &[sqlite_store::PolicyVersi
     }
 }
 
+// --- D1-4: Source Registry seed ---
+//
+// The v8 seed reads existing state (static connector
+// entries, linked connector accounts, the mail source,
+// the reminder backend, the files root) into the
+// `sources` table — the D1-2 Policy one-time-import
+// pattern. The seed inputs are snapshotted from the
+// in-memory maps BEFORE taking the SQLite lock (the
+// D1-2 rule: map locks first, never under the SQLite
+// lock). A seed failure warns only: the registry is
+// metadata, and a failed seed must never fail startup.
+
+/// Snapshot the v8 seed inputs from AppState. Call
+/// before taking the SQLite lock.
+fn snapshot_seed_inputs(state: &AppState) -> crate::source_registry::SeedInputs {
+    let accounts = state
+        .connector_accounts
+        .lock()
+        .expect("connector accounts lock")
+        .values()
+        .cloned()
+        .collect();
+    crate::source_registry::SeedInputs {
+        accounts,
+        files_root: state.files_root.clone(),
+        origin_device_id: state.origin_device_id.clone(),
+        device_backend: if std::env::var("MOCK_DEVICE_BACKEND").as_deref() == Ok("eventkit") {
+            "eventkit"
+        } else {
+            "fake"
+        },
+    }
+}
+
+/// Seed the registry from `inputs` and rebuild the read
+/// cache. First-write-wins, so a restart is a no-op for
+/// rows that already exist.
+fn seed_sources_from(
+    state: &AppState,
+    conn: &mut Connection,
+    inputs: &crate::source_registry::SeedInputs,
+) {
+    let entries: Vec<(&'static str, &'static str, &'static [&'static str])> = CONNECTOR_REGISTRY
+        .iter()
+        .map(|e| (e.id, e.name, e.capabilities))
+        .collect();
+    match crate::source_registry::seed_sources(conn, inputs, &entries) {
+        Ok(_) => {
+            if let Err(detail) = state.source_registry.load(conn) {
+                eprintln!("warning: D1-4 source registry load failed: {detail}");
+            }
+        }
+        Err(detail) => eprintln!("warning: D1-4 source seed failed: {detail}"),
+    }
+}
+
 // --- D1-2: Mandates (Q-D1-22) ---
 //
 // A Mandate is an authorization snapshot: the goal text,
@@ -8393,6 +8568,90 @@ struct LocationCreateDto {
     workspace_id: Option<String>,
     name: Option<String>,
     path: Option<String>,
+}
+
+// --- D1-4: Source Registry (plan §5) ---
+//
+// Reads go to SQLite when configured (the table is the
+// fact source) and fall back to the in-memory read cache
+// otherwise. Disconnect is a write and requires SQLite
+// mode, same as the goal archive. Disconnect flips only
+// the row's `status` flag — the source's history
+// Effect/Inbox rows are untouched, nothing is deleted
+// (Q-D1-42); re-disconnect is a 200 no-op returning the
+// current row, same as the goal re-archive.
+
+async fn sources_list(State(state): State<AppState>) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    if let Some(sqlite) = &state.sqlite {
+        let conn = sqlite.lock().expect("sqlite lock");
+        return match sqlite_store::list_sources(&conn) {
+            Ok(records) => Json(records).into_response(),
+            Err(detail) => {
+                eprintln!("warning: source list failed ({detail})");
+                sqlite_error_response()
+            }
+        };
+    }
+    Json(state.source_registry.list()).into_response()
+}
+
+async fn sources_get(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    if let Some(sqlite) = &state.sqlite {
+        let conn = sqlite.lock().expect("sqlite lock");
+        return match sqlite_store::get_source(&conn, &id) {
+            Ok(Some(record)) => Json(record).into_response(),
+            Ok(None) => unknown_record("source"),
+            Err(detail) => {
+                eprintln!("warning: source get failed ({detail})");
+                sqlite_error_response()
+            }
+        };
+    }
+    match state.source_registry.get(&id) {
+        Some(record) => Json(record).into_response(),
+        None => unknown_record("source"),
+    }
+}
+
+async fn sources_disconnect(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let record = {
+        let mut conn = sqlite.lock().expect("sqlite lock");
+        match sqlite_store::disconnect_source(&mut conn, &id, &state.origin_device_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => return unknown_record("source"),
+            Err(detail) => {
+                eprintln!("warning: source disconnect failed ({detail})");
+                return sqlite_error_response();
+            }
+        }
+    };
+    // Refresh the read cache after the write (the lock
+    // above is released, so no lock-order inversion).
+    if let Ok(conn) = sqlite.lock() {
+        let _ = state.source_registry.load(&conn);
+    }
+    Json(record).into_response()
 }
 
 async fn locations_create(
@@ -16154,6 +16413,10 @@ pub fn app(state: AppState) -> Router {
         .route("/policies/versions", get(policies_versions_list))
         .route("/mandates", get(mandates_list))
         .route("/mandates/{id}", get(mandates_get))
+        // D1-4: sources (3 routes).
+        .route("/sources/list", get(sources_list))
+        .route("/sources/{id}", get(sources_get))
+        .route("/sources/{id}/disconnect", post(sources_disconnect))
         .route("/locations/create", post(locations_create))
         .route("/locations/list", get(locations_list))
         .route("/locations/{id}", get(locations_get))

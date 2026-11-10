@@ -36,6 +36,7 @@ use agent_desktop::config_client::{ConfigClient, ConfigView};
 use agent_desktop::peer_client::{Peer, PeerClient, PeerInboxMessage, PeerInvite, PeerRequest, PeerStatus};
 use agent_desktop::space_client::{Space, SpaceClient, SpaceItem};
 use agent_desktop::goals_client::{Goal, GoalClient};
+use agent_desktop::sources_client::{Source, SourceClient};
 use agent_desktop::feed_client::{FeedClient, FeedSeenResult, FeedStatus, FeedUnit};
 use agent_desktop::chat_records_client::{
     ChatRecordsClient, ChatThemes, ChatTurnView, HistoryWindow, SearchMatch, SeenResult,
@@ -763,6 +764,32 @@ pub fn goal_create(title: String, description: Option<String>) -> Result<Goal, S
 #[tauri::command(rename_all = "snake_case")]
 pub fn goal_archive(goal_id: String) -> Result<Goal, String> {
     goal_client()?.archive_goal(&goal_id).map_err(agent_err_string)
+}
+
+// --- Sources surface (D1-4, minimal list/detail/disconnect) ---
+//
+// All commands carry rename_all = "snake_case" (Task 9
+// lesson): the invoke client sends snake_case params.
+
+fn source_client() -> Result<SourceClient, String> {
+    SourceClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn source_list() -> Result<Vec<Source>, String> {
+    source_client()?.list_sources().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn source_get(source_id: String) -> Result<Source, String> {
+    source_client()?.get_source(&source_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn source_disconnect(source_id: String) -> Result<Source, String> {
+    source_client()?
+        .disconnect_source(&source_id)
+        .map_err(agent_err_string)
 }
 
 // --- Feed surface (Task 17, unit subset) ---

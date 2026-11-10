@@ -51,11 +51,12 @@ use crate::execution_store::ExecutionFileRecord;
 /// v5 adds the D1-1 goals table (see SCHEMA_V5);
 /// v6 adds the D1-2 policy_versions + mandates tables
 /// (see SCHEMA_V6); v7 adds the D1-3 event_cursors
-/// table (see SCHEMA_V7).
+/// table (see SCHEMA_V7); v8 adds the D1-4 sources
+/// table (see SCHEMA_V8).
 /// Row-level `schema_version` fields are a separate concept
 /// (the record contract version, still 1 for P0-A+ rows) and
 /// are untouched.
-pub const DB_SCHEMA_VERSION: i64 = 7;
+pub const DB_SCHEMA_VERSION: i64 = 8;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -418,6 +419,36 @@ CREATE TABLE IF NOT EXISTS event_cursors (
 );
 ";
 
+/// D1-4 (plan §5, Q-D1-41): one row per source instance —
+/// a connector account, a device backend, a mail source,
+/// a file root — not per capability group. `kind` is one
+/// of `connector|device|file|mail`; `health` is
+/// `unknown|ok|degraded` (unknown at registration — no
+/// live health probe exists in D1-4); `cursor` is the
+/// source's consumption cursor (for the file source, the
+/// last whole-tree hash seen by `files_subscribe`);
+/// `dedup_key` is `{kind}:{scope}` (recorded, not
+/// enforced — the plan names the column but no UNIQUE);
+/// `status` is `active|disconnected` (a disconnect flips
+/// this flag only — never a delete). `config_json` holds
+/// connection params only, never secrets.
+const SCHEMA_V8: &str = "
+CREATE TABLE IF NOT EXISTS sources (
+    source_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    health TEXT NOT NULL,
+    cursor TEXT NOT NULL,
+    dedup_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL
+);
+";
+
 fn err(e: rusqlite::Error) -> String {
     format!("sqlite: {e}")
 }
@@ -556,6 +587,21 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V7).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '7')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // D1-4: sources (one row per source instance, plan
+    // §5). One transaction, v5/v6/v7 style; a fresh
+    // database runs v1–v8 in the same transaction. The
+    // table starts empty — rows are seeded at v8 startup
+    // from existing state (see source_registry::seed_sources),
+    // never by the migration itself.
+    if version < 8 {
+        tx.execute_batch(SCHEMA_V8).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '8')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -898,6 +944,310 @@ pub fn next_goal_number(conn: &Connection) -> Result<u64, String> {
         .max()
         .map(|n| (n + 1) as u64)
         .unwrap_or(1))
+}
+
+// --- D1-2: Policy versions + Mandates ---
+
+// --- D1-4: Source Registry ---
+//
+// One row per source instance (plan §5, Q-D1-41): a
+// connector account, a device backend, a mail source, a
+// file root — never a capability group. Registration and
+// disconnect both commit the row write and its event in
+// one transaction (D1-3's policy/mandate pattern), so the
+// fold (last event per aggregate == table row) can cover
+// this domain. The only fold exception is the `cursor`
+// field (see fold_matches_tables): it is a consumption
+// high-water mark that advances with `file.changed`
+// events, not a registration fact.
+
+/// One row of `sources`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceRow {
+    pub source_id: String,
+    pub kind: String,
+    pub display_name: String,
+    pub config_json: String,
+    pub scope: String,
+    pub health: String,
+    pub cursor: String,
+    pub dedup_key: String,
+    pub status: String,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+    pub origin_device_id: String,
+}
+
+const SOURCE_COLS: &str =
+    "source_id, kind, display_name, config_json, scope, health, cursor, dedup_key, status, created_ms, updated_ms, origin_device_id";
+
+fn source_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRow> {
+    Ok(SourceRow {
+        source_id: row.get(0)?,
+        kind: row.get(1)?,
+        display_name: row.get(2)?,
+        config_json: row.get(3)?,
+        scope: row.get(4)?,
+        health: row.get(5)?,
+        cursor: row.get(6)?,
+        dedup_key: row.get(7)?,
+        status: row.get(8)?,
+        created_ms: row.get(9)?,
+        updated_ms: row.get(10)?,
+        origin_device_id: row.get(11)?,
+    })
+}
+
+/// Register a source row, first-write-wins: when a row
+/// with the same `source_id` already exists it is
+/// returned untouched (no rewrite, no second event) and
+/// `inserted` is false. A fresh insert and its
+/// `source.registered` event commit in one transaction;
+/// the payload is the post-state row serialization, same
+/// shape as the policy/mandate events.
+pub fn register_source_tx(
+    tx: &rusqlite::Transaction<'_>,
+    row: &SourceRow,
+    origin_device_id: &str,
+) -> Result<(SourceRow, bool), String> {
+    let changed = tx
+        .execute(
+            "INSERT OR IGNORE INTO sources (source_id, kind, display_name, config_json, scope, health, cursor, dedup_key, status, created_ms, updated_ms, origin_device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                row.source_id,
+                row.kind,
+                row.display_name,
+                row.config_json,
+                row.scope,
+                row.health,
+                row.cursor,
+                row.dedup_key,
+                row.status,
+                row.created_ms,
+                row.updated_ms,
+                row.origin_device_id,
+            ],
+        )
+        .map_err(err)?;
+    if changed == 0 {
+        let existing: SourceRow = tx
+            .query_row(
+                &format!("SELECT {SOURCE_COLS} FROM sources WHERE source_id = ?1"),
+                params![row.source_id],
+                source_from_row,
+            )
+            .map_err(err)?;
+        return Ok((existing, false));
+    }
+    let payload = serde_json::to_string(row).map_err(|e| e.to_string())?;
+    append_event(
+        tx,
+        "source",
+        &row.source_id,
+        "source.registered",
+        &payload,
+        origin_device_id,
+        row.created_ms,
+        1,
+    )?;
+    Ok((row.clone(), true))
+}
+
+/// All source rows, insertion order (rowid): the list
+/// shows every status — a disconnected source is still
+/// registered and readable, same as an archived goal's
+/// detail (unlike the goals list, which hides archived
+/// rows, disconnect is a live-state flag, not an archive).
+pub fn list_sources(conn: &Connection) -> Result<Vec<SourceRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT {SOURCE_COLS} FROM sources ORDER BY rowid ASC"))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map([], source_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+pub fn get_source(conn: &Connection, source_id: &str) -> Result<Option<SourceRow>, String> {
+    conn.query_row(
+        &format!("SELECT {SOURCE_COLS} FROM sources WHERE source_id = ?1"),
+        params![source_id],
+        source_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// Flip one source row's status and record the matching
+/// event in the same transaction. Re-flipping to the
+/// status the row already has is a 200 no-op (same as the
+/// goal re-archive): no rewrite, no second event.
+/// Disconnect is a flag flip only — the source's live
+/// state stops updating, its history Effect/Inbox rows
+/// are untouched, and nothing is deleted (Q-D1-42).
+/// Reconnect is the reverse flip; it reuses the
+/// `source.registered` event type (the plan names no
+/// separate reconnect event) so the fold invariant —
+/// last event payload == table row — still holds.
+fn set_source_status_tx(
+    tx: &rusqlite::Transaction<'_>,
+    source_id: &str,
+    status: &str,
+    event_type: &str,
+    origin_device_id: &str,
+) -> Result<Option<SourceRow>, String> {
+    let current: Option<SourceRow> = tx
+        .query_row(
+            &format!("SELECT {SOURCE_COLS} FROM sources WHERE source_id = ?1"),
+            params![source_id],
+            source_from_row,
+        )
+        .optional()
+        .map_err(err)?;
+    let Some(row) = current else {
+        return Ok(None);
+    };
+    if row.status == status {
+        return Ok(Some(row));
+    }
+    let now = now_ms() as i64;
+    tx.execute(
+        "UPDATE sources SET status = ?1, updated_ms = ?2 WHERE source_id = ?3",
+        params![status, now, source_id],
+    )
+    .map_err(err)?;
+    let updated: SourceRow = tx
+        .query_row(
+            &format!("SELECT {SOURCE_COLS} FROM sources WHERE source_id = ?1"),
+            params![source_id],
+            source_from_row,
+        )
+        .map_err(err)?;
+    let payload = serde_json::to_string(&updated).map_err(|e| e.to_string())?;
+    append_event(
+        tx,
+        "source",
+        &updated.source_id,
+        event_type,
+        &payload,
+        origin_device_id,
+        now,
+        1,
+    )?;
+    Ok(Some(updated))
+}
+
+pub fn disconnect_source(
+    conn: &mut Connection,
+    source_id: &str,
+    origin_device_id: &str,
+) -> Result<Option<SourceRow>, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let row = set_source_status_tx(&tx, source_id, "disconnected", "source.disconnected", origin_device_id)?;
+    tx.commit().map_err(err)?;
+    Ok(row)
+}
+
+pub fn reconnect_source(
+    conn: &mut Connection,
+    source_id: &str,
+    origin_device_id: &str,
+) -> Result<Option<SourceRow>, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let row = set_source_status_tx(&tx, source_id, "active", "source.registered", origin_device_id)?;
+    tx.commit().map_err(err)?;
+    Ok(row)
+}
+
+/// Advance a source row's `cursor` only when the value
+/// actually changes (a no-op write would move
+/// `updated_ms` without a matching event and break the
+/// fold). The update deliberately leaves `updated_ms`
+/// alone: the cursor is a consumption high-water mark,
+/// not registration state, and the change itself is
+/// timestamped by the `file.changed` events — so the
+/// fold (which excludes only `cursor`) still holds.
+pub fn update_source_cursor_tx(
+    tx: &rusqlite::Transaction<'_>,
+    source_id: &str,
+    cursor: &str,
+) -> Result<bool, String> {
+    let changed = tx
+        .execute(
+            "UPDATE sources SET cursor = ?1 WHERE source_id = ?2 AND cursor != ?1",
+            params![cursor, source_id],
+        )
+        .map_err(err)?;
+    Ok(changed > 0)
+}
+
+pub fn update_source_cursor(
+    conn: &mut Connection,
+    source_id: &str,
+    cursor: &str,
+) -> Result<bool, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let changed = update_source_cursor_tx(&tx, source_id, cursor)?;
+    tx.commit().map_err(err)?;
+    Ok(changed)
+}
+
+/// Record one `file.changed` event per changed file path
+/// (Q-D1-44): payload is canonical JSON
+/// `{path_hash, old_cursor, new_cursor}` — a path hash
+/// and the cursor transition only, never file content
+/// (red line 7). In the same transaction, the file source
+/// row's cursor advances to `new_cursor` and the
+/// `files-watcher` event_cursors row advances to the
+/// highest event id written, so a restart neither replays
+/// consumed changes nor loses the cursor. No changes
+/// means no writes at all. Returns the event ids written.
+pub fn record_file_changes(
+    conn: &mut Connection,
+    source_id: &str,
+    path_hashes: &[String],
+    old_cursor: &str,
+    new_cursor: &str,
+    origin_device_id: &str,
+) -> Result<Vec<i64>, String> {
+    if path_hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tx = conn.transaction().map_err(err)?;
+    let now = now_ms() as i64;
+    let mut ids: Vec<i64> = Vec::new();
+    for path_hash in path_hashes {
+        let payload = canonical_json(&serde_json::json!({
+            "path_hash": path_hash,
+            "old_cursor": old_cursor,
+            "new_cursor": new_cursor,
+        }));
+        let id = append_event(
+            &tx,
+            "file",
+            path_hash,
+            "file.changed",
+            &payload,
+            origin_device_id,
+            now,
+            1,
+        )?;
+        ids.push(id);
+    }
+    let max_id = *ids.iter().max().unwrap_or(&0);
+    update_source_cursor_tx(&tx, source_id, new_cursor)?;
+    tx.execute(
+        "INSERT INTO event_cursors (consumer_name, last_event_id, updated_ms, origin_device_id)
+         VALUES ('files-watcher', ?1, ?2, ?3)
+         ON CONFLICT(consumer_name) DO UPDATE SET last_event_id = excluded.last_event_id, updated_ms = excluded.updated_ms, origin_device_id = excluded.origin_device_id",
+        params![max_id, now, origin_device_id],
+    )
+    .map_err(err)?;
+    tx.commit().map_err(err)?;
+    Ok(ids)
 }
 
 // --- D1-2: Policy versions + Mandates ---
@@ -1938,6 +2288,36 @@ pub fn list_events(conn: &Connection) -> Result<Vec<EventRow>, String> {
     Ok(rows)
 }
 
+/// Events for one aggregate, oldest first (the
+/// `Source::events` read path).
+pub fn list_events_for(
+    conn: &Connection,
+    aggregate_kind: &str,
+    aggregate_id: &str,
+) -> Result<Vec<EventRow>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, aggregate_kind, aggregate_id, seq, event_type, payload_json, created_ms, origin_device_id, schema_version FROM events WHERE aggregate_kind = ?1 AND aggregate_id = ?2 ORDER BY id ASC")
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![aggregate_kind, aggregate_id], |row| {
+            Ok(EventRow {
+                id: row.get(0)?,
+                aggregate_kind: row.get(1)?,
+                aggregate_id: row.get(2)?,
+                seq: row.get(3)?,
+                event_type: row.get(4)?,
+                payload_json: row.get(5)?,
+                created_ms: row.get(6)?,
+                origin_device_id: row.get(7)?,
+                schema_version: row.get(8)?,
+            })
+        })
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
 /// Projection equivalence for the migrated domains: folding the
 /// event log (last payload per aggregate, in `seq` order) must
 /// reproduce the state tables exactly. Inbox / Outbox events
@@ -1946,7 +2326,15 @@ pub fn list_events(conn: &Connection) -> Result<Vec<EventRow>, String> {
 /// D1-3 extends the fold to `policy_versions` and `mandates`
 /// (their writers emit `policy_version.created` /
 /// `mandate.created` / `mandate.superseded` with the post-state
-/// row as payload). `event_cursors` cannot be folded the same
+/// row as payload). D1-4 extends it to `sources` the same
+/// way — except the `cursor` field, which is a consumption
+/// high-water mark, not registration state: it advances with
+/// `file.changed` events (which carry their own old/new
+/// cursor and are not source events), so the fold compares
+/// source rows with `cursor` excluded on both sides. The
+/// durable record of the cursor is the `files-watcher`
+/// event_cursors row plus the `file.changed` events
+/// themselves. `event_cursors` cannot be folded the same
 /// way — a cursor event per advance would be self-referential
 /// (each advance creates a higher-id event, so the cursor
 /// could never catch up) — so the check for cursors is a
@@ -1963,6 +2351,8 @@ pub fn fold_matches_tables(conn: &Connection) -> Result<bool, String> {
     let mut folded_policy_versions: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
     let mut folded_mandates: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    let mut folded_sources: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
     for event in &events {
         let payload: serde_json::Value =
@@ -1982,6 +2372,9 @@ pub fn fold_matches_tables(conn: &Connection) -> Result<bool, String> {
             }
             "mandate" => {
                 folded_mandates.insert(event.aggregate_id.clone(), payload);
+            }
+            "source" => {
+                folded_sources.insert(event.aggregate_id.clone(), payload);
             }
             _ => {}
         }
@@ -2037,6 +2430,26 @@ pub fn fold_matches_tables(conn: &Connection) -> Result<bool, String> {
         }
     }
     if folded_mandates.len() != list_mandates(conn, None, None)?.len() {
+        return Ok(false);
+    }
+    for row in list_sources(conn)? {
+        let key = row.source_id.clone();
+        let mut expected = table_value(&serde_json::to_string(&row).map_err(|e| e.to_string())?)?;
+        // D1-4: the `cursor` is a consumption high-water
+        // mark, not registration state — compare with it
+        // excluded on both sides (see the fold doc comment).
+        if let Some(obj) = expected.as_object_mut() {
+            obj.remove("cursor");
+        }
+        let mut folded = folded_sources.get(&key).cloned().unwrap_or(serde_json::Value::Null);
+        if let Some(obj) = folded.as_object_mut() {
+            obj.remove("cursor");
+        }
+        if folded != expected {
+            return Ok(false);
+        }
+    }
+    if folded_sources.len() != list_sources(conn)?.len() {
         return Ok(false);
     }
     let event_ids: std::collections::HashSet<i64> = events.iter().map(|e| e.id).collect();

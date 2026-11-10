@@ -31,6 +31,7 @@ pub mod session_store;
 pub mod connector_store;
 pub mod vault_store;
 pub mod policy_store;
+pub mod source_registry;
 pub mod model_store;
 pub mod peer_store;
 pub mod space_store;

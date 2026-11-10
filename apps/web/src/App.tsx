@@ -38,6 +38,9 @@ import { SpacesView } from "./views/SpacesView";
 import { GoalClient, type GoalGateway } from "./domain/goals_client";
 import { InvokeGoalClient } from "./domain/invoke_goals_client";
 import { GoalsView } from "./views/GoalsView";
+import { SourceClient, type SourceGateway } from "./domain/sources_client";
+import { InvokeSourceClient } from "./domain/invoke_sources_client";
+import { SourcesView } from "./views/SourcesView";
 import { FeedClient, type FeedGateway } from "./domain/feed_client";
 import { InvokeFeedClient } from "./domain/invoke_feed_client";
 import { ChatRecordsClient, type ChatRecordsGateway } from "./domain/chat_records_client";
@@ -153,6 +156,7 @@ interface Clients {
   peers: PeerGateway;
   spaces: SpaceGateway;
   goals: GoalGateway;
+  sources: SourceGateway;
   feed: FeedGateway;
   chatRecords: ChatRecordsGateway;
   nodes: NodeGateway;
@@ -166,7 +170,7 @@ interface Clients {
   engineering: EngineeringGateway;
 }
 
-type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "goals" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "notes" | "engineering" | "patches" | "settings";
+type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "goals" | "sources" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "notes" | "engineering" | "patches" | "settings";
 
 // Visible navigation: the workbench (sessions) is the only
 // chat entry and the default view (R1, 2026-10-28). The legacy
@@ -179,6 +183,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "connectors", label: "Connectors" },
   { id: "tasks", label: "Tasks" },
   { id: "goals", label: "Goals" },
+  { id: "sources", label: "Sources" },
   { id: "devices", label: "Devices" },
   { id: "reminders", label: "Reminders" },
   { id: "loops", label: "Loops" },
@@ -252,6 +257,7 @@ export function App() {
           peers: new InvokePeerClient(),
           spaces: new InvokeSpaceClient(),
           goals: new InvokeGoalClient(),
+          sources: new InvokeSourceClient(),
           feed: new InvokeFeedClient(),
           chatRecords: new InvokeChatRecordsClient(),
           nodes: new InvokeNodeClient(),
@@ -282,6 +288,7 @@ export function App() {
           peers: new PeerClient(MOCK_BASE_URL),
           spaces: new SpaceClient(MOCK_BASE_URL),
           goals: new GoalClient(MOCK_BASE_URL),
+          sources: new SourceClient(MOCK_BASE_URL),
           feed: new FeedClient(MOCK_BASE_URL),
           chatRecords: new ChatRecordsClient(MOCK_BASE_URL),
           nodes: new NodeClient(MOCK_BASE_URL),
@@ -609,6 +616,12 @@ export function App() {
           <p className="empty">Choosing transport…</p>
         ) : (
           <GoalsView client={clients.goals} />
+        ))}
+      {tab === "sources" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : (
+          <SourcesView client={clients.sources} />
         ))}
       {tab === "feed" &&
         (clients === null ? (
