@@ -214,6 +214,10 @@ async fn p0d_import_switch_restart_and_export_equivalence() {
             command: None,
             // E2-A field; this fixture models a pre-E2-A row.
             consumed_by_worker_session_id: None,
+            // D1-2 fields; this fixture models a pre-D1-2 row,
+            // which carries no version.
+            version: None,
+            supersedes_version: None,
         },
     )
     .expect("append approval");

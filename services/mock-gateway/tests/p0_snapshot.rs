@@ -157,6 +157,10 @@ fn approval_record(id: &str, tool: &str, status: &str) -> ApprovalFileRecord {
         // E2-A field; snapshot fixtures model pre-E2-A rows,
         // which carry no consuming worker session.
         consumed_by_worker_session_id: None,
+        // D1-2 fields; snapshot fixtures model pre-D1-2 rows,
+        // which carry no version.
+        version: None,
+        supersedes_version: None,
     }
 }
 

@@ -483,6 +483,10 @@ pub struct AppState {
     // in-memory map); the counter is the id allocator,
     // seeded from the goals table on restart.
     next_goal_id: Arc<Mutex<u64>>,
+    // D1-2: mandates live in SQLite only (same shape as
+    // goals); the counter is the id allocator, seeded from
+    // the mandates table on restart.
+    next_mandate_id: Arc<Mutex<u64>>,
     locations: Arc<Mutex<HashMap<String, Location>>>,
     next_location_id: Arc<Mutex<u64>>,
     location_state_path: Option<PathBuf>,
@@ -822,6 +826,7 @@ impl AppState {
             projects: Arc::new(Mutex::new(HashMap::new())),
             next_project_id: Arc::new(Mutex::new(1)),
             next_goal_id: Arc::new(Mutex::new(1)),
+            next_mandate_id: Arc::new(Mutex::new(1)),
             project_state_path: None,
             locations: Arc::new(Mutex::new(HashMap::new())),
             next_location_id: Arc::new(Mutex::new(1)),
@@ -1953,7 +1958,7 @@ impl AppState {
     /// Call `sqlite_import_and_switch` for the explicit D4 switch.
     pub fn with_sqlite_path(mut self, path: PathBuf) -> Self {
         match sqlite_store::open_db(&path) {
-            Ok(conn) => {
+            Ok(mut conn) => {
                 let done = sqlite_store::import_done(&conn).unwrap_or(false);
                 let mut backend = StateBackend::Shadow;
                 if done {
@@ -2017,6 +2022,28 @@ impl AppState {
                         let mut current = self.next_goal_id.lock().expect("goal id lock");
                         *current = (*current).max(next_goal);
                     }
+                    if let Ok(next_mandate) = sqlite_store::next_mandate_number(&conn) {
+                        let mut current = self.next_mandate_id.lock().expect("mandate id lock");
+                        *current = (*current).max(next_mandate);
+                    }
+                    // D1-2 (Q-D1-21): one-time Policy import
+                    // (v1 from the JSONL-loaded document when
+                    // the table is empty) + reload from the
+                    // versions table — the table, not the
+                    // JSONL file, is the fact source after v6.
+                    // The document is built from the maps
+                    // before any SQLite write (map locks
+                    // first); `conn` is a plain local here,
+                    // not a locked guard.
+                    let document = current_policy_document(&self);
+                    if let Err(detail) =
+                        import_policy_version_once(&self, &mut conn, &document)
+                    {
+                        eprintln!("warning: D1-2 policy import failed: {detail}");
+                    }
+                    let policy_versions =
+                        sqlite_store::list_policy_versions(&conn).unwrap_or_default();
+                    apply_policy_versions(&self, &policy_versions);
                 }
                 self.sqlite = Some(Arc::new(Mutex::new(conn)));
                 self.sqlite_path = Some(path);
@@ -2354,6 +2381,11 @@ impl AppState {
         let Some(sqlite) = &self.sqlite else {
             return Err("sqlite not configured".to_string());
         };
+        // D1-2 (Q-D1-21): build the candidate v1 Policy
+        // document from the maps BEFORE taking the SQLite
+        // lock (map locks first, never under the SQLite
+        // lock — see the comment below).
+        let policy_document = current_policy_document(self);
         let mut guard = sqlite.lock().expect("sqlite lock");
         let conn = &mut *guard;
         let executions = match &self.executions_path {
@@ -2375,6 +2407,12 @@ impl AppState {
             &approvals,
             sqlite_store::now_ms(),
         )?;
+        // D1-2 (Q-D1-21): one-time Policy import (v1 from
+        // the JSONL-loaded document when the table is empty
+        // and a policy file exists).
+        if let Err(detail) = import_policy_version_once(self, &mut *conn, &policy_document) {
+            eprintln!("warning: D1-2 policy import failed: {detail}");
+        }
         // Reload the write-through cache from SQLite while the
         // connection is still in hand, then release it before
         // touching any map lock (persist call sites take the
@@ -2384,6 +2422,8 @@ impl AppState {
         let effect_rows = sqlite_store::list_effects(conn);
         let approval_rows = sqlite_store::list_approvals(conn);
         let numbers = sqlite_store::next_numbers(conn);
+        let policy_versions = sqlite_store::list_policy_versions(conn);
+        let next_mandate = sqlite_store::next_mandate_number(conn);
         drop(guard);
         if let Ok(rows) = exec_rows {
             let mut map = HashMap::new();
@@ -2431,6 +2471,16 @@ impl AppState {
             drop(current);
             let mut current = self.next_approval_id.lock().expect("approval id lock");
             *current = (*current).max(next_appr);
+        }
+        // D1-2 (Q-D1-21): the versions table overrides the
+        // JSONL-loaded policy (map locks only — the SQLite
+        // guard is already released).
+        if let Ok(versions) = policy_versions {
+            apply_policy_versions(self, &versions);
+        }
+        if let Ok(next_mandate) = next_mandate {
+            let mut current = self.next_mandate_id.lock().expect("mandate id lock");
+            *current = (*current).max(next_mandate);
         }
         *self.sqlite_backend.lock().expect("sqlite backend lock") = StateBackend::Sqlite;
         *self.sqlite_broken.lock().expect("sqlite broken lock") = false;
@@ -3916,8 +3966,14 @@ async fn approval_decide(
     // apply step is never reached. Reject-on-approved and any
     // decide on a consumed or rejected record still 409 below;
     // the apply command remains the real approval gate.
-    if bound
-        && status == ApprovalStatus::Approved
+    // D1-2 (Q-D1-24): the no-op and the single-decision guard
+    // below now apply to unbound records too — a decision is
+    // final whoever the record is bound to. The one exception
+    // is an unbound record in Edited status: it was refined
+    // via `approval_edit_message` (a pre-decision edit, not a
+    // decision) and is still decidable. Bound records keep the
+    // old shape: deciding Edited on them still 409s.
+    if status == ApprovalStatus::Approved
         && record.status == ApprovalStatus::Approved
         && !record.consumed
     {
@@ -3926,7 +3982,11 @@ async fn approval_decide(
         drop(approvals);
         return Json(serde_json::json!({ "tool_call_id": tool_call_id, "status": current })).into_response();
     }
-    if bound && (record.consumed || record.status != ApprovalStatus::Pending || status == ApprovalStatus::Edited) {
+    let already_decided = record.consumed
+        || (record.status != ApprovalStatus::Pending
+            && !(record.status == ApprovalStatus::Edited && !bound));
+    let edited_via_decide = bound && status == ApprovalStatus::Edited;
+    if already_decided || edited_via_decide {
         return (StatusCode::CONFLICT, Json(serde_json::json!({"error":"loop_approval_already_decided_or_invalid"}))).into_response();
     }
     record.status = status;
@@ -3970,6 +4030,11 @@ struct ApprovalView {
     /// E2-A §2.7: the worker session that consumed this
     /// approval to create a run. Null when unconsumed.
     consumed_by_worker_session_id: Option<String>,
+    /// D1-2 (Q-D1-24): the approval version (SQLite mode
+    /// only; the in-memory map carries no version, so this
+    /// is null in JSONL/shadow views). Null for unversioned
+    /// rows.
+    version: Option<u64>,
 }
 
 fn approval_number(approval_id: &str) -> u64 {
@@ -3989,6 +4054,7 @@ fn approval_view(approval_id: &str, record: &ApprovalState) -> ApprovalView {
         effect_binding: record.effect_binding.clone(),
         message: record.message.clone(),
         consumed_by_worker_session_id: record.consumed_by_worker_session_id.clone(),
+        version: None,
     }
 }
 
@@ -4007,6 +4073,7 @@ fn approval_view_from_file(record: &ApprovalFileRecord) -> ApprovalView {
         effect_binding: record.effect_binding.clone(),
         message: record.message.clone(),
         consumed_by_worker_session_id: record.consumed_by_worker_session_id.clone(),
+        version: record.version,
     }
 }
 
@@ -4190,6 +4257,14 @@ pub(crate) fn persist_approval(state: &AppState, tool_call_id: &str, approval: &
         message: approval.message.clone(),
         command: approval.command.clone(),
         consumed_by_worker_session_id: approval.consumed_by_worker_session_id.clone(),
+        // D1-2 (Q-D1-24): the version is computed inside
+        // `upsert_approval_tx` (from the stored row), never
+        // by the caller — the in-memory map carries no
+        // version, so None here means "let the transaction
+        // decide". In JSONL mode the record stays
+        // unversioned (no version field is written).
+        version: None,
+        supersedes_version: None,
     };
     match state.sqlite_mode() {
         StateBackend::Sqlite => {
@@ -5900,8 +5975,457 @@ fn cors_layer() -> CorsLayer {
 // cleared records.
 
 fn persist_policy_line(state: &AppState, line: &PolicyStateLine) {
+    // D1-2 (Q-D1-21): in SQLite mode the policy_versions
+    // table is the fact source; the JSONL file is a
+    // read-only archive after the one-time v6 import and
+    // is never appended again. JSONL/shadow mode keeps
+    // appending (no versioning exists there).
+    if state.sqlite_mode() == StateBackend::Sqlite {
+        return;
+    }
     let Some(path) = &state.policy_state_path else { return };
     append_policy_state(path, line);
+}
+
+// --- D1-2: Policy versions (Q-D1-21) ---
+//
+// Policy is one document with one version number. The
+// document is the five policy components as canonical
+// JSON; every /permissions/* write records the post-write
+// document as a new row in `policy_versions` (SQLite mode
+// only), and the JSONL file stops being appended — after
+// the one-time v6 import it is a read-only archive.
+//
+// Ordering note (plan §3 reads "insert the version row,
+// then update the memory map"): the write path updates
+// the memory map first and the version row records the
+// post-write document, so the helper always runs AFTER
+// the map mutation. The version row therefore contains
+// exactly the document the write produced; the plan's
+// atomicity intent (one version row per write, never a
+// stale document) is preserved, the literal order is not.
+
+/// The five-component Policy document (Q-D1-21): the
+/// versioned unit. `network_rules` is null when no rules
+/// were ever set (distinct from an explicitly empty list).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PolicyDocument {
+    defaults: PolicyDefaults,
+    overrides: PolicyOverrides,
+    #[serde(default)]
+    connector_policies: Vec<ConnectorPolicy>,
+    #[serde(default)]
+    network_rules: Option<Vec<NetworkRule>>,
+    #[serde(default)]
+    scopes: Vec<ScopeRecord>,
+}
+
+/// The current Policy document, built from the in-memory
+/// maps (same five components as `policy_view`, but with
+/// the raw records instead of view shapes, and rules as
+/// an Option so "never set" stays null).
+fn current_policy_document(state: &AppState) -> PolicyDocument {
+    let mut connectors: Vec<ConnectorPolicy> = state
+        .policy_connectors
+        .lock()
+        .expect("policy connectors lock")
+        .values()
+        .filter(|r| !r.deleted)
+        .cloned()
+        .collect();
+    connectors.sort_by(|a, b| a.connector_id.cmp(&b.connector_id));
+    let mut scopes: Vec<ScopeRecord> = state
+        .policy_scopes
+        .lock()
+        .expect("policy scopes lock")
+        .values()
+        .filter(|r| !r.deleted)
+        .cloned()
+        .collect();
+    scopes.sort_by(|a, b| {
+        (a.scope_type.clone(), a.scope_id.clone())
+            .cmp(&(b.scope_type.clone(), b.scope_id.clone()))
+    });
+    PolicyDocument {
+        defaults: policy_defaults(state),
+        overrides: policy_overrides(state),
+        connector_policies: connectors,
+        network_rules: state
+            .policy_rules
+            .lock()
+            .expect("policy rules lock")
+            .clone(),
+        scopes,
+    }
+}
+
+/// Apply a stored Policy document to the in-memory maps
+/// (restart recovery: the versions table overrides the
+/// JSONL-loaded state).
+fn apply_policy_document(state: &AppState, doc: &PolicyDocument) {
+    *state
+        .policy_defaults
+        .lock()
+        .expect("policy defaults lock") = Some(doc.defaults.clone());
+    *state
+        .policy_overrides
+        .lock()
+        .expect("policy overrides lock") = Some(doc.overrides.clone());
+    let mut connectors = HashMap::new();
+    for record in &doc.connector_policies {
+        connectors.insert(record.connector_id.clone(), record.clone());
+    }
+    *state
+        .policy_connectors
+        .lock()
+        .expect("policy connectors lock") = connectors;
+    *state.policy_rules.lock().expect("policy rules lock") = doc.network_rules.clone();
+    let mut scopes = HashMap::new();
+    for record in &doc.scopes {
+        scopes.insert(record.key(), record.clone());
+    }
+    *state.policy_scopes.lock().expect("policy scopes lock") = scopes;
+}
+
+/// Record the current Policy document as a new version
+/// row (SQLite mode only). Called at the end of every
+/// /permissions/* write handler, after the in-memory maps
+/// hold the post-write document. Best-effort: a
+/// versioning failure must not fail a policy write that
+/// already succeeded in memory (warn only). The document
+/// is built before the SQLite lock is taken (map locks
+/// first, never under the SQLite lock).
+fn record_policy_version(state: &AppState) {
+    if state.sqlite.is_none() || state.sqlite_mode() != StateBackend::Sqlite {
+        return;
+    }
+    let document = current_policy_document(state);
+    let Ok(document_value) = serde_json::to_value(&document) else {
+        eprintln!("warning: D1-2 policy version skipped (cannot encode document)");
+        return;
+    };
+    let document_json = sqlite_store::canonical_json(&document_value);
+    let digest = sqlite_store::sha256_hex(document_json.as_bytes());
+    let Some(sqlite) = &state.sqlite else { return };
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    if let Err(detail) = sqlite_store::insert_policy_version(
+        &mut conn,
+        &document_json,
+        &digest,
+        sqlite_store::now_ms(),
+        &state.origin_device_id,
+    ) {
+        eprintln!("warning: D1-2 policy version insert failed: {detail}");
+    }
+}
+
+/// One-time import of the JSONL policy as version 1, run
+/// at v6 startup when `policy_versions` is empty and a
+/// policy JSONL file exists. The document is passed in
+/// pre-built (maps only, no SQLite lock held by the
+/// caller). After the import the file is a read-only
+/// archive. Returns true when a version was imported.
+fn import_policy_version_once(
+    state: &AppState,
+    conn: &mut Connection,
+    document: &PolicyDocument,
+) -> Result<bool, String> {
+    let Some(path) = &state.policy_state_path else {
+        return Ok(false);
+    };
+    if !path.exists() {
+        return Ok(false);
+    }
+    if !sqlite_store::list_policy_versions(conn)?.is_empty() {
+        return Ok(false);
+    }
+    let document_value =
+        serde_json::to_value(document).map_err(|e| format!("sqlite: cannot encode policy: {e}"))?;
+    let document_json = sqlite_store::canonical_json(&document_value);
+    let digest = sqlite_store::sha256_hex(document_json.as_bytes());
+    sqlite_store::insert_policy_version(
+        conn,
+        &document_json,
+        &digest,
+        sqlite_store::now_ms(),
+        &state.origin_device_id,
+    )?;
+    Ok(true)
+}
+
+/// Apply stored Policy versions to the in-memory maps:
+/// retain every version's network rules (the frozen-rules
+/// gate resolves by digest, so all versions stay
+/// available) and apply the latest version's document.
+/// No-op when the table is empty.
+fn apply_policy_versions(state: &AppState, versions: &[sqlite_store::PolicyVersionRow]) {
+    for version in versions {
+        if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&version.document_json) {
+            if let Some(rules) = doc
+                .get("network_rules")
+                .and_then(|r| serde_json::from_value::<Vec<NetworkRule>>(r.clone()).ok())
+            {
+                retain_policy_rules_version(state, &rules);
+            }
+        }
+    }
+    if let Some(latest) = versions.last() {
+        match serde_json::from_str::<PolicyDocument>(&latest.document_json) {
+            Ok(doc) => apply_policy_document(state, &doc),
+            Err(detail) => eprintln!(
+                "warning: D1-2 latest policy version {} does not parse ({detail}); keeping loaded policy",
+                latest.version_id
+            ),
+        }
+    }
+}
+
+// --- D1-2: Mandates (Q-D1-22) ---
+//
+// A Mandate is an authorization snapshot: the goal text,
+// the tool set the entry point may invoke, and the policy
+// version live at its creation. Policy changes never
+// re-approve a Mandate — the Mandate pins its creation
+// version; a new Task/Execution binds the then-current
+// version. Creation is SQLite-mode only and best-effort:
+// a mandate failure must never fail the Task/Execution
+// creation that triggered it (warn only).
+
+/// D1-2 (Q-D1-22): the tool set a Mandate may authorize.
+/// Task records declare no tool set of their own, so the
+/// loop engine's whitelist stands in as the declared set
+/// — the only tools an entry point can invoke today.
+/// Local definition (no runtime evidence behind the
+/// choice beyond the whitelist itself); keep in sync with
+/// `loop_engine::normalize` (same 11 names, same order).
+const MANDATE_TOOLS: &[&str] = &[
+    "fs.list",
+    "fs.read",
+    "fs.write",
+    "reminders.list",
+    "reminders.set_completed",
+    "email.threads",
+    "email.message",
+    "code.search",
+    "git.read",
+    "worker.run",
+    "worker.wait",
+];
+
+/// The `allowed_json` document for a new Mandate
+/// (canonical JSON): the goal, the entry point kind and
+/// the tool set it may invoke. The policy's granted
+/// scopes are NOT duplicated here — the bound
+/// `policy_version_id` names the document that holds them.
+fn mandate_allowed_json(goal_id: Option<&str>, goal: &str, entry: &str) -> String {
+    let value = serde_json::json!({
+        "goal_id": goal_id,
+        "goal": goal,
+        "entry": entry,
+        "tools": MANDATE_TOOLS,
+    });
+    sqlite_store::canonical_json(&value)
+}
+
+/// The policy version a new Mandate binds: the latest
+/// stored version, or a v1 recorded from the current
+/// document when none exists yet (first-use baseline).
+/// SQLite mode only; None otherwise. The document is
+/// built from the maps before any SQLite lock is taken.
+fn current_policy_version_id(state: &AppState) -> Option<String> {
+    if state.sqlite.is_none() || state.sqlite_mode() != StateBackend::Sqlite {
+        return None;
+    }
+    let latest = {
+        let Some(sqlite) = &state.sqlite else {
+            return None;
+        };
+        let conn = sqlite.lock().expect("sqlite lock");
+        sqlite_store::latest_policy_version(&conn)
+    };
+    match latest {
+        Ok(Some(row)) => Some(row.version_id),
+        Ok(None) => {
+            let document = current_policy_document(state);
+            let Ok(document_value) = serde_json::to_value(&document) else {
+                eprintln!(
+                    "warning: D1-2 mandate policy baseline skipped (cannot encode document)"
+                );
+                return None;
+            };
+            let document_json = sqlite_store::canonical_json(&document_value);
+            let digest = sqlite_store::sha256_hex(document_json.as_bytes());
+            let Some(sqlite) = &state.sqlite else {
+                return None;
+            };
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            match sqlite_store::insert_policy_version(
+                &mut conn,
+                &document_json,
+                &digest,
+                sqlite_store::now_ms(),
+                &state.origin_device_id,
+            ) {
+                Ok(row) => Some(row.version_id),
+                Err(detail) => {
+                    eprintln!("warning: D1-2 mandate policy baseline failed: {detail}");
+                    None
+                }
+            }
+        }
+        Err(detail) => {
+            eprintln!("warning: D1-2 mandate policy lookup failed: {detail}");
+            None
+        }
+    }
+}
+
+/// The goal title for a Mandate's `goal` text: the goals
+/// table title when the goal exists, else the raw goal id,
+/// else the empty string (no goal was named — the Mandate
+/// still records the tool set + policy version).
+fn mandate_goal_text(state: &AppState, goal_id: Option<&str>) -> String {
+    let Some(goal_id) = goal_id else {
+        return String::new();
+    };
+    let Some(sqlite) = &state.sqlite else {
+        return goal_id.to_string();
+    };
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::get_goal(&conn, goal_id) {
+        Ok(Some(row)) => row.title,
+        _ => goal_id.to_string(),
+    }
+}
+
+/// Create one Mandate row. SQLite mode only, best-effort
+/// (warn only, never fail the caller). Returns the row.
+fn create_mandate(
+    state: &AppState,
+    task_id: Option<String>,
+    execution_id: Option<String>,
+    goal_id: Option<String>,
+    entry: &str,
+) -> Option<sqlite_store::MandateRow> {
+    if state.sqlite.is_none() || state.sqlite_mode() != StateBackend::Sqlite {
+        return None;
+    }
+    let policy_version_id = current_policy_version_id(state)?;
+    let mut next = state.next_mandate_id.lock().expect("mandate id lock");
+    let number = *next;
+    *next += 1;
+    drop(next);
+    let goal = mandate_goal_text(state, goal_id.as_deref());
+    let row = sqlite_store::MandateRow {
+        mandate_id: format!("mandate-{number}"),
+        task_id,
+        execution_id,
+        goal: goal.clone(),
+        allowed_json: mandate_allowed_json(goal_id.as_deref(), &goal, entry),
+        policy_version_id,
+        status: "active".to_string(),
+        created_ms: sqlite_store::now_ms() as i64,
+        origin_device_id: state.origin_device_id.clone(),
+    };
+    let Some(sqlite) = &state.sqlite else {
+        return None;
+    };
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::insert_mandate(&mut conn, &row) {
+        Ok(()) => Some(row),
+        Err(detail) => {
+            eprintln!("warning: D1-2 mandate insert failed: {detail}");
+            None
+        }
+    }
+}
+
+/// The Mandate hook for Task creation: one task-level row
+/// (execution_id NULL).
+fn create_task_mandate(state: &AppState, record: &TaskFileRecord) {
+    create_mandate(
+        state,
+        Some(record.task_id.clone()),
+        None,
+        record.goal_id.clone(),
+        "task",
+    );
+}
+
+/// The Mandate hook for a Task goal change: supersede the
+/// old task-level rows and create a fresh one binding the
+/// current policy version.
+fn supersede_task_mandates_and_create(state: &AppState, record: &TaskFileRecord) {
+    if state.sqlite.is_none() || state.sqlite_mode() != StateBackend::Sqlite {
+        return;
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return;
+    };
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    if let Err(detail) = sqlite_store::supersede_mandates_for_task(&mut conn, &record.task_id) {
+        eprintln!("warning: D1-2 mandate supersede failed: {detail}");
+        return;
+    }
+    drop(conn);
+    create_mandate(
+        state,
+        Some(record.task_id.clone()),
+        None,
+        record.goal_id.clone(),
+        "task",
+    );
+}
+
+/// The Mandate hook for Execution creation. Adapter/direct
+/// executions (no task, no loop) carry no goal and no
+/// entry-point tool set: no Mandate. A task execution
+/// reuses the task's active Mandate when it already binds
+/// the current policy version; otherwise (policy changed
+/// since the task was created) a fresh execution-level
+/// row binds the current version — a new Execution binds
+/// the new version (plan §3 item 2). A loop execution
+/// always gets a fresh row.
+fn bind_execution_mandate(state: &AppState, record: &ExecutionFileRecord) {
+    if record.task_id.is_none() && record.loop_id.is_none() {
+        return;
+    }
+    if state.sqlite.is_none() || state.sqlite_mode() != StateBackend::Sqlite {
+        return;
+    }
+    if let Some(task_id) = &record.task_id {
+        let current = current_policy_version_id(state);
+        let reuse = {
+            let Some(sqlite) = &state.sqlite else {
+                return;
+            };
+            let conn = sqlite.lock().expect("sqlite lock");
+            sqlite_store::list_active_task_mandates(&conn, task_id)
+                .map(|rows| {
+                    rows.iter()
+                        .any(|row| current.as_deref() == Some(row.policy_version_id.as_str()))
+                })
+                .unwrap_or(false)
+        };
+        if reuse {
+            return;
+        }
+        create_mandate(
+            state,
+            Some(task_id.clone()),
+            Some(record.execution_id.clone()),
+            record.goal_id.clone(),
+            "task",
+        );
+        return;
+    }
+    create_mandate(
+        state,
+        None,
+        Some(record.execution_id.clone()),
+        record.goal_id.clone(),
+        "loop",
+    );
 }
 
 fn policy_defaults(state: &AppState) -> PolicyDefaults {
@@ -6077,6 +6601,8 @@ async fn policy_active_update(
     }
     overrides.updated_ms = now_ms();
     store_policy_overrides(&state, overrides);
+    // D1-2 (Q-D1-21): one version row per policy write.
+    record_policy_version(&state);
     Json(policy_effective(&state))
 }
 
@@ -6105,6 +6631,8 @@ async fn policy_connector_update(
         .expect("policy connectors lock")
         .insert(connector.clone(), record.clone());
     persist_policy_line(&state, &PolicyStateLine::ConnectorPolicy(record));
+    // D1-2 (Q-D1-21): one version row per policy write.
+    record_policy_version(&state);
     Json(connector_policy_view(&state, &connector)).into_response()
 }
 
@@ -6123,6 +6651,8 @@ async fn policy_connector_reset(
         persist_policy_line(&state, &PolicyStateLine::ConnectorPolicy(updated));
     }
     drop(map);
+    // D1-2 (Q-D1-21): one version row per policy write.
+    record_policy_version(&state);
     Json(connector_policy_view(&state, &connector)).into_response()
 }
 
@@ -6157,6 +6687,8 @@ async fn policy_hitl_update(
     }
     overrides.updated_ms = now_ms();
     store_policy_overrides(&state, overrides);
+    // D1-2 (Q-D1-21): one version row per policy write.
+    record_policy_version(&state);
     Json(hitl_view(&state))
 }
 
@@ -6167,6 +6699,9 @@ async fn policy_hitl_snooze_delete(State(state): State<AppState>) -> Json<HitlVi
         overrides.updated_ms = now_ms();
         store_policy_overrides(&state, overrides);
     }
+    // D1-2 (Q-D1-21): one version row per policy write
+    // (even a no-op delete: the write was issued).
+    record_policy_version(&state);
     Json(hitl_view(&state))
 }
 
@@ -6188,6 +6723,8 @@ async fn policy_mitm_update(
     overrides.mitm_enabled = Some(req.enabled);
     overrides.updated_ms = now_ms();
     store_policy_overrides(&state, overrides);
+    // D1-2 (Q-D1-21): one version row per policy write.
+    record_policy_version(&state);
     Json(SwitchView { enabled: policy_effective(&state).mitm_enabled })
 }
 
@@ -6199,6 +6736,8 @@ async fn policy_tproxy_update(
     overrides.tproxy_enabled = Some(req.enabled);
     overrides.updated_ms = now_ms();
     store_policy_overrides(&state, overrides);
+    // D1-2 (Q-D1-21): one version row per policy write.
+    record_policy_version(&state);
     Json(SwitchView { enabled: policy_effective(&state).tproxy_enabled })
 }
 
@@ -6210,6 +6749,8 @@ async fn policy_sni_rejection_update(
     overrides.sni_rejection_enabled = Some(req.enabled);
     overrides.updated_ms = now_ms();
     store_policy_overrides(&state, overrides);
+    // D1-2 (Q-D1-21): one version row per policy write.
+    record_policy_version(&state);
     Json(SwitchView { enabled: policy_effective(&state).sni_rejection_enabled })
 }
 
@@ -6229,6 +6770,8 @@ async fn policy_network_rules_update(
     *state.policy_rules.lock().expect("policy rules lock") = Some(req.rules.clone());
     retain_policy_rules_version(&state, &req.rules);
     persist_policy_line(&state, &PolicyStateLine::NetworkRules { rules: req.rules.clone() });
+    // D1-2 (Q-D1-21): one version row per policy write.
+    record_policy_version(&state);
     Json(req.rules).into_response()
 }
 
@@ -6257,6 +6800,9 @@ async fn policy_reset(State(state): State<AppState>) -> Json<PolicyView> {
     }
     scopes.retain(|_, r| !r.deleted);
     drop(scopes);
+    // D1-2 (Q-D1-21): one version row per policy write —
+    // the reset's five section mutations are one write.
+    record_policy_version(&state);
     Json(policy_view(&state))
 }
 
@@ -6294,6 +6840,8 @@ async fn policy_revoke(
     }
     scopes.retain(|_, r| !r.deleted);
     revoked.sort();
+    // D1-2 (Q-D1-21): one version row per policy write.
+    record_policy_version(&state);
     Json(RevokeView { revoked })
 }
 
@@ -6332,6 +6880,8 @@ async fn policy_scope_update(
         .expect("policy scopes lock")
         .insert(record.key(), record.clone());
     persist_policy_line(&state, &PolicyStateLine::Scope(record.clone()));
+    // D1-2 (Q-D1-21): one version row per policy write.
+    record_policy_version(&state);
     Json(scope_view(&record))
 }
 
@@ -6425,6 +6975,8 @@ async fn policy_settings_update(
     }
     defaults.updated_ms = now_ms();
     store_policy_defaults(&state, defaults);
+    // D1-2 (Q-D1-21): one version row per policy write.
+    record_policy_version(&state);
     Json(policy_defaults(&state))
 }
 
@@ -6436,6 +6988,92 @@ async fn connectors_permissions(
         return unknown_connector();
     }
     Json(connector_policy_view(&state, &id)).into_response()
+}
+
+// --- D1-2: Policy versions + Mandates (read surface) ---
+//
+// HTTP-only in this batch (plan §1): no frontend views
+// yet — Policy/Mandate reads land here first, UI follows
+// when a reader exists.
+
+/// GET /policies/versions: every Policy version, oldest
+/// first (document + digest + supersedes chain).
+async fn policies_versions_list(State(state): State<AppState>) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::list_policy_versions(&conn) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(detail) => {
+            eprintln!("warning: policy version list failed ({detail})");
+            sqlite_error_response()
+        }
+    }
+}
+
+/// GET /mandates: Mandate list, optionally filtered by
+/// ?task_id= and/or ?execution_id= (same query-filter
+/// precedent as /tasks/list).
+#[derive(Debug, Deserialize)]
+struct MandateListQuery {
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    execution_id: Option<String>,
+}
+
+async fn mandates_list(
+    State(state): State<AppState>,
+    Query(query): Query<MandateListQuery>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::list_mandates(
+        &conn,
+        query.task_id.as_deref(),
+        query.execution_id.as_deref(),
+    ) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(detail) => {
+            eprintln!("warning: mandate list failed ({detail})");
+            sqlite_error_response()
+        }
+    }
+}
+
+/// GET /mandates/{id}: one Mandate row, or 404.
+async fn mandates_get(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::get_mandate(&conn, &id) {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown mandate" })),
+        )
+            .into_response(),
+        Err(detail) => {
+            eprintln!("warning: mandate get failed ({detail})");
+            sqlite_error_response()
+        }
+    }
 }
 
 // --- Model surface (Task 12) ---
@@ -9631,6 +10269,9 @@ pub(crate) fn create_execution_with_binding(
     };
     state.executions.lock().expect("execution lock").insert(record.execution_id.clone(), record.clone());
     persist_execution_with_snapshot(state, &record, snapshot.as_ref());
+    // D1-2 (Q-D1-22): bind (or reuse) a Mandate for this
+    // Execution.
+    bind_execution_mandate(state, &record);
     record
 }
 
@@ -11825,6 +12466,8 @@ async fn tasks_create(
     };
     state.tasks.lock().expect("task lock").insert(record.task_id.clone(), record.clone());
     persist_task(&state, &record);
+    // D1-2 (Q-D1-22): one task-level Mandate row.
+    create_task_mandate(&state, &record);
     Json(record).into_response()
 }
 
@@ -11887,6 +12530,12 @@ async fn tasks_update(
     let Some(record) = tasks.get_mut(&req.task_id) else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" }))).into_response();
     };
+    // D1-2 (Q-D1-22): a goal change supersedes the Task's
+    // Mandates (computed before the move below).
+    let goal_changed = req
+        .goal_id
+        .as_ref()
+        .is_some_and(|goal_id| Some(goal_id) != record.goal_id.as_ref());
     record.status = req.status;
     if let Some(path) = req.artifact_path {
         record.artifact_path = Some(path);
@@ -11904,6 +12553,12 @@ async fn tasks_update(
     }
     let updated = record.clone();
     persist_task(&state, &updated);
+    drop(tasks);
+    // D1-2 (Q-D1-22): a goal change supersedes the old
+    // task-level Mandates and creates a fresh one.
+    if goal_changed {
+        supersede_task_mandates_and_create(&state, &updated);
+    }
     Json(updated).into_response()
 }
 
@@ -15395,6 +16050,10 @@ pub fn app(state: AppState) -> Router {
         .route("/goals/list", get(goals_list))
         .route("/goals/{id}", get(goals_get))
         .route("/goals/{id}/archive", post(goals_archive))
+        // D1-2: policy versions + mandates (3 routes).
+        .route("/policies/versions", get(policies_versions_list))
+        .route("/mandates", get(mandates_list))
+        .route("/mandates/{id}", get(mandates_get))
         .route("/locations/create", post(locations_create))
         .route("/locations/list", get(locations_list))
         .route("/locations/{id}", get(locations_get))

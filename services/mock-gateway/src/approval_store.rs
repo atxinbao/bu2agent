@@ -60,6 +60,23 @@ pub struct ApprovalFileRecord {
     /// to create a run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumed_by_worker_session_id: Option<String>,
+    /// D1-2 (Q-D1-24): monotonically increasing version. 1
+    /// on the first SQLite write; +1 per decided/edited
+    /// write (see `upsert_approval_tx`). None for
+    /// unversioned rows (JSONL mode / pre-D1-2 rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
+    /// D1-2 (Q-D1-24): the version this write superseded,
+    /// set only on decided/edited writes. The supersede
+    /// chain lives in the event payload; this field mirrors
+    /// the link on the row so the folded event log still
+    /// reproduces the table exactly (`fold_matches_tables`
+    /// compares the last payload per approval against the
+    /// row serialization, so a payload-only link would
+    /// break the fold). None when no write has superseded
+    /// anything yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_version: Option<u64>,
 }
 
 /// Read every well-formed record from `path`, in file order.
@@ -144,6 +161,8 @@ mod tests {
             message: None,
             command: None,
             consumed_by_worker_session_id: None,
+            version: None,
+            supersedes_version: None,
         }
     }
 

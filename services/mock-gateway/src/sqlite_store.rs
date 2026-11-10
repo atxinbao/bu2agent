@@ -48,11 +48,13 @@ use crate::execution_store::ExecutionFileRecord;
 /// v2 adds the P0-R evidence table (see SCHEMA_V2); v3 adds
 /// the P3-B patches + patch_files tables (see SCHEMA_V3);
 /// v4 adds the E2-slice worker_runs table (see SCHEMA_V4);
-/// v5 adds the D1-1 goals table (see SCHEMA_V5).
+/// v5 adds the D1-1 goals table (see SCHEMA_V5);
+/// v6 adds the D1-2 policy_versions + mandates tables
+/// (see SCHEMA_V6).
 /// Row-level `schema_version` fields are a separate concept
 /// (the record contract version, still 1 for P0-A+ rows) and
 /// are untouched.
-pub const DB_SCHEMA_VERSION: i64 = 5;
+pub const DB_SCHEMA_VERSION: i64 = 6;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -369,6 +371,36 @@ CREATE TABLE IF NOT EXISTS goals (
 );
 ";
 
+/// D1-2 v6 step: `policy_versions` (one row per Policy
+/// document version, supersedes chain) and `mandates`
+/// (authorization snapshots binding a task/execution to a
+/// goal, a tool set and a policy version). Mandate lookups
+/// filter by task/execution, hence the two indexes.
+const SCHEMA_V6: &str = "
+CREATE TABLE IF NOT EXISTS policy_versions (
+    version_id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL UNIQUE,
+    document_json TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    supersedes TEXT,
+    created_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mandates (
+    mandate_id TEXT PRIMARY KEY,
+    task_id TEXT,
+    execution_id TEXT,
+    goal TEXT NOT NULL,
+    allowed_json TEXT NOT NULL,
+    policy_version_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mandates_task ON mandates(task_id);
+CREATE INDEX IF NOT EXISTS idx_mandates_execution ON mandates(execution_id);
+";
+
 fn err(e: rusqlite::Error) -> String {
     format!("sqlite: {e}")
 }
@@ -472,6 +504,35 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         )
         .map_err(err)?;
     }
+    // D1-2 v6 step: policy_versions + mandates tables,
+    // plus the approvals version columns in the same step.
+    // The version is advanced to 6 only after all three
+    // succeed; a fresh database runs v1–v6 in the same
+    // transaction. Pre-D1-2 approval rows read as version
+    // 1 (the backfilled value); `supersedes_version` stays
+    // NULL until a decided/edited write supersedes one.
+    if version < 6 {
+        tx.execute_batch(SCHEMA_V6).map_err(err)?;
+        backfill_column_typed(&tx, "approvals", "version", "INTEGER")?;
+        backfill_column_typed(&tx, "approvals", "supersedes_version", "INTEGER")?;
+        // Pre-D1-2 approval rows read as version 1. The
+        // table may be absent in a partial fixture (same
+        // precedent as the backfills below: a missing table
+        // is a no-op, not an error).
+        if table_exists(&tx, "approvals")? {
+            tx.execute(
+                "UPDATE approvals SET version = 1 WHERE version IS NULL",
+                [],
+            )
+            .map_err(err)?;
+        }
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '6')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
     // P0-E additive column: databases migrated by P0-D have no
     // worker_sessions.detail, but the approved plan's recovery
     // scan records its note ("process ended" / "clean shutdown")
@@ -517,6 +578,18 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     backfill_column(&tx, "approvals", "consumed_by_worker_session_id")?;
     tx.commit().map_err(err)?;
     Ok(())
+}
+
+/// Whether a table exists (partial fixtures may lack one;
+/// see the backfill precedent below).
+fn table_exists(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<bool, String> {
+    tx.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![table],
+        |row| row.get::<_, i64>(0),
+    )
+    .map_err(err)
+    .map(|count| count > 0)
 }
 
 /// Add a nullable TEXT column when the table exists and the
@@ -784,6 +857,270 @@ pub fn archive_goal(conn: &mut Connection, goal_id: &str) -> Result<Option<GoalR
 pub fn next_goal_number(conn: &Connection) -> Result<u64, String> {
     let mut stmt = conn
         .prepare("SELECT goal_id FROM goals")
+        .map_err(err)?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(err)?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(err)?;
+    Ok(ids
+        .iter()
+        .map(|id| id_suffix(id))
+        .filter(|n| *n > 0)
+        .max()
+        .map(|n| (n + 1) as u64)
+        .unwrap_or(1))
+}
+
+// --- D1-2: Policy versions + Mandates ---
+//
+// A Policy version is one immutable document snapshot:
+// the five-component policy document as canonical JSON,
+// its sha256 digest, and the previous version it
+// supersedes. Versions are insert-only (old versions are
+// never deleted or rewritten); the current version is
+// simply the highest `version`.
+
+/// One row of `policy_versions`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyVersionRow {
+    pub version_id: String,
+    pub version: i64,
+    pub document_json: String,
+    pub digest: String,
+    pub supersedes: Option<String>,
+    pub created_ms: i64,
+    pub origin_device_id: String,
+}
+
+const POLICY_VERSION_COLS: &str =
+    "version_id, version, document_json, digest, supersedes, created_ms, origin_device_id";
+
+fn policy_version_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PolicyVersionRow> {
+    Ok(PolicyVersionRow {
+        version_id: row.get(0)?,
+        version: row.get(1)?,
+        document_json: row.get(2)?,
+        digest: row.get(3)?,
+        supersedes: row.get(4)?,
+        created_ms: row.get(5)?,
+        origin_device_id: row.get(6)?,
+    })
+}
+
+/// Insert the next Policy version: `version = MAX+1`,
+/// `version_id = "policy-v{version}"`, `supersedes` = the
+/// previous version's id (None for v1). The caller owns
+/// the document (canonical JSON) and its digest.
+pub fn insert_policy_version(
+    conn: &mut Connection,
+    document_json: &str,
+    digest: &str,
+    created_ms: u64,
+    origin_device_id: &str,
+) -> Result<PolicyVersionRow, String> {
+    let prev: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT version_id, version FROM policy_versions ORDER BY version DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(err)?;
+    let version = prev.as_ref().map(|(_, v)| v + 1).unwrap_or(1);
+    let row = PolicyVersionRow {
+        version_id: format!("policy-v{version}"),
+        version,
+        document_json: document_json.to_string(),
+        digest: digest.to_string(),
+        supersedes: prev.map(|(id, _)| id),
+        created_ms: created_ms as i64,
+        origin_device_id: origin_device_id.to_string(),
+    };
+    conn.execute(
+        "INSERT INTO policy_versions (version_id, version, document_json, digest, supersedes, created_ms, origin_device_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            row.version_id,
+            row.version,
+            row.document_json,
+            row.digest,
+            row.supersedes,
+            row.created_ms,
+            row.origin_device_id,
+        ],
+    )
+    .map_err(err)?;
+    Ok(row)
+}
+
+/// All versions, oldest first.
+pub fn list_policy_versions(conn: &Connection) -> Result<Vec<PolicyVersionRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {POLICY_VERSION_COLS} FROM policy_versions ORDER BY version ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map([], policy_version_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+/// The current version (highest `version`), if any.
+pub fn latest_policy_version(conn: &Connection) -> Result<Option<PolicyVersionRow>, String> {
+    conn.query_row(
+        &format!(
+            "SELECT {POLICY_VERSION_COLS} FROM policy_versions ORDER BY version DESC LIMIT 1"
+        ),
+        [],
+        policy_version_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// One row of `mandates`: an authorization snapshot
+/// binding a Task (task-level row, `execution_id` NULL)
+/// or one Execution to a goal text, an allowed tool set
+/// (`allowed_json`, canonical JSON) and the policy
+/// version live at its creation. Superseded rows are
+/// kept, never deleted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateRow {
+    pub mandate_id: String,
+    pub task_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub goal: String,
+    pub allowed_json: String,
+    pub policy_version_id: String,
+    pub status: String,
+    pub created_ms: i64,
+    pub origin_device_id: String,
+}
+
+const MANDATE_COLS: &str =
+    "mandate_id, task_id, execution_id, goal, allowed_json, policy_version_id, status, created_ms, origin_device_id";
+
+fn mandate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MandateRow> {
+    Ok(MandateRow {
+        mandate_id: row.get(0)?,
+        task_id: row.get(1)?,
+        execution_id: row.get(2)?,
+        goal: row.get(3)?,
+        allowed_json: row.get(4)?,
+        policy_version_id: row.get(5)?,
+        status: row.get(6)?,
+        created_ms: row.get(7)?,
+        origin_device_id: row.get(8)?,
+    })
+}
+
+pub fn insert_mandate(conn: &mut Connection, row: &MandateRow) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO mandates (mandate_id, task_id, execution_id, goal, allowed_json, policy_version_id, status, created_ms, origin_device_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            row.mandate_id,
+            row.task_id,
+            row.execution_id,
+            row.goal,
+            row.allowed_json,
+            row.policy_version_id,
+            row.status,
+            row.created_ms,
+            row.origin_device_id,
+        ],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// Mandates, oldest first, optionally filtered by task
+/// and/or execution (both filters are exact matches).
+pub fn list_mandates(
+    conn: &Connection,
+    task_id: Option<&str>,
+    execution_id: Option<&str>,
+) -> Result<Vec<MandateRow>, String> {
+    let mut sql = format!("SELECT {MANDATE_COLS} FROM mandates");
+    let mut clauses: Vec<String> = Vec::new();
+    if task_id.is_some() {
+        clauses.push("task_id = ?1".to_string());
+    }
+    if execution_id.is_some() {
+        clauses.push(format!("execution_id = ?{}", clauses.len() + 1));
+    }
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+    sql.push_str(" ORDER BY created_ms ASC, mandate_id ASC");
+    let mut stmt = conn.prepare(&sql).map_err(err)?;
+    let rows = match (task_id, execution_id) {
+        (Some(task_id), Some(execution_id)) => {
+            stmt.query_map(params![task_id, execution_id], mandate_from_row)
+        }
+        (Some(task_id), None) => stmt.query_map(params![task_id], mandate_from_row),
+        (None, Some(execution_id)) => stmt.query_map(params![execution_id], mandate_from_row),
+        (None, None) => stmt.query_map([], mandate_from_row),
+    }
+    .map_err(err)?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(err)?;
+    Ok(rows)
+}
+
+pub fn get_mandate(conn: &Connection, mandate_id: &str) -> Result<Option<MandateRow>, String> {
+    conn.query_row(
+        &format!("SELECT {MANDATE_COLS} FROM mandates WHERE mandate_id = ?1"),
+        params![mandate_id],
+        mandate_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// The Task's active task-level Mandates (execution_id
+/// NULL): at most one in practice, but the query does not
+/// assume it — supersede marks all of them.
+pub fn list_active_task_mandates(
+    conn: &Connection,
+    task_id: &str,
+) -> Result<Vec<MandateRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {MANDATE_COLS} FROM mandates WHERE task_id = ?1 AND execution_id IS NULL AND status = 'active' ORDER BY created_ms ASC, mandate_id ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![task_id], mandate_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+/// Supersede a Task's active task-level Mandates (old
+/// rows are kept, never deleted). Returns the number of
+/// rows superseded.
+pub fn supersede_mandates_for_task(conn: &mut Connection, task_id: &str) -> Result<usize, String> {
+    let changed = conn
+        .execute(
+            "UPDATE mandates SET status = 'superseded' WHERE task_id = ?1 AND execution_id IS NULL AND status = 'active'",
+            params![task_id],
+        )
+        .map_err(err)?;
+    Ok(changed)
+}
+
+/// Next mandate number (max `mandate-<n>` suffix + 1,
+/// same shape as `next_goal_number`).
+pub fn next_mandate_number(conn: &Connection) -> Result<u64, String> {
+    let mut stmt = conn
+        .prepare("SELECT mandate_id FROM mandates")
         .map_err(err)?;
     let ids = stmt
         .query_map([], |row| row.get::<_, String>(0))
@@ -1110,6 +1447,18 @@ fn upsert_effect_tx(
     Ok(())
 }
 
+/// The previous approval row's lifecycle head, for event
+/// inference + versioning in `upsert_approval_tx` (a named
+/// struct instead of a 6-tuple: clippy `type_complexity`).
+struct OldApprovalHead {
+    status: String,
+    consumed: bool,
+    message: Option<String>,
+    effect_binding: Option<String>,
+    version: Option<i64>,
+    supersedes_version: Option<i64>,
+}
+
 fn upsert_approval_tx(
     tx: &rusqlite::Transaction<'_>,
     record: &ApprovalFileRecord,
@@ -1120,17 +1469,19 @@ fn upsert_approval_tx(
     // every persist call site: new row -> requested, consumed
     // flip -> consumed, message change -> edited, status change
     // -> decided, binding-only change -> bound.
-    let old: Option<(String, bool, Option<String>, Option<String>)> = tx
+    let old: Option<OldApprovalHead> = tx
         .query_row(
-            "SELECT status, consumed, message, effect_binding FROM approvals WHERE approval_id = ?1",
+            "SELECT status, consumed, message, effect_binding, version, supersedes_version FROM approvals WHERE approval_id = ?1",
             params![record.tool_call_id],
             |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)? != 0,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
+                Ok(OldApprovalHead {
+                    status: row.get::<_, String>(0)?,
+                    consumed: row.get::<_, i64>(1)? != 0,
+                    message: row.get::<_, Option<String>>(2)?,
+                    effect_binding: row.get::<_, Option<String>>(3)?,
+                    version: row.get::<_, Option<i64>>(4)?,
+                    supersedes_version: row.get::<_, Option<i64>>(5)?,
+                })
             },
         )
         .optional()
@@ -1147,19 +1498,39 @@ fn upsert_approval_tx(
     let created_ms = old_created.unwrap_or(now);
     let event_type = match &old {
         None => "approval.requested",
-        Some((old_status, old_consumed, old_message, old_binding)) => {
-            if !*old_consumed && record.consumed {
+        Some(head) => {
+            if !head.consumed && record.consumed {
                 "approval.consumed"
-            } else if old_message.as_deref() != record.message.as_deref() {
+            } else if head.message.as_deref() != record.message.as_deref() {
                 "approval.edited"
-            } else if old_status != &record.status {
+            } else if head.status != record.status {
                 "approval.decided"
-            } else if old_binding.as_deref() != record.effect_binding.as_deref() {
+            } else if head.effect_binding.as_deref() != record.effect_binding.as_deref() {
                 "approval.bound"
             } else {
                 "approval.decided"
             }
         }
+    };
+    // D1-2 (Q-D1-24): versioning. A new row starts at 1.
+    // A decided/edited write bumps the version by one and
+    // records the superseded version; every other write
+    // keeps both (a pre-D1-2 / JSONL-imported row with a
+    // NULL version reads as 1). The version rides in the
+    // event payload, so the supersede chain is readable
+    // from the event log without a second table.
+    let old_version = old.as_ref().and_then(|head| head.version);
+    let old_supersedes = old.as_ref().and_then(|head| head.supersedes_version);
+    let is_versioned_write = event_type == "approval.decided" || event_type == "approval.edited";
+    let new_version: i64 = match &old {
+        None => 1,
+        Some(_) if is_versioned_write => old_version.unwrap_or(1) + 1,
+        Some(_) => old_version.unwrap_or(1),
+    };
+    let new_supersedes: Option<i64> = if is_versioned_write && old.is_some() {
+        Some(old_version.unwrap_or(1))
+    } else {
+        old_supersedes
     };
     let seq = {
         let suffix = id_suffix(&record.tool_call_id);
@@ -1178,8 +1549,8 @@ fn upsert_approval_tx(
         None => None,
     };
     tx.execute(
-        "INSERT INTO approvals (seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json, consumed_by_worker_session_id, origin_device_id, schema_version, created_ms, updated_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        "INSERT INTO approvals (seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json, consumed_by_worker_session_id, origin_device_id, schema_version, created_ms, updated_at_ms, version, supersedes_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT(approval_id) DO UPDATE SET
            seq = excluded.seq, tool = excluded.tool, status = excluded.status,
            binding_json = excluded.binding_json, consumed = excluded.consumed,
@@ -1188,7 +1559,8 @@ fn upsert_approval_tx(
            command_json = excluded.command_json,
            consumed_by_worker_session_id = excluded.consumed_by_worker_session_id,
            origin_device_id = excluded.origin_device_id, schema_version = excluded.schema_version,
-           created_ms = excluded.created_ms, updated_at_ms = excluded.updated_at_ms",
+           created_ms = excluded.created_ms, updated_at_ms = excluded.updated_at_ms,
+           version = excluded.version, supersedes_version = excluded.supersedes_version",
         params![
             seq,
             record.tool_call_id,
@@ -1211,10 +1583,18 @@ fn upsert_approval_tx(
             1i64,
             created_ms,
             now,
+            new_version,
+            new_supersedes,
         ],
     )
     .map_err(err)?;
-    let payload = serde_json::to_string(record).map_err(|e| format!("sqlite: cannot encode approval: {e}"))?;
+    // The payload is the stored row: the record with the
+    // computed version fields set, so the folded event log
+    // reproduces the table exactly (see fold_matches_tables).
+    let mut payload_record = record.clone();
+    payload_record.version = Some(new_version as u64);
+    payload_record.supersedes_version = new_supersedes.map(|v| v as u64);
+    let payload = serde_json::to_string(&payload_record).map_err(|e| format!("sqlite: cannot encode approval: {e}"))?;
     let event_id = append_event(
         tx,
         "approval",
@@ -1379,12 +1759,14 @@ fn approval_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalFileRe
         message: row.get(9)?,
         command,
         consumed_by_worker_session_id: row.get(11)?,
+        version: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
+        supersedes_version: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
     })
 }
 
 pub fn list_approvals(conn: &Connection) -> Result<Vec<ApprovalFileRecord>, String> {
     let mut stmt = conn
-        .prepare("SELECT seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json, consumed_by_worker_session_id FROM approvals ORDER BY seq ASC, approval_id ASC")
+        .prepare("SELECT seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json, consumed_by_worker_session_id, version, supersedes_version FROM approvals ORDER BY seq ASC, approval_id ASC")
         .map_err(err)?;
     let rows = stmt
         .query_map([], approval_from_row)
@@ -1396,7 +1778,7 @@ pub fn list_approvals(conn: &Connection) -> Result<Vec<ApprovalFileRecord>, Stri
 
 pub fn get_approval(conn: &Connection, approval_id: &str) -> Result<Option<ApprovalFileRecord>, String> {
     conn.query_row(
-        "SELECT seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json, consumed_by_worker_session_id FROM approvals WHERE approval_id = ?1",
+        "SELECT seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json, consumed_by_worker_session_id, version, supersedes_version FROM approvals WHERE approval_id = ?1",
         params![approval_id],
         approval_from_row,
     )
@@ -2975,12 +3357,28 @@ pub fn shadow_compare(
     }
     let sqlite_approvals = list_approvals(conn)?;
     for row in &fold_approvals(approvals) {
+        // D1-2: `version` / `supersedes_version` are
+        // assigned by `upsert_approval_tx`, not by the
+        // writer — the JSONL record carries None while the
+        // stored row carries the assigned version. Compare
+        // with both cleared (versioning itself is covered
+        // by the fold test + d1_policy P3, which compare
+        // payload against row).
+        let mut row = row.clone();
+        row.version = None;
+        row.supersedes_version = None;
         match sqlite_approvals.iter().find(|r| r.tool_call_id == row.tool_call_id) {
-            Some(found) if found == row => {}
-            Some(found) => report.mismatches.push(format!(
-                "approval {} differs: jsonl {found:?} vs sqlite {row:?}",
-                row.tool_call_id
-            )),
+            Some(found) => {
+                let mut found = found.clone();
+                found.version = None;
+                found.supersedes_version = None;
+                if found != row {
+                    report.mismatches.push(format!(
+                        "approval {} differs: jsonl {found:?} vs sqlite {row:?}",
+                        row.tool_call_id
+                    ));
+                }
+            }
             None => report
                 .mismatches
                 .push(format!("approval {} missing in sqlite", row.tool_call_id)),
@@ -4295,6 +4693,13 @@ pub fn create_worker_run(
     // in-memory map is updated by the server right after the
     // insert returns; a crash between the two loses only the
     // cache entry (startup reloads it from SQLite).
+    //
+    // D1-2 (Q-D1-24): the backfill DOES emit its own event
+    // now — an explicit `approval.bound` in the same
+    // transaction, carrying the stored row after the update,
+    // so the folded event log still reproduces the table
+    // exactly. No event when the run has no approval (or
+    // the row is missing, defensively skipped).
     if let (Some(approval_id), Some(worker_session_id)) =
         (&inserted.approval_id, &inserted.worker_session_id)
     {
@@ -4303,6 +4708,20 @@ pub fn create_worker_run(
             params![worker_session_id, now, approval_id],
         )
         .map_err(err)?;
+        if let Some(row) = get_approval(&tx, approval_id)? {
+            let payload = serde_json::to_string(&row)
+                .map_err(|e| format!("sqlite: cannot encode approval: {e}"))?;
+            append_event(
+                &tx,
+                "approval",
+                approval_id,
+                "approval.bound",
+                &payload,
+                "unknown",
+                now,
+                1,
+            )?;
+        }
     }
     tx.commit().map_err(err)?;
     Ok(inserted)
@@ -4600,6 +5019,8 @@ mod tests {
             message: Some("please write".to_string()),
             command: None,
             consumed_by_worker_session_id: None,
+            version: None,
+            supersedes_version: None,
         }
     }
 
