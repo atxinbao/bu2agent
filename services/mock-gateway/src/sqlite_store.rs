@@ -46,11 +46,13 @@ use crate::execution_store::ExecutionFileRecord;
 
 /// DB schema version. v1 is the P0-D baseline (10 tables);
 /// v2 adds the P0-R evidence table (see SCHEMA_V2); v3 adds
-/// the P3-B patches + patch_files tables (see SCHEMA_V3).
+/// the P3-B patches + patch_files tables (see SCHEMA_V3);
+/// v4 adds the E2-slice worker_runs table (see SCHEMA_V4);
+/// v5 adds the D1-1 goals table (see SCHEMA_V5).
 /// Row-level `schema_version` fields are a separate concept
 /// (the record contract version, still 1 for P0-A+ rows) and
 /// are untouched.
-pub const DB_SCHEMA_VERSION: i64 = 4;
+pub const DB_SCHEMA_VERSION: i64 = 5;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -345,6 +347,28 @@ CREATE INDEX IF NOT EXISTS idx_worker_runs_status ON worker_runs(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_runs_approval ON worker_runs(approval_id);
 ";
 
+/// D1-1 v5 migration: the `goals` table only, plus the
+/// `executions.goal_id` column backfill in the same step
+/// (P0-E column-backfill precedent: the column is added
+/// here, no version beyond v5). No FKs (same convention
+/// as v1–v4), no changes to existing rows: old executions
+/// read `goal_id` as NULL (unlinked). A Goal is a direct
+/// management record like Project (no Effect, no approval):
+/// archive is a status flip, never a delete; the list
+/// hides archived rows, detail still reads them.
+const SCHEMA_V5: &str = "
+CREATE TABLE IF NOT EXISTS goals (
+    goal_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL
+);
+";
+
 fn err(e: rusqlite::Error) -> String {
     format!("sqlite: {e}")
 }
@@ -421,11 +445,26 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     }
     // E2-slice v4 step: worker_runs table only, plus the
     // executions.deadline_ms column backfill in the same
-    // step. The version is advanced to 4 (DB_SCHEMA_VERSION)
-    // only after both succeed.
+    // step. The version is advanced to 4 only after both
+    // succeed; a fresh database runs v1, v2, v3, v4 and v5
+    // in the same transaction.
     if version < 4 {
         tx.execute_batch(SCHEMA_V4).map_err(err)?;
         backfill_column_typed(&tx, "executions", "deadline_ms", "INTEGER")?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '4')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // D1-1 v5 step: goals table only, plus the
+    // executions.goal_id column backfill in the same step.
+    // The version is advanced to 5 (DB_SCHEMA_VERSION)
+    // only after both succeed.
+    if version < 5 {
+        tx.execute_batch(SCHEMA_V5).map_err(err)?;
+        backfill_column_typed(&tx, "executions", "goal_id", "TEXT")?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -641,6 +680,125 @@ pub fn next_numbers(conn: &Connection) -> Result<(u64, u64, u64), String> {
     ))
 }
 
+/// D1-1 Goal row (SQLite only, no JSONL mirror): a Goal is
+/// a first-class object a Task can link to (`goal_id`),
+/// managed directly like Project — no Effect, no approval.
+/// Archive is a status flip, never a delete; the list hides
+/// archived rows, detail still reads them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoalRow {
+    pub goal_id: String,
+    pub title: String,
+    pub description: String,
+    pub status: String,
+    pub created_ms: u64,
+    pub updated_ms: u64,
+    pub origin_device_id: String,
+    pub schema_version: i64,
+}
+
+fn goal_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalRow> {
+    Ok(GoalRow {
+        goal_id: row.get(0)?,
+        title: row.get(1)?,
+        description: row.get(2)?,
+        status: row.get(3)?,
+        created_ms: row.get::<_, i64>(4)? as u64,
+        updated_ms: row.get::<_, i64>(5)? as u64,
+        origin_device_id: row.get(6)?,
+        schema_version: row.get(7)?,
+    })
+}
+
+const GOAL_COLS: &str =
+    "goal_id, title, description, status, created_ms, updated_ms, origin_device_id, schema_version";
+
+pub fn insert_goal(conn: &mut Connection, row: &GoalRow) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO goals (goal_id, title, description, status, created_ms, updated_ms, origin_device_id, schema_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            row.goal_id,
+            row.title,
+            row.description,
+            row.status,
+            row.created_ms as i64,
+            row.updated_ms as i64,
+            row.origin_device_id,
+            row.schema_version,
+        ],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// Active goals only, insertion order (rowid): the list
+/// hides archived rows, same as the Project list.
+pub fn list_goals(conn: &Connection) -> Result<Vec<GoalRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {GOAL_COLS} FROM goals WHERE status = 'active' ORDER BY rowid ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map([], goal_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+/// Detail reads any status: an archived goal is still
+/// readable, same as the Project detail.
+pub fn get_goal(conn: &Connection, goal_id: &str) -> Result<Option<GoalRow>, String> {
+    conn.query_row(
+        &format!("SELECT {GOAL_COLS} FROM goals WHERE goal_id = ?1"),
+        params![goal_id],
+        goal_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// Archive is a status flip, never a delete. Re-archiving
+/// an already-archived goal returns the current row, same
+/// as the Project archive. Returns None when the goal does
+/// not exist.
+pub fn archive_goal(conn: &mut Connection, goal_id: &str) -> Result<Option<GoalRow>, String> {
+    let now = now_ms() as i64;
+    let changed = conn
+        .execute(
+            "UPDATE goals SET status = 'archived', updated_ms = ?1 WHERE goal_id = ?2 AND status = 'active'",
+            params![now, goal_id],
+        )
+        .map_err(err)?;
+    if changed == 0 {
+        return get_goal(conn, goal_id);
+    }
+    get_goal(conn, goal_id)
+}
+
+/// Next goal number (max `goal-N` suffix + 1, else 1),
+/// for seeding the in-memory `next_goal_id` counter on
+/// restart — same shape as `next_numbers`.
+pub fn next_goal_number(conn: &Connection) -> Result<u64, String> {
+    let mut stmt = conn
+        .prepare("SELECT goal_id FROM goals")
+        .map_err(err)?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(err)?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(err)?;
+    Ok(ids
+        .iter()
+        .map(|id| id_suffix(id))
+        .filter(|n| *n > 0)
+        .max()
+        .map(|n| (n + 1) as u64)
+        .unwrap_or(1))
+}
+
 // Eight arguments because an event row has eight meaningful
 // fields; grouping them into a struct would only move the
 // field list, not shrink it, and every producer site already
@@ -740,14 +898,15 @@ fn upsert_execution_tx(
         }
     };
     tx.execute(
-        "INSERT INTO executions (seq, execution_id, task_id, loop_id, session_id, worker_session_id, workspace_snapshot_id, status, origin_device_id, schema_version, created_ms, updated_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "INSERT INTO executions (seq, execution_id, task_id, loop_id, session_id, worker_session_id, workspace_snapshot_id, status, origin_device_id, schema_version, created_ms, updated_at_ms, goal_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(execution_id) DO UPDATE SET
            seq = excluded.seq, task_id = excluded.task_id, loop_id = excluded.loop_id,
            session_id = excluded.session_id, worker_session_id = excluded.worker_session_id,
            workspace_snapshot_id = excluded.workspace_snapshot_id, status = excluded.status,
            origin_device_id = excluded.origin_device_id, schema_version = excluded.schema_version,
-           created_ms = excluded.created_ms, updated_at_ms = excluded.updated_at_ms",
+           created_ms = excluded.created_ms, updated_at_ms = excluded.updated_at_ms,
+           goal_id = excluded.goal_id",
         params![
             seq,
             record.execution_id,
@@ -761,6 +920,7 @@ fn upsert_execution_tx(
             record.schema_version as i64,
             created_ms,
             now,
+            record.goal_id,
         ],
     )
     .map_err(err)?;
@@ -1130,7 +1290,7 @@ pub fn upsert_approval(conn: &mut Connection, record: &ApprovalFileRecord) -> Re
 
 pub fn list_executions(conn: &Connection) -> Result<Vec<ExecutionFileRecord>, String> {
     let mut stmt = conn
-        .prepare("SELECT execution_id, task_id, loop_id, session_id, worker_session_id, workspace_snapshot_id, status, origin_device_id, schema_version FROM executions ORDER BY seq ASC, execution_id ASC")
+        .prepare("SELECT execution_id, task_id, loop_id, session_id, worker_session_id, workspace_snapshot_id, status, origin_device_id, schema_version, goal_id FROM executions ORDER BY seq ASC, execution_id ASC")
         .map_err(err)?;
     let rows = stmt
         .query_map([], |row| {
@@ -1144,6 +1304,7 @@ pub fn list_executions(conn: &Connection) -> Result<Vec<ExecutionFileRecord>, St
                 status: row.get(6)?,
                 origin_device_id: row.get(7)?,
                 schema_version: row.get::<_, i64>(8)? as u64,
+                goal_id: row.get(9)?,
             })
         })
         .map_err(err)?
@@ -2908,6 +3069,9 @@ fn execution_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExecutionFile
         status: row.get(6)?,
         origin_device_id: row.get(7)?,
         schema_version: row.get::<_, i64>(8)? as u64,
+        // D1-1: NULL for executions created before the v5
+        // backfill (unlinked); the v5 step adds the column.
+        goal_id: row.get(9)?,
     })
 }
 
@@ -2998,7 +3162,7 @@ fn snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRow> {
     })
 }
 
-const EXECUTION_COLS: &str = "execution_id, task_id, loop_id, session_id, worker_session_id, workspace_snapshot_id, status, origin_device_id, schema_version";
+const EXECUTION_COLS: &str = "execution_id, task_id, loop_id, session_id, worker_session_id, workspace_snapshot_id, status, origin_device_id, schema_version, goal_id";
 const EFFECT_COLS: &str = "effect_id, execution_id, capability, operation, scope, input_digest, approval_id, idempotency_key, status, reconciliation_result, reconciliation_detail, reconciliation_checked_ms, detail, origin_device_id, schema_version";
 const ASSIGNMENT_COLS: &str = "assignment_id, execution_id, worker_session_id, origin_device_id, status, detail, lease_expires_ms, heartbeat_ms, schema_version";
 const WORKER_COLS: &str = "worker_session_id, origin_device_id, status, detail, schema_version";
@@ -4390,6 +4554,7 @@ mod tests {
             task_id: Some("task-1".to_string()),
             loop_id: None,
             session_id: None,
+            goal_id: None,
             worker_session_id: None,
             workspace_snapshot_id: None,
             status: status.to_string(),

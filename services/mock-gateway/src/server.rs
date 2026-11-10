@@ -479,6 +479,10 @@ pub struct AppState {
     projects: Arc<Mutex<HashMap<String, Project>>>,
     next_project_id: Arc<Mutex<u64>>,
     project_state_path: Option<PathBuf>,
+    // D1-1: goals live in SQLite only (no JSONL mirror, no
+    // in-memory map); the counter is the id allocator,
+    // seeded from the goals table on restart.
+    next_goal_id: Arc<Mutex<u64>>,
     locations: Arc<Mutex<HashMap<String, Location>>>,
     next_location_id: Arc<Mutex<u64>>,
     location_state_path: Option<PathBuf>,
@@ -817,6 +821,7 @@ impl AppState {
             binding_state_path: None,
             projects: Arc::new(Mutex::new(HashMap::new())),
             next_project_id: Arc::new(Mutex::new(1)),
+            next_goal_id: Arc::new(Mutex::new(1)),
             project_state_path: None,
             locations: Arc::new(Mutex::new(HashMap::new())),
             next_location_id: Arc::new(Mutex::new(1)),
@@ -2007,6 +2012,10 @@ impl AppState {
                         drop(current);
                         let mut current = self.next_approval_id.lock().expect("approval id lock");
                         *current = (*current).max(next_appr);
+                    }
+                    if let Ok(next_goal) = sqlite_store::next_goal_number(&conn) {
+                        let mut current = self.next_goal_id.lock().expect("goal id lock");
+                        *current = (*current).max(next_goal);
                     }
                 }
                 self.sqlite = Some(Arc::new(Mutex::new(conn)));
@@ -7567,6 +7576,130 @@ async fn projects_archive(
     Json(updated).into_response()
 }
 
+// --- Goals (D1-1) ---
+//
+// A Goal is a first-class object a Task can link to
+// (goal_id), managed directly like Project: no Effect, no
+// approval loop (direct management actions, same rationale
+// as the server.rs:7334-7341 comment on the four JSONL
+// stores). SQLite only, no JSONL mirror. Archive is a
+// status flip, never a delete; list hides archived rows,
+// detail still reads them. Writes require SQLite mode
+// (same fail-closed rule as the assignment takeover);
+// reads serve whenever SQLite is attached.
+
+const GOAL_ACTIVE: &str = "active";
+
+#[derive(Debug, Deserialize)]
+struct GoalCreateDto {
+    title: Option<String>,
+    description: Option<String>,
+}
+
+async fn goals_create(
+    State(state): State<AppState>,
+    Json(req): Json<GoalCreateDto>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let Some(title) = req.title.filter(|t| !t.trim().is_empty()) else {
+        return bad_request("title is required");
+    };
+    let mut next = state.next_goal_id.lock().expect("goal id lock");
+    let id = format!("goal-{}", *next);
+    *next += 1;
+    drop(next);
+    let now = now_ms();
+    let record = sqlite_store::GoalRow {
+        goal_id: id,
+        title,
+        description: req.description.unwrap_or_default(),
+        status: GOAL_ACTIVE.to_string(),
+        created_ms: now,
+        updated_ms: now,
+        origin_device_id: state.origin_device_id.clone(),
+        schema_version: 1,
+    };
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    if let Err(detail) = sqlite_store::insert_goal(&mut conn, &record) {
+        eprintln!("warning: goal insert failed ({detail})");
+        return sqlite_error_response();
+    }
+    Json(record).into_response()
+}
+
+async fn goals_list(State(state): State<AppState>) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::list_goals(&conn) {
+        Ok(records) => Json(records).into_response(),
+        Err(detail) => {
+            eprintln!("warning: goal list failed ({detail})");
+            sqlite_error_response()
+        }
+    }
+}
+
+async fn goals_get(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    let conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::get_goal(&conn, &id) {
+        Ok(Some(record)) => Json(record).into_response(),
+        Ok(None) => unknown_record("goal"),
+        Err(detail) => {
+            eprintln!("warning: goal get failed ({detail})");
+            sqlite_error_response()
+        }
+    }
+}
+
+async fn goals_archive(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    // A goal is pure metadata: archive is always allowed.
+    // Existing references keep reading back with status
+    // archived; nothing is deleted or unlinked.
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::archive_goal(&mut conn, &id) {
+        Ok(Some(record)) => Json(record).into_response(),
+        Ok(None) => unknown_record("goal"),
+        Err(detail) => {
+            eprintln!("warning: goal archive failed ({detail})");
+            sqlite_error_response()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct LocationCreateDto {
     workspace_id: Option<String>,
@@ -8923,6 +9056,14 @@ async fn feed_units_seen(
 #[derive(Debug, Deserialize)]
 struct TaskCreateDto {
     directory: String,
+    /// D1-1: structural links to the scene the task serves.
+    /// Optional; absent stays None (unlinked).
+    #[serde(default)]
+    goal_id: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8941,6 +9082,16 @@ struct TaskUpdateDto {
     task_id: String,
     status: String,
     artifact_path: Option<String>,
+    /// D1-1: link fields, same shape as the create DTO.
+    /// Present values replace the link; absent leaves it.
+    /// (No clearing through this route: absent and null
+    /// are indistinguishable in the DTO.)
+    #[serde(default)]
+    goal_id: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
 }
 
 fn valid_task_status(status: &str) -> bool {
@@ -9296,11 +9447,22 @@ fn build_workspace_snapshot(
         .unwrap_or(absolute)
         .to_string_lossy()
         .into_owned();
-    // Connector ids: connected connections, excluding a
+    // D1-1 content digest: same canonical-JSON + SHA-256
+    // algorithm as `snapshot_content_sha256`, applied to one
+    // source's content (handle + status, no secret, no
+    // timestamps) so a config drift changes the snapshot
+    // hash while a routine heartbeat does not.
+    let content_digest = |value: serde_json::Value| {
+        sqlite_store::sha256_hex(sqlite_store::canonical_json(&value).as_bytes())
+    };
+    // Connector entries: connected connections, excluding a
     // connector whose accounts are all unlinked (connected
     // lives on the connection row, unlinked on the account row;
     // a connector with no accounts at all still counts when its
-    // connection says connected). Sorted, deduplicated.
+    // connection says connected). Each entry is
+    // "<id>:sha256:<digest>" where the digest covers the
+    // connection state and the account handles only.
+    // Sorted, deduplicated.
     let connections = state.connector_connections.lock().expect("connector connections lock");
     let accounts = state.connector_accounts.lock().expect("connector accounts lock");
     let mut connector_ids: Vec<String> = connections
@@ -9311,18 +9473,50 @@ fn build_workspace_snapshot(
             let rows: Vec<_> = accounts.values().filter(|a| &a.connector_id == id).collect();
             rows.is_empty() || rows.iter().any(|a| !a.unlinked)
         })
+        .map(|id| {
+            let mut handles: Vec<(&str, bool)> = accounts
+                .values()
+                .filter(|a| a.connector_id == id)
+                .map(|a| (a.account_id.as_str(), a.unlinked))
+                .collect();
+            handles.sort();
+            let digest = content_digest(serde_json::json!({
+                "accounts": handles
+                    .iter()
+                    .map(|(account_id, unlinked)| serde_json::json!({
+                        "account_id": account_id,
+                        "unlinked": unlinked,
+                    }))
+                    .collect::<Vec<_>>(),
+                "connected": true,
+                "connector_id": id,
+            }));
+            format!("{id}:sha256:{digest}")
+        })
         .collect();
     drop(accounts);
     drop(connections);
     connector_ids.sort();
     connector_ids.dedup();
+    // Device entries: non-unpaired nodes, same
+    // "<id>:sha256:<digest>" shape. The digest covers the
+    // node's identity and status only — no heartbeat or
+    // creation timestamps.
     let mut device_ids: Vec<String> = state
         .nodes
         .lock()
         .expect("node lock")
         .values()
         .filter(|node| !node.unpaired)
-        .map(|node| node.node_id.clone())
+        .map(|node| {
+            let digest = content_digest(serde_json::json!({
+                "name": node.name,
+                "node_id": node.node_id,
+                "status": node.status,
+                "unpaired": node.unpaired,
+            }));
+            format!("{}:sha256:{digest}", node.node_id)
+        })
         .collect();
     device_ids.sort();
     device_ids.dedup();
@@ -9339,6 +9533,9 @@ fn build_workspace_snapshot(
         connector_ids_json: serde_json::to_string(&connector_ids).expect("connector ids serialize"),
         device_ids_json: serde_json::to_string(&device_ids).expect("device ids serialize"),
         policy_binding_ids_json,
+        // D1-1 placeholder: the real scope value is filled
+        // in by D1-5 (Q-D1-52); this batch only annotates the
+        // hardcoded "default", it does not change the value.
         memory_scope: "default".to_string(),
         instruction_digest: instruction_digest.to_string(),
         origin_device_id: state.origin_device_id.clone(),
@@ -9356,17 +9553,37 @@ pub(crate) fn create_execution(
     task_id: Option<String>,
     loop_id: Option<String>,
 ) -> ExecutionFileRecord {
-    create_execution_with_binding(state, task_id, loop_id, None)
+    // D1-1: a task execution serves the task's linked goal,
+    // resolved from the Task record here. Tasks carry no
+    // session in their request, so session_id stays None
+    // for task executions (loop executions pass theirs
+    // from the loop start caller).
+    let goal_id = task_id.as_ref().and_then(|id| {
+        state
+            .tasks
+            .lock()
+            .expect("task lock")
+            .get(id)
+            .and_then(|record| record.goal_id.clone())
+    });
+    create_execution_with_binding(state, task_id, loop_id, None, None, goal_id)
 }
 
 /// P3-A: Execution creation with an optional frozen binding.
 /// The snapshot's three binding columns come from here; every
 /// other creation path passes `None` and keeps them NULL.
+/// D1-1: `session_id` and `goal_id` are passed through by
+/// the caller that has them (loop start passes both from
+/// the StartLoop request; task executions resolve the goal
+/// from the Task record in `create_execution` above and
+/// pass no session; worker runs and adapters pass neither).
 pub(crate) fn create_execution_with_binding(
     state: &AppState,
     task_id: Option<String>,
     loop_id: Option<String>,
     binding: Option<SnapshotBinding>,
+    session_id: Option<String>,
+    goal_id: Option<String>,
 ) -> ExecutionFileRecord {
     let mut next = state.next_execution_id.lock().expect("execution id lock");
     let number = *next;
@@ -9404,7 +9621,8 @@ pub(crate) fn create_execution_with_binding(
         execution_id: id,
         task_id,
         loop_id,
-        session_id: None,
+        session_id,
+        goal_id,
         worker_session_id,
         workspace_snapshot_id: snapshot.as_ref().map(|row| row.snapshot_id.clone()),
         status: "running".to_string(),
@@ -11601,15 +11819,44 @@ async fn tasks_create(
         draft_sha256: None,
         draft_bytes: None,
         execute_binding: None,
+        goal_id: req.goal_id,
+        project_id: req.project_id,
+        workspace_id: req.workspace_id,
     };
     state.tasks.lock().expect("task lock").insert(record.task_id.clone(), record.clone());
     persist_task(&state, &record);
     Json(record).into_response()
 }
 
-async fn tasks_list(State(state): State<AppState>) -> Json<Vec<TaskFileRecord>> {
+/// D1-1: list filters. Each is an exact match on the
+/// task's link field; absent means no filter on that
+/// dimension. No new route: the filters ride the existing
+/// list query.
+#[derive(Debug, Deserialize)]
+struct TaskListQuery {
+    #[serde(default)]
+    goal_id: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+async fn tasks_list(
+    State(state): State<AppState>,
+    Query(query): Query<TaskListQuery>,
+) -> Json<Vec<TaskFileRecord>> {
     let mut records: Vec<TaskFileRecord> =
         state.tasks.lock().expect("task lock").values().cloned().collect();
+    if let Some(goal_id) = &query.goal_id {
+        records.retain(|r| r.goal_id.as_deref() == Some(goal_id.as_str()));
+    }
+    if let Some(project_id) = &query.project_id {
+        records.retain(|r| r.project_id.as_deref() == Some(project_id.as_str()));
+    }
+    if let Some(workspace_id) = &query.workspace_id {
+        records.retain(|r| r.workspace_id.as_deref() == Some(workspace_id.as_str()));
+    }
     records.sort_by_key(|r| task_number(&r.task_id));
     Json(records)
 }
@@ -11643,6 +11890,17 @@ async fn tasks_update(
     record.status = req.status;
     if let Some(path) = req.artifact_path {
         record.artifact_path = Some(path);
+    }
+    // D1-1: changing a link does not freeze anything —
+    // freezing is still `execute_binding`'s job.
+    if let Some(goal_id) = req.goal_id {
+        record.goal_id = Some(goal_id);
+    }
+    if let Some(project_id) = req.project_id {
+        record.project_id = Some(project_id);
+    }
+    if let Some(workspace_id) = req.workspace_id {
+        record.workspace_id = Some(workspace_id);
     }
     let updated = record.clone();
     persist_task(&state, &updated);
@@ -13102,6 +13360,8 @@ pub(crate) async fn create_worker_run_internal(
                     worktree_id: binding.worktree_id.clone(),
                     root_digest: binding.root_digest.clone(),
                 }),
+                None,
+                None,
             )
             .execution_id
         }
@@ -15004,10 +15264,19 @@ async fn loop_start(
             Err(detail) => return bad_request(detail),
         },
     };
+    let session_id = req.session_id.clone();
+    let goal_id = req.goal_id.clone();
     let result = state.loops.start(req);
     if let Ok(view) = &result {
         // P0 phase 1: the loop attempt gets its Execution shell record.
-        create_execution_with_binding(&state, None, Some(view.record.loop_id.clone()), binding);
+        create_execution_with_binding(
+            &state,
+            None,
+            Some(view.record.loop_id.clone()),
+            binding,
+            session_id,
+            goal_id,
+        );
         spawn_driver(&state, &view.record.loop_id);
     }
     loop_response(&state, result)
@@ -15121,6 +15390,11 @@ pub fn app(state: AppState) -> Router {
         .route("/projects/list", get(projects_list))
         .route("/projects/{id}", get(projects_get))
         .route("/projects/{id}/archive", post(projects_archive))
+        // D1-1: goals (4 routes).
+        .route("/goals/create", post(goals_create))
+        .route("/goals/list", get(goals_list))
+        .route("/goals/{id}", get(goals_get))
+        .route("/goals/{id}/archive", post(goals_archive))
         .route("/locations/create", post(locations_create))
         .route("/locations/list", get(locations_list))
         .route("/locations/{id}", get(locations_get))

@@ -171,6 +171,7 @@ async fn p0d_import_switch_restart_and_export_equivalence() {
             task_id: Some("task-9".to_string()),
             loop_id: None,
             session_id: None,
+            goal_id: None,
             worker_session_id: None,
             workspace_snapshot_id: None,
             status: "running".to_string(),

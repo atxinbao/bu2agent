@@ -347,6 +347,14 @@ pub struct StartLoop {
     /// snapshot freezes this worktree's location, id, and root
     /// digest; absent means unbound (today's behaviour).
     pub worktree_id: Option<String>,
+    /// D1-1: originating conversation session, when one
+    /// exists. Passed through to the loop's Execution
+    /// (create_execution_with_binding); absent stays None.
+    pub session_id: Option<String>,
+    /// D1-1: goal the loop serves, when one is linked.
+    /// Passed through to the loop's Execution; absent stays
+    /// None.
+    pub goal_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

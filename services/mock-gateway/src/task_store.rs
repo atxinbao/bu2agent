@@ -52,6 +52,17 @@ pub struct TaskFileRecord {
     /// as None (unfrozen).
     #[serde(default)]
     pub execute_binding: Option<TaskExecuteBinding>,
+    /// D1-1: structural links to the scene the task serves.
+    /// Optional, set at create or via update; old JSONL
+    /// lines load as None (unlinked). Changing a link does
+    /// not freeze anything — freezing is still
+    /// `execute_binding`'s job.
+    #[serde(default)]
+    pub goal_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 pub fn load_tasks(path: &Path) -> Vec<TaskFileRecord> {
@@ -183,6 +194,9 @@ mod tests {
                 draft_sha256: None,
                 draft_bytes: None,
                 execute_binding: None,
+                goal_id: None,
+                project_id: None,
+                workspace_id: None,
             },
         );
         append_task(
@@ -197,6 +211,9 @@ mod tests {
                 draft_sha256: None,
                 draft_bytes: None,
                 execute_binding: None,
+                goal_id: None,
+                project_id: None,
+                workspace_id: None,
             },
         );
         let records = load_tasks(&path);
@@ -219,6 +236,9 @@ mod tests {
                 draft_sha256: None,
                 draft_bytes: None,
                 execute_binding: None,
+                goal_id: None,
+                project_id: None,
+                workspace_id: None,
             },
             TaskFileRecord {
                 task_id: "other".to_string(),
@@ -230,6 +250,9 @@ mod tests {
                 draft_sha256: None,
                 draft_bytes: None,
                 execute_binding: None,
+                goal_id: None,
+                project_id: None,
+                workspace_id: None,
             },
         ];
         assert_eq!(next_task_number(&records), 4);

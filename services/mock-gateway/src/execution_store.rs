@@ -50,6 +50,13 @@ pub struct ExecutionFileRecord {
     /// only reserves the field; no creation path sets it yet.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Goal this execution serves, when one is linked. D1-1:
+    /// resolved from the Task record for task executions,
+    /// passed by the loop start caller for loop executions;
+    /// None for adapter/direct executions and for rows
+    /// written before the v5 backfill.
+    #[serde(default)]
+    pub goal_id: Option<String>,
     /// Worker session currently driving this execution. P0-A
     /// only reserves the field; WorkerSession storage is later.
     #[serde(default)]
@@ -212,6 +219,7 @@ mod tests {
                 task_id: Some("task-1".to_string()),
                 loop_id: None,
                 session_id: None,
+                goal_id: None,
                 worker_session_id: None,
                 workspace_snapshot_id: None,
                 status: "running".to_string(),
@@ -226,6 +234,7 @@ mod tests {
                 task_id: Some("task-1".to_string()),
                 loop_id: None,
                 session_id: None,
+                goal_id: None,
                 worker_session_id: None,
                 workspace_snapshot_id: None,
                 status: "completed".to_string(),
@@ -268,6 +277,7 @@ mod tests {
                 task_id: Some("task-1".to_string()),
                 loop_id: None,
                 session_id: Some("session-1".to_string()),
+                goal_id: None,
                 worker_session_id: None,
                 workspace_snapshot_id: None,
                 status: "running".to_string(),

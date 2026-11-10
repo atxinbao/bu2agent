@@ -35,6 +35,7 @@ use agent_desktop::model_client::{ModelClient, ModelView};
 use agent_desktop::config_client::{ConfigClient, ConfigView};
 use agent_desktop::peer_client::{Peer, PeerClient, PeerInboxMessage, PeerInvite, PeerRequest, PeerStatus};
 use agent_desktop::space_client::{Space, SpaceClient, SpaceItem};
+use agent_desktop::goals_client::{Goal, GoalClient};
 use agent_desktop::feed_client::{FeedClient, FeedSeenResult, FeedStatus, FeedUnit};
 use agent_desktop::chat_records_client::{
     ChatRecordsClient, ChatThemes, ChatTurnView, HistoryWindow, SearchMatch, SeenResult,
@@ -731,6 +732,37 @@ pub fn space_save(
 #[tauri::command(rename_all = "snake_case")]
 pub fn space_delete(slug: String) -> Result<Space, String> {
     space_client()?.delete_space(&slug).map_err(agent_err_string)
+}
+
+// --- Goals surface (D1-1, minimal list/detail) ---
+//
+// All commands carry rename_all = "snake_case" (Task 9
+// lesson): the invoke client sends snake_case params.
+
+fn goal_client() -> Result<GoalClient, String> {
+    GoalClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn goal_list() -> Result<Vec<Goal>, String> {
+    goal_client()?.list_goals().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn goal_get(goal_id: String) -> Result<Goal, String> {
+    goal_client()?.get_goal(&goal_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn goal_create(title: String, description: Option<String>) -> Result<Goal, String> {
+    goal_client()?
+        .create_goal(&title, description.as_deref())
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn goal_archive(goal_id: String) -> Result<Goal, String> {
+    goal_client()?.archive_goal(&goal_id).map_err(agent_err_string)
 }
 
 // --- Feed surface (Task 17, unit subset) ---

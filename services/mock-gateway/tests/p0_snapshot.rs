@@ -115,6 +115,9 @@ fn task_record(
         draft_sha256: None,
         draft_bytes: None,
         execute_binding: None,
+        goal_id: None,
+        project_id: None,
+        workspace_id: None,
     }
 }
 
