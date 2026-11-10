@@ -683,8 +683,11 @@ async fn e2d_progress_visible_while_running() {
 
 /// D5 (§6): `worker.wait` waits for the run's terminal
 /// state and returns its status + effect_id. The loop
-/// enqueues a git-worktree-add run, then waits for it; the
-/// wait's returned body is asserted through the loop view's
+/// enqueues a git-worktree-add run, then waits for it (up to
+/// three 10 s wait rounds: a slow runner can leave the run
+/// still "running" after a single wait, and the loop would
+/// then complete with the run unfinished); the last wait's
+/// returned body is asserted through the loop view's
 /// `body_digest` (the view exposes no body).
 #[tokio::test]
 async fn e2d_loop_waits_for_run_terminal() {
@@ -695,6 +698,15 @@ async fn e2d_loop_waits_for_run_terminal() {
     std::fs::create_dir_all(repo.join("scratch")).unwrap();
     let h = Harness::serve(vec![], Some(real_git()), Some(real_cargo())).await;
     let worktree = h.setup_worktree(&repo).await;
+    // Three wait rounds, not one: a slow runner (Windows CI)
+    // can leave the git-worktree-add run still "running" after
+    // a single 10 s wait (the approved worker.wait cap), and
+    // the loop would then complete with the run unfinished.
+    // Each wait returns the terminal shape as soon as the run
+    // is terminal, so the last wait is the one that must carry
+    // it; earlier waits may legitimately return "running".
+    // Three rounds stay one proposal under the loop's
+    // max_calls cap of 5 (run + 3 waits = 4).
     h.set_replies(vec![
         worker_run_proposal(
             &worktree,
@@ -703,20 +715,23 @@ async fn e2d_loop_waits_for_run_terminal() {
             None,
         ),
         worker_wait_proposal("run-1", None),
+        worker_wait_proposal("run-1", None),
+        worker_wait_proposal("run-1", None),
         done(),
     ]);
     let loop_id = h.start_with_worktree(&worktree).await;
     let (approval, binding) = h.await_approval(&loop_id).await;
     let _ = h.approve_and_resume(&loop_id, &approval, &binding).await;
     let view = h.drive_to_completed(&loop_id).await;
-    let row = h.run("run-1").await;
+    let row = h.wait_run("run-1", 60).await;
     assert_eq!(row["status"], "succeeded", "{row}");
     let effect_id = row["effect_id"].as_str().unwrap().to_string();
-    // The wait call succeeded and its body is exactly the
+    // The last wait call succeeded and its body is exactly the
     // terminal shape: status + effect_id + run_id.
     let waits = h.calls_for(&view, "worker.wait");
-    assert_eq!(waits.len(), 1, "{view}");
-    assert_eq!(waits[0]["status"], "succeeded", "{waits:?}");
+    assert_eq!(waits.len(), 3, "{view}");
+    let last = waits.last().unwrap();
+    assert_eq!(last["status"], "succeeded", "{waits:?}");
     let expected = serde_json::to_string(&json!({
         "effect_id": effect_id,
         "run_id": "run-1",
@@ -724,11 +739,11 @@ async fn e2d_loop_waits_for_run_terminal() {
     }))
     .unwrap();
     assert_eq!(
-        waits[0]["result"]["body_digest"]["sha256"],
+        last["result"]["body_digest"]["sha256"],
         sha256_hex(expected.as_bytes())
     );
     assert_eq!(
-        waits[0]["result"]["body_digest"]["bytes"],
+        last["result"]["body_digest"]["bytes"],
         expected.len()
     );
     // The run's Effect is the one the wait returned.
