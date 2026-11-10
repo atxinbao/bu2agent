@@ -487,6 +487,11 @@ pub struct AppState {
     // goals); the counter is the id allocator, seeded from
     // the mandates table on restart.
     next_mandate_id: Arc<Mutex<u64>>,
+    // D1-5: memories live in SQLite only (same shape as
+    // goals/mandates); the counter is the id allocator,
+    // seeded from both memory tables on restart. One
+    // global `memory-N` sequence across the two tables.
+    next_memory_id: Arc<Mutex<u64>>,
     // D1-4: the Source Registry read cache (the SQLite
     // `sources` table is the fact source; this map is
     // rebuilt from it at startup). Empty until a SQLite
@@ -857,6 +862,7 @@ impl AppState {
             next_project_id: Arc::new(Mutex::new(1)),
             next_goal_id: Arc::new(Mutex::new(1)),
             next_mandate_id: Arc::new(Mutex::new(1)),
+            next_memory_id: Arc::new(Mutex::new(1)),
             source_registry: crate::source_registry::SourceRegistry::new(),
             files_last_tree: Arc::new(Mutex::new(HashMap::new())),
             project_state_path: None,
@@ -2057,6 +2063,10 @@ impl AppState {
                     if let Ok(next_mandate) = sqlite_store::next_mandate_number(&conn) {
                         let mut current = self.next_mandate_id.lock().expect("mandate id lock");
                         *current = (*current).max(next_mandate);
+                    }
+                    if let Ok(next_memory) = crate::memory_store::next_memory_number(&conn) {
+                        let mut current = self.next_memory_id.lock().expect("memory id lock");
+                        *current = (*current).max(next_memory);
                     }
                     // D1-2 (Q-D1-21): one-time Policy import
                     // (v1 from the JSONL-loaded document when
@@ -8563,6 +8573,252 @@ async fn goals_archive(
     }
 }
 
+// D1-5 (Q-D1-51–Q-D1-54): memories are direct-managed
+// metadata like Goals (no Effect, no approval loop,
+// SQLite only, no JSONL mirror). Save is user-explicit
+// only — nothing extracts memories automatically.
+// Writes require SQLite mode (same fail-closed rule as
+// the assignment takeover); reads serve whenever SQLite
+// is attached. Delete is a tombstone, never a physical
+// delete; list hides tombstones, detail still reads them.
+//
+// Save DTO (LOCAL DEFINITION — the plan names the
+// scope triple and the provenance fields but leaves
+// the request shape unspecified):
+//   {
+//     "layer": "project" | "user",
+//     "content": "...",
+//     "scope": {"workspace_id"?, "project_id"?, "session_id"?},
+//     "current_scope": {"workspace_id"?, "project_id"?, "session_id"?},
+//     "source": {"session_id"?, "execution_id"?, "source_id"?,
+//                "author": "..."}
+//   }
+// `current_scope` is the caller's declared current
+// scope (there is no server-side "current scope").
+// A save whose scope differs from current_scope is
+// rejected with 409 `memory_scope_mismatch` (the code
+// Q-D1-52 leaves open; §6 M2 names 409). The user
+// layer uses the all-empty (global) scope only.
+
+#[derive(Debug, Deserialize)]
+struct MemoryScopeDto {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemorySourceDto {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    execution_id: Option<String>,
+    #[serde(default)]
+    source_id: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemorySaveDto {
+    layer: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    scope: Option<MemoryScopeDto>,
+    #[serde(default)]
+    current_scope: Option<MemoryScopeDto>,
+    #[serde(default)]
+    source: Option<MemorySourceDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryListQuery {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    layer: Option<String>,
+}
+
+/// Blank or whitespace-only strings are absent, same
+/// normalization as the location/project create DTOs.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
+fn memory_scope_from(dto: Option<MemoryScopeDto>) -> crate::memory_store::MemoryScope {
+    let dto = dto.unwrap_or(MemoryScopeDto {
+        workspace_id: None,
+        project_id: None,
+        session_id: None,
+    });
+    crate::memory_store::MemoryScope {
+        workspace_id: non_empty(dto.workspace_id),
+        project_id: non_empty(dto.project_id),
+        session_id: non_empty(dto.session_id),
+    }
+}
+
+async fn memories_save(
+    State(state): State<AppState>,
+    Json(req): Json<MemorySaveDto>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let Some(layer) = non_empty(req.layer) else {
+        return bad_request("layer is required");
+    };
+    if layer != "project" && layer != "user" {
+        return bad_request("layer must be 'project' or 'user'");
+    }
+    let Some(content) = non_empty(req.content) else {
+        return bad_request("content is required");
+    };
+    let Some(source) = req.source else {
+        return bad_request("source is required");
+    };
+    let Some(author) = non_empty(source.author) else {
+        return bad_request("source.author is required");
+    };
+    let scope = memory_scope_from(req.scope);
+    let current_scope = memory_scope_from(req.current_scope);
+    // Q-D1-52: the user layer is global — it carries no
+    // scope triple of its own.
+    if layer == "user" && !scope.is_empty() {
+        return bad_request("user memories use the empty (global) scope");
+    }
+    // Q-D1-52: write to a scope other than the caller's
+    // current scope is rejected (409 per §6 M2).
+    if scope.canonical() != current_scope.canonical() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "memory_scope_mismatch"})),
+        )
+            .into_response();
+    }
+    let mut next = state.next_memory_id.lock().expect("memory id lock");
+    let id = format!("memory-{}", *next);
+    *next += 1;
+    drop(next);
+    let now = now_ms();
+    let provenance = crate::memory_store::MemorySource {
+        session_id: non_empty(source.session_id),
+        execution_id: non_empty(source.execution_id),
+        source_id: non_empty(source.source_id),
+        author,
+        created_ms: now,
+    };
+    let record = crate::memory_store::MemoryRow {
+        memory_id: id,
+        layer,
+        scope_json: scope.canonical(),
+        content,
+        source_json: provenance.canonical(),
+        created_ms: now,
+        updated_ms: now,
+        deleted: false,
+        origin_device_id: state.origin_device_id.clone(),
+        schema_version: 1,
+    };
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    if let Err(detail) = crate::memory_store::insert_memory(&mut conn, &record) {
+        eprintln!("warning: memory insert failed ({detail})");
+        return sqlite_error_response();
+    }
+    Json(record).into_response()
+}
+
+async fn memories_list(
+    State(state): State<AppState>,
+    Query(query): Query<MemoryListQuery>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if let Some(layer) = &query.layer {
+        if layer != "project" && layer != "user" {
+            return bad_request("layer must be 'project' or 'user'");
+        }
+    }
+    let scope = crate::memory_store::MemoryScope {
+        workspace_id: non_empty(query.workspace_id),
+        project_id: non_empty(query.project_id),
+        session_id: non_empty(query.session_id),
+    };
+    let conn = sqlite.lock().expect("sqlite lock");
+    match crate::memory_store::list_memories(&conn, query.layer.as_deref(), &scope) {
+        Ok(records) => Json(records).into_response(),
+        Err(detail) => {
+            eprintln!("warning: memory list failed ({detail})");
+            sqlite_error_response()
+        }
+    }
+}
+
+async fn memories_get(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    let conn = sqlite.lock().expect("sqlite lock");
+    match crate::memory_store::get_memory(&conn, &id) {
+        Ok(Some(record)) => Json(record).into_response(),
+        Ok(None) => unknown_record("memory"),
+        Err(detail) => {
+            eprintln!("warning: memory get failed ({detail})");
+            sqlite_error_response()
+        }
+    }
+}
+
+async fn memories_delete(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    // Tombstone only: the text stays on disk. A re-delete
+    // returns the current row (no second event).
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    match crate::memory_store::delete_memory(&mut conn, &id, &state.origin_device_id) {
+        Ok(Some(record)) => Json(record).into_response(),
+        Ok(None) => unknown_record("memory"),
+        Err(detail) => {
+            eprintln!("warning: memory delete failed ({detail})");
+            sqlite_error_response()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct LocationCreateDto {
     workspace_id: Option<String>,
@@ -10378,6 +10634,7 @@ fn build_workspace_snapshot(
     snapshot_id: &str,
     instruction_digest: &str,
     binding: Option<&SnapshotBinding>,
+    scope: &crate::memory_store::MemoryScope,
 ) -> sqlite_store::SnapshotRow {
     let home = match &state.sqlite_path {
         Some(path) => path.parent().map(|parent| parent.to_path_buf()),
@@ -10480,10 +10737,14 @@ fn build_workspace_snapshot(
         connector_ids_json: serde_json::to_string(&connector_ids).expect("connector ids serialize"),
         device_ids_json: serde_json::to_string(&device_ids).expect("device ids serialize"),
         policy_binding_ids_json,
-        // D1-1 placeholder: the real scope value is filled
-        // in by D1-5 (Q-D1-52); this batch only annotates the
-        // hardcoded "default", it does not change the value.
-        memory_scope: "default".to_string(),
+        // D1-5 (Q-D1-52): the snapshot freezes the scope
+        // triple of the Execution's binding — the Task's
+        // workspace/project links plus the caller's
+        // session. No binding at all means the all-empty
+        // (global) triple, canonical "{}". Old rows are
+        // untouched (insert-only), so their frozen scope
+        // stays byte-identical.
+        memory_scope: scope.canonical(),
         instruction_digest: instruction_digest.to_string(),
         origin_device_id: state.origin_device_id.clone(),
         schema_version: 1,
@@ -10554,12 +10815,30 @@ pub(crate) fn create_execution_with_binding(
         sqlite_store::sha256_hex(b"")
     };
     let worker_session_id = state.current_worker_session();
+    // D1-5 (Q-D1-52): the scope triple frozen into the
+    // snapshot is derived from the Execution's binding —
+    // the Task record's workspace/project links (when
+    // this is a task execution) plus the caller's
+    // session_id. There is no server-side "current
+    // scope": loop executions without a task carry no
+    // workspace/project, adapter executions carry none
+    // of the three. goal_id is NOT part of the triple.
+    let scope = {
+        let tasks = state.tasks.lock().expect("task lock");
+        let task = task_id.as_ref().and_then(|id| tasks.get(id));
+        crate::memory_store::MemoryScope {
+            workspace_id: task.and_then(|t| t.workspace_id.clone()),
+            project_id: task.and_then(|t| t.project_id.clone()),
+            session_id: session_id.clone(),
+        }
+    };
     let snapshot = if state.sqlite.is_some() {
         Some(build_workspace_snapshot(
             state,
             &format!("snapshot-{number}"),
             &instruction_digest,
             binding.as_ref(),
+            &scope,
         ))
     } else {
         None
@@ -16409,6 +16688,10 @@ pub fn app(state: AppState) -> Router {
         .route("/goals/list", get(goals_list))
         .route("/goals/{id}", get(goals_get))
         .route("/goals/{id}/archive", post(goals_archive))
+        .route("/memories/save", post(memories_save))
+        .route("/memories/list", get(memories_list))
+        .route("/memories/{id}", get(memories_get))
+        .route("/memories/{id}/delete", post(memories_delete))
         // D1-2: policy versions + mandates (3 routes).
         .route("/policies/versions", get(policies_versions_list))
         .route("/mandates", get(mandates_list))

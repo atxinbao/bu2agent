@@ -645,13 +645,13 @@ async fn p0e_snapshot_immutable_and_gate_live() {
         .expect("snapshot")
         .expect("snapshot row");
     // Adapter execution: empty-template digest (the well-known
-    // SHA-256 of ""), placeholder memory scope, gateway home
-    // as the files_root approximation.
+    // SHA-256 of ""), empty scope triple (no task, loop, or
+    // session), gateway home as the files_root approximation.
     assert_eq!(
         before.instruction_digest,
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     );
-    assert_eq!(before.memory_scope, "default");
+    assert_eq!(before.memory_scope, "{}");
     let home = dir.canonicalize().unwrap().to_string_lossy().into_owned();
     assert_eq!(before.files_root, home);
     assert_eq!(before.connector_ids_json, "[]");

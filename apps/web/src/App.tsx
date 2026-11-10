@@ -41,6 +41,8 @@ import { GoalsView } from "./views/GoalsView";
 import { SourceClient, type SourceGateway } from "./domain/sources_client";
 import { InvokeSourceClient } from "./domain/invoke_sources_client";
 import { SourcesView } from "./views/SourcesView";
+import { MemoryClient, type MemoryGateway } from "./domain/memories_client";
+import { MemoriesView } from "./views/MemoriesView";
 import { FeedClient, type FeedGateway } from "./domain/feed_client";
 import { InvokeFeedClient } from "./domain/invoke_feed_client";
 import { ChatRecordsClient, type ChatRecordsGateway } from "./domain/chat_records_client";
@@ -157,6 +159,14 @@ interface Clients {
   spaces: SpaceGateway;
   goals: GoalGateway;
   sources: SourceGateway;
+  // D1-5: optional — only the HTTP branch sets it. There
+  // is no InvokeMemoryClient and no shell memory command
+  // in this batch (the plan names neither), and the HTTP
+  // client cannot serve the Tauri webview anyway: the
+  // gateway CORS layer allows only :5173 origins, not
+  // tauri://localhost. The Memories tab shows a note in
+  // the packaged app until a later batch wires invoke.
+  memories?: MemoryGateway;
   feed: FeedGateway;
   chatRecords: ChatRecordsGateway;
   nodes: NodeGateway;
@@ -170,7 +180,7 @@ interface Clients {
   engineering: EngineeringGateway;
 }
 
-type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "goals" | "sources" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "notes" | "engineering" | "patches" | "settings";
+type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "goals" | "sources" | "memories" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "notes" | "engineering" | "patches" | "settings";
 
 // Visible navigation: the workbench (sessions) is the only
 // chat entry and the default view (R1, 2026-10-28). The legacy
@@ -184,6 +194,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "tasks", label: "Tasks" },
   { id: "goals", label: "Goals" },
   { id: "sources", label: "Sources" },
+  { id: "memories", label: "Memories" },
   { id: "devices", label: "Devices" },
   { id: "reminders", label: "Reminders" },
   { id: "loops", label: "Loops" },
@@ -258,6 +269,8 @@ export function App() {
           spaces: new InvokeSpaceClient(),
           goals: new InvokeGoalClient(),
           sources: new InvokeSourceClient(),
+          // D1-5: no InvokeMemoryClient in this batch —
+          // memories stays unset in the invoke branch.
           feed: new InvokeFeedClient(),
           chatRecords: new InvokeChatRecordsClient(),
           nodes: new InvokeNodeClient(),
@@ -289,6 +302,7 @@ export function App() {
           spaces: new SpaceClient(MOCK_BASE_URL),
           goals: new GoalClient(MOCK_BASE_URL),
           sources: new SourceClient(MOCK_BASE_URL),
+          memories: new MemoryClient(MOCK_BASE_URL),
           feed: new FeedClient(MOCK_BASE_URL),
           chatRecords: new ChatRecordsClient(MOCK_BASE_URL),
           nodes: new NodeClient(MOCK_BASE_URL),
@@ -622,6 +636,17 @@ export function App() {
           <p className="empty">Choosing transport…</p>
         ) : (
           <SourcesView client={clients.sources} />
+        ))}
+      {tab === "memories" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : clients.memories === undefined ? (
+          <p className="note">
+            Memories need a shell client in the packaged app — not wired in
+            this batch. They work in browser preview over HTTP.
+          </p>
+        ) : (
+          <MemoriesView client={clients.memories} />
         ))}
       {tab === "feed" &&
         (clients === null ? (

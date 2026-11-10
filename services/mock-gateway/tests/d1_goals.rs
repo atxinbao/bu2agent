@@ -374,8 +374,10 @@ async fn g3_execution_binds_session_and_goal() {
 /// connector's connection state changes, the new
 /// Execution's snapshot digest changes, while the old
 /// snapshot row stays byte-identical — including after a
-/// gateway restart. `memory_scope` is still the "default"
-/// placeholder this batch (D1-5 fills the real value).
+/// gateway restart. `memory_scope` is the scope triple:
+/// this loop carries no session and no task, so the
+/// all-empty (global) triple "{}" (D1-5 fills the real
+/// value; D1-1's "default" placeholder is gone).
 #[tokio::test]
 async fn g4_snapshot_content_drift_detectable() {
     let mut h = Harness::serve(vec![done(), done()]).await;
@@ -393,7 +395,7 @@ async fn g4_snapshot_content_drift_detectable() {
             .expect("snapshot-1 exists")
     };
     let snap1_json = serde_json::to_string(&snap1).unwrap();
-    assert_eq!(snap1.memory_scope, "default");
+    assert_eq!(snap1.memory_scope, "{}");
     assert_eq!(snap1.connector_ids_json, "[]");
     // Change one connector's connection state: link an
     // account, then connect.
@@ -430,7 +432,7 @@ async fn g4_snapshot_content_drift_detectable() {
     );
     assert_eq!(snap1_again, snap1);
     assert_eq!(serde_json::to_string(&snap1_again).unwrap(), snap1_json);
-    assert_eq!(snap1_again.memory_scope, "default");
+    assert_eq!(snap1_again.memory_scope, "{}");
     h.restart().await;
     let snap1_after_restart = {
         let conn = h.db();

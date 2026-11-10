@@ -52,11 +52,13 @@ use crate::execution_store::ExecutionFileRecord;
 /// v6 adds the D1-2 policy_versions + mandates tables
 /// (see SCHEMA_V6); v7 adds the D1-3 event_cursors
 /// table (see SCHEMA_V7); v8 adds the D1-4 sources
-/// table (see SCHEMA_V8).
+/// table (see SCHEMA_V8); v9 adds the D1-5
+/// project_memories + user_memories tables (see
+/// SCHEMA_V9).
 /// Row-level `schema_version` fields are a separate concept
 /// (the record contract version, still 1 for P0-A+ rows) and
 /// are untouched.
-pub const DB_SCHEMA_VERSION: i64 = 8;
+pub const DB_SCHEMA_VERSION: i64 = 9;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -449,6 +451,37 @@ CREATE TABLE IF NOT EXISTS sources (
 );
 ";
 
+/// D1-5 (Q-D1-51): the two memory tables share one
+/// shape. `scope_json` is the canonical scope triple,
+/// `source_json` the provenance record; `deleted` is
+/// the tombstone (text stays on disk).
+const SCHEMA_V9: &str = "
+CREATE TABLE IF NOT EXISTS project_memories (
+    memory_id TEXT PRIMARY KEY,
+    layer TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    content TEXT NOT NULL,
+    source_json TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    deleted INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_memories (
+    memory_id TEXT PRIMARY KEY,
+    layer TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    content TEXT NOT NULL,
+    source_json TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    deleted INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL
+);
+";
+
 fn err(e: rusqlite::Error) -> String {
     format!("sqlite: {e}")
 }
@@ -602,6 +635,15 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V8).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '8')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    if version < 9 {
+        tx.execute_batch(SCHEMA_V9).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '9')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -1147,6 +1189,16 @@ pub fn disconnect_source(
 ) -> Result<Option<SourceRow>, String> {
     let tx = conn.transaction().map_err(err)?;
     let row = set_source_status_tx(&tx, source_id, "disconnected", "source.disconnected", origin_device_id)?;
+    if row.is_some() {
+        // D1-5 (Q-D1-54): source-cleanup cascade — the
+        // tombstones and their `memory.deleted` events
+        // commit in the same transaction as the flag
+        // flip. Idempotent: a re-disconnect finds no
+        // live memory naming this source, so it writes
+        // nothing. Memories of other sources are
+        // untouched, and nothing goes into Inbox.
+        crate::memory_store::tombstone_memories_for_source_tx(&tx, source_id, origin_device_id)?;
+    }
     tx.commit().map_err(err)?;
     Ok(row)
 }
@@ -1590,7 +1642,7 @@ pub fn next_mandate_number(conn: &Connection) -> Result<u64, String> {
 // field list, not shrink it, and every producer site already
 // passes them in this order.
 #[allow(clippy::too_many_arguments)]
-fn append_event(
+pub(crate) fn append_event(
     tx: &rusqlite::Transaction<'_>,
     kind: &str,
     aggregate_id: &str,
@@ -2339,7 +2391,10 @@ pub fn list_events_for(
 /// (each advance creates a higher-id event, so the cursor
 /// could never catch up) — so the check for cursors is a
 /// reference invariant instead: every cursor's `last_event_id`
-/// is 0 or the id of an event that exists.
+/// is 0 or the id of an event that exists. D1-5 extends the
+/// fold to `memory` the same way (one map keyed by
+/// `memory_id` across both memory tables — ids are a
+/// global sequence, so the key stays unique).
 pub fn fold_matches_tables(conn: &Connection) -> Result<bool, String> {
     let events = list_events(conn)?;
     let mut folded_executions: std::collections::HashMap<String, serde_json::Value> =
@@ -2353,6 +2408,8 @@ pub fn fold_matches_tables(conn: &Connection) -> Result<bool, String> {
     let mut folded_mandates: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
     let mut folded_sources: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    let mut folded_memories: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
     for event in &events {
         let payload: serde_json::Value =
@@ -2375,6 +2432,9 @@ pub fn fold_matches_tables(conn: &Connection) -> Result<bool, String> {
             }
             "source" => {
                 folded_sources.insert(event.aggregate_id.clone(), payload);
+            }
+            "memory" => {
+                folded_memories.insert(event.aggregate_id.clone(), payload);
             }
             _ => {}
         }
@@ -2450,6 +2510,22 @@ pub fn fold_matches_tables(conn: &Connection) -> Result<bool, String> {
         }
     }
     if folded_sources.len() != list_sources(conn)?.len() {
+        return Ok(false);
+    }
+    // D1-5: one map across both memory tables (ids are a
+    // global sequence). Tombstoned rows are included —
+    // their `memory.deleted` event carries the post-state
+    // row, so the last event still equals the table row.
+    let project_memories = crate::memory_store::list_project_memories_all(conn)?;
+    let user_memories = crate::memory_store::list_user_memories_all(conn)?;
+    for row in project_memories.iter().chain(user_memories.iter()) {
+        let key = row.memory_id.clone();
+        let expected = table_value(&serde_json::to_string(&row).map_err(|e| e.to_string())?)?;
+        if folded_memories.get(&key) != Some(&expected) {
+            return Ok(false);
+        }
+    }
+    if folded_memories.len() != project_memories.len() + user_memories.len() {
         return Ok(false);
     }
     let event_ids: std::collections::HashSet<i64> = events.iter().map(|e| e.id).collect();
