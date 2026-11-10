@@ -50,11 +50,12 @@ use crate::execution_store::ExecutionFileRecord;
 /// v4 adds the E2-slice worker_runs table (see SCHEMA_V4);
 /// v5 adds the D1-1 goals table (see SCHEMA_V5);
 /// v6 adds the D1-2 policy_versions + mandates tables
-/// (see SCHEMA_V6).
+/// (see SCHEMA_V6); v7 adds the D1-3 event_cursors
+/// table (see SCHEMA_V7).
 /// Row-level `schema_version` fields are a separate concept
 /// (the record contract version, still 1 for P0-A+ rows) and
 /// are untouched.
-pub const DB_SCHEMA_VERSION: i64 = 6;
+pub const DB_SCHEMA_VERSION: i64 = 7;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -401,6 +402,22 @@ CREATE INDEX IF NOT EXISTS idx_mandates_task ON mandates(task_id);
 CREATE INDEX IF NOT EXISTS idx_mandates_execution ON mandates(execution_id);
 ";
 
+/// D1-3 (plan §4, Q-D1-32): the consumption cursor for one
+/// event-log consumer. `consumer_name` is the idempotency
+/// key (event id + consumer name); `last_event_id` is the
+/// high-water mark — the consumer reads only events with
+/// `id > last_event_id`. `origin_device_id` names the
+/// device that last advanced the cursor (same convention as
+/// the events table); the cursor never carries a payload.
+const SCHEMA_V7: &str = "
+CREATE TABLE IF NOT EXISTS event_cursors (
+    consumer_name TEXT PRIMARY KEY,
+    last_event_id INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL
+);
+";
+
 fn err(e: rusqlite::Error) -> String {
     format!("sqlite: {e}")
 }
@@ -528,6 +545,17 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         }
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '6')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // D1-3: event_cursors (consumer high-water marks for
+    // the event log). One transaction, v5/v6 style.
+    if version < 7 {
+        tx.execute_batch(SCHEMA_V7).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '7')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -912,6 +940,12 @@ fn policy_version_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PolicyVe
 /// `version_id = "policy-v{version}"`, `supersedes` = the
 /// previous version's id (None for v1). The caller owns
 /// the document (canonical JSON) and its digest.
+///
+/// D1-3 (Q-D1-34): the insert and its `policy_version.created`
+/// event commit in one transaction, so the fold (last event
+/// per aggregate == table row) can cover this domain. The
+/// payload is the post-state row serialization, same shape
+/// as the execution/effect/approval events.
 pub fn insert_policy_version(
     conn: &mut Connection,
     document_json: &str,
@@ -919,7 +953,8 @@ pub fn insert_policy_version(
     created_ms: u64,
     origin_device_id: &str,
 ) -> Result<PolicyVersionRow, String> {
-    let prev: Option<(String, i64)> = conn
+    let tx = conn.transaction().map_err(err)?;
+    let prev: Option<(String, i64)> = tx
         .query_row(
             "SELECT version_id, version FROM policy_versions ORDER BY version DESC LIMIT 1",
             [],
@@ -937,7 +972,7 @@ pub fn insert_policy_version(
         created_ms: created_ms as i64,
         origin_device_id: origin_device_id.to_string(),
     };
-    conn.execute(
+    tx.execute(
         "INSERT INTO policy_versions (version_id, version, document_json, digest, supersedes, created_ms, origin_device_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
@@ -951,6 +986,18 @@ pub fn insert_policy_version(
         ],
     )
     .map_err(err)?;
+    let payload = serde_json::to_string(&row).map_err(|e| e.to_string())?;
+    append_event(
+        &tx,
+        "policy_version",
+        &row.version_id,
+        "policy_version.created",
+        &payload,
+        &row.origin_device_id,
+        row.created_ms,
+        1,
+    )?;
+    tx.commit().map_err(err)?;
     Ok(row)
 }
 
@@ -1018,8 +1065,13 @@ fn mandate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MandateRow> {
     })
 }
 
+/// D1-3 (Q-D1-34): the insert and its `mandate.created`
+/// event commit in one transaction, so the fold (last event
+/// per aggregate == table row) can cover this domain. The
+/// payload is the post-state row serialization.
 pub fn insert_mandate(conn: &mut Connection, row: &MandateRow) -> Result<(), String> {
-    conn.execute(
+    let tx = conn.transaction().map_err(err)?;
+    tx.execute(
         "INSERT INTO mandates (mandate_id, task_id, execution_id, goal, allowed_json, policy_version_id, status, created_ms, origin_device_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
@@ -1035,6 +1087,18 @@ pub fn insert_mandate(conn: &mut Connection, row: &MandateRow) -> Result<(), Str
         ],
     )
     .map_err(err)?;
+    let payload = serde_json::to_string(row).map_err(|e| e.to_string())?;
+    append_event(
+        &tx,
+        "mandate",
+        &row.mandate_id,
+        "mandate.created",
+        &payload,
+        &row.origin_device_id,
+        row.created_ms,
+        1,
+    )?;
+    tx.commit().map_err(err)?;
     Ok(())
 }
 
@@ -1106,13 +1170,48 @@ pub fn list_active_task_mandates(
 /// Supersede a Task's active task-level Mandates (old
 /// rows are kept, never deleted). Returns the number of
 /// rows superseded.
+///
+/// D1-3 (Q-D1-34): the status update and one
+/// `mandate.superseded` event per superseded row (payload
+/// = post-state row serialization) commit in one
+/// transaction, so the fold's last-event-per-aggregate rule
+/// still reproduces the table exactly.
 pub fn supersede_mandates_for_task(conn: &mut Connection, task_id: &str) -> Result<usize, String> {
-    let changed = conn
+    let tx = conn.transaction().map_err(err)?;
+    let active: Vec<MandateRow> = {
+        let mut stmt = tx
+            .prepare(&format!(
+                "SELECT {MANDATE_COLS} FROM mandates WHERE task_id = ?1 AND execution_id IS NULL AND status = 'active' ORDER BY created_ms ASC, mandate_id ASC"
+            ))
+            .map_err(err)?;
+        let rows = stmt
+            .query_map(params![task_id], mandate_from_row)
+            .map_err(err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(err)?;
+        rows
+    };
+    let changed = tx
         .execute(
             "UPDATE mandates SET status = 'superseded' WHERE task_id = ?1 AND execution_id IS NULL AND status = 'active'",
             params![task_id],
         )
         .map_err(err)?;
+    for mut row in active {
+        row.status = "superseded".to_string();
+        let payload = serde_json::to_string(&row).map_err(|e| e.to_string())?;
+        append_event(
+            &tx,
+            "mandate",
+            &row.mandate_id,
+            "mandate.superseded",
+            &payload,
+            &row.origin_device_id,
+            now_ms() as i64,
+            1,
+        )?;
+    }
+    tx.commit().map_err(err)?;
     Ok(changed)
 }
 
@@ -1390,16 +1489,32 @@ fn upsert_effect_tx(
     let source = format!("event-{event_id}");
     match record.status.as_str() {
         // 测试失败是已知结果，不进 Inbox；其他失败仍保留待处理行。
+        // D1-3 (Q-D1-34附带项): the same open-row guard as
+        // the unknown branch — a second upsert of the same
+        // still-failed row (e.g. a re-persist through
+        // `persist_effect`) must not open a second `failed`
+        // row for the same effect_id. The P3-C §5.4
+        // exception is unchanged: (`test`, `run`) Effects
+        // never open a `failed` Inbox row.
         "failed" if !(record.capability == "test" && record.operation == "run") => {
-            insert_inbox(
-                tx,
-                "failed",
-                record.execution_id.as_deref(),
-                Some(&record.effect_id),
-                None,
-                &source,
-                now,
-            )?;
+            let open: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM inbox WHERE kind = 'failed' AND effect_id = ?1 AND resolved_ms IS NULL",
+                    params![record.effect_id],
+                    |row| row.get(0),
+                )
+                .map_err(err)?;
+            if open == 0 {
+                insert_inbox(
+                    tx,
+                    "failed",
+                    record.execution_id.as_deref(),
+                    Some(&record.effect_id),
+                    None,
+                    &source,
+                    now,
+                )?;
+            }
         }
         // E2-A §2.6: the unknown branch used to insert
         // unconditionally, so a second upsert of the same
@@ -1410,9 +1525,8 @@ fn upsert_effect_tx(
         // and inbox-64/65/66. Same open-row guard as the
         // approval branch below: insert only when no open row
         // for this effect_id exists. (The `failed` branch
-        // above has the same unconditional shape; no duplicate
-        // failed row has been confirmed, so per plan §2.6 it
-        // is audited here and left unchanged.)
+        // above had the same unconditional shape; D1-3 now
+        // guards it too — see the comment there.)
         "unknown" => {
             let open: i64 = tx
                 .query_row(
@@ -1829,6 +1943,15 @@ pub fn list_events(conn: &Connection) -> Result<Vec<EventRow>, String> {
 /// reproduce the state tables exactly. Inbox / Outbox events
 /// are not part of this check (Inbox creation has no event by
 /// design; Outbox rows are delivery state, not domain state).
+/// D1-3 extends the fold to `policy_versions` and `mandates`
+/// (their writers emit `policy_version.created` /
+/// `mandate.created` / `mandate.superseded` with the post-state
+/// row as payload). `event_cursors` cannot be folded the same
+/// way — a cursor event per advance would be self-referential
+/// (each advance creates a higher-id event, so the cursor
+/// could never catch up) — so the check for cursors is a
+/// reference invariant instead: every cursor's `last_event_id`
+/// is 0 or the id of an event that exists.
 pub fn fold_matches_tables(conn: &Connection) -> Result<bool, String> {
     let events = list_events(conn)?;
     let mut folded_executions: std::collections::HashMap<String, serde_json::Value> =
@@ -1836,6 +1959,10 @@ pub fn fold_matches_tables(conn: &Connection) -> Result<bool, String> {
     let mut folded_effects: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
     let mut folded_approvals: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    let mut folded_policy_versions: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    let mut folded_mandates: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
     for event in &events {
         let payload: serde_json::Value =
@@ -1849,6 +1976,12 @@ pub fn fold_matches_tables(conn: &Connection) -> Result<bool, String> {
             }
             "approval" => {
                 folded_approvals.insert(event.aggregate_id.clone(), payload);
+            }
+            "policy_version" => {
+                folded_policy_versions.insert(event.aggregate_id.clone(), payload);
+            }
+            "mandate" => {
+                folded_mandates.insert(event.aggregate_id.clone(), payload);
             }
             _ => {}
         }
@@ -1885,6 +2018,32 @@ pub fn fold_matches_tables(conn: &Connection) -> Result<bool, String> {
     }
     if folded_approvals.len() != list_approvals(conn)?.len() {
         return Ok(false);
+    }
+    for row in list_policy_versions(conn)? {
+        let key = row.version_id.clone();
+        let expected = table_value(&serde_json::to_string(&row).map_err(|e| e.to_string())?)?;
+        if folded_policy_versions.get(&key) != Some(&expected) {
+            return Ok(false);
+        }
+    }
+    if folded_policy_versions.len() != list_policy_versions(conn)?.len() {
+        return Ok(false);
+    }
+    for row in list_mandates(conn, None, None)? {
+        let key = row.mandate_id.clone();
+        let expected = table_value(&serde_json::to_string(&row).map_err(|e| e.to_string())?)?;
+        if folded_mandates.get(&key) != Some(&expected) {
+            return Ok(false);
+        }
+    }
+    if folded_mandates.len() != list_mandates(conn, None, None)?.len() {
+        return Ok(false);
+    }
+    let event_ids: std::collections::HashSet<i64> = events.iter().map(|e| e.id).collect();
+    for cursor in list_event_cursors(conn)? {
+        if cursor.last_event_id != 0 && !event_ids.contains(&cursor.last_event_id) {
+            return Ok(false);
+        }
     }
     Ok(true)
 }
@@ -3031,13 +3190,20 @@ pub fn get_outbox(conn: &Connection, outbox_id: &str) -> Result<Option<OutboxRow
 /// Dedup: one row per (execution, destination_kind); re-enqueue
 /// returns the existing row with no new event. P0-D has exactly
 /// one destination kind, `local_notification`.
-pub fn enqueue_outbox(
-    conn: &mut Connection,
+/// D1-3 (plan §4): the transaction-level enqueue. The
+/// dedup check, the row insert, and the `outbox.enqueued`
+/// event all run inside the caller's transaction and commit
+/// with it — this is what lets the Execution terminal
+/// transition enqueue its notification atomically (the
+/// producer) instead of in a second transaction that could
+/// split from the transition.
+pub fn enqueue_outbox_tx(
+    tx: &rusqlite::Transaction<'_>,
     execution_id: &str,
     payload_summary_json: &str,
 ) -> Result<OutboxRow, String> {
     let dedup_key = format!("{execution_id}:local_notification");
-    if let Some(existing) = conn
+    if let Some(existing) = tx
         .query_row(
             "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms FROM outbox WHERE dedup_key = ?1",
             params![dedup_key],
@@ -3048,9 +3214,8 @@ pub fn enqueue_outbox(
     {
         return Ok(existing);
     }
-    let tx = conn.transaction().map_err(err)?;
     let now = now_ms() as i64;
-    let seq = next_seq_for(&tx, "outbox", "outbox_id")?;
+    let seq = next_seq_for(tx, "outbox", "outbox_id")?;
     let outbox_id = format!("outbox-{seq}");
     tx.execute(
         "INSERT INTO outbox (seq, outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms)
@@ -3070,7 +3235,17 @@ pub fn enqueue_outbox(
         updated_at_ms: now,
     };
     let payload = serde_json::to_string(&row).map_err(|e| e.to_string())?;
-    append_event(&tx, "outbox", &outbox_id, "outbox.enqueued", &payload, "unknown", now, 1)?;
+    append_event(tx, "outbox", &outbox_id, "outbox.enqueued", &payload, "unknown", now, 1)?;
+    Ok(row)
+}
+
+pub fn enqueue_outbox(
+    conn: &mut Connection,
+    execution_id: &str,
+    payload_summary_json: &str,
+) -> Result<OutboxRow, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let row = enqueue_outbox_tx(&tx, execution_id, payload_summary_json)?;
     tx.commit().map_err(err)?;
     Ok(row)
 }
@@ -3173,6 +3348,162 @@ pub fn deliver_outbox_via_log_sink(
         );
     }
     Ok(row)
+}
+
+// --- D1-3: event_cursors + the Outbox consumer ---
+//
+// The consumer (`outbox-deliverer`) reads the event log
+// from its cursor and delivers every `outbox.enqueued`
+// or `outbox.requeued` row it has not seen yet. Cursor
+// advance and the delivery side effects commit in ONE
+// transaction, so the cursor can never run ahead of the
+// effect (a crash before commit replays from the old
+// cursor) nor lag behind it without an idempotent replay
+// (re-delivering an already `sent` row is a no-op:
+// `set_outbox_status` returns the row unchanged and
+// appends no second event). Event id + consumer name is
+// the idempotency key.
+//
+// A `requeued` event is a delivery trigger too: the
+// operator's requeue is the manual decision, and the next
+// tick carries the delivery out — "no auto-retry" (plan §4,
+// Q-D1-33) means a `failed` row is never retried on its
+// own, not that a requeued row needs a second manual call.
+// A requeued row is equally deliverable through the manual
+// `POST /outbox/{id}/deliver` route; whichever runs first
+// wins, the other is a no-op.
+//
+// The consumer deliberately does NOT call `deliver_outbox`
+// / `deliver_outbox_via_log_sink`: those open their own
+// transactions, which cannot run inside the consumer's.
+// The delivery state machine is the same (`set_outbox_status`
+// to `sent`, which appends the `outbox.sent` event), and the
+// log line below is printed after commit, in the same
+// format, so log and state cannot split.
+//
+// Timed delivery is NOT here: it hooks on after
+// E2-D batch 2 lands (Q-D1-35).
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventCursorRow {
+    pub consumer_name: String,
+    pub last_event_id: i64,
+    pub updated_ms: i64,
+    pub origin_device_id: String,
+}
+
+/// The consumer's high-water mark, 0 when it has never run.
+pub fn get_event_cursor(conn: &Connection, consumer_name: &str) -> Result<i64, String> {
+    let last: Option<i64> = conn
+        .query_row(
+            "SELECT last_event_id FROM event_cursors WHERE consumer_name = ?1",
+            params![consumer_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(err)?;
+    Ok(last.unwrap_or(0))
+}
+
+pub fn list_event_cursors(conn: &Connection) -> Result<Vec<EventCursorRow>, String> {
+    let mut stmt = conn
+        .prepare("SELECT consumer_name, last_event_id, updated_ms, origin_device_id FROM event_cursors ORDER BY consumer_name ASC")
+        .map_err(err)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(EventCursorRow {
+                consumer_name: row.get(0)?,
+                last_event_id: row.get(1)?,
+                updated_ms: row.get(2)?,
+                origin_device_id: row.get(3)?,
+            })
+        })
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+/// Advance the cursor and deliver every unseen
+/// `outbox.enqueued` / `outbox.requeued` row, in one
+/// transaction. Returns the rows delivered in this run
+/// (empty when there is nothing new — the cursor is not
+/// written in that case, so a no-op run leaves the row
+/// untouched).
+pub fn consume_outbox_events(
+    conn: &mut Connection,
+    consumer_name: &str,
+    origin_device_id: &str,
+) -> Result<Vec<OutboxRow>, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let last: i64 = tx
+        .query_row(
+            "SELECT last_event_id FROM event_cursors WHERE consumer_name = ?1",
+            params![consumer_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(err)?
+        .unwrap_or(0);
+    let events: Vec<(i64, String, String, String)> = {
+        let mut stmt = tx
+            .prepare("SELECT id, aggregate_kind, aggregate_id, event_type FROM events WHERE id > ?1 ORDER BY id ASC")
+            .map_err(err)?;
+        let rows = stmt
+            .query_map(params![last], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(err)?;
+        rows
+    };
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+    let max_id = events.last().map(|(id, _, _, _)| *id).unwrap_or(last);
+    let mut delivered: Vec<OutboxRow> = Vec::new();
+    for (_, kind, aggregate_id, event_type) in &events {
+        if kind != "outbox" || (event_type != "outbox.enqueued" && event_type != "outbox.requeued") {
+            continue;
+        }
+        let pending: bool = tx
+            .query_row(
+                "SELECT status = 'pending' FROM outbox WHERE outbox_id = ?1",
+                params![aggregate_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(err)?
+            .unwrap_or(false);
+        if !pending {
+            continue;
+        }
+        if let Some(row) = set_outbox_status(&tx, aggregate_id, "sent", "outbox.sent")? {
+            delivered.push(row);
+        }
+    }
+    let now = now_ms() as i64;
+    tx.execute(
+        "INSERT INTO event_cursors (consumer_name, last_event_id, updated_ms, origin_device_id)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(consumer_name) DO UPDATE SET last_event_id = excluded.last_event_id, updated_ms = excluded.updated_ms, origin_device_id = excluded.origin_device_id",
+        params![consumer_name, max_id, now, origin_device_id],
+    )
+    .map_err(err)?;
+    tx.commit().map_err(err)?;
+    for row in &delivered {
+        eprintln!(
+            "outbox local_notification delivered: execution {} summary {}",
+            row.execution_id, row.payload_summary_json
+        );
+    }
+    Ok(delivered)
 }
 
 // --- P0-E tables: test-seam inserts only (no production driver) ---
@@ -3950,15 +4281,32 @@ pub fn sweep_expired_assignment(
         }
         execution.status = "needs_review".to_string();
         upsert_execution_tx(&tx, &execution, "execution.transitioned", false)?;
-        insert_inbox(
-            &tx,
-            "unknown_requires_reconciliation",
-            Some(&execution_id),
-            None,
-            None,
-            &format!("event-{event_id}"),
-            now_ms() as i64,
-        )?;
+        // D1-3 (Q-D1-34附带项): the second dedupe hole.
+        // The sweep row is execution-keyed (no effect_id),
+        // so the guard counts open `unknown_requires_
+        // reconciliation` rows for this execution_id. A
+        // second sweep of a second lost assignment for the
+        // same still-unreviewed execution must not open a
+        // second row — the first one is still the open
+        // audit item.
+        let open: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM inbox WHERE kind = 'unknown_requires_reconciliation' AND execution_id = ?1 AND resolved_ms IS NULL",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .map_err(err)?;
+        if open == 0 {
+            insert_inbox(
+                &tx,
+                "unknown_requires_reconciliation",
+                Some(&execution_id),
+                None,
+                None,
+                &format!("event-{event_id}"),
+                now_ms() as i64,
+            )?;
+        }
         Ok(SweepOutcome { assignment_lost: true, execution_transitioned: true })
     })();
     match outcome {
@@ -4581,6 +4929,22 @@ fn transition_execution_with_event(
                 .map_err(err)
                 .map_err(ExecutionTransitionError::Internal)?;
             }
+            // D1-3 (plan §4): the Outbox producer. Every
+            // terminal transition enqueues exactly one
+            // local_notification row, in the SAME transaction
+            // as the transition itself — the notification can
+            // never exist without the terminal state, nor the
+            // terminal state without its notification. The
+            // `dedup_key` UNIQUE makes a second terminal
+            // attempt a no-op even if this branch ran twice.
+            // The summary carries ids and the terminal status
+            // only (no payload content, no secrets).
+            let summary = canonical_json(&serde_json::json!({
+                "execution_id": execution_id,
+                "status": status,
+            }));
+            enqueue_outbox_tx(&tx, execution_id, &summary)
+                .map_err(ExecutionTransitionError::Internal)?;
         }
         Ok(record)
     };

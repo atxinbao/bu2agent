@@ -2377,6 +2377,34 @@ impl AppState {
         swept
     }
 
+    /// D1-3: the Outbox deliverer (`outbox-deliverer`), run
+    /// from the assignment sweeper's 10 s tick — no second
+    /// scheduler. Drains unseen `outbox.enqueued` /
+    /// `outbox.requeued` events through
+    /// `consume_outbox_events` (cursor advance + delivery in
+    /// one transaction). Returns the number of rows
+    /// delivered on this tick.
+    pub fn deliver_pending_outbox(&self) -> usize {
+        if self.sqlite_mode() != StateBackend::Sqlite || self.sqlite_is_broken() {
+            return 0;
+        }
+        let Some(sqlite) = &self.sqlite else {
+            return 0;
+        };
+        let mut conn = sqlite.lock().expect("sqlite lock");
+        match sqlite_store::consume_outbox_events(
+            &mut conn,
+            "outbox-deliverer",
+            &self.origin_device_id,
+        ) {
+            Ok(rows) => rows.len(),
+            Err(detail) => {
+                eprintln!("warning: D1-3 outbox deliver failed: {detail}");
+                0
+            }
+        }
+    }
+
     pub(crate) fn sqlite_mode(&self) -> StateBackend {
         *self.sqlite_backend.lock().expect("sqlite backend lock")
     }
@@ -14977,6 +15005,56 @@ async fn outbox_get(
     }
 }
 
+/// D1-3 (plan §4): manual top-up delivery of one Outbox
+/// row through the log sink. A row that is already `sent`
+/// (or `failed`) is returned unchanged — delivery is
+/// idempotent, a repeat call never re-delivers. Unknown id
+/// is 404, same shape as `outbox_get`.
+async fn outbox_deliver(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::deliver_outbox_via_log_sink(&mut conn, &id) {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown outbox item" })))
+            .into_response(),
+        Err(_) => sqlite_error_response(),
+    }
+}
+
+/// D1-3 (plan §4): manual requeue of one Outbox row. This
+/// opens the P0-D "No route exposes this" gap: a `failed`
+/// row returns to `pending` so it can be delivered again —
+/// by the tick consumer on its next pass (the `outbox.requeued`
+/// event is a delivery trigger) or by a manual
+/// `POST /outbox/{id}/deliver`, whichever runs first. A row
+/// that is not `failed` is returned unchanged.
+async fn outbox_requeue(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::requeue_outbox(&mut conn, &id) {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown outbox item" })))
+            .into_response(),
+        Err(_) => sqlite_error_response(),
+    }
+}
+
 // --- Chat sessions (Round 3, 3a) ---
 //
 // Session bodies live here, never in the audit JSONL files.
@@ -16225,6 +16303,8 @@ pub fn app(state: AppState) -> Router {
         .route("/inbox/ack", post(inbox_ack))
         .route("/outbox/list", get(outbox_list))
         .route("/outbox/get", get(outbox_get))
+        .route("/outbox/{id}/deliver", post(outbox_deliver))
+        .route("/outbox/{id}/requeue", post(outbox_requeue))
         .route("/sessions/create", post(sessions_create))
         .route("/sessions/list", get(sessions_list))
         .route("/sessions/get", get(sessions_get))
@@ -16259,6 +16339,9 @@ pub fn spawn_assignment_sweeper(state: AppState) -> tokio::task::JoinHandle<()> 
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             state.sweep_expired_assignments();
+            // D1-3: the Outbox deliverer rides the same
+            // 10 s tick — no second scheduler.
+            state.deliver_pending_outbox();
         }
     })
 }
