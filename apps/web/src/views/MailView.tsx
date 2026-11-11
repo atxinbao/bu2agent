@@ -1,7 +1,11 @@
 // Mail view: email read surface, batch 1 (Task 22,
-// option A). Threads list -> thread messages -> message
-// reading -> attachment download. Reads only: no send,
-// no delete, no sync cache.
+// option A) + D1-6a manual incremental sync. Threads
+// list -> thread messages -> message reading ->
+// attachment download. Reads only: no send, no delete.
+// The sync button is a manual trigger: it records the
+// inbox first 50 into local SQLite (body hash only,
+// never body text); there is no auto-trigger — that
+// waits for A1 timers.
 //
 // Honest copy (shown in the view): on the packaged Mac
 // app this reads real Mail.app data via AppleScript;
@@ -13,6 +17,7 @@
 import { useEffect, useState } from "react";
 import type {
   EmailGateway,
+  MailSyncResult,
   MailboxInfo,
   MailboxSetup,
   MessageView,
@@ -48,6 +53,7 @@ export function MailView({
   const [message, setMessage] = useState<MessageView | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [syncResult, setSyncResult] = useState<MailSyncResult | null>(null);
 
   async function refresh() {
     setBusy(true);
@@ -67,6 +73,19 @@ export function MailView({
     void refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  async function syncMail() {
+    setBusy(true);
+    setError(null);
+    try {
+      setSyncResult(await email.syncMail());
+      await refresh();
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function openThread(threadId: string) {
     setBusy(true);
@@ -151,11 +170,18 @@ export function MailView({
     <div className="view">
       <h2>Mail</h2>
       <p className="note">
-        只读：线程列表、消息阅读、附件下载；不发送、不删除、不做增量同步缓存。
+        只读：线程列表、消息阅读、附件下载；不发送、不删除。
+        手动同步把收件箱前 50 封写入本地 SQLite（只存正文哈希，不存正文）；自动同步等 A1 定时器。
         打包的 Mac 应用读真实 Mail.app 数据（AppleScript 问 Mail.app）；其他平台返回 501。
         线程按规范化主题分组（Mail 的 AppleScript 没有 thread id），线程 id 是本地定义。
       </p>
       {error !== null && <p className="error">{error}</p>}
+      {syncResult !== null && (
+        <p className="note">
+          已同步：新增 {syncResult.syncedCount} 封，跳过 {syncResult.skippedCount} 封，
+          本地共 {syncResult.totalCount} 封。
+        </p>
+      )}
       {mailbox === null ? (
         <p className="empty">邮箱状态未知（状态查询失败）。</p>
       ) : (
@@ -178,6 +204,9 @@ export function MailView({
       <div className="row">
         <button type="button" onClick={() => void refresh()} disabled={busy}>
           刷新
+        </button>{" "}
+        <button type="button" onClick={() => void syncMail()} disabled={busy}>
+          同步邮件
         </button>
       </div>
       <h3>线程</h3>

@@ -55,8 +55,9 @@ use agent_desktop::stream_client::{
     SxsSelection,
 };
 use agent_desktop::email_client::{
-    EmailClient, MailboxInfo, MailboxSetup, MessageView, ThreadView,
+    EmailClient, MailSyncResult, MailboxInfo, MailboxSetup, MessageView, ThreadView,
 };
+use agent_desktop::calendar_client::{CalendarClient, CalendarEvent};
 use agent_desktop::voice_client::{
     ActiveVoice, CatalogFilters, CatalogVoice, CustomVoice, OnboardingReset, PipelineProfile,
     PipelineSelection, VoiceClient,
@@ -1565,6 +1566,29 @@ pub fn email_message_get(message_id: String) -> Result<MessageView, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn email_message_attachment(message_id: String, index: usize) -> Result<Vec<u8>, String> {
     email_client()?.attachment_download(&message_id, index).map_err(agent_err_string)
+}
+
+// --- Calendar surface (D1-6a, read-only list/detail) ---
+//
+// All commands carry rename_all = "snake_case" (Task 9
+// lesson): the invoke client sends snake_case params.
+fn calendar_client() -> Result<CalendarClient, String> {
+    CalendarClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn calendar_list() -> Result<Vec<CalendarEvent>, String> {
+    calendar_client()?.list_events().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn calendar_get(event_id: String) -> Result<CalendarEvent, String> {
+    calendar_client()?.get_event(&event_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn mail_sync() -> Result<MailSyncResult, String> {
+    email_client()?.sync_mail().map_err(agent_err_string)
 }
 
 // --- Effects / Executions / Inbox / Assignments / Evidence (P0-R R4) ---

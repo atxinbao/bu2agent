@@ -46,6 +46,15 @@ export interface MessageView {
   attachments: AttachmentMeta[];
 }
 
+// D1-6a: one mail sync pass (manual trigger only).
+// Counts + the mail-source cursor.
+export interface MailSyncResult {
+  syncedCount: number;
+  skippedCount: number;
+  totalCount: number;
+  cursor: string;
+}
+
 // Transport-neutral surface used by the Mail view. The
 // HTTP client below and the invoke client both implement
 // it, so the view never knows which transport it runs on.
@@ -56,6 +65,14 @@ export interface EmailGateway {
   thread(threadId: string): Promise<ThreadView>;
   message(messageId: string): Promise<MessageView>;
   attachment(messageId: string, index: number): Promise<number[]>;
+  syncMail(): Promise<MailSyncResult>;
+}
+
+interface ServerMailSyncResult {
+  synced_count: number;
+  skipped_count: number;
+  total_count: number;
+  cursor: string;
 }
 
 interface ServerThreadView {
@@ -139,6 +156,19 @@ export class EmailClient implements EmailGateway {
 
   mailbox(): Promise<MailboxInfo> {
     return this.requestJson<MailboxInfo>("GET", "/api/email/mailbox");
+  }
+
+  async syncMail(): Promise<MailSyncResult> {
+    const result = await this.requestJson<ServerMailSyncResult>(
+      "POST",
+      "/api/email/sync",
+    );
+    return {
+      syncedCount: result.synced_count,
+      skippedCount: result.skipped_count,
+      totalCount: result.total_count,
+      cursor: result.cursor,
+    };
   }
 
   mailboxSetup(): Promise<MailboxSetup> {

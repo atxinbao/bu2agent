@@ -7,11 +7,19 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   EmailGateway,
+  MailSyncResult,
   MailboxInfo,
   MailboxSetup,
   MessageView,
   ThreadView,
 } from "./email_client";
+
+interface ServerMailSyncResult {
+  synced_count: number;
+  skipped_count: number;
+  total_count: number;
+  cursor: string;
+}
 
 interface ServerThreadView {
   thread_id: string;
@@ -68,6 +76,16 @@ function toMessageView(server: ServerMessageView): MessageView {
 export class InvokeEmailClient implements EmailGateway {
   mailbox(): Promise<MailboxInfo> {
     return invoke("email_mailbox");
+  }
+
+  async syncMail(): Promise<MailSyncResult> {
+    const result = await invoke<ServerMailSyncResult>("mail_sync");
+    return {
+      syncedCount: result.synced_count,
+      skippedCount: result.skipped_count,
+      totalCount: result.total_count,
+      cursor: result.cursor,
+    };
   }
 
   mailboxSetup(): Promise<MailboxSetup> {

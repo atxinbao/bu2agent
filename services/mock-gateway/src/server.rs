@@ -10088,6 +10088,93 @@ async fn email_attachment_get(
     }
 }
 
+// --- D1-6a: mail incremental sync + calendar read-only ---
+//
+// Mail sync is a manual trigger only: POST
+// /api/email/sync reads the inbox window from the
+// MailSource (AppleScript on macOS, Mock in tests,
+// Unavailable → 501 on non-macOS) and records new
+// messages into SQLite (v10 mail_messages). No Effect,
+// no approval, no Outbox — fact recording (red line
+// 3). The fetch runs outside the SQLite lock
+// (osascript calls must not hold it); the write is one
+// transaction (rows + events + cursor).
+async fn email_sync(State(state): State<AppState>) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let messages = match crate::mail_sync::fetch_window(state.mail_source.as_ref()) {
+        Ok(messages) => messages,
+        Err(err) => return mail_error_response(err, "sync"),
+    };
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    match crate::mail_sync::record_sync(
+        &mut conn,
+        &messages,
+        crate::mail_sync::MAIL_SOURCE_ID,
+        &state.origin_device_id,
+    ) {
+        Ok(result) => Json(serde_json::to_value(result).unwrap_or(serde_json::Value::Null))
+            .into_response(),
+        Err(detail) => {
+            eprintln!("warning: mail sync failed ({detail})");
+            sqlite_error_response()
+        }
+    }
+}
+
+fn calendar_error_response(
+    err: crate::calendar_backend::CalendarError,
+) -> axum::response::Response {
+    match err {
+        crate::calendar_backend::CalendarError::Unavailable(reason) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response(),
+        crate::calendar_backend::CalendarError::Denied => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "calendar access denied" })),
+        )
+            .into_response(),
+        crate::calendar_backend::CalendarError::Upstream(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "calendar source error" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn calendar_events_list(State(_state): State<AppState>) -> impl IntoResponse {
+    match crate::calendar_backend::list_events() {
+        Ok(events) => Json(serde_json::to_value(events).unwrap_or(serde_json::Value::Null))
+            .into_response(),
+        Err(err) => calendar_error_response(err),
+    }
+}
+
+async fn calendar_event_get(
+    State(_state): State<AppState>,
+    axum::extract::Path(event_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match crate::calendar_backend::get_event(&event_id) {
+        Ok(Some(event)) => Json(serde_json::to_value(event).unwrap_or(serde_json::Value::Null))
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown event" })),
+        )
+            .into_response(),
+        Err(err) => calendar_error_response(err),
+    }
+}
+
 // --- Feed surface (Task 17, unit subset) ---
 //
 // Local semantics only (see feed_store.rs): Mock seed
@@ -16669,6 +16756,11 @@ pub fn app(state: AppState) -> Router {
             "/api/email/messages/{message_id}/attachments/{index}",
             get(email_attachment_get),
         )
+        // D1-6a: manual mail sync (SQLite v10) + calendar
+        // read-only (EventKit on macOS, 501 elsewhere).
+        .route("/api/email/sync", post(email_sync))
+        .route("/api/calendar/events", get(calendar_events_list))
+        .route("/api/calendar/events/{id}", get(calendar_event_get))
         .route("/api/nodes/register", post(nodes_register))
         .route("/api/nodes/list", post(nodes_list))
         .route("/api/nodes/heartbeat", post(nodes_heartbeat))

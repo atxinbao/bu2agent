@@ -54,6 +54,143 @@ pub fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
 
+/// D1-6a: ISO8601 / RFC3339 timestamps without a date
+/// crate (the workspace has no chrono/time dependency,
+/// and this batch must not add one for two small
+/// conversions). The mail sync and the calendar backend
+/// both need epoch milliseconds: Mail's display dates
+/// and EventKit's ISO8601 strings.
+///
+/// `iso8601_to_ms` parses `YYYY-MM-DDTHH:MM:SS[.fff]`
+/// with a `Z` or `±HH:MM` offset (a space may replace
+/// the `T`; a missing offset means UTC). Anything else
+/// returns 0 — callers treat 0 as "unknown date", never
+/// as 1970-01-01 (AppleScript's locale display dates,
+/// for example, do not parse and land at 0 by design).
+///
+/// `ms_to_iso8601_utc` formats epoch milliseconds as
+/// UTC `YYYY-MM-DDTHH:MM:SS.mmmZ`. Both use Howard
+/// Hinnant's civil-date algorithms (days-from-civil /
+/// civil-from-days), which are exact for the proleptic
+/// Gregorian calendar on either side of the epoch.
+pub fn iso8601_to_ms(value: &str) -> i64 {
+    let bytes = value.as_bytes();
+    if bytes.len() < 19 {
+        return 0;
+    }
+    let num = |from: usize, len: usize| -> Option<i64> {
+        value.get(from..from + len)?.parse::<i64>().ok()
+    };
+    if bytes[4] != b'-' || bytes[7] != b'-' || (bytes[10] != b'T' && bytes[10] != b' ') || bytes[13] != b':' || bytes[16] != b':' {
+        return 0;
+    }
+    let (year, month, day, hour, minute, second) = match (
+        num(0, 4),
+        num(5, 2),
+        num(8, 2),
+        num(11, 2),
+        num(14, 2),
+        num(17, 2),
+    ) {
+        (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) => (y, mo, d, h, mi, s),
+        _ => return 0,
+    };
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return 0;
+    }
+    // Fractional seconds and the zone designator follow
+    // the seconds; the zone is `Z` or `±HH:MM`.
+    let mut idx = 19;
+    let mut millis: i64 = 0;
+    if idx < bytes.len() && bytes[idx] == b'.' {
+        let start = idx + 1;
+        let mut end = start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == start {
+            return 0;
+        }
+        let digits = &value[start..end];
+        let scale = 10i64.pow((3usize.saturating_sub(digits.len())) as u32);
+        let frac: i64 = digits.parse().ok().unwrap_or(0);
+        millis = if digits.len() >= 3 {
+            frac / 10i64.pow((digits.len() - 3) as u32)
+        } else {
+            frac * scale
+        };
+        idx = end;
+    }
+    let mut offset_ms: i64 = 0;
+    if idx < bytes.len() {
+        match bytes[idx] {
+            b'Z' | b'z' => idx += 1,
+            b'+' | b'-' => {
+                let sign = if bytes[idx] == b'-' { -1 } else { 1 };
+                if bytes.len() < idx + 6 || bytes[idx + 3] != b':' {
+                    return 0;
+                }
+                let (oh, om) = match (num(idx + 1, 2), num(idx + 4, 2)) {
+                    (Some(h), Some(m)) => (h, m),
+                    _ => return 0,
+                };
+                if oh > 23 || om > 59 {
+                    return 0;
+                }
+                offset_ms = sign * (oh * 3_600_000 + om * 60_000);
+                idx += 6;
+            }
+            _ => return 0,
+        }
+    }
+    if idx != bytes.len() {
+        return 0;
+    }
+    let days = days_from_civil(year, month as u32, day as u32);
+    days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * 1000 + millis - offset_ms
+}
+
+pub fn ms_to_iso8601_utc(ms: i64) -> String {
+    let days = ms.div_euclid(86_400_000);
+    let rem = ms.rem_euclid(86_400_000);
+    let (year, month, day) = civil_from_days(days);
+    let hour = rem / 3_600_000;
+    let minute = (rem % 3_600_000) / 60_000;
+    let second = (rem % 60_000) / 1000;
+    let millis = rem % 1000;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Proleptic Gregorian date for days since 1970-01-01.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 /// Q5 unified digest: every approval-bound operation commits to a
 /// (tool, mode, params) triple, serialized as one JSON tuple and
 /// hashed. `mode` is `Some` for operations whose mode changes the
@@ -184,6 +321,43 @@ mod tests {
         assert_eq!(delete_digest("/x"), None);
         assert_eq!(mkdir_digest("../x"), None);
         assert_eq!(rename_digest("a", "/x"), None);
+    }
+
+    #[test]
+    fn iso8601_round_trips_and_offsets() {
+        assert_eq!(ms_to_iso8601_utc(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(iso8601_to_ms("1970-01-01T00:00:00.000Z"), 0);
+        assert_eq!(iso8601_to_ms("1970-01-01T00:00:00Z"), 0);
+        // 2026-11-01T10:00:00Z is the Mock mail seed date.
+        let ms = iso8601_to_ms("2026-11-01T10:00:00Z");
+        assert_eq!(ms_to_iso8601_utc(ms), "2026-11-01T10:00:00.000Z");
+        assert_eq!(iso8601_to_ms("2026-11-01T10:00:00.500Z"), ms + 500);
+        assert_eq!(iso8601_to_ms("2026-11-01T18:00:00+08:00"), ms);
+        assert_eq!(iso8601_to_ms("2026-11-01T02:00:00-08:00"), ms);
+        // Leap day round-trips; pre-epoch dates work too.
+        assert_eq!(
+            ms_to_iso8601_utc(iso8601_to_ms("2024-02-29T12:00:00Z")),
+            "2024-02-29T12:00:00.000Z"
+        );
+        assert_eq!(
+            ms_to_iso8601_utc(iso8601_to_ms("1969-12-31T23:59:59.999Z")),
+            "1969-12-31T23:59:59.999Z"
+        );
+    }
+
+    #[test]
+    fn iso8601_unparseable_is_zero() {
+        assert_eq!(iso8601_to_ms(""), 0);
+        assert_eq!(iso8601_to_ms("not a date"), 0);
+        // AppleScript locale display dates do not parse.
+        assert_eq!(iso8601_to_ms("Saturday, November 1, 2026 at 10:00:00 AM"), 0);
+        assert_eq!(iso8601_to_ms("2026-13-01T10:00:00Z"), 0);
+        assert_eq!(iso8601_to_ms("2026-11-01"), 0);
+        // A missing zone designator means UTC (local definition).
+        assert_eq!(
+            iso8601_to_ms("2026-11-01T10:00:00"),
+            iso8601_to_ms("2026-11-01T10:00:00Z")
+        );
     }
 
     #[test]

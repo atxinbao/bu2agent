@@ -58,7 +58,7 @@ use crate::execution_store::ExecutionFileRecord;
 /// Row-level `schema_version` fields are a separate concept
 /// (the record contract version, still 1 for P0-A+ rows) and
 /// are untouched.
-pub const DB_SCHEMA_VERSION: i64 = 9;
+pub const DB_SCHEMA_VERSION: i64 = 10;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -482,6 +482,35 @@ CREATE TABLE IF NOT EXISTS user_memories (
 );
 ";
 
+/// D1-6a (Q-D1-64): one table, the mail sync fact
+/// record. `message_id` is the local stable id
+/// (`mail-N`, assigned in first-seen scan order);
+/// `(source_id, native_id)` is the dedupe key and the
+/// rebuild remap key — a re-sync after a rebuild
+/// reassigns the same local ids because the scan order
+/// is deterministic. `body_hash` is a SHA-256 hex of
+/// the body text; the body itself is never stored
+/// (plan §7 item 5: body_hash only, full text needs a
+/// separate approval). `subject`/`sender` live in this
+/// user-local table but never enter the event log (the
+/// `mail.synced` payload carries only lengths and
+/// hashes — see `redact_event_payload`).
+const SCHEMA_V10: &str = "
+CREATE TABLE IF NOT EXISTS mail_messages (
+    message_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    native_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    date_ms INTEGER NOT NULL,
+    body_hash TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL,
+    UNIQUE (source_id, native_id)
+);
+";
+
 fn err(e: rusqlite::Error) -> String {
     format!("sqlite: {e}")
 }
@@ -644,6 +673,19 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V9).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '9')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // D1-6a v10 step: mail_messages table only. One
+    // transaction, v5–v9 style; a fresh database runs
+    // v1–v10 in the same transaction. The table starts
+    // empty — rows arrive only from POST /api/email/sync.
+    if version < 10 {
+        tx.execute_batch(SCHEMA_V10).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '10')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -1637,6 +1679,106 @@ pub fn next_mandate_number(conn: &Connection) -> Result<u64, String> {
         .unwrap_or(1))
 }
 
+/// D1-6a (Q-D1-64, §11 red line 7): the privacy red
+/// line, mechanized. `append_event` is the single choke
+/// point for event-payload writes — every producer in
+/// the crate funnels through it — and it calls this
+/// helper before inserting.
+///
+/// Two shapes, by aggregate kind:
+///
+/// - Row-serialization kinds (`execution`, `effect`,
+///   `approval`, `policy_version`, `mandate`, `source`,
+///   `memory`, `outbox`, `inbox`, `assignment`): the
+///   payload IS the post-state row, and
+///   `fold_matches_tables` requires the last event
+///   payload to equal the row serialization exactly.
+///   These pass through byte-identical — redacting them
+///   would break the fold. They are secret-free by
+///   construction (no credential, body, or full-content
+///   field lives in those rows; memory `content` is
+///   user-saved text, not a secret).
+///
+/// - Every other kind (today `file` and `mail`): the
+///   payload must be an object carrying only whitelisted
+///   fields — ids, hashes, counts, kinds, flags,
+///   timestamps, cursors. Anything else (body text,
+///   subjects, senders, secrets, full content) is
+///   dropped. A payload that is not a JSON object, or
+///   that does not parse at all, fails closed to `"{}"`:
+///   an unparseable string must never reach the log,
+///   because it could carry anything.
+///
+/// The whitelist is deliberately narrow: a new event
+/// type that needs a field not listed here must add it
+/// here (and say why) instead of routing around the
+/// helper. `file.changed` passes unchanged in practice
+/// — its three fields are all on the list — and the
+/// tests lock that in, so the choke point cannot
+/// silently mangle an existing payload.
+const ROW_SERIALIZATION_KINDS: &[&str] = &[
+    "execution",
+    "effect",
+    "approval",
+    "policy_version",
+    "mandate",
+    "source",
+    "memory",
+    "outbox",
+    "inbox",
+    "assignment",
+];
+
+/// Fields a non-row event payload may carry. Ids,
+/// hashes, counts, kinds, flags, timestamps, cursors
+/// only — never body text, subjects, senders, secrets,
+/// or full content.
+const REDACTED_PAYLOAD_FIELDS: &[&str] = &[
+    "message_id",
+    "source_id",
+    "native_id",
+    "thread_id",
+    "body_hash",
+    "subject_len",
+    "sender_hash",
+    "date_ms",
+    "created_ms",
+    "updated_ms",
+    "origin_device_id",
+    "schema_version",
+    "synced_count",
+    "skipped_count",
+    "total_count",
+    "count",
+    "cursor",
+    "old_cursor",
+    "new_cursor",
+    "path_hash",
+    "execution_id",
+    "status",
+    "kind",
+    "seq",
+];
+
+pub(crate) fn redact_event_payload(kind: &str, payload_json: &str) -> String {
+    if ROW_SERIALIZATION_KINDS.contains(&kind) {
+        return payload_json.to_string();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload_json) else {
+        return "{}".to_string();
+    };
+    let Some(obj) = value.as_object() else {
+        return "{}".to_string();
+    };
+    let mut kept = serde_json::Map::new();
+    for (key, val) in obj {
+        if REDACTED_PAYLOAD_FIELDS.contains(&key.as_str()) {
+            kept.insert(key.clone(), val.clone());
+        }
+    }
+    canonical_json(&serde_json::Value::Object(kept))
+}
+
 // Eight arguments because an event row has eight meaningful
 // fields; grouping them into a struct would only move the
 // field list, not shrink it, and every producer site already
@@ -1652,6 +1794,12 @@ pub(crate) fn append_event(
     created_ms: i64,
     schema_version: i64,
 ) -> Result<i64, String> {
+    // D1-6a red line 7: every payload passes the redact
+    // choke point before it reaches the log. Row
+    // serializations pass through byte-identical (the
+    // fold depends on it); anything else is whitelisted
+    // down to ids/hashes/counts.
+    let payload_json = redact_event_payload(kind, payload_json);
     let seq: i64 = tx
         .query_row(
             "SELECT MAX(seq) FROM events WHERE aggregate_kind = ?1 AND aggregate_id = ?2",
@@ -6628,5 +6776,149 @@ mod tests {
         assert!(fold_matches_tables(&conn).expect("fold"));
         let events = list_events(&conn).expect("events");
         assert!(events.iter().any(|e| e.event_type == "execution.transitioned"));
+    }
+
+    #[test]
+    fn redact_passes_row_serializations_byte_identical() {
+        // D1-6a red line 7: the fold requires the last
+        // event payload to equal the row serialization
+        // exactly, so every row-serialization kind must
+        // survive redact untouched — including a memory
+        // row whose `content` is arbitrary user text.
+        let memory = serde_json::json!({
+            "memory_id": "memory-1",
+            "layer": "project",
+            "scope_json": "{}",
+            "content": "password hunter2, body text, anything at all",
+            "source_json": "{\"author\":\"tester\",\"created_ms\":1}",
+            "created_ms": 1,
+            "updated_ms": 1,
+            "deleted": false,
+            "origin_device_id": "mac-local",
+            "schema_version": 1
+        });
+        let raw = serde_json::to_string(&memory).unwrap();
+        for kind in [
+            "execution",
+            "effect",
+            "approval",
+            "policy_version",
+            "mandate",
+            "source",
+            "memory",
+            "outbox",
+            "inbox",
+            "assignment",
+        ] {
+            assert_eq!(redact_event_payload(kind, &raw), raw, "kind {kind}");
+        }
+    }
+
+    #[test]
+    fn redact_keeps_file_changed_unchanged() {
+        // The only pre-existing non-row payload: its
+        // three fields are all on the whitelist, and the
+        // canonical re-serialization must equal the
+        // canonical input (keys already sorted).
+        let raw = canonical_json(&serde_json::json!({
+            "path_hash": "abc",
+            "old_cursor": "c0",
+            "new_cursor": "c1",
+        }));
+        assert_eq!(redact_event_payload("file", &raw), raw);
+    }
+
+    #[test]
+    fn redact_drops_body_and_secrets_from_new_kinds() {
+        let raw = serde_json::to_string(&serde_json::json!({
+            "message_id": "mail-1",
+            "source_id": "mail-source",
+            "native_id": "42",
+            "thread_id": "thread-abc",
+            "body_hash": "deadbeef",
+            "subject_len": 12,
+            "sender_hash": "cafe",
+            "date_ms": 1794000000000i64,
+            "created_ms": 1794000000001i64,
+            "subject": "Quarterly results (confidential)",
+            "sender": "boss@example.invalid",
+            "body": "The secret launch code is hunter2.",
+            "body_text": "The secret launch code is hunter2.",
+            "secret": "sk-live-abc123",
+            "password": "hunter2",
+            "token": "tok-abc",
+            "content": "full note text"
+        }))
+        .unwrap();
+        let redacted = redact_event_payload("mail", &raw);
+        let value: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        for kept in [
+            "message_id",
+            "source_id",
+            "native_id",
+            "thread_id",
+            "body_hash",
+            "subject_len",
+            "sender_hash",
+            "date_ms",
+            "created_ms",
+        ] {
+            assert!(value.get(kept).is_some(), "kept {kept}");
+        }
+        for dropped in [
+            "subject", "sender", "body", "body_text", "secret", "password", "token", "content",
+        ] {
+            assert!(value.get(dropped).is_none(), "dropped {dropped}");
+        }
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("confidential"));
+        assert!(!redacted.contains("sk-live"));
+        // Unknown kinds get the same strict treatment.
+        assert_eq!(redact_event_payload("future-kind", &raw), redacted);
+    }
+
+    #[test]
+    fn redact_fails_closed_on_unparseable_payloads() {
+        assert_eq!(redact_event_payload("mail", "not json at all"), "{}");
+        assert_eq!(redact_event_payload("mail", "[1,2,3]"), "{}");
+        assert_eq!(redact_event_payload("mail", "\"a string\""), "{}");
+        assert_eq!(redact_event_payload("mail", ""), "{}");
+    }
+
+    #[test]
+    fn redact_runs_inside_append_event_and_fold_still_holds() {
+        let path = temp_db("d1-6a-redact");
+        let mut conn = open_db(&path).expect("open");
+        // A row-serialization event still folds.
+        upsert_execution(&mut conn, &execution("execution-1", "running")).expect("exec");
+        // A mail event through the real choke point: the
+        // body/secret never reach the log.
+        let tx = conn.transaction().expect("tx");
+        append_event(
+            &tx,
+            "mail",
+            "mail-1",
+            "mail.synced",
+            "{\"message_id\":\"mail-1\",\"body\":\"hunter2 secret body\",\"body_hash\":\"abc\"}",
+            "mac-local",
+            1,
+            1,
+        )
+        .expect("event");
+        tx.commit().expect("commit");
+        assert!(fold_matches_tables(&conn).expect("fold"));
+        let events = list_events(&conn).expect("events");
+        let mail = events
+            .iter()
+            .find(|e| e.event_type == "mail.synced")
+            .expect("mail event");
+        assert!(!mail.payload_json.contains("hunter2"));
+        assert_eq!(
+            mail.payload_json,
+            canonical_json(&serde_json::json!({
+                "body_hash": "abc",
+                "message_id": "mail-1",
+            }))
+        );
     }
 }

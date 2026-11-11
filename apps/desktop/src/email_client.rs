@@ -57,6 +57,18 @@ pub struct MessageView {
     pub attachments: Vec<AttachmentMeta>,
 }
 
+/// D1-6a: one mail sync pass (manual trigger only).
+/// Counts + the mail-source cursor; the gateway records
+/// one row + one `mail.synced` event per new message in
+/// the same transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailSyncResult {
+    pub synced_count: usize,
+    pub skipped_count: usize,
+    pub total_count: usize,
+    pub cursor: String,
+}
+
 /// `base_url` must look like `http://127.0.0.1:3001` and pass
 /// the egress allowlist (localhost Mock only).
 #[derive(Debug, Clone)]
@@ -113,5 +125,9 @@ impl EmailClient {
         index: usize,
     ) -> std::result::Result<Vec<u8>, AgentError> {
         Ok(self.http.get_bytes(&format!("/api/email/messages/{message_id}/attachments/{index}"))?)
+    }
+
+    pub fn sync_mail(&self) -> std::result::Result<MailSyncResult, AgentError> {
+        Ok(self.http.post_json("/api/email/sync", "{}")?)
     }
 }

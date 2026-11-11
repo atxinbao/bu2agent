@@ -53,6 +53,10 @@ import { EmailClient } from "./domain/email_client";
 import type { EmailGateway } from "./domain/email_client";
 import { InvokeEmailClient } from "./domain/invoke_email_client";
 import { MailView } from "./views/MailView";
+import { CalendarClient } from "./domain/calendar_client";
+import type { CalendarGateway } from "./domain/calendar_client";
+import { InvokeCalendarClient } from "./domain/invoke_calendar_client";
+import { CalendarView } from "./views/CalendarView";
 import { NotesView } from "./views/NotesView";
 import { NodeClient, type NodeGateway } from "./domain/node_client";
 import { InvokeNodeClient } from "./domain/invoke_node_client";
@@ -161,6 +165,7 @@ interface Clients {
   goals: GoalGateway;
   sources: SourceGateway;
   memories: MemoryGateway;
+  calendar: CalendarGateway;
   feed: FeedGateway;
   chatRecords: ChatRecordsGateway;
   nodes: NodeGateway;
@@ -174,7 +179,7 @@ interface Clients {
   engineering: EngineeringGateway;
 }
 
-type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "goals" | "sources" | "memories" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "notes" | "engineering" | "patches" | "settings";
+type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "goals" | "sources" | "memories" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "calendar" | "notes" | "engineering" | "patches" | "settings";
 
 // Visible navigation: the workbench (sessions) is the only
 // chat entry and the default view (R1, 2026-10-28). The legacy
@@ -196,6 +201,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "spaces", label: "Spaces" },
   { id: "feed", label: "Feed" },
   { id: "mail", label: "Mail" },
+  { id: "calendar", label: "Calendar" },
   { id: "notes", label: "Notes" },
   { id: "engineering", label: "工程" },
   { id: "patches", label: "补丁" },
@@ -264,6 +270,7 @@ export function App() {
           goals: new InvokeGoalClient(),
           sources: new InvokeSourceClient(),
           memories: new InvokeMemoryClient(),
+          calendar: new InvokeCalendarClient(),
           feed: new InvokeFeedClient(),
           chatRecords: new InvokeChatRecordsClient(),
           nodes: new InvokeNodeClient(),
@@ -296,6 +303,7 @@ export function App() {
           goals: new GoalClient(MOCK_BASE_URL),
           sources: new SourceClient(MOCK_BASE_URL),
           memories: new MemoryClient(MOCK_BASE_URL),
+          calendar: new CalendarClient(MOCK_BASE_URL),
           feed: new FeedClient(MOCK_BASE_URL),
           chatRecords: new ChatRecordsClient(MOCK_BASE_URL),
           nodes: new NodeClient(MOCK_BASE_URL),
@@ -647,6 +655,12 @@ export function App() {
           <p className="empty">Choosing transport…</p>
         ) : (
           <MailView email={clients.email} loops={clients.loops} onNavigate={(target) => setTab(target)} />
+        ))}
+      {tab === "calendar" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : (
+          <CalendarView client={clients.calendar} />
         ))}
       {tab === "notes" &&
         (clients === null ? (
