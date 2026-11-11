@@ -34,9 +34,11 @@
 //! grouped by normalized subject (leading Re:/Fwd:
 //! prefixes stripped, case-insensitive) and the thread id
 //! is a stable hash of that normalized subject. The
-//! message date is a display string (AppleScript's date
-//! string is locale-dependent; it is passed through, not
-//! normalized to milliseconds).
+//! message date is emitted as UTC ISO8601
+//! (`YYYY-MM-DDTHH:MM:SSZ`, via the `isoDate` handler,
+//! D1-6a fix F-2) so `iso8601_to_ms` parses it;
+//! unparseable dates still fall back to `date_ms` 0
+//! ("unknown date").
 //!
 //! Batch-1 window (option A, approved 2026-11-03): every
 //! AppleScript loop scans at most the first 50 messages
@@ -86,7 +88,7 @@ pub struct ThreadView {
     pub snippet: String,
 }
 
-/// One message. `date` is a display string (see the
+/// One message. `date` is a UTC ISO8601 string (see the
 /// module docs). `body_text` is plain text only (plan
 /// S4); HTML is not expanded in batch 1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -447,7 +449,14 @@ use std::{
 /// Batch-1 read window (see the module docs): every
 /// AppleScript loop scans at most this many messages of
 /// the inbox, in Mail's inbox order.
-#[cfg(target_os = "macos")]
+///
+/// Gated on macOS-or-test (D1-6a fix F-2): the script
+/// builders below are plain string construction, so the
+/// guard test can run on every platform; only
+/// `run_script` itself is macOS-only. Without the `test`
+/// arm the builders would be dead code on Linux/Windows
+/// lib builds (their only callers are macOS methods).
+#[cfg(any(target_os = "macos", test))]
 const INBOX_WINDOW: usize = 50;
 
 /// Hard cap on one `osascript` invocation (see the
@@ -459,6 +468,102 @@ const SCRIPT_TIMEOUT_SECS: u64 = 30;
 /// output in (gateway requests run concurrently).
 #[cfg(target_os = "macos")]
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Shared date handlers (D1-6a fix F-2): `isoDate`
+/// emits UTC ISO8601 with a `Z` suffix so
+/// `iso8601_to_ms` parses it. The old `(date received of
+/// m as string)` produced a locale display string that
+/// parsed to `date_ms` 0 on every real row. Both handlers
+/// live at top level like `cleanText` and are called with
+/// `my`, because `time to GMT` is a script global that
+/// must not be resolved inside `tell application "Mail"`.
+#[cfg(any(target_os = "macos", test))]
+const DATE_HANDLERS: &str = r#"on pad2(n)
+  if n < 10 then
+    return "0" & (n as string)
+  else
+    return n as string
+  end if
+end pad2
+
+on isoDate(d)
+  -- `time to GMT` is seconds east of GMT; `iso8601_to_ms`
+  -- accepts the `Z` suffix. Unparseable dates still fall
+  -- back to date_ms 0 ("unknown date") in the gateway.
+  set g to d - (time to GMT)
+  return (year of g as string) & "-" & my pad2(month of g as integer) & "-" & my pad2(day of g) & "T" & my pad2(hours of g) & ":" & my pad2(minutes of g) & ":" & my pad2(seconds of g) & "Z"
+end isoDate
+"#;
+
+/// AppleScript for the inbox dump. Plain string
+/// construction (no macOS calls) so the F-2 guard test
+/// can run on every platform.
+#[cfg(any(target_os = "macos", test))]
+fn inbox_dump_script() -> String {
+    let raw_script = format!(
+        r#"on cleanText(t)
+  set AppleScript's text item delimiters to {{tab, return, linefeed}}
+  set parts to text items of t
+  set AppleScript's text item delimiters to " "
+  return parts as string
+end cleanText
+{DATE_HANDLERS}with timeout of 60 seconds
+  tell application "Mail"
+    set totalCount to count messages of inbox
+    if totalCount is 0 then
+      return ""
+    end if
+    set endIdx to totalCount
+    if endIdx > __WINDOW__ then
+      set endIdx to __WINDOW__
+    end if
+    set windowMessages to messages 1 thru endIdx of inbox
+    set out to ""
+    repeat with m in windowMessages
+      set addrs to ""
+      repeat with r in to recipients of m
+        set addrs to addrs & address of r & ","
+      end repeat
+      set out to out & (id of m as string) & (character id 31) & my cleanText(subject of m) & (character id 31) & my cleanText(sender of m) & (character id 31) & addrs & (character id 31) & my isoDate(date received of m) & return
+    end repeat
+    return out
+  end tell
+end timeout"#,
+        DATE_HANDLERS = DATE_HANDLERS
+    );
+    raw_script.replace("__WINDOW__", &INBOX_WINDOW.to_string())
+}
+
+/// AppleScript for one message's metadata, by id. Plain
+/// string construction (no macOS calls) so the F-2 guard
+/// test can run on every platform.
+#[cfg(any(target_os = "macos", test))]
+fn find_meta_script(message_id: &str) -> String {
+    format!(
+        r#"on cleanText(t)
+  set AppleScript's text item delimiters to {{tab, return, linefeed}}
+  set parts to text items of t
+  set AppleScript's text item delimiters to " "
+  return parts as string
+end cleanText
+{DATE_HANDLERS}with timeout of 30 seconds
+  tell application "Mail"
+    try
+      set m to first message of inbox whose id is {message_id}
+      set addrs to ""
+      repeat with r in to recipients of m
+        set addrs to addrs & address of r & ","
+      end repeat
+      return (id of m as string) & (character id 31) & my cleanText(subject of m) & (character id 31) & my cleanText(sender of m) & (character id 31) & addrs & (character id 31) & my isoDate(date received of m) & return
+    on error
+      return "«BU2AGENT_MESSAGE_NOT_FOUND»"
+    end try
+  end tell
+end timeout"#,
+        DATE_HANDLERS = DATE_HANDLERS,
+        message_id = message_id
+    )
+}
 
 #[cfg(target_os = "macos")]
 impl AppleScriptMailSource {
@@ -580,35 +685,7 @@ impl AppleScriptMailSource {
         // (see the U2 502 fix: the v1 window prelude
         // used the single-line form plus `end if`,
         // which fails osascript compilation outright).
-        let raw_script = r#"on cleanText(t)
-  set AppleScript's text item delimiters to {tab, return, linefeed}
-  set parts to text items of t
-  set AppleScript's text item delimiters to " "
-  return parts as string
-end cleanText
-with timeout of 60 seconds
-  tell application "Mail"
-    set totalCount to count messages of inbox
-    if totalCount is 0 then
-      return ""
-    end if
-    set endIdx to totalCount
-    if endIdx > __WINDOW__ then
-      set endIdx to __WINDOW__
-    end if
-    set windowMessages to messages 1 thru endIdx of inbox
-    set out to ""
-    repeat with m in windowMessages
-      set addrs to ""
-      repeat with r in to recipients of m
-        set addrs to addrs & address of r & ","
-      end repeat
-      set out to out & (id of m as string) & (character id 31) & my cleanText(subject of m) & (character id 31) & my cleanText(sender of m) & (character id 31) & addrs & (character id 31) & (date received of m as string) & return
-    end repeat
-    return out
-  end tell
-end timeout"#;
-        let script = raw_script.replace("__WINDOW__", &INBOX_WINDOW.to_string());
+        let script = inbox_dump_script();
         let dump = Self::run_script(&script)?;
         Ok(parse_dump(&dump))
     }
@@ -623,29 +700,7 @@ end timeout"#;
         // directly instead of rescanning the first page of
         // the inbox; older messages and attachments must
         // remain readable after the list window is applied.
-        let script = format!(
-            r#"on cleanText(t)
-  set AppleScript's text item delimiters to {{tab, return, linefeed}}
-  set parts to text items of t
-  set AppleScript's text item delimiters to " "
-  return parts as string
-end cleanText
-with timeout of 30 seconds
-  tell application "Mail"
-    try
-      set m to first message of inbox whose id is {message_id}
-      set addrs to ""
-      repeat with r in to recipients of m
-        set addrs to addrs & address of r & ","
-      end repeat
-      return (id of m as string) & (character id 31) & my cleanText(subject of m) & (character id 31) & my cleanText(sender of m) & (character id 31) & addrs & (character id 31) & (date received of m as string) & return
-    on error
-      return "«BU2AGENT_MESSAGE_NOT_FOUND»"
-    end try
-  end tell
-end timeout"#,
-            message_id = message_id
-        );
+        let script = find_meta_script(message_id);
         let dump = Self::run_script(&script)?;
         let (metas, _) = parse_dump(&dump);
         metas
@@ -878,6 +933,29 @@ end timeout"#,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applescript_dates_are_iso8601_utc() {
+        // D1-6a fix F-2: both AppleScript dumps must emit
+        // dates via `isoDate` (UTC, `Z` suffix) so
+        // `iso8601_to_ms` parses them. The old locale
+        // display string parsed to `date_ms` 0 on every
+        // real row. The builders are plain string
+        // construction, so this guard runs on every
+        // platform even though `run_script` is macOS-only.
+        for script in [inbox_dump_script(), find_meta_script("123")] {
+            assert!(script.contains("on isoDate(d)"), "isoDate handler missing");
+            assert!(script.contains("time to GMT"), "UTC conversion missing");
+            assert!(
+                script.contains("my isoDate(date received of m)"),
+                "date must go through isoDate"
+            );
+            assert!(
+                !script.contains("date received of m as string"),
+                "locale display date must not come back"
+            );
+        }
+    }
 
     #[test]
     fn subject_normalization_strips_reply_prefixes() {

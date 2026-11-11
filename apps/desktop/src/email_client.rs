@@ -69,18 +69,32 @@ pub struct MailSyncResult {
     pub cursor: String,
 }
 
+/// D1-6a fix F-1: mail sync runs AppleScript against a real
+/// mailbox and takes ~50 s for a 50-message window, far past
+/// the shared 10 s read timeout. Sync alone gets a 120 s
+/// bound (2x+ headroom over the observed ~50 s); every other
+/// email call keeps the 10 s default so a hung gateway still
+/// fails fast instead of hanging the CLI.
+const MAIL_SYNC_TIMEOUT_MS: u64 = 120_000;
+
 /// `base_url` must look like `http://127.0.0.1:3001` and pass
 /// the egress allowlist (localhost Mock only).
 #[derive(Debug, Clone)]
 pub struct EmailClient {
     http: HttpClient,
+    /// Sync-only client with the long timeout (F-1). All
+    /// other calls share `http` and its 10 s default.
+    sync_http: HttpClient,
 }
 
 impl EmailClient {
     pub fn new(base_url: &str) -> Result<Self> {
         let policy = EgressPolicy::mock();
         policy.check_url(base_url)?;
-        Ok(Self { http: HttpClient::new(base_url)? })
+        Ok(Self {
+            http: HttpClient::new(base_url)?,
+            sync_http: HttpClient::with_timeout(base_url, MAIL_SYNC_TIMEOUT_MS)?,
+        })
     }
 
     pub fn mailbox(&self) -> std::result::Result<MailboxInfo, AgentError> {
@@ -128,6 +142,10 @@ impl EmailClient {
     }
 
     pub fn sync_mail(&self) -> std::result::Result<MailSyncResult, AgentError> {
-        Ok(self.http.post_json("/api/email/sync", "{}")?)
+        // F-1: sync alone uses the long-timeout client; a
+        // real mailbox takes ~50 s and the shared 10 s
+        // client times out first with "cannot read mock
+        // gateway response" while the gateway still finishes.
+        Ok(self.sync_http.post_json("/api/email/sync", "{}")?)
     }
 }
