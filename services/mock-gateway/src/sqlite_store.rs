@@ -58,7 +58,7 @@ use crate::execution_store::ExecutionFileRecord;
 /// Row-level `schema_version` fields are a separate concept
 /// (the record contract version, still 1 for P0-A+ rows) and
 /// are untouched.
-pub const DB_SCHEMA_VERSION: i64 = 10;
+pub const DB_SCHEMA_VERSION: i64 = 11;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -511,6 +511,34 @@ CREATE TABLE IF NOT EXISTS mail_messages (
 );
 ";
 
+/// D1-6b-1 (Q-D1-6b-05/08/23): one table, the mail send
+/// fact record. `sent_id` is the local stable id
+/// (`sent-N`, a distinct shape from `mail-N`);
+/// `idempotency_key` is UNIQUE — the replay backstop
+/// (same key + same content replays the original row,
+/// same key + different content is a 409). `native_id`
+/// is nullable (Mail.app may accept a send whose id the
+/// script cannot read back). `body_hash` is a SHA-256
+/// hex of the body text; the body itself is never
+/// stored. `policy_version` is the current Policy
+/// version at write time, for the Mandate audit trail.
+const SCHEMA_V11: &str = "
+CREATE TABLE IF NOT EXISTS sent_messages (
+    sent_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    native_id TEXT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    to_json TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body_hash TEXT NOT NULL,
+    sent_ms INTEGER NOT NULL,
+    effect_id TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL
+);
+";
+
 fn err(e: rusqlite::Error) -> String {
     format!("sqlite: {e}")
 }
@@ -686,6 +714,19 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V10).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '10')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // D1-6b-1 v11 step: sent_messages table only. One
+    // transaction, v5–v10 style; a fresh database runs
+    // v1–v11 in the same transaction. The table starts
+    // empty — rows arrive only from POST /api/email/send.
+    if version < 11 {
+        tx.execute_batch(SCHEMA_V11).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '11')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -1758,6 +1799,18 @@ const REDACTED_PAYLOAD_FIELDS: &[&str] = &[
     "status",
     "kind",
     "seq",
+    // D1-6b-1 `mail.sent` fields (each added with its
+    // reason, per this helper's own rule):
+    // `sent_id` — the sent message's local id, like
+    // `message_id` for synced mail.
+    "sent_id",
+    // `recipient_count` — how many recipients, a count
+    // only, never the addresses themselves.
+    "recipient_count",
+    // `recipient_hash` — sha256 of the canonical
+    // recipient list, like `sender_hash` for synced
+    // mail: the set is auditable without naming anyone.
+    "recipient_hash",
 ];
 
 pub(crate) fn redact_event_payload(kind: &str, payload_json: &str) -> String {

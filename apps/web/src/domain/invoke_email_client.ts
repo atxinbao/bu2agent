@@ -11,6 +11,8 @@ import type {
   MailboxInfo,
   MailboxSetup,
   MessageView,
+  SendMailInput,
+  SentMessage,
   ThreadView,
 } from "./email_client";
 
@@ -73,6 +75,38 @@ function toMessageView(server: ServerMessageView): MessageView {
   };
 }
 
+interface ServerSentMessage {
+  sent_id: string;
+  source_id: string;
+  native_id: string | null;
+  idempotency_key: string;
+  to_json: string;
+  subject: string;
+  body_hash: string;
+  sent_ms: number;
+  effect_id: string;
+  policy_version: string;
+  created_ms: number;
+  origin_device_id: string;
+}
+
+function toSentMessage(server: ServerSentMessage): SentMessage {
+  return {
+    sentId: server.sent_id,
+    sourceId: server.source_id,
+    nativeId: server.native_id,
+    idempotencyKey: server.idempotency_key,
+    toJson: server.to_json,
+    subject: server.subject,
+    bodyHash: server.body_hash,
+    sentMs: server.sent_ms,
+    effectId: server.effect_id,
+    policyVersion: server.policy_version,
+    createdMs: server.created_ms,
+    originDeviceId: server.origin_device_id,
+  };
+}
+
 export class InvokeEmailClient implements EmailGateway {
   mailbox(): Promise<MailboxInfo> {
     return invoke("email_mailbox");
@@ -116,5 +150,26 @@ export class InvokeEmailClient implements EmailGateway {
 
   attachment(messageId: string, index: number): Promise<number[]> {
     return invoke("email_message_attachment", { message_id: messageId, index });
+  }
+
+  async sendMail(input: SendMailInput): Promise<SentMessage> {
+    const sent = await invoke<ServerSentMessage>("mail_send", {
+      to: input.to,
+      subject: input.subject,
+      body: input.body,
+      idempotency_key: input.idempotencyKey,
+      tool_call_id: input.toolCallId ?? null,
+    });
+    return toSentMessage(sent);
+  }
+
+  async listSent(): Promise<SentMessage[]> {
+    const rows = await invoke<ServerSentMessage[]>("mail_sent_list");
+    return rows.map(toSentMessage);
+  }
+
+  async sent(sentId: string): Promise<SentMessage> {
+    const row = await invoke<ServerSentMessage>("mail_sent_get", { sent_id: sentId });
+    return toSentMessage(row);
   }
 }

@@ -654,7 +654,7 @@ export function App() {
         (clients === null ? (
           <p className="empty">Choosing transport…</p>
         ) : (
-          <MailView email={clients.email} loops={clients.loops} onNavigate={(target) => setTab(target)} />
+          <MailView email={clients.email} loops={clients.loops} agent={clients.agent} onNavigate={(target) => setTab(target)} />
         ))}
       {tab === "calendar" &&
         (clients === null ? (

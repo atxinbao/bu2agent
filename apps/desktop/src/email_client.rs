@@ -69,12 +69,50 @@ pub struct MailSyncResult {
     pub cursor: String,
 }
 
+/// D1-6b-1: one accepted send (the `sent_messages` fact
+/// row). The body is never in this struct — only its
+/// hash. "Sent" means Mail.app accepted the message,
+/// never that it was delivered (Q-D1-6b-06).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentMessageRow {
+    pub sent_id: String,
+    pub source_id: String,
+    pub native_id: Option<String>,
+    pub idempotency_key: String,
+    pub to_json: String,
+    pub subject: String,
+    pub body_hash: String,
+    pub sent_ms: i64,
+    pub effect_id: String,
+    pub policy_version: String,
+    pub created_ms: i64,
+    pub origin_device_id: String,
+}
+
+/// D1-6b-1: a send request. The idempotency key is
+/// client-supplied and required (Q-D1-6b-05); the
+/// approval id is the decided digest-bound approval for
+/// this exact message (Q-D1-6b-22).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendMailInput {
+    pub to: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    pub idempotency_key: String,
+    pub tool_call_id: Option<String>,
+}
+
 /// D1-6a fix F-1: mail sync runs AppleScript against a real
 /// mailbox and takes ~50 s for a 50-message window, far past
 /// the shared 10 s read timeout. Sync alone gets a 120 s
 /// bound (2x+ headroom over the observed ~50 s); every other
 /// email call keeps the 10 s default so a hung gateway still
 /// fails fast instead of hanging the CLI.
+///
+/// D1-6b-1: send shares the long-timeout client — a send
+/// is one `osascript` call capped at 30 s gateway-side,
+/// and the 10 s default would time out before the
+/// gateway finishes (the same F-1 failure shape).
 const MAIL_SYNC_TIMEOUT_MS: u64 = 120_000;
 
 /// `base_url` must look like `http://127.0.0.1:3001` and pass
@@ -82,8 +120,10 @@ const MAIL_SYNC_TIMEOUT_MS: u64 = 120_000;
 #[derive(Debug, Clone)]
 pub struct EmailClient {
     http: HttpClient,
-    /// Sync-only client with the long timeout (F-1). All
-    /// other calls share `http` and its 10 s default.
+    /// Long-timeout client (F-1): sync and send share
+    /// it — both run AppleScript gateway-side and can
+    /// take up to ~50 s / 30 s. All other calls share
+    /// `http` and its 10 s default.
     sync_http: HttpClient,
 }
 
@@ -147,5 +187,29 @@ impl EmailClient {
         // client times out first with "cannot read mock
         // gateway response" while the gateway still finishes.
         Ok(self.sync_http.post_json("/api/email/sync", "{}")?)
+    }
+
+    /// D1-6b-1: send one plain-text message through the
+    /// digest-bound approval flow (approval_request →
+    /// decide → send). Uses the long-timeout client
+    /// (same F-1 reason as sync: the gateway-side send
+    /// can take up to 30 s). The gateway's extra
+    /// `replayed` flag is ignored on decode; the row is
+    /// the fact record.
+    pub fn send_mail(
+        &self,
+        input: &SendMailInput,
+    ) -> std::result::Result<SentMessageRow, AgentError> {
+        let body = serde_json::to_string(input)
+            .map_err(|_| crate::http_client::transport_error("cannot encode mail send"))?;
+        Ok(self.sync_http.post_json("/api/email/send", &body)?)
+    }
+
+    pub fn list_sent(&self) -> std::result::Result<Vec<SentMessageRow>, AgentError> {
+        Ok(self.http.get_json("/api/email/sent")?)
+    }
+
+    pub fn sent_get(&self, sent_id: &str) -> std::result::Result<SentMessageRow, AgentError> {
+        Ok(self.http.get_json(&format!("/api/email/sent/{sent_id}"))?)
     }
 }

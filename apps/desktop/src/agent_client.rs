@@ -95,6 +95,15 @@ struct ApprovalRequestDto {
     content_base64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     append: Option<bool>,
+    /// D1-6b-1: the mail send presentation. The server
+    /// recomputes `mail_send_digest` from these fields;
+    /// a client hash is never trusted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,7 +179,7 @@ impl AgentClient {
             return Err(invalid("unknown tool").into());
         };
         self.post_approval(
-            &ApprovalRequestDto { tool: tool.to_string(), path: None, content_base64: None, append: None },
+            &ApprovalRequestDto { tool: tool.to_string(), path: None, content_base64: None, append: None, to: None, subject: None, body: None },
             requires,
         )
     }
@@ -199,6 +208,9 @@ impl AgentClient {
                     path: Some(path.clone()),
                     content_base64: Some(to_base64(text.as_bytes())),
                     append: Some(false),
+                    to: None,
+                    subject: None,
+                    body: None,
                 }
             }
             "fs.delete" => {
@@ -209,6 +221,40 @@ impl AgentClient {
                     path: Some(path.clone()),
                     content_base64: None,
                     append: None,
+                    to: None,
+                    subject: None,
+                    body: None,
+                }
+            }
+            // D1-6b-1: a mail send approval binds the exact
+            // message (Q-D1-6b-22). `to` arrives as a JSON
+            // array string — the invoke transport only
+            // carries string args, and the server
+            // recomputes the digest from the decoded
+            // list, never from a client hash.
+            "mail.send" => {
+                let args = args
+                    .ok_or_else(|| invalid("mail.send approval requires to, subject and body"))?;
+                let to_raw = args
+                    .get("to")
+                    .ok_or_else(|| invalid("mail.send approval requires to"))?;
+                let to: Vec<String> = serde_json::from_str(to_raw).map_err(|_| {
+                    invalid("mail.send approval to must be a JSON array of addresses")
+                })?;
+                let subject = args
+                    .get("subject")
+                    .ok_or_else(|| invalid("mail.send approval requires subject"))?;
+                let body = args
+                    .get("body")
+                    .ok_or_else(|| invalid("mail.send approval requires body"))?;
+                ApprovalRequestDto {
+                    tool: tool.to_string(),
+                    path: None,
+                    content_base64: None,
+                    append: None,
+                    to: Some(to),
+                    subject: Some(subject.clone()),
+                    body: Some(body.clone()),
                 }
             }
             _ => {

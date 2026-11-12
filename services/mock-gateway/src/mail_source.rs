@@ -5,6 +5,15 @@
 //! sync cache: every call queries the source live (plan
 //! S6). No approval loop: these are reads.
 //!
+//! D1-6b-1 adds the one write: `MailSource::send`
+//! (plain-text, no attachments), gated by the same
+//! `mail_running` pgrep check and the same 30 s
+//! `run_script` cap. "Sent" means Mail.app accepted the
+//! message, never that it was delivered (Q-D1-6b-06);
+//! the send script form is best-effort and window
+//! validation on a real Mac is the proof, as with the
+//! batch-1 read scripts.
+//!
 //! The source is a trait so the mechanism can change
 //! without touching routes, clients, or UI:
 //!
@@ -124,12 +133,33 @@ pub struct AttachmentData {
 /// `NotFound` -> 404, `Unavailable` -> 501, `Denied` ->
 /// 403, `Upstream` -> 502. Error strings are generic on
 /// purpose: automation stderr can contain local paths.
+/// `NotRunning` (Mail.app is not running) and `Timeout`
+/// (the script was killed at the gateway's 30 s cap) are
+/// separate variants because the D1-6b-1 send route must
+/// tell them apart: a timeout leaves the send ambiguous
+/// (Effect unknown), while "not running" is a definite
+/// gateway-side failure (Effect failed). Both still map
+/// to 502 on the read paths.
 #[derive(Debug, Clone)]
 pub enum MailError {
     NotFound(&'static str),
     Unavailable(String),
     Denied,
     Upstream(String),
+    NotRunning,
+    Timeout,
+}
+
+/// The outcome of a real send: Mail.app accepted the
+/// message ("sent" = accepted, never "delivered" —
+/// Q-D1-6b-06). `native_id` is the Mail id of the sent
+/// message when the script could read it back, `None`
+/// when it could not (Q-D1-6b-08: the `sent-N` row +
+/// Effect + event are the credential chain, not the
+/// native id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentMessage {
+    pub native_id: Option<String>,
 }
 
 /// Live-query email source (no sync cache in batch 1).
@@ -140,6 +170,11 @@ pub trait MailSource: Send + Sync {
     fn thread(&self, thread_id: &str) -> Result<ThreadView, MailError>;
     fn message(&self, message_id: &str) -> Result<MessageView, MailError>;
     fn attachment(&self, message_id: &str, index: usize) -> Result<AttachmentData, MailError>;
+    /// D1-6b-1: send one plain-text message (no
+    /// attachments) via Mail.app. `to` is the
+    /// deduplicated, sorted recipient list. The send is
+    /// synchronous: success means Mail.app accepted it.
+    fn send(&self, to: &[String], subject: &str, body: &str) -> Result<SentMessage, MailError>;
 }
 
 /// One message's metadata, as dumped by the AppleScript
@@ -383,6 +418,13 @@ impl MailSource for MockMailSource {
         }
         Err(MailError::NotFound("attachment"))
     }
+
+    fn send(&self, _to: &[String], _subject: &str, _body: &str) -> Result<SentMessage, MailError> {
+        // The Mock source never sends: the packaged app
+        // uses AppleScript, tests inject their own fake.
+        // Accepting here would fabricate a send.
+        Ok(SentMessage { native_id: None })
+    }
 }
 
 /// Every call fails: the production source on platforms
@@ -412,6 +454,12 @@ impl MailSource for UnavailableMailSource {
 
     fn attachment(&self, _message_id: &str, _index: usize) -> Result<AttachmentData, MailError> {
         Err(MailError::Unavailable("mail source unavailable on this platform".to_string()))
+    }
+
+    fn send(&self, _to: &[String], _subject: &str, _body: &str) -> Result<SentMessage, MailError> {
+        Err(MailError::Unavailable(
+            "mail source unavailable on this platform".to_string(),
+        ))
     }
 }
 
@@ -565,6 +613,72 @@ end timeout"#,
     )
 }
 
+/// Escape one value for an AppleScript double-quoted
+/// string literal: backslash and quote are escaped, and
+/// newlines / carriage returns / tabs become their
+/// escape sequences (AppleScript interprets `\n`, `\r`,
+/// `\t` inside literals). Any other control character
+/// becomes a space — it must never reach the script
+/// verbatim, where it could break the literal or the
+/// `osascript -e` argument.
+#[cfg(any(target_os = "macos", test))]
+fn applescript_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// AppleScript for sending one plain-text message
+/// (D1-6b-1, best-effort — the exact send form is
+/// UNVERIFIED: window validation on a real Mac is the
+/// proof, same as the batch-1 read scripts). Plain
+/// string construction (no macOS calls) so the guard
+/// test runs on every platform. `visible:false` keeps
+/// Mail.app from opening a compose window; the message
+/// id is returned when Mail can still read it after
+/// `send`, and the empty string otherwise (native_id
+/// stays nullable — Q-D1-6b-08). `to` is the caller's
+/// deduplicated, sorted recipient list.
+#[cfg(any(target_os = "macos", test))]
+fn send_script(to: &[String], subject: &str, body: &str) -> String {
+    let recipients = to
+        .iter()
+        .map(|addr| format!("\"{}\"", applescript_escape(addr)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"with timeout of 30 seconds
+  tell application "Mail"
+    set msg to make new outgoing message with properties {{subject:"{subject}", content:"{body}", visible:false}}
+    tell msg
+      repeat with addr in {{{recipients}}}
+        make new to recipient at end of to recipients with properties {{address:addr}}
+      end repeat
+    end tell
+    send msg
+    try
+      return (id of msg as string)
+    on error
+      return ""
+    end try
+  end tell
+end timeout"#,
+        subject = applescript_escape(subject),
+        body = applescript_escape(body),
+        recipients = recipients,
+    )
+}
+
 #[cfg(target_os = "macos")]
 impl AppleScriptMailSource {
     pub fn new() -> Self {
@@ -585,9 +699,11 @@ impl AppleScriptMailSource {
     /// Run one AppleScript program, capped at
     /// `SCRIPT_TIMEOUT_SECS`. Maps automation denial to
     /// `Denied` (the spec's MailSender detects exactly
-    /// this), a missing Mail to `Upstream`, a timeout to
-    /// `Upstream`, and everything else to a generic
-    /// `Upstream`. Output goes to temp files, not pipes:
+    /// this), a missing Mail to `NotRunning` (Q-D1-6b-07:
+    /// never launch Mail.app for a send — or a read), a
+    /// timeout to `Timeout` (the caller must treat the
+    /// outcome as unknown, never guessed), and everything
+    /// else to a generic `Upstream`. Output goes to temp files, not pipes:
     /// a large dump could fill a pipe buffer while the
     /// parent polls, deadlocking the wait; temp files
     /// also make the timeout kill clean (no leaked
@@ -596,7 +712,7 @@ impl AppleScriptMailSource {
     /// stderr can contain local paths.
     fn run_script(script: &str) -> Result<String, MailError> {
         if !Self::mail_running() {
-            return Err(MailError::Upstream("Mail is not running".to_string()));
+            return Err(MailError::NotRunning);
         }
         let n = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
         let stem = format!("bu2agent-mail-script-{}-{n}", std::process::id());
@@ -643,7 +759,7 @@ impl AppleScriptMailSource {
                         let _ = child.wait();
                         let _ = fs::remove_file(&out_path);
                         let _ = fs::remove_file(&err_path);
-                        return Err(MailError::Upstream("Mail script timed out".to_string()));
+                        return Err(MailError::Timeout);
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
@@ -751,7 +867,7 @@ impl Default for AppleScriptMailSource {
 impl MailSource for AppleScriptMailSource {
     fn mailbox(&self) -> Result<MailboxInfo, MailError> {
         if !Self::mail_running() {
-            return Err(MailError::Upstream("Mail is not running".to_string()));
+            return Err(MailError::NotRunning);
         }
         let script = r#"with timeout of 30 seconds
   tell application "Mail"
@@ -928,6 +1044,27 @@ end timeout"#,
             Err(other) => Err(other),
         }
     }
+
+    fn send(&self, to: &[String], subject: &str, body: &str) -> Result<SentMessage, MailError> {
+        // D1-6b-1: the send form is best-effort (see
+        // `send_script`); window validation on a real Mac
+        // is the proof. `run_script` already gates on
+        // Mail.app running (Q-D1-6b-07) and maps the
+        // 30 s kill to `Timeout`. An empty script result
+        // means Mail accepted the send but the id could
+        // not be read back — native_id stays None
+        // (Q-D1-6b-08), never fabricated.
+        let script = send_script(to, subject, body);
+        let out = Self::run_script(&script)?;
+        let native_id = out.trim().to_string();
+        Ok(SentMessage {
+            native_id: if native_id.is_empty() {
+                None
+            } else {
+                Some(native_id)
+            },
+        })
+    }
 }
 
 #[cfg(test)]
@@ -955,6 +1092,74 @@ mod tests {
                 "locale display date must not come back"
             );
         }
+    }
+
+    #[test]
+    fn send_script_builds_a_plain_text_send() {
+        // D1-6b-1: the send form is best-effort (the
+        // exact AppleScript is UNVERIFIED — window
+        // validation on a real Mac is the proof). This
+        // guard only locks the construction: a hidden
+        // compose window, one `to recipient` per
+        // address, the escaped subject/body, and an id
+        // readback that tolerates an empty result. It
+        // runs on every platform because the builder is
+        // plain string construction.
+        let script = send_script(
+            &[
+                "b@example.invalid".to_string(),
+                "a@example.invalid".to_string(),
+            ],
+            "Hello \"quoted\"",
+            "Line one\nLine two \\ backslash",
+        );
+        assert!(
+            script.contains("make new outgoing message"),
+            "must create an outgoing message"
+        );
+        assert!(
+            script.contains("visible:false"),
+            "must not open a compose window"
+        );
+        assert!(
+            script.contains("make new to recipient"),
+            "must add recipients"
+        );
+        assert!(
+            script.contains("\"b@example.invalid\""),
+            "recipients must be listed"
+        );
+        assert!(
+            script.contains("\"a@example.invalid\""),
+            "recipients must be listed"
+        );
+        assert!(script.contains("send msg"), "must send the message");
+        assert!(
+            script.contains("id of msg"),
+            "must try to read the sent id back"
+        );
+        // Values are escaped into the literals, never
+        // pasted raw: a quote or backslash in the input
+        // must not break the AppleScript literal.
+        assert!(
+            script.contains("Hello \\\"quoted\\\""),
+            "subject quote must be escaped"
+        );
+        assert!(
+            script.contains("Line one\\nLine two \\\\ backslash"),
+            "body newline/backslash must be escaped"
+        );
+        assert!(
+            !script.contains("Hello \"quoted\""),
+            "raw subject must not appear"
+        );
+    }
+
+    #[test]
+    fn applescript_escape_neutralizes_control_characters() {
+        assert_eq!(applescript_escape("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(applescript_escape("a\nb\rc\td"), "a\\nb\\rc\\td");
+        assert_eq!(applescript_escape("a\u{1}b"), "a b");
     }
 
     #[test]

@@ -49,6 +49,7 @@ pub mod worker;
 pub mod code_search;
 pub mod mail_source;
 pub mod mail_sync;
+pub mod mail_send;
 pub mod calendar_backend;
 pub mod device_store;
 pub mod device_backend;

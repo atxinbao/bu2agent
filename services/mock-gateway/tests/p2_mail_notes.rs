@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use mock_gateway::loop_engine::*;
 use mock_gateway::mail_source::{
-    AttachmentData, MailError, MailSource, MailboxInfo, MessageView, MockMailSource,
+    AttachmentData, MailError, MailSource, MailboxInfo, MessageView, MockMailSource, SentMessage,
     SetupInfo, ThreadView,
 };
 use mock_gateway::server::{app, AppState};
@@ -131,6 +131,10 @@ impl MailSource for LongBodyMailSource {
 
     fn attachment(&self, message_id: &str, index: usize) -> Result<AttachmentData, MailError> {
         MockMailSource.attachment(message_id, index)
+    }
+
+    fn send(&self, to: &[String], subject: &str, body: &str) -> Result<SentMessage, MailError> {
+        MockMailSource.send(to, subject, body)
     }
 }
 

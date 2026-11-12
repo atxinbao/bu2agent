@@ -79,6 +79,7 @@ function requiresApproval(tool: string): boolean | undefined {
       return false;
     case "fs.write":
     case "fs.delete":
+    case "mail.send":
     case "reminders.set_completed":
     case "worker.run":
       return true;
@@ -150,6 +151,18 @@ export class AgentClient implements AgentGateway {
         throw new Error("fs.delete approval requires path");
       }
       body.path = args.path;
+    } else if (tool === "mail.send") {
+      // D1-6b-1: a mail send approval binds the exact
+      // message (Q-D1-6b-22). `to` arrives as a JSON
+      // array string (the invoke transport only carries
+      // string args); the server recomputes the digest
+      // from the decoded list, never from a client hash.
+      if (args?.to === undefined || args?.subject === undefined || args?.body === undefined) {
+        throw new Error("mail.send approval requires to, subject and body");
+      }
+      body.to = JSON.parse(args.to) as string[];
+      body.subject = args.subject;
+      body.body = args.body;
     }
     const response = await this.post<ApprovalRequestResponse>("/approval/request", body);
     if (response.requires_approval !== requires) {

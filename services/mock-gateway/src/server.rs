@@ -3854,6 +3854,14 @@ struct ApprovalRequestDto {
     content_base64: Option<String>,
     append: Option<bool>,
     message: Option<String>,
+    /// D1-6b-1 (Q-D1-6b-22): the mail send presentation.
+    /// The server recomputes `mail_send_digest` from
+    /// these fields, never from a client hash — the
+    /// approval binds the exact message, not the bare
+    /// ability to send mail.
+    to: Option<Vec<String>>,
+    subject: Option<String>,
+    body: Option<String>,
     /// P3-C (§7): a client-presented Worker command spec.
     /// Never trusted: the handler recomputes the spec from
     /// the raw presentation below and rejects a mismatch.
@@ -3962,6 +3970,52 @@ async fn approval_request(
             match crate::operation_binding::export_digest(from, to) {
                 Some(digest) => Some(digest),
                 None => return bad_request("invalid export path"),
+            }
+        }
+        "mail.send" => {
+            // D1-6b-1 (Q-D1-6b-22): when the mail fields
+            // are presented, the digest is computed here
+            // from them — same normalization (deduplicated,
+            // sorted recipients; body hashed server-side)
+            // as the send route, so the two digests match.
+            // When they are entirely absent the request
+            // stays tool-only (the plan's "optional
+            // fields"): the approvals-query smoke tests
+            // use bare `mail.send` as the unbound
+            // connector-tool example, and the Mock route
+            // keeps its tool-only gate. A tool-only
+            // record can never authorize the real send —
+            // the send route rejects a missing digest
+            // with 403 `approval_binding_mismatch`.
+            // A partial presentation is a client error.
+            // No planned Effect is created for mail.send
+            // here (the `worker.run` precedent): the send
+            // route plans its own Effect on its write
+            // Execution (Q-D1-6b-23) and binds this
+            // approval to it at consume time.
+            if req.to.is_none() && req.subject.is_none() && req.body.is_none() {
+                None
+            } else {
+                let (Some(to), Some(subject), Some(body)) = (
+                    req.to.as_deref(),
+                    req.subject.as_deref(),
+                    req.body.as_deref(),
+                ) else {
+                    return bad_request("mail.send approval requires to, subject and body");
+                };
+                if subject.is_empty() || body.is_empty() {
+                    return bad_request("mail.send approval requires non-empty subject and body");
+                }
+                let recipients = crate::mail_send::normalize_recipients(to);
+                if recipients.is_empty() {
+                    return bad_request("mail.send approval requires at least one recipient");
+                }
+                let body_hash = crate::mail_send::mail_body_hash(body);
+                Some(crate::operation_binding::mail_send_digest(
+                    &recipients,
+                    subject,
+                    &body_hash,
+                ))
             }
         }
         "worker.run" => {
@@ -6453,11 +6507,24 @@ const MANDATE_TOOLS: &[&str] = &[
 /// scopes are NOT duplicated here — the bound
 /// `policy_version_id` names the document that holds them.
 fn mandate_allowed_json(goal_id: Option<&str>, goal: &str, entry: &str) -> String {
+    mandate_allowed_json_for_tools(goal_id, goal, entry, MANDATE_TOOLS)
+}
+
+/// The `allowed_json` document for a direct-write
+/// Mandate (D1-6b-1, Q-D1-6b-23): same shape, but the
+/// tool set is the single write tool the Execution may
+/// invoke, not the full loop tool list.
+fn mandate_allowed_json_for_tools(
+    goal_id: Option<&str>,
+    goal: &str,
+    entry: &str,
+    tools: &[&str],
+) -> String {
     let value = serde_json::json!({
         "goal_id": goal_id,
         "goal": goal,
         "entry": entry,
-        "tools": MANDATE_TOOLS,
+        "tools": tools,
     });
     sqlite_store::canonical_json(&value)
 }
@@ -6570,6 +6637,51 @@ fn create_mandate(
         Ok(()) => Some(row),
         Err(detail) => {
             eprintln!("warning: D1-2 mandate insert failed: {detail}");
+            None
+        }
+    }
+}
+
+/// Create one Mandate row for a direct write Execution
+/// (D1-6b-1, Q-D1-6b-23). `create_execution_with_binding`
+/// binds no Mandate for executions without a task or a
+/// loop, so the write route calls this explicitly after
+/// building its Execution: `allowed_json.tools` is the
+/// single write tool, `goal_id` is empty, the entry is
+/// `direct-write`. SQLite mode only, best-effort (warn
+/// only, never fail the caller), like `create_mandate`.
+fn create_write_mandate(
+    state: &AppState,
+    execution_id: &str,
+    tool: &str,
+) -> Option<sqlite_store::MandateRow> {
+    if state.sqlite.is_none() || state.sqlite_mode() != StateBackend::Sqlite {
+        return None;
+    }
+    let policy_version_id = current_policy_version_id(state)?;
+    let mut next = state.next_mandate_id.lock().expect("mandate id lock");
+    let number = *next;
+    *next += 1;
+    drop(next);
+    let row = sqlite_store::MandateRow {
+        mandate_id: format!("mandate-{number}"),
+        task_id: None,
+        execution_id: Some(execution_id.to_string()),
+        goal: String::new(),
+        allowed_json: mandate_allowed_json_for_tools(None, "", "direct-write", &[tool]),
+        policy_version_id,
+        status: "active".to_string(),
+        created_ms: sqlite_store::now_ms() as i64,
+        origin_device_id: state.origin_device_id.clone(),
+    };
+    let Some(sqlite) = &state.sqlite else {
+        return None;
+    };
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::insert_mandate(&mut conn, &row) {
+        Ok(()) => Some(row),
+        Err(detail) => {
+            eprintln!("warning: D1-6b-1 write mandate insert failed: {detail}");
             None
         }
     }
@@ -9985,6 +10097,9 @@ fn email_error_text(err: MailError) -> String {
         MailError::Unavailable(_) => "mail source unavailable".to_string(),
         MailError::Denied => "mail automation denied".to_string(),
         MailError::Upstream(_) => "mail source error".to_string(),
+        // D1-6b-1: the loop-tool text stays generic —
+        // the send route distinguishes these itself.
+        MailError::NotRunning | MailError::Timeout => "mail source error".to_string(),
     }
 }
 
@@ -10006,6 +10121,14 @@ fn mail_error_response(err: MailError, not_found_what: &'static str) -> axum::re
         )
             .into_response(),
         MailError::Upstream(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "mail source error" })),
+        )
+            .into_response(),
+        // D1-6b-1: same 502 as any other upstream
+        // failure on the read paths; the send route
+        // matches on the variant itself, not the status.
+        MailError::NotRunning | MailError::Timeout => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "error": "mail source error" })),
         )
@@ -10124,6 +10247,497 @@ async fn email_sync(State(state): State<AppState>) -> impl IntoResponse {
             .into_response(),
         Err(detail) => {
             eprintln!("warning: mail sync failed ({detail})");
+            sqlite_error_response()
+        }
+    }
+}
+
+// --- D1-6b-1: real mail send + sent readers ---
+//
+// POST /api/email/send is the one real write in 6b:
+// a digest-bound, Mandate-bound, Effect-recorded send
+// through Mail.app. "Sent" means Mail.app accepted the
+// message, never that it was delivered (Q-D1-6b-06).
+// No loop write tools (Q-D1-6b-25); the Mock
+// /connectors/mail/send route is untouched.
+//
+// Route order (the E2-A V1 lesson): source-connected
+// check first, then the idempotency replay check
+// BEFORE planning a new Effect, then plan (reusing a
+// planned row with the same approval_id when one
+// exists), consume the bound approval, execute, and
+// finish. The digest is checked BEFORE planning, so a
+// mismatch leaves no orphaned planned row.
+//
+// Evidence: there is no readback in 6b-1 — Sent
+// mailbox re-check needs a native_id the script may
+// not return (Q-D1-6b-08), so `write_time_observation`
+// has no ("mail", "send") arm and no Evidence row is
+// written; verify stays 409 `effect_no_readback`. The
+// sent-N row + `mail.sent` event are the audit trail;
+// a readback is a later batch's work, never faked here.
+
+/// D1-6b-1 (Q-D1-6b-24): a disconnected mail-source
+/// rejects new writes. Read paths are unaffected. A
+/// missing Registry row (seed never ran) is not a
+/// disconnect — the write proceeds.
+fn mail_source_disconnected(state: &AppState) -> bool {
+    let Some(sqlite) = &state.sqlite else {
+        return false;
+    };
+    let Ok(conn) = sqlite.lock() else {
+        return false;
+    };
+    matches!(
+        sqlite_store::get_source(&conn, crate::mail_sync::MAIL_SOURCE_ID),
+        Ok(Some(row)) if row.status == "disconnected"
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct EmailSendDto {
+    // All four validated fields are Option so a missing
+    // field is the route's own 400 (not the extractor's
+    // 422): "no key → 400" must hold however the client
+    // forgets the key. LOCAL DEFINITION (plan §2).
+    to: Option<Vec<String>>,
+    subject: Option<String>,
+    body: Option<String>,
+    idempotency_key: Option<String>,
+    tool_call_id: Option<String>,
+}
+
+fn sent_row_response(
+    row: &crate::mail_send::SentMessageRow,
+    replayed: bool,
+) -> axum::response::Response {
+    let mut value = serde_json::to_value(row).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("replayed".to_string(), serde_json::Value::Bool(replayed));
+    }
+    Json(value).into_response()
+}
+
+async fn email_send(
+    State(state): State<AppState>,
+    Json(req): Json<EmailSendDto>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    // 1. Validate the DTO: empty to / subject / body /
+    // idempotency_key → 400. Plain-text send, no
+    // attachments.
+    let Some(to_raw) = req.to else {
+        return bad_request("to is required");
+    };
+    let Some(subject) = req.subject.filter(|s| !s.is_empty()) else {
+        return bad_request("subject must not be empty");
+    };
+    let Some(body) = req.body.filter(|s| !s.is_empty()) else {
+        return bad_request("body must not be empty");
+    };
+    let Some(idempotency_key) = req.idempotency_key.filter(|k| !k.trim().is_empty()) else {
+        return bad_request("idempotency_key is required");
+    };
+    let recipients = crate::mail_send::normalize_recipients(&to_raw);
+    if recipients.is_empty() {
+        return bad_request("to must contain at least one recipient");
+    }
+    let body_hash = crate::mail_send::mail_body_hash(&body);
+    let digest = crate::operation_binding::mail_send_digest(&recipients, &subject, &body_hash);
+    // 2. Disconnected source rejects new writes (409).
+    if mail_source_disconnected(&state) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "source_disconnected" })),
+        )
+            .into_response();
+    }
+    // 3. Idempotency replay BEFORE planning a new Effect:
+    // same key + same content → 200 original row, no
+    // second send, no second Effect; same key +
+    // different content → 409.
+    {
+        let conn = sqlite.lock().expect("sqlite lock");
+        match crate::mail_send::find_by_idempotency_key(&conn, &idempotency_key) {
+            Ok(Some(existing)) => {
+                if existing.to_json == crate::mail_send::recipients_json(&recipients)
+                    && existing.subject == subject
+                    && existing.body_hash == body_hash
+                {
+                    return sent_row_response(&existing, true);
+                }
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "idempotency_key_conflict" })),
+                )
+                    .into_response();
+            }
+            Ok(None) => {}
+            Err(detail) => {
+                eprintln!("warning: mail send idempotency lookup failed ({detail})");
+                return sqlite_error_response();
+            }
+        }
+    }
+    // 4. Approval peek (read-only, nothing burned): the
+    // digest is checked BEFORE planning, so a mismatch
+    // leaves no orphaned planned row and the approval
+    // stays unconsumed for a correct retry (SD3).
+    let Some(approval_id) = req.tool_call_id.clone() else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "approval_required" })),
+        )
+            .into_response();
+    };
+    {
+        let approvals = state.approvals.lock().expect("approval lock");
+        let Some(record) = approvals.get(&approval_id) else {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "approval_required" })),
+            )
+                .into_response();
+        };
+        if record.tool != "mail.send" {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "approval_required" })),
+            )
+                .into_response();
+        }
+        if record.status == ApprovalStatus::Rejected {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "approval_rejected" })),
+            )
+                .into_response();
+        }
+        if record.status != ApprovalStatus::Approved {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "approval_required" })),
+            )
+                .into_response();
+        }
+        if record.consumed {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "approval_already_consumed" })),
+            )
+                .into_response();
+        }
+        match record.operation_digest.as_deref() {
+            // A tool-only approval can never authorize a
+            // digest-bound write.
+            None => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({ "error": "approval_binding_mismatch" })),
+                )
+                    .into_response();
+            }
+            Some(bound) if bound != digest => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "approval_digest_mismatch" })),
+                )
+                    .into_response();
+            }
+            _ => {}
+        }
+    }
+    // 5. Reuse-or-plan (E2-A V1): a planned row with the
+    // same approval_id — a previous attempt that planned
+    // then failed to consume — is reused, never
+    // duplicated. Otherwise build the write Execution +
+    // single-tool Mandate (Q-D1-6b-23) and plan through
+    // the shared ledger entry. The adapter fallback is
+    // NOT used for 6b writes.
+    let (execution_id, effect) = match effect_for_approval(&state, &approval_id, Some(&digest)) {
+        Some(effect) => match effect.status.as_str() {
+            "planned" | "authorized" => {
+                let Some(execution_id) = effect.execution_id.clone() else {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({ "error": "effect_idempotency_unavailable" })),
+                    )
+                        .into_response();
+                };
+                (execution_id, effect)
+            }
+            "succeeded" => {
+                // Terminal with an unconsumed approval
+                // should not happen (consume precedes
+                // terminal), but a succeeded replay is
+                // still the original row, never a resend.
+                let conn = sqlite.lock().expect("sqlite lock");
+                match crate::mail_send::find_by_idempotency_key(&conn, &idempotency_key) {
+                    Ok(Some(existing)) => return sent_row_response(&existing, true),
+                    _ => {
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({ "error": "effect_terminal", "effect_id": effect.effect_id, "status": effect.status })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            _ => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "effect_not_ready", "effect_id": effect.effect_id, "status": effect.status })),
+                )
+                    .into_response();
+            }
+        },
+        None => {
+            let execution = create_execution_with_binding(&state, None, None, None, None, None);
+            create_write_mandate(&state, &execution.execution_id, "mail.send");
+            match ledger_entry(
+                &state,
+                Some(execution.execution_id.clone()),
+                "mail",
+                "send",
+                &idempotency_key,
+                Some(digest.clone()),
+                Some(approval_id.clone()),
+            ) {
+                LedgerEntryDecision::Entered(entry) => (entry.execution_id, entry.effect),
+                LedgerEntryDecision::Replay(other) => {
+                    let conn = sqlite.lock().expect("sqlite lock");
+                    match crate::mail_send::find_by_idempotency_key(&conn, &idempotency_key) {
+                        Ok(Some(existing)) => return sent_row_response(&existing, true),
+                        _ => {
+                            return (
+                                StatusCode::CONFLICT,
+                                Json(serde_json::json!({ "error": "effect_idempotency_replay", "effect_id": other.effect_id, "status": other.status })),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+                LedgerEntryDecision::Blocked(other) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+    // 6. Consume the bound approval (binding + push to
+    // authorized), then drive the Effect to started.
+    if let Err(response) = consume_bound_approval_for_effect(
+        &state,
+        "mail.send",
+        &req.tool_call_id,
+        &digest,
+        Some(&effect.effect_id),
+    ) {
+        return *response;
+    }
+    if let Err(response) = start_bound_effect(&state, &effect) {
+        return *response;
+    }
+    // 7. Execute outside the SQLite lock: the AppleScript
+    // call can take up to 30 s. Same spawn_blocking shape
+    // as device_set. The send inputs are cloned for the
+    // blocking task; the originals are still needed below
+    // for the fact row.
+    let source = Arc::clone(&state.mail_source);
+    let send_recipients = recipients.clone();
+    let send_subject = subject.clone();
+    let send_body = body.clone();
+    let send_result = tokio::task::spawn_blocking(move || {
+        source.send(&send_recipients, &send_subject, &send_body)
+    })
+    .await;
+    let outcome = match send_result {
+        Ok(result) => result,
+        Err(_) => Err(MailError::Timeout),
+    };
+    let policy_version = current_policy_version_id(&state).unwrap_or_default();
+    match outcome {
+        Ok(sent) => {
+            // Record the fact row + mail.sent event in one
+            // transaction FIRST, then finish the Effect:
+            // a succeeded Effect must never exist without
+            // its fact row.
+            let sent_ms = now_ms() as i64;
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            match crate::mail_send::record_sent(
+                &mut conn,
+                sent.native_id.as_deref(),
+                &idempotency_key,
+                &recipients,
+                &subject,
+                &body_hash,
+                sent_ms,
+                &effect.effect_id,
+                &execution_id,
+                &policy_version,
+                &state.origin_device_id,
+            ) {
+                Ok(row) => {
+                    drop(conn);
+                    match ledger_entry_finish(&state, &effect.effect_id, LedgerOutcome::Succeeded) {
+                        Ok(_) => sent_row_response(&row, false),
+                        Err(_) => {
+                            eprintln!(
+                                "warning: mail send effect finish failed for {}",
+                                effect.effect_id
+                            );
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({ "error": "effect_transition_failed" })),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+                Err(detail) => {
+                    // A UNIQUE-key race (a concurrent send
+                    // with the same key won the row): the
+                    // mail content was sent, so the existing
+                    // row is the replay, never a second row.
+                    drop(conn);
+                    let conn = sqlite.lock().expect("sqlite lock");
+                    match crate::mail_send::find_by_idempotency_key(&conn, &idempotency_key) {
+                        Ok(Some(existing))
+                            if existing.to_json
+                                == crate::mail_send::recipients_json(&recipients)
+                                && existing.subject == subject
+                                && existing.body_hash == body_hash =>
+                        {
+                            drop(conn);
+                            let _ = ledger_entry_finish(
+                                &state,
+                                &effect.effect_id,
+                                LedgerOutcome::Succeeded,
+                            );
+                            sent_row_response(&existing, true)
+                        }
+                        _ => {
+                            eprintln!("warning: mail send record failed ({detail})");
+                            let _ = ledger_entry_finish(
+                                &state,
+                                &effect.effect_id,
+                                LedgerOutcome::Failed,
+                            );
+                            (
+                                StatusCode::CONFLICT,
+                                Json(serde_json::json!({ "error": "idempotency_key_conflict" })),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            // Only a killed/ambiguous script run is
+            // Unknown (P0-R): Mail.app may or may not
+            // have sent the message, so an
+            // unknown_requires_reconciliation Inbox row
+            // is opened by the transition itself. Every
+            // other gateway-side failure is Failed.
+            let (status, error, outcome) = match err {
+                MailError::Timeout => (
+                    StatusCode::BAD_GATEWAY,
+                    "mail source error",
+                    LedgerOutcome::Unknown,
+                ),
+                MailError::NotRunning => (
+                    StatusCode::BAD_GATEWAY,
+                    "Mail is not running",
+                    LedgerOutcome::Failed,
+                ),
+                MailError::Denied => (
+                    StatusCode::FORBIDDEN,
+                    "mail automation denied",
+                    LedgerOutcome::Failed,
+                ),
+                MailError::Unavailable(reason) => {
+                    let _ = ledger_entry_finish(&state, &effect.effect_id, LedgerOutcome::Failed);
+                    return (
+                        StatusCode::NOT_IMPLEMENTED,
+                        Json(serde_json::json!({ "error": reason, "effect_id": effect.effect_id })),
+                    )
+                        .into_response();
+                }
+                _ => (
+                    StatusCode::BAD_GATEWAY,
+                    "mail source error",
+                    LedgerOutcome::Failed,
+                ),
+            };
+            let _ = ledger_entry_finish(&state, &effect.effect_id, outcome);
+            (
+                status,
+                Json(serde_json::json!({ "error": error, "effect_id": effect.effect_id })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn email_sent_list(State(state): State<AppState>) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    match crate::mail_send::list_sent_messages(&conn) {
+        Ok(rows) => {
+            Json(serde_json::to_value(rows).unwrap_or(serde_json::Value::Null)).into_response()
+        }
+        Err(detail) => {
+            eprintln!("warning: sent list failed ({detail})");
+            sqlite_error_response()
+        }
+    }
+}
+
+async fn email_sent_get(
+    State(state): State<AppState>,
+    axum::extract::Path(sent_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    match crate::mail_send::get_sent_message(&conn, &sent_id) {
+        Ok(Some(row)) => {
+            Json(serde_json::to_value(row).unwrap_or(serde_json::Value::Null)).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown sent message" })),
+        )
+            .into_response(),
+        Err(detail) => {
+            eprintln!("warning: sent get failed ({detail})");
             sqlite_error_response()
         }
     }
@@ -16759,6 +17373,10 @@ pub fn app(state: AppState) -> Router {
         // D1-6a: manual mail sync (SQLite v10) + calendar
         // read-only (EventKit on macOS, 501 elsewhere).
         .route("/api/email/sync", post(email_sync))
+        // D1-6b-1: real mail send (SQLite v11) + sent readers.
+        .route("/api/email/send", post(email_send))
+        .route("/api/email/sent", get(email_sent_list))
+        .route("/api/email/sent/{id}", get(email_sent_get))
         .route("/api/calendar/events", get(calendar_events_list))
         .route("/api/calendar/events/{id}", get(calendar_event_get))
         .route("/api/nodes/register", post(nodes_register))

@@ -55,6 +55,37 @@ export interface MailSyncResult {
   cursor: string;
 }
 
+// D1-6b-1: one accepted send (the `sent_messages` fact
+// row). The body is never in this shape — only its
+// hash. "Sent" means Mail.app accepted the message,
+// never that it was delivered (Q-D1-6b-06).
+export interface SentMessage {
+  sentId: string;
+  sourceId: string;
+  nativeId: string | null;
+  idempotencyKey: string;
+  toJson: string;
+  subject: string;
+  bodyHash: string;
+  sentMs: number;
+  effectId: string;
+  policyVersion: string;
+  createdMs: number;
+  originDeviceId: string;
+}
+
+// D1-6b-1: a send request. The idempotency key is
+// client-supplied and required (Q-D1-6b-05); the
+// toolCallId is the decided digest-bound approval for
+// this exact message (Q-D1-6b-22).
+export interface SendMailInput {
+  to: string[];
+  subject: string;
+  body: string;
+  idempotencyKey: string;
+  toolCallId?: string;
+}
+
 // Transport-neutral surface used by the Mail view. The
 // HTTP client below and the invoke client both implement
 // it, so the view never knows which transport it runs on.
@@ -66,6 +97,9 @@ export interface EmailGateway {
   message(messageId: string): Promise<MessageView>;
   attachment(messageId: string, index: number): Promise<number[]>;
   syncMail(): Promise<MailSyncResult>;
+  sendMail(input: SendMailInput): Promise<SentMessage>;
+  listSent(): Promise<SentMessage[]>;
+  sent(sentId: string): Promise<SentMessage>;
 }
 
 interface ServerMailSyncResult {
@@ -127,6 +161,38 @@ function toMessageView(server: ServerMessageView): MessageView {
   };
 }
 
+interface ServerSentMessage {
+  sent_id: string;
+  source_id: string;
+  native_id: string | null;
+  idempotency_key: string;
+  to_json: string;
+  subject: string;
+  body_hash: string;
+  sent_ms: number;
+  effect_id: string;
+  policy_version: string;
+  created_ms: number;
+  origin_device_id: string;
+}
+
+function toSentMessage(server: ServerSentMessage): SentMessage {
+  return {
+    sentId: server.sent_id,
+    sourceId: server.source_id,
+    nativeId: server.native_id,
+    idempotencyKey: server.idempotency_key,
+    toJson: server.to_json,
+    subject: server.subject,
+    bodyHash: server.body_hash,
+    sentMs: server.sent_ms,
+    effectId: server.effect_id,
+    policyVersion: server.policy_version,
+    createdMs: server.created_ms,
+    originDeviceId: server.origin_device_id,
+  };
+}
+
 const ALLOWED_HOSTS = ["127.0.0.1", "localhost"];
 
 function checkUrl(baseUrl: string): void {
@@ -150,6 +216,19 @@ export class EmailClient implements EmailGateway {
     if (!response.ok) {
       const text = await response.text();
       throw new Error(`email gateway ${method} ${path} failed: ${response.status} ${text}`);
+    }
+    return (await response.json()) as T;
+  }
+
+  private async postJson<T>(path: string, body: unknown): Promise<T> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`email gateway POST ${path} failed: ${response.status} ${text}`);
     }
     return (await response.json()) as T;
   }
@@ -212,5 +291,26 @@ export class EmailClient implements EmailGateway {
     }
     const buffer = await response.arrayBuffer();
     return Array.from(new Uint8Array(buffer));
+  }
+
+  async sendMail(input: SendMailInput): Promise<SentMessage> {
+    const sent = await this.postJson<ServerSentMessage>("/api/email/send", {
+      to: input.to,
+      subject: input.subject,
+      body: input.body,
+      idempotency_key: input.idempotencyKey,
+      tool_call_id: input.toolCallId ?? null,
+    });
+    return toSentMessage(sent);
+  }
+
+  async listSent(): Promise<SentMessage[]> {
+    const rows = await this.requestJson<ServerSentMessage[]>("GET", "/api/email/sent");
+    return rows.map(toSentMessage);
+  }
+
+  async sent(sentId: string): Promise<SentMessage> {
+    const row = await this.requestJson<ServerSentMessage>("GET", `/api/email/sent/${sentId}`);
+    return toSentMessage(row);
   }
 }

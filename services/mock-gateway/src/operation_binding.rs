@@ -281,6 +281,28 @@ pub fn export_digest(from_raw: &str, to_raw: &str) -> Option<String> {
     Some(operation_digest("fs.export", None, &params))
 }
 
+/// Digest for a real mail send (D1-6b-1, Q-D1-6b-22).
+/// LOCAL DEFINITION: the digest commits to the sorted,
+/// deduplicated recipients (as one hash), the subject
+/// hash, and the body hash — raw text lives only in
+/// request memory, never in the digest inputs. Both the
+/// approval-request path and the send route call this
+/// same function over the same normalized inputs, so the
+/// two digests can never drift apart. `body_hash` is the
+/// caller's sha256 of the body (the body itself is never
+/// hashed twice or stored).
+pub fn mail_send_digest(to_sorted: &[String], subject: &str, body_hash: &str) -> String {
+    let params = BTreeMap::from([
+        ("body_hash".to_string(), body_hash.to_string()),
+        (
+            "recipients_hash".to_string(),
+            sha256_hex(to_sorted.join(",").as_bytes()),
+        ),
+        ("subject_hash".to_string(), sha256_hex(subject.as_bytes())),
+    ]);
+    operation_digest("mail.send", None, &params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +343,54 @@ mod tests {
         assert_eq!(delete_digest("/x"), None);
         assert_eq!(mkdir_digest("../x"), None);
         assert_eq!(rename_digest("a", "/x"), None);
+    }
+
+    #[test]
+    fn mail_send_digest_is_stable_and_sensitive() {
+        // D1-6b-1: inputs are hashes (recipients joined
+        // then hashed, subject hashed, body pre-hashed);
+        // raw text never enters the digest inputs.
+        let body_hash = sha256_hex(b"hello body");
+        let to = vec![
+            "a@example.invalid".to_string(),
+            "b@example.invalid".to_string(),
+        ];
+        let base = mail_send_digest(&to, "Hello", &body_hash);
+        assert_eq!(mail_send_digest(&to, "Hello", &body_hash), base);
+        // Recipient order does not matter: callers pass
+        // the sorted list, so a permutation digests the
+        // same — and the unsorted callers' job is to sort
+        // first, not the digest's.
+        assert_ne!(
+            mail_send_digest(
+                &[
+                    "b@example.invalid".to_string(),
+                    "a@example.invalid".to_string(),
+                ],
+                "Hello",
+                &body_hash
+            ),
+            base
+        );
+        assert_ne!(
+            mail_send_digest(&to, "Other", &body_hash),
+            base,
+            "subject changes the digest"
+        );
+        assert_ne!(
+            mail_send_digest(&to, "Hello", &sha256_hex(b"other body")),
+            base,
+            "body hash changes the digest"
+        );
+        assert_ne!(
+            mail_send_digest(&["c@example.invalid".to_string()], "Hello", &body_hash),
+            base,
+            "recipients change the digest"
+        );
+        assert_ne!(
+            mail_send_digest(&to, "Hello", &body_hash),
+            write_digest("a.txt", b"hello", false).expect("digest")
+        );
     }
 
     #[test]

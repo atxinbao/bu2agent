@@ -55,7 +55,8 @@ use agent_desktop::stream_client::{
     SxsSelection,
 };
 use agent_desktop::email_client::{
-    EmailClient, MailSyncResult, MailboxInfo, MailboxSetup, MessageView, ThreadView,
+    EmailClient, MailSyncResult, MailboxInfo, MailboxSetup, MessageView, SendMailInput,
+    SentMessageRow, ThreadView,
 };
 use agent_desktop::calendar_client::{CalendarClient, CalendarEvent};
 use agent_desktop::voice_client::{
@@ -1589,6 +1590,39 @@ pub fn calendar_get(event_id: String) -> Result<CalendarEvent, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn mail_sync() -> Result<MailSyncResult, String> {
     email_client()?.sync_mail().map_err(agent_err_string)
+}
+
+// D1-6b-1: real mail send + sent readers. The send
+// carries the decided digest-bound approval id and the
+// client-supplied idempotency key; the gateway binds,
+// consumes, and records the Effect + fact row.
+#[tauri::command(rename_all = "snake_case")]
+pub fn mail_send(
+    to: Vec<String>,
+    subject: String,
+    body: String,
+    idempotency_key: String,
+    tool_call_id: Option<String>,
+) -> Result<SentMessageRow, String> {
+    email_client()?
+        .send_mail(&SendMailInput {
+            to,
+            subject,
+            body,
+            idempotency_key,
+            tool_call_id,
+        })
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn mail_sent_list() -> Result<Vec<SentMessageRow>, String> {
+    email_client()?.list_sent().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn mail_sent_get(sent_id: String) -> Result<SentMessageRow, String> {
+    email_client()?.sent_get(&sent_id).map_err(agent_err_string)
 }
 
 // --- Effects / Executions / Inbox / Assignments / Evidence (P0-R R4) ---

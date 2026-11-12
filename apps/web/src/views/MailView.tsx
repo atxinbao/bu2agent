@@ -1,7 +1,10 @@
 // Mail view: email read surface, batch 1 (Task 22,
-// option A) + D1-6a manual incremental sync. Threads
-// list -> thread messages -> message reading ->
-// attachment download. Reads only: no send, no delete.
+// option A) + D1-6a manual incremental sync + D1-6b-1
+// real send. Threads list -> thread messages ->
+// message reading -> attachment download. Send goes
+// through the digest-bound approval flow
+// (approval_request -> decide -> send); delete stays
+// out — this view never deletes.
 // The sync button is a manual trigger: it records the
 // inbox first 50 into local SQLite (body hash only,
 // never body text); there is no auto-trigger — that
@@ -13,14 +16,19 @@
 // by normalized subject (Mail's AppleScript dictionary
 // exposes no thread id), so thread ids are a local
 // definition, not the original product's thread ids.
+// "已发送" means Mail.app accepted the message; it
+// never promises the recipient received it.
 
 import { useEffect, useState } from "react";
+import type { AgentGateway } from "../domain/agent_client";
 import type {
   EmailGateway,
   MailSyncResult,
   MailboxInfo,
   MailboxSetup,
   MessageView,
+  SendMailInput,
+  SentMessage,
   ThreadView,
 } from "../domain/email_client";
 import type { LoopGateway } from "../domain/loop_client";
@@ -28,8 +36,8 @@ import type { LoopGateway } from "../domain/loop_client";
 // P2 摘要为草稿入口：直接调 loop，不走 Workbench 对话。循环
 // 内读邮件（email.threads / email.message，只读工具）后用
 // fs.write 写草稿；写草稿的审批在 Loops 页的等待审批 UI 里
-// 批，与现有循环流程一致。MailView 本身仍只读：不加发送、
-// 不加删除。
+// 批，与现有循环流程一致。MailView 的发送走下面的审批流，
+// 仍不加删除。
 const LOOP_MAX_CALLS = 5;
 const LOOP_BUDGET_MS = 120000;
 
@@ -37,13 +45,30 @@ function errText(e: unknown): string {
   return typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
 }
 
+function newIdempotencyKey(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `key-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+}
+
+interface PendingSend {
+  to: string[];
+  subject: string;
+  body: string;
+  idempotencyKey: string;
+  toolCallId: string;
+}
+
 export function MailView({
   email,
   loops,
+  agent,
   onNavigate,
 }: {
   email: EmailGateway;
   loops: LoopGateway;
+  agent: AgentGateway;
   onNavigate: (target: "loops") => void;
 }) {
   const [mailbox, setMailbox] = useState<MailboxInfo | null>(null);
@@ -54,6 +79,12 @@ export function MailView({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [syncResult, setSyncResult] = useState<MailSyncResult | null>(null);
+  const [sent, setSent] = useState<SentMessage[] | null>(null);
+  const [sendResult, setSendResult] = useState<SentMessage | null>(null);
+  const [toInput, setToInput] = useState("");
+  const [subjectInput, setSubjectInput] = useState("");
+  const [bodyInput, setBodyInput] = useState("");
+  const [pendingSend, setPendingSend] = useState<PendingSend | null>(null);
 
   async function refresh() {
     setBusy(true);
@@ -62,6 +93,7 @@ export function MailView({
       setMailbox(await email.mailbox());
       setSetup(await email.mailboxSetup());
       setThreads(await email.threads(50, null));
+      setSent(await email.listSent());
     } catch (err) {
       setError(errText(err));
     } finally {
@@ -80,6 +112,84 @@ export function MailView({
     try {
       setSyncResult(await email.syncMail());
       await refresh();
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // D1-6b-1 send flow: request a digest-bound approval
+  // for this exact message, then decide in this view,
+  // then send with the decided approval id. The pending
+  // copy is frozen at request time: editing the form
+  // afterwards cannot change what the approval bound.
+  async function requestSendApproval() {
+    const to = toInput.split(",").map((s) => s.trim()).filter((s) => s !== "");
+    if (to.length === 0 || subjectInput === "" || bodyInput === "") {
+      setError("收件人、主题、正文都不能为空。");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const request = await agent.requestApproval("mail.send", {
+        to: JSON.stringify(to),
+        subject: subjectInput,
+        body: bodyInput,
+      });
+      if (!request.tool_call_id) {
+        setError("审批请求未返回 tool_call_id。");
+        return;
+      }
+      setPendingSend({
+        to,
+        subject: subjectInput,
+        body: bodyInput,
+        idempotencyKey: newIdempotencyKey(),
+        toolCallId: request.tool_call_id,
+      });
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function approveAndSend() {
+    if (pendingSend === null) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await agent.decideApproval(pendingSend.toolCallId, "approve");
+      const input: SendMailInput = {
+        to: pendingSend.to,
+        subject: pendingSend.subject,
+        body: pendingSend.body,
+        idempotencyKey: pendingSend.idempotencyKey,
+        toolCallId: pendingSend.toolCallId,
+      };
+      const row = await email.sendMail(input);
+      setSendResult(row);
+      setPendingSend(null);
+      setToInput("");
+      setSubjectInput("");
+      setBodyInput("");
+      setSent(await email.listSent());
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rejectSend() {
+    if (pendingSend === null) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await agent.decideApproval(pendingSend.toolCallId, "reject");
+      setPendingSend(null);
     } catch (err) {
       setError(errText(err));
     } finally {
@@ -170,10 +280,11 @@ export function MailView({
     <div className="view">
       <h2>Mail</h2>
       <p className="note">
-        只读：线程列表、消息阅读、附件下载；不发送、不删除。
+        线程列表、消息阅读、附件下载；发送走审批流（先请求审批、通过后再发送），不删除。
         手动同步把收件箱前 50 封写入本地 SQLite（只存正文哈希，不存正文）；自动同步等 A1 定时器。
         打包的 Mac 应用读真实 Mail.app 数据（AppleScript 问 Mail.app）；其他平台返回 501。
         线程按规范化主题分组（Mail 的 AppleScript 没有 thread id），线程 id 是本地定义。
+        “已发送”指 Mail.app 已接受这封邮件，不承诺对方收到。
       </p>
       {error !== null && <p className="error">{error}</p>}
       {syncResult !== null && (
@@ -181,6 +292,76 @@ export function MailView({
           已同步：新增 {syncResult.syncedCount} 封，跳过 {syncResult.skippedCount} 封，
           本地共 {syncResult.totalCount} 封。
         </p>
+      )}
+      {sendResult !== null && (
+        <p className="note">
+          已发送：{sendResult.sentId}（{sendResult.subject}）——Mail.app 已接受，不承诺对方收到。
+        </p>
+      )}
+      <h3>发送邮件</h3>
+      <div>
+        <label>
+          收件人（多个用逗号分隔）：
+          <input
+            type="text"
+            value={toInput}
+            onChange={(e) => setToInput(e.target.value)}
+            disabled={busy || pendingSend !== null}
+          />
+        </label>{" "}
+        <label>
+          主题：
+          <input
+            type="text"
+            value={subjectInput}
+            onChange={(e) => setSubjectInput(e.target.value)}
+            disabled={busy || pendingSend !== null}
+          />
+        </label>
+        <div>
+          <label>
+            正文（纯文本，不含附件）：
+            <textarea
+              value={bodyInput}
+              onChange={(e) => setBodyInput(e.target.value)}
+              disabled={busy || pendingSend !== null}
+            />
+          </label>
+        </div>
+        <div className="row">
+          <button type="button" onClick={() => void requestSendApproval()} disabled={busy || pendingSend !== null}>
+            请求审批
+          </button>
+        </div>
+        {pendingSend !== null && (
+          <div>
+            <p>
+              待审批：{pendingSend.to.join("、")} · {pendingSend.subject}（
+              {pendingSend.toolCallId}）
+            </p>
+            <div className="row">
+              <button type="button" onClick={() => void approveAndSend()} disabled={busy}>
+                通过并发送
+              </button>{" "}
+              <button type="button" onClick={() => void rejectSend()} disabled={busy}>
+                拒绝
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+      <h3>已发送</h3>
+      {(sent ?? []).length === 0 ? (
+        <p className="empty">无已发送记录。</p>
+      ) : (
+        <ul>
+          {(sent ?? []).map((s) => (
+            <li key={s.sentId}>
+              {s.sentId} · {s.subject} · {s.toJson} ·{" "}
+              {new Date(s.sentMs).toLocaleString()}
+            </li>
+          ))}
+        </ul>
       )}
       {mailbox === null ? (
         <p className="empty">邮箱状态未知（状态查询失败）。</p>
