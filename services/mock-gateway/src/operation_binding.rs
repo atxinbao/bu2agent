@@ -303,6 +303,19 @@ pub fn mail_send_digest(to_sorted: &[String], subject: &str, body_hash: &str) ->
     operation_digest("mail.send", None, &params)
 }
 
+/// Digest for a real mail delete (D1-6b-3,
+/// Q-D1-6b-22). LOCAL DEFINITION: the digest commits
+/// to the resolved native id — the message's real
+/// identity (the local `mail-N` is only an alias, so it
+/// never enters the digest). Both the approval-request
+/// path and the delete route call this same function
+/// over the same native id, so the two digests can never
+/// drift apart. The signature is the plan §6.2 shape.
+pub fn mail_delete_digest(native_id: &str) -> String {
+    let params = BTreeMap::from([("native_id".to_string(), native_id.to_string())]);
+    operation_digest("mail.delete", None, &params)
+}
+
 /// Digest for a real calendar create (D1-6b-2,
 /// Q-D1-6b-22). LOCAL DEFINITION: the digest commits
 /// to the calendar id, the title hash, the exact
@@ -422,6 +435,26 @@ mod tests {
         assert_ne!(
             mail_send_digest(&to, "Hello", &body_hash),
             write_digest("a.txt", b"hello", false).expect("digest")
+        );
+    }
+
+    #[test]
+    fn mail_delete_digest_is_stable_and_sensitive() {
+        // D1-6b-3: the digest commits to the native id
+        // only — a different message digests differently,
+        // and the delete digest never collides with the
+        // send digest for the same id string.
+        let base = mail_delete_digest("4242");
+        assert_eq!(mail_delete_digest("4242"), base);
+        assert_ne!(
+            mail_delete_digest("4243"),
+            base,
+            "native id changes the digest"
+        );
+        assert_ne!(
+            mail_delete_digest("4242"),
+            mail_send_digest(&["a@example.invalid".to_string()], "Hello", &sha256_hex(b"x")),
+            "delete and send digests differ"
         );
     }
 

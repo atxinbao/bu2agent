@@ -175,6 +175,26 @@ pub trait MailSource: Send + Sync {
     /// deduplicated, sorted recipient list. The send is
     /// synchronous: success means Mail.app accepted it.
     fn send(&self, to: &[String], subject: &str, body: &str) -> Result<SentMessage, MailError>;
+    /// D1-6b-3: delete one message by native id — move
+    /// to Trash only, never purge (Q-D1-6b-12). Success
+    /// means Mail.app accepted the move to Trash.
+    /// `NotFound` when no message with that id is in the
+    /// inbox (the inbox-only addressing the batch-1 reads
+    /// already use; other folders are unverified, plan
+    /// §4.5 — window validation is the proof).
+    ///
+    /// Default is Unavailable: the pre-6b-3 test fakes
+    /// (6a sync, 6b-1 send) never exercise delete, and a
+    /// source that does not implement it must say so
+    /// rather than claim a delete. The three production
+    /// sources (AppleScript / Mock / Unavailable) all
+    /// implement this explicitly, so the default can
+    /// never silently mask a production gap.
+    fn delete(&self, _message_id: &str) -> Result<(), MailError> {
+        Err(MailError::Unavailable(
+            "mail delete unavailable for this source".to_string(),
+        ))
+    }
 }
 
 /// One message's metadata, as dumped by the AppleScript
@@ -425,6 +445,13 @@ impl MailSource for MockMailSource {
         // Accepting here would fabricate a send.
         Ok(SentMessage { native_id: None })
     }
+
+    fn delete(&self, _message_id: &str) -> Result<(), MailError> {
+        // The Mock source never deletes (the send
+        // precedent): the packaged app uses AppleScript,
+        // tests inject their own fake.
+        Ok(())
+    }
 }
 
 /// Every call fails: the production source on platforms
@@ -457,6 +484,12 @@ impl MailSource for UnavailableMailSource {
     }
 
     fn send(&self, _to: &[String], _subject: &str, _body: &str) -> Result<SentMessage, MailError> {
+        Err(MailError::Unavailable(
+            "mail source unavailable on this platform".to_string(),
+        ))
+    }
+
+    fn delete(&self, _message_id: &str) -> Result<(), MailError> {
         Err(MailError::Unavailable(
             "mail source unavailable on this platform".to_string(),
         ))
@@ -676,6 +709,39 @@ end timeout"#,
         subject = applescript_escape(subject),
         body = applescript_escape(body),
         recipients = recipients,
+    )
+}
+
+/// AppleScript for deleting one message by id (D1-6b-3,
+/// best-effort — the exact delete form is UNVERIFIED:
+/// whether `delete` means Trash vs purge, and the
+/// non-inbox addressing form, are both open (plan §8);
+/// window validation on a real Mac is the proof, same
+/// as the 6b-1 send script). Inbox-only addressing, the
+/// batch-1 `find_meta` form: the message is looked up
+/// in the inbox, `delete`d, and "deleted" is returned.
+/// A lookup miss returns the «BU2AGENT_MESSAGE_NOT_FOUND»
+/// sentinel (the find_meta precedent) so the caller can
+/// map it to `NotFound` instead of guessing. Plain
+/// string construction (no macOS calls) so the guard
+/// test runs on every platform. `message_id` must be a
+/// plain integer (the caller validates, like
+/// `find_meta`); it is interpolated, never quoted.
+#[cfg(any(target_os = "macos", test))]
+fn delete_script(message_id: &str) -> String {
+    format!(
+        r#"with timeout of 30 seconds
+  tell application "Mail"
+    try
+      set m to first message of inbox whose id is {message_id}
+      delete m
+      return "deleted"
+    on error
+      return "«BU2AGENT_MESSAGE_NOT_FOUND»"
+    end try
+  end tell
+end timeout"#,
+        message_id = message_id
     )
 }
 
@@ -1065,6 +1131,29 @@ end timeout"#,
             },
         })
     }
+
+    fn delete(&self, message_id: &str) -> Result<(), MailError> {
+        // D1-6b-3: inbox-only addressing, the find_meta
+        // form. Mail ids are integers; a non-numeric id
+        // can never match, and must not reach the script.
+        // `run_script` already gates on Mail.app running
+        // (Q-D1-6b-07) and maps the 30 s kill to
+        // `Timeout`. The script's own sentinel maps a
+        // lookup miss to `NotFound`; any other unexpected
+        // output is an upstream failure, never a success.
+        if message_id.parse::<i64>().is_err() {
+            return Err(MailError::NotFound("message"));
+        }
+        let script = delete_script(message_id);
+        let out = Self::run_script(&script)?;
+        match out.trim() {
+            "deleted" => Ok(()),
+            "«BU2AGENT_MESSAGE_NOT_FOUND»" => Err(MailError::NotFound("message")),
+            _ => Err(MailError::Upstream(
+                "Mail delete returned an unexpected result".to_string(),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1262,5 +1351,35 @@ mod tests {
         let source = UnavailableMailSource;
         assert!(matches!(source.mailbox(), Err(MailError::Unavailable(_))));
         assert!(matches!(source.threads(50, 0), Err(MailError::Unavailable(_))));
+    }
+
+    #[test]
+    fn delete_script_builds_a_trash_only_delete() {
+        // D1-6b-3: the delete form is best-effort (the
+        // exact AppleScript is UNVERIFIED — window
+        // validation on a real Mac is the proof, same as
+        // the 6b-1 send script). The guard pins what the
+        // form must and must not do: inbox lookup by id,
+        // a plain `delete` (Trash semantics per Mail.app;
+        // no purge wording anywhere), and the not-found
+        // sentinel so a lookup miss maps to NotFound.
+        let script = delete_script("12345");
+        assert!(
+            script.contains("first message of inbox whose id is 12345"),
+            "inbox lookup by id missing: {script}"
+        );
+        assert!(script.contains("delete m"), "delete missing: {script}");
+        assert!(
+            script.contains("«BU2AGENT_MESSAGE_NOT_FOUND»"),
+            "not-found sentinel missing: {script}"
+        );
+        assert!(
+            !script.to_lowercase().contains("purge"),
+            "purge must never appear: {script}"
+        );
+        assert!(
+            !script.contains("empty trash"),
+            "trash emptying must never appear: {script}"
+        );
     }
 }

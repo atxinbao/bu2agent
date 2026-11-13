@@ -89,6 +89,40 @@ pub struct SentMessageRow {
     pub origin_device_id: String,
 }
 
+/// D1-6b-3: one synced mail row (the gateway
+/// `MailMessageRow` shape). The list includes
+/// tombstoned rows with `deleted: true` (approved plan
+/// §3 / Q-D1-6b-14); `synced_get` likewise returns a
+/// tombstoned row with `deleted: true`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailMessageRow {
+    pub message_id: String,
+    pub source_id: String,
+    pub native_id: String,
+    pub thread_id: String,
+    pub subject: String,
+    pub sender: String,
+    pub date_ms: i64,
+    pub body_hash: String,
+    pub created_ms: i64,
+    pub origin_device_id: String,
+    pub deleted: bool,
+    pub updated_ms: i64,
+}
+
+/// D1-6b-3: one delete outcome (the gateway
+/// `MailDeleteResponse` shape). `message_id` is `None`
+/// when the deleted mail was never synced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailDeleteResponse {
+    pub message_id: Option<String>,
+    pub source_id: String,
+    pub native_id: String,
+    pub deleted: bool,
+    pub effect_id: Option<String>,
+    pub replayed: bool,
+}
+
 /// D1-6b-1: a send request. The idempotency key is
 /// client-supplied and required (Q-D1-6b-05); the
 /// approval id is the decided digest-bound approval for
@@ -211,5 +245,35 @@ impl EmailClient {
 
     pub fn sent_get(&self, sent_id: &str) -> std::result::Result<SentMessageRow, AgentError> {
         Ok(self.http.get_json(&format!("/api/email/sent/{sent_id}"))?)
+    }
+
+    /// D1-6b-3: delete one message — Trash only, never
+    /// purge (Q-D1-6b-12). Uses the long-timeout client
+    /// (same F-1 reason as sync/send: the gateway-side
+    /// delete can take up to 30 s). The `tool_call_id`
+    /// travels as a query parameter: `delete_json` sends
+    /// no body (the Task 11 DELETE precedent).
+    pub fn delete_message(
+        &self,
+        message_id: &str,
+        tool_call_id: &str,
+    ) -> std::result::Result<MailDeleteResponse, AgentError> {
+        Ok(self.sync_http.delete_json(&format!(
+            "/api/email/messages/{message_id}?tool_call_id={tool_call_id}"
+        ))?)
+    }
+
+    /// D1-6b-3: list synced mail. The list includes
+    /// tombstoned rows with `deleted: true` (approved
+    /// plan §3 / Q-D1-6b-14).
+    pub fn list_synced(&self) -> std::result::Result<Vec<MailMessageRow>, AgentError> {
+        Ok(self.http.get_json("/api/email/synced")?)
+    }
+
+    /// D1-6b-3: one synced row by local id; a tombstoned
+    /// row is still returned, with `deleted: true` (the
+    /// goals-detail precedent).
+    pub fn synced_get(&self, message_id: &str) -> std::result::Result<MailMessageRow, AgentError> {
+        Ok(self.http.get_json(&format!("/api/email/synced/{message_id}"))?)
     }
 }

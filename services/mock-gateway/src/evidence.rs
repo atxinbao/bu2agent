@@ -140,6 +140,12 @@ pub enum Current {
     /// D1-6b-2: the re-read found no event with the
     /// fact row's identifier.
     CalendarMissing,
+    /// D1-6b-3: a mail delete observation — whether the
+    /// message is still readable by native id. `present`
+    /// is the live re-read; the observed JSON carries
+    /// the id and the flag only, never subject / sender
+    /// / body.
+    MailMessage { message_id: String, present: bool },
 }
 
 impl Current {
@@ -205,6 +211,14 @@ impl Current {
                 "fields_match": fields_match,
             }),
             Current::CalendarMissing => json!({"kind": "absent"}),
+            Current::MailMessage {
+                message_id,
+                present,
+            } => json!({
+                "kind": "mail-message",
+                "message_id": message_id,
+                "present": present,
+            }),
         }
     }
 }
@@ -719,6 +733,25 @@ pub fn observe_current(
                 Err(_) => Ok(Current::Unreadable),
             }
         }
+        // D1-6b-3: a mail delete re-reads by the native id
+        // the Effect scope names. The read is the inbox
+        // `message()` surface (the batch-1 read form): a
+        // message that is gone from the inbox reads as
+        // absent. A backend error means the world could
+        // not be read — Unreadable, which verifies
+        // Inconclusive. No fact row is required: a
+        // never-synced delete has no row (Q-D1-6b-15).
+        ("mail", "delete") => match state.mail_source.message(&effect.scope) {
+            Ok(_) => Ok(Current::MailMessage {
+                message_id: effect.scope.clone(),
+                present: true,
+            }),
+            Err(crate::mail_source::MailError::NotFound(_)) => Ok(Current::MailMessage {
+                message_id: effect.scope.clone(),
+                present: false,
+            }),
+            Err(_) => Ok(Current::Unreadable),
+        },
         _ => Err(ObserveError::NoMethod),
     }
 }
@@ -935,6 +968,20 @@ pub fn reconcile_outcome(
             } => ReconcileOutcome::Landed {
                 observed: current.to_json(),
                 reason: "fields_match",
+            },
+            _ => inconclusive(&current),
+        },
+        // D1-6b-3: a mail delete reconciles when the
+        // message is gone from the inbox; anything else is
+        // Inconclusive, never a false mismatch (the
+        // calendar precedent — an unknown Effect's delete
+        // may still be in flight).
+        ("mail", "delete") => match &current {
+            Current::MailMessage {
+                present: false, ..
+            } => ReconcileOutcome::Landed {
+                observed: current.to_json(),
+                reason: "target_absent",
             },
             _ => inconclusive(&current),
         },
@@ -1330,6 +1377,27 @@ pub fn verify_outcome(
             } => VerifyOutcome::Mismatch {
                 observed: current.to_json(),
                 reason: "field_mismatch",
+            },
+            _ => verify_inconclusive(&current),
+        },
+        // D1-6b-3: a mail delete verifies against the live
+        // re-read. Absent → verified (absence IS the
+        // success condition for a delete — the reverse of
+        // the reminder rule); still present → mismatch
+        // (P0-R); unreadable → inconclusive (no Evidence
+        // row is written).
+        ("mail", "delete") => match &current {
+            Current::MailMessage {
+                present: false, ..
+            } => VerifyOutcome::Verified {
+                observed: current.to_json(),
+                reason: "target_absent",
+            },
+            Current::MailMessage {
+                present: true, ..
+            } => VerifyOutcome::Mismatch {
+                observed: current.to_json(),
+                reason: "target_present",
             },
             _ => verify_inconclusive(&current),
         },

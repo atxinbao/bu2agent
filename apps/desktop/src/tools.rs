@@ -46,6 +46,13 @@ impl ToolRegistry {
         // D1-6b-2: calendar create is approval-gated like
         // mail.send (digest-bound write, Q-D1-6b-22).
         registry.tools.push(ToolSpec { name: "calendar.create".to_string(), requires_approval: true, capability: "calendar".to_string() });
+        // D1-6b-3: mail delete is approval-gated like
+        // mail.send / calendar.create (digest-bound write,
+        // Q-D1-6b-22). Trash only, never purge
+        // (Q-D1-6b-12). This registry is the tool-list
+        // surface, not the loop whitelist — 6b adds no
+        // loop write tools (Q-D1-6b-25).
+        registry.tools.push(ToolSpec { name: "mail.delete".to_string(), requires_approval: true, capability: "mail".to_string() });
         registry.tools.push(ToolSpec { name: "reminders.set_completed".to_string(), requires_approval: true, capability: "reminders".to_string() });
         // P2: the loop mail tools were missing from phase4; the
         // desktop AgentClient reports unknown tool without them.

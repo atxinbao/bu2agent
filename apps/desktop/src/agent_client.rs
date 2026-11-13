@@ -121,6 +121,11 @@ struct ApprovalRequestDto {
     location: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
+    /// D1-6b-3: the mail delete presentation. The server
+    /// recomputes `mail_delete_digest` from this native
+    /// id; a client hash is never trusted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,7 +201,7 @@ impl AgentClient {
             return Err(invalid("unknown tool").into());
         };
         self.post_approval(
-            &ApprovalRequestDto { tool: tool.to_string(), path: None, content_base64: None, append: None, to: None, subject: None, body: None, calendar_id: None, title: None, start_ms: None, end_ms: None, all_day: None, location: None, notes: None },
+            &ApprovalRequestDto { tool: tool.to_string(), path: None, content_base64: None, append: None, to: None, subject: None, body: None, calendar_id: None, title: None, start_ms: None, end_ms: None, all_day: None, location: None, notes: None, native_id: None },
             requires,
         )
     }
@@ -235,6 +240,7 @@ impl AgentClient {
                     all_day: None,
                     location: None,
                     notes: None,
+                    native_id: None,
                 }
             }
             "fs.delete" => {
@@ -255,6 +261,7 @@ impl AgentClient {
                     all_day: None,
                     location: None,
                     notes: None,
+                    native_id: None,
                 }
             }
             // D1-6b-1: a mail send approval binds the exact
@@ -293,6 +300,7 @@ impl AgentClient {
                     all_day: None,
                     location: None,
                     notes: None,
+                    native_id: None,
                 }
             }
             // D1-6b-2: a calendar create approval binds the
@@ -345,6 +353,35 @@ impl AgentClient {
                     all_day: Some(all_day),
                     location: args.get("location").cloned(),
                     notes: args.get("notes").cloned(),
+                    native_id: None,
+                }
+            }
+            // D1-6b-3: a mail delete approval binds the
+            // native id (Q-D1-6b-22). The server
+            // recomputes the digest from it, never from a
+            // client hash.
+            "mail.delete" => {
+                let args = args
+                    .ok_or_else(|| invalid("mail.delete approval requires native_id"))?;
+                let native_id = args
+                    .get("native_id")
+                    .ok_or_else(|| invalid("mail.delete approval requires native_id"))?;
+                ApprovalRequestDto {
+                    tool: tool.to_string(),
+                    path: None,
+                    content_base64: None,
+                    append: None,
+                    to: None,
+                    subject: None,
+                    body: None,
+                    calendar_id: None,
+                    title: None,
+                    start_ms: None,
+                    end_ms: None,
+                    all_day: None,
+                    location: None,
+                    notes: None,
+                    native_id: Some(native_id.clone()),
                 }
             }
             _ => {

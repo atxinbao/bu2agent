@@ -188,6 +188,14 @@ export class AgentClient implements AgentGateway {
       body.all_day = args.all_day === "true";
       if (args.location !== undefined) body.location = args.location;
       if (args.notes !== undefined) body.notes = args.notes;
+    } else if (tool === "mail.delete") {
+      // D1-6b-3: a mail delete approval binds the native
+      // id (Q-D1-6b-22). The server recomputes the digest
+      // from it, never from a client hash.
+      if (args?.native_id === undefined) {
+        throw new Error("mail.delete approval requires native_id");
+      }
+      body.native_id = args.native_id;
     }
     const response = await this.post<ApprovalRequestResponse>("/approval/request", body);
     if (response.requires_approval !== requires) {

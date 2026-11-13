@@ -507,6 +507,8 @@ CREATE TABLE IF NOT EXISTS mail_messages (
     body_hash TEXT NOT NULL,
     created_ms INTEGER NOT NULL,
     origin_device_id TEXT NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    updated_ms INTEGER NOT NULL DEFAULT 0,
     UNIQUE (source_id, native_id)
 );
 ";
@@ -817,6 +819,15 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     // E2-A §2.7: the consuming worker session (nullable,
     // backfill only, version stays 4). Old rows stay NULL.
     backfill_column(&tx, "approvals", "consumed_by_worker_session_id")?;
+    // D1-6b-3 additive columns: databases migrated before
+    // 6b-3 have no mail_messages.deleted / updated_ms.
+    // Nullable INTEGER backfill, idempotent, schema
+    // version stays 12 (column backfill, not a v13
+    // migration — the E2-D progress_json precedent). Old
+    // rows read NULL, which the row reader treats as
+    // deleted = false / updated_ms = 0.
+    backfill_column_typed(&tx, "mail_messages", "deleted", "INTEGER")?;
+    backfill_column_typed(&tx, "mail_messages", "updated_ms", "INTEGER")?;
     tx.commit().map_err(err)?;
     Ok(())
 }

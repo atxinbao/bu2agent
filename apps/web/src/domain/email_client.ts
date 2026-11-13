@@ -86,6 +86,38 @@ export interface SendMailInput {
   toolCallId?: string;
 }
 
+// D1-6b-3: one synced mail row (the gateway
+// `MailMessageRow` shape, camel-cased). The list
+// includes tombstoned rows with `deleted: true`;
+// `synced` may return a tombstoned row with
+// `deleted: true`.
+export interface SyncedMessage {
+  messageId: string;
+  sourceId: string;
+  nativeId: string;
+  threadId: string;
+  subject: string;
+  sender: string;
+  dateMs: number;
+  bodyHash: string;
+  createdMs: number;
+  originDeviceId: string;
+  deleted: boolean;
+  updatedMs: number;
+}
+
+// D1-6b-3: one delete outcome (the gateway
+// `MailDeleteResponse` shape). `messageId` is null when
+// the deleted mail was never synced.
+export interface MailDeleteResult {
+  messageId: string | null;
+  sourceId: string;
+  nativeId: string;
+  deleted: boolean;
+  effectId: string | null;
+  replayed: boolean;
+}
+
 // Transport-neutral surface used by the Mail view. The
 // HTTP client below and the invoke client both implement
 // it, so the view never knows which transport it runs on.
@@ -100,6 +132,9 @@ export interface EmailGateway {
   sendMail(input: SendMailInput): Promise<SentMessage>;
   listSent(): Promise<SentMessage[]>;
   sent(sentId: string): Promise<SentMessage>;
+  deleteMessage(messageId: string, toolCallId: string): Promise<MailDeleteResult>;
+  listSynced(): Promise<SyncedMessage[]>;
+  synced(messageId: string): Promise<SyncedMessage>;
 }
 
 interface ServerMailSyncResult {
@@ -190,6 +225,58 @@ function toSentMessage(server: ServerSentMessage): SentMessage {
     policyVersion: server.policy_version,
     createdMs: server.created_ms,
     originDeviceId: server.origin_device_id,
+  };
+}
+
+interface ServerSyncedMessage {
+  message_id: string;
+  source_id: string;
+  native_id: string;
+  thread_id: string;
+  subject: string;
+  sender: string;
+  date_ms: number;
+  body_hash: string;
+  created_ms: number;
+  origin_device_id: string;
+  deleted: boolean;
+  updated_ms: number;
+}
+
+function toSyncedMessage(server: ServerSyncedMessage): SyncedMessage {
+  return {
+    messageId: server.message_id,
+    sourceId: server.source_id,
+    nativeId: server.native_id,
+    threadId: server.thread_id,
+    subject: server.subject,
+    sender: server.sender,
+    dateMs: server.date_ms,
+    bodyHash: server.body_hash,
+    createdMs: server.created_ms,
+    originDeviceId: server.origin_device_id,
+    deleted: server.deleted,
+    updatedMs: server.updated_ms,
+  };
+}
+
+interface ServerMailDeleteResponse {
+  message_id: string | null;
+  source_id: string;
+  native_id: string;
+  deleted: boolean;
+  effect_id: string | null;
+  replayed: boolean;
+}
+
+function toMailDeleteResult(server: ServerMailDeleteResponse): MailDeleteResult {
+  return {
+    messageId: server.message_id,
+    sourceId: server.source_id,
+    nativeId: server.native_id,
+    deleted: server.deleted,
+    effectId: server.effect_id,
+    replayed: server.replayed,
   };
 }
 
@@ -312,5 +399,30 @@ export class EmailClient implements EmailGateway {
   async sent(sentId: string): Promise<SentMessage> {
     const row = await this.requestJson<ServerSentMessage>("GET", `/api/email/sent/${sentId}`);
     return toSentMessage(row);
+  }
+
+  async deleteMessage(messageId: string, toolCallId: string): Promise<MailDeleteResult> {
+    // D1-6b-3: Trash only, never purge (Q-D1-6b-12).
+    // The tool_call_id travels as a query parameter —
+    // the DELETE carries no body (the desktop
+    // delete_json sends none).
+    const result = await this.requestJson<ServerMailDeleteResponse>(
+      "DELETE",
+      `/api/email/messages/${messageId}?tool_call_id=${toolCallId}`,
+    );
+    return toMailDeleteResult(result);
+  }
+
+  async listSynced(): Promise<SyncedMessage[]> {
+    const rows = await this.requestJson<ServerSyncedMessage[]>("GET", "/api/email/synced");
+    return rows.map(toSyncedMessage);
+  }
+
+  async synced(messageId: string): Promise<SyncedMessage> {
+    const row = await this.requestJson<ServerSyncedMessage>(
+      "GET",
+      `/api/email/synced/${messageId}`,
+    );
+    return toSyncedMessage(row);
   }
 }

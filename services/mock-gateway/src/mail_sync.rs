@@ -87,6 +87,16 @@ pub struct MailMessageRow {
     pub body_hash: String,
     pub created_ms: u64,
     pub origin_device_id: String,
+    /// D1-6b-3 tombstone: `true` once the message was
+    /// moved to Trash. The text stays on the row (red
+    /// line 9: deletion is tombstone-only). Rows
+    /// backfilled before 6b-3 read NULL, which maps to
+    /// `false` here.
+    pub deleted: bool,
+    /// D1-6b-3: advances on tombstone (the sync time on
+    /// insert). Backfilled rows read NULL, which maps
+    /// to 0 here.
+    pub updated_ms: i64,
 }
 
 fn mail_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MailMessageRow> {
@@ -101,11 +111,13 @@ fn mail_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MailMessageRow> {
         body_hash: row.get(7)?,
         created_ms: row.get(8)?,
         origin_device_id: row.get(9)?,
+        deleted: row.get::<_, Option<i64>>(10)?.unwrap_or(0) != 0,
+        updated_ms: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
     })
 }
 
 const MAIL_COLS: &str =
-    "message_id, source_id, native_id, thread_id, subject, sender, date_ms, body_hash, created_ms, origin_device_id";
+    "message_id, source_id, native_id, thread_id, subject, sender, date_ms, body_hash, created_ms, origin_device_id, deleted, updated_ms";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MailSyncResult {
@@ -218,6 +230,15 @@ pub fn record_sync(
     let mut skipped = 0usize;
     let now = now_ms();
     for message in messages {
+        // D1-6b-3: this exists check is the anti-resurrect
+        // defense — a tombstoned row is still in the
+        // table, so a re-sync skips it instead of
+        // re-inserting it. Adding a `deleted = 0`
+        // condition here would do the opposite: the
+        // tombstoned row would look absent and the
+        // INSERT would hit the (source_id, native_id)
+        // UNIQUE key. The tombstone lives in the table
+        // precisely so the sync can see it and skip.
         let exists: bool = tx
             .query_row(
                 "SELECT 1 FROM mail_messages WHERE source_id = ?1 AND native_id = ?2",
@@ -247,11 +268,13 @@ pub fn record_sync(
             body_hash: sha256_hex(message.body_text.as_bytes()),
             created_ms: now,
             origin_device_id: origin_device_id.to_string(),
+            deleted: false,
+            updated_ms: now as i64,
         };
         tx.execute(
             &format!(
                 "INSERT INTO mail_messages ({MAIL_COLS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
             ),
             params![
                 row.message_id,
@@ -264,6 +287,8 @@ pub fn record_sync(
                 row.body_hash,
                 row.created_ms as i64,
                 row.origin_device_id,
+                0i64,
+                row.updated_ms,
             ],
         )
         .map_err(err)?;
@@ -298,6 +323,13 @@ pub fn record_sync(
 }
 
 /// All synced rows for one source, oldest first.
+/// D1-6b-3 (approved plan §3 / Q-D1-6b-14): the list
+/// INCLUDES tombstoned rows, with `deleted = true`
+/// visible — the tombstone state must be verifiable
+/// over HTTP (red line 5: no reader without a write
+/// side). `mail_from_row` maps a NULL `deleted`
+/// (pre-6b-3 rows, backfilled NULL) to `false`, so
+/// legacy rows stay visible as live rows.
 pub fn list_mail_messages(
     conn: &Connection,
     source_id: &str,
@@ -315,7 +347,10 @@ pub fn list_mail_messages(
     Ok(rows)
 }
 
-/// One synced row by local id, any source.
+/// One synced row by local id, any source. Tombstoned
+/// rows are still returned (the goals-detail precedent):
+/// the delete route and the reader both need to see the
+/// tombstone state.
 pub fn get_mail_message(
     conn: &Connection,
     message_id: &str,
@@ -327,6 +362,162 @@ pub fn get_mail_message(
     )
     .optional()
     .map_err(err)
+}
+
+/// One synced row by native id, for one source.
+pub fn find_by_native_id(
+    conn: &Connection,
+    source_id: &str,
+    native_id: &str,
+) -> Result<Option<MailMessageRow>, String> {
+    conn.query_row(
+        &format!(
+            "SELECT {MAIL_COLS} FROM mail_messages WHERE source_id = ?1 AND native_id = ?2"
+        ),
+        params![source_id, native_id],
+        mail_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// Resolve a delete-route id to its (row, native id).
+/// Local `mail-N` first, then a row by native id, then
+/// a bare numeric native id with no row (a never-synced
+/// message, Q-D1-6b-15). Anything else is unknown
+/// (`None` — the caller answers 404, never a guess).
+pub fn resolve_delete_target(
+    conn: &Connection,
+    message_id: &str,
+) -> Result<Option<(Option<MailMessageRow>, String)>, String> {
+    if let Some(row) = get_mail_message(conn, message_id)? {
+        let native_id = row.native_id.clone();
+        return Ok(Some((Some(row), native_id)));
+    }
+    if let Some(row) = find_by_native_id(conn, MAIL_SOURCE_ID, message_id)? {
+        let native_id = row.native_id.clone();
+        return Ok(Some((Some(row), native_id)));
+    }
+    if message_id.parse::<i64>().is_ok() {
+        return Ok(Some((None, message_id.to_string())));
+    }
+    Ok(None)
+}
+
+/// The `mail.deleted` event payload: ids and timestamps
+/// only. No subject, no sender, no body — the payload
+/// is built redacted and `append_event` whitelists it
+/// again. Every field here is already on the redact
+/// allowlist, so no addition was needed (plan §4.3).
+fn deleted_payload(row: &MailMessageRow, execution_id: &str, deleted_ms: i64) -> String {
+    canonical_json(&serde_json::json!({
+        "message_id": row.message_id,
+        "source_id": row.source_id,
+        "native_id": row.native_id,
+        "created_ms": row.created_ms,
+        "updated_ms": deleted_ms,
+        "execution_id": execution_id,
+    }))
+}
+
+/// The `mail.deleted` event payload for a never-synced
+/// delete (no row, Q-D1-6b-15): the aggregate is the
+/// native id itself, and there is no local `message_id`
+/// to name — no empty fact row is created for it.
+fn deleted_payload_no_row(
+    native_id: &str,
+    execution_id: &str,
+    deleted_ms: i64,
+) -> String {
+    // No fact row exists (Q-D1-6b-15), so there is no
+    // local `mail-N` and no `updated_ms`; the native id
+    // doubles as the aggregate / message id, matching
+    // the `aggregate_id` passed to `append_event`.
+    canonical_json(&serde_json::json!({
+        "message_id": native_id,
+        "source_id": MAIL_SOURCE_ID,
+        "native_id": native_id,
+        "created_ms": deleted_ms,
+        "execution_id": execution_id,
+    }))
+}
+
+/// Outcome of a tombstone write.
+pub enum TombstoneOutcome {
+    /// Newly tombstoned (the returned row is post-state).
+    Tombstoned(MailMessageRow),
+    /// Already tombstoned (the returned row is current
+    /// state; no second event was written).
+    AlreadyTombstoned(MailMessageRow),
+}
+
+/// Tombstone one synced row in a single transaction:
+/// `deleted = 1`, `updated_ms` advances, text stays on
+/// the row, plus one `mail.deleted` event. A re-delete
+/// is a no-op returning the current row (no second
+/// event), like re-archive / re-disconnect and the D1-5
+/// memory delete. Unknown id returns `Ok(None)`.
+pub fn tombstone_mail_message(
+    conn: &mut Connection,
+    message_id: &str,
+    execution_id: &str,
+    origin_device_id: &str,
+) -> Result<Option<TombstoneOutcome>, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let Some(row) = get_mail_message(&tx, message_id)? else {
+        return Ok(None);
+    };
+    if row.deleted {
+        tx.commit().map_err(err)?;
+        return Ok(Some(TombstoneOutcome::AlreadyTombstoned(row)));
+    }
+    let now = now_ms() as i64;
+    tx.execute(
+        "UPDATE mail_messages SET deleted = 1, updated_ms = ?1 WHERE message_id = ?2",
+        params![now, message_id],
+    )
+    .map_err(err)?;
+    let mut row = row;
+    row.deleted = true;
+    row.updated_ms = now;
+    append_event(
+        &tx,
+        "mail",
+        &row.message_id,
+        "mail.deleted",
+        &deleted_payload(&row, execution_id, now),
+        origin_device_id,
+        now,
+        1,
+    )?;
+    tx.commit().map_err(err)?;
+    Ok(Some(TombstoneOutcome::Tombstoned(row)))
+}
+
+/// Record a never-synced delete (no row, Q-D1-6b-15):
+/// the `mail.deleted` event alone, aggregate id = the
+/// native id. The Effect + this event are the
+/// credential; no empty fact row is created.
+pub fn record_deleted_no_row(
+    conn: &mut Connection,
+    native_id: &str,
+    execution_id: &str,
+    origin_device_id: &str,
+) -> Result<(), String> {
+    let tx = conn.transaction().map_err(err)?;
+    let now = now_ms() as i64;
+    append_event(
+        &tx,
+        "mail",
+        native_id,
+        "mail.deleted",
+        &deleted_payload_no_row(native_id, execution_id, now),
+        origin_device_id,
+        now,
+        1,
+    )?;
+    tx.commit().map_err(err)?;
+    Ok(())
 }
 
 /// Next free mail number (max suffix + 1, or 1). The

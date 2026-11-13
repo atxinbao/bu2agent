@@ -1,10 +1,12 @@
 // Mail view: email read surface, batch 1 (Task 22,
 // option A) + D1-6a manual incremental sync + D1-6b-1
-// real send. Threads list -> thread messages ->
-// message reading -> attachment download. Send goes
-// through the digest-bound approval flow
-// (approval_request -> decide -> send); delete stays
-// out — this view never deletes.
+// real send + D1-6b-3 delete. Threads list -> thread
+// messages -> message reading -> attachment download.
+// Send goes through the digest-bound approval flow
+// (approval_request -> decide -> send); delete goes
+// through the same flow (approval_request -> decide ->
+// delete) and is Trash only — never permanently
+// deleted.
 // The sync button is a manual trigger: it records the
 // inbox first 50 into local SQLite (body hash only,
 // never body text); there is no auto-trigger — that
@@ -23,12 +25,14 @@ import { useEffect, useState } from "react";
 import type { AgentGateway } from "../domain/agent_client";
 import type {
   EmailGateway,
+  MailDeleteResult,
   MailSyncResult,
   MailboxInfo,
   MailboxSetup,
   MessageView,
   SendMailInput,
   SentMessage,
+  SyncedMessage,
   ThreadView,
 } from "../domain/email_client";
 import type { LoopGateway } from "../domain/loop_client";
@@ -36,8 +40,7 @@ import type { LoopGateway } from "../domain/loop_client";
 // P2 摘要为草稿入口：直接调 loop，不走 Workbench 对话。循环
 // 内读邮件（email.threads / email.message，只读工具）后用
 // fs.write 写草稿；写草稿的审批在 Loops 页的等待审批 UI 里
-// 批，与现有循环流程一致。MailView 的发送走下面的审批流，
-// 仍不加删除。
+// 批，与现有循环流程一致。MailView 的发送与删除走下面的审批流。
 const LOOP_MAX_CALLS = 5;
 const LOOP_BUDGET_MS = 120000;
 
@@ -57,6 +60,12 @@ interface PendingSend {
   subject: string;
   body: string;
   idempotencyKey: string;
+  toolCallId: string;}
+
+interface PendingDelete {
+  messageId: string;
+  nativeId: string;
+  subject: string | null;
   toolCallId: string;
 }
 
@@ -81,6 +90,9 @@ export function MailView({
   const [syncResult, setSyncResult] = useState<MailSyncResult | null>(null);
   const [sent, setSent] = useState<SentMessage[] | null>(null);
   const [sendResult, setSendResult] = useState<SentMessage | null>(null);
+  const [synced, setSynced] = useState<SyncedMessage[] | null>(null);
+  const [deleteResult, setDeleteResult] = useState<MailDeleteResult | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(null);
   const [toInput, setToInput] = useState("");
   const [subjectInput, setSubjectInput] = useState("");
   const [bodyInput, setBodyInput] = useState("");
@@ -94,6 +106,7 @@ export function MailView({
       setSetup(await email.mailboxSetup());
       setThreads(await email.threads(50, null));
       setSent(await email.listSent());
+      setSynced(await email.listSynced());
     } catch (err) {
       setError(errText(err));
     } finally {
@@ -197,6 +210,66 @@ export function MailView({
     }
   }
 
+  // D1-6b-3 delete flow: same approval shape as send —
+  // request a digest-bound approval for this native id,
+  // decide in this view, then delete with the decided
+  // approval id. Trash only, never permanently deleted
+  // (Q-D1-6b-12); the approval binds the exact message.
+  async function requestDeleteApproval(row: SyncedMessage) {
+    setBusy(true);
+    setError(null);
+    try {
+      const request = await agent.requestApproval("mail.delete", {
+        native_id: row.nativeId,
+      });
+      if (!request.tool_call_id) {
+        setError("审批请求未返回 tool_call_id。");
+        return;
+      }
+      setPendingDelete({
+        messageId: row.messageId,
+        nativeId: row.nativeId,
+        subject: row.subject,
+        toolCallId: request.tool_call_id,
+      });
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function approveAndDelete() {
+    if (pendingDelete === null) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await agent.decideApproval(pendingDelete.toolCallId, "approve");
+      const result = await email.deleteMessage(pendingDelete.messageId, pendingDelete.toolCallId);
+      setDeleteResult(result);
+      setPendingDelete(null);
+      setSynced(await email.listSynced());
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rejectDelete() {
+    if (pendingDelete === null) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await agent.decideApproval(pendingDelete.toolCallId, "reject");
+      setPendingDelete(null);
+    } catch (err) {
+      setError(errText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function openThread(threadId: string) {
     setBusy(true);
     setError(null);
@@ -280,8 +353,8 @@ export function MailView({
     <div className="view">
       <h2>Mail</h2>
       <p className="note">
-        线程列表、消息阅读、附件下载；发送走审批流（先请求审批、通过后再发送），不删除。
-        手动同步把收件箱前 50 封写入本地 SQLite（只存正文哈希，不存正文）；自动同步等 A1 定时器。
+        线程列表、消息阅读、附件下载；发送与删除走审批流（先请求审批、通过后再执行）。
+        删除只移入废纸篓，永不彻底删除。手动同步把收件箱前 50 封写入本地 SQLite（只存正文哈希，不存正文）；自动同步等 A1 定时器。
         打包的 Mac 应用读真实 Mail.app 数据（AppleScript 问 Mail.app）；其他平台返回 501。
         线程按规范化主题分组（Mail 的 AppleScript 没有 thread id），线程 id 是本地定义。
         “已发送”指 Mail.app 已接受这封邮件，不承诺对方收到。
@@ -296,6 +369,12 @@ export function MailView({
       {sendResult !== null && (
         <p className="note">
           已发送：{sendResult.sentId}（{sendResult.subject}）——Mail.app 已接受，不承诺对方收到。
+        </p>
+      )}
+      {deleteResult !== null && (
+        <p className="note">
+          已移入废纸篓：{deleteResult.messageId ?? deleteResult.nativeId}
+          （{deleteResult.replayed ? "已删除过，未重复执行" : "本次删除"}）——只移入废纸篓，未彻底删除。
         </p>
       )}
       <h3>发送邮件</h3>
@@ -362,6 +441,42 @@ export function MailView({
             </li>
           ))}
         </ul>
+      )}
+      <h3>已同步（可删除）</h3>
+      {(synced ?? []).length === 0 ? (
+        <p className="empty">无已同步邮件。</p>
+      ) : (
+        <ul>
+          {(synced ?? []).map((row) => (
+            <li key={row.messageId}>
+              {row.messageId} · {row.subject ?? "（无主题）"} · {row.sender ?? ""} ·{" "}
+              {new Date(row.dateMs).toLocaleString()}{" "}
+              <button
+                type="button"
+                onClick={() => void requestDeleteApproval(row)}
+                disabled={busy || pendingDelete !== null}
+              >
+                移入废纸篓
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {pendingDelete !== null && (
+        <div>
+          <p>
+            待审批删除：{pendingDelete.messageId} · {pendingDelete.subject ?? "（无主题）"}（
+            {pendingDelete.toolCallId}）——只移入废纸篓，永不彻底删除。
+          </p>
+          <div className="row">
+            <button type="button" onClick={() => void approveAndDelete()} disabled={busy}>
+              通过并移入废纸篓
+            </button>{" "}
+            <button type="button" onClick={() => void rejectDelete()} disabled={busy}>
+              拒绝
+            </button>
+          </div>
+        </div>
       )}
       {mailbox === null ? (
         <p className="empty">邮箱状态未知（状态查询失败）。</p>

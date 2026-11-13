@@ -522,7 +522,10 @@ pub struct AppState {
     voice_active: Arc<Mutex<Option<String>>>,
     voice_pipeline: Arc<Mutex<Option<String>>>,
     voice_state_path: Option<PathBuf>,
-    mail_source: Arc<dyn MailSource>,
+    /// D1-6b-3: `pub(crate)` like `calendar_backend`
+    /// below — the Evidence readback in `evidence.rs`
+    /// needs the mail source for the delete re-read.
+    pub(crate) mail_source: Arc<dyn MailSource>,
     /// D1-6b-2: the calendar backend (EventKit on macOS,
     /// the 501 stub elsewhere). Reads delegate to the
     /// D1-6a free functions; writes go through this
@@ -3893,6 +3896,13 @@ struct ApprovalRequestDto {
     all_day: Option<bool>,
     location: Option<String>,
     notes: Option<String>,
+    /// D1-6b-3 (Q-D1-6b-22): the mail delete
+    /// presentation — the native id of the message to
+    /// delete. The server recomputes
+    /// `mail_delete_digest` from it, never from a client
+    /// hash — the approval binds the exact message, not
+    /// the bare ability to delete mail.
+    native_id: Option<String>,
     /// P3-C (§7): a client-presented Worker command spec.
     /// Never trusted: the handler recomputes the spec from
     /// the raw presentation below and rejects a mismatch.
@@ -4112,6 +4122,34 @@ async fn approval_request(
                     &location_hash,
                     &notes_hash,
                 ))
+            }
+        }
+        "mail.delete" => {
+            // D1-6b-3 (Q-D1-6b-22): when the native id is
+            // presented, the digest is computed here from
+            // it — the same input the delete route resolves
+            // its path id to, so the two digests match.
+            // When it is absent the request stays
+            // tool-only (the mail.send precedent): a
+            // tool-only record can never authorize the
+            // real delete — the delete route rejects a
+            // missing digest with 403
+            // `approval_binding_mismatch`. An empty id is
+            // a client error. No planned Effect is created
+            // here (the `worker.run` precedent): the
+            // delete route plans its own Effect on its
+            // write Execution (Q-D1-6b-23) and binds this
+            // approval to it at consume time.
+            if req.native_id.is_none() {
+                None
+            } else {
+                let Some(native_id) = req.native_id.as_deref() else {
+                    return bad_request("mail.delete approval requires native_id");
+                };
+                if native_id.is_empty() {
+                    return bad_request("mail.delete approval requires non-empty native_id");
+                }
+                Some(crate::operation_binding::mail_delete_digest(native_id))
             }
         }
         "worker.run" => {
@@ -10834,6 +10872,475 @@ async fn email_sent_get(
             .into_response(),
         Err(detail) => {
             eprintln!("warning: sent get failed ({detail})");
+            sqlite_error_response()
+        }
+    }
+}
+
+/// D1-6b-3 (Q-D1-6b-12/13/15/22/23/24): delete one
+/// message — Trash only, never purge. `{message_id}` is
+/// a local `mail-N` or a native id; the digest binds
+/// the resolved native id. Tombstone only: the row is
+/// never hard-deleted (a hard delete would resurrect
+/// the mail on next sync — the `(source_id, native_id)`
+/// UNIQUE dedupe). A re-delete of a tombstoned row
+/// returns 200 with the current row and no second event,
+/// no second Effect. Deleting never-synced mail is
+/// allowed (Q-D1-6b-15): the real-mailbox delete
+/// executes, no empty fact row is created, and the
+/// response is the minimal delete record below.
+///
+/// The `tool_call_id` travels as a query parameter, not
+/// a JSON body: the desktop `HttpClient::delete_json`
+/// sends no body (the Task 11 DELETE precedent —
+/// connector-reset / hitl-snooze), so a body would make
+/// the invoke path unable to call this route at all.
+#[derive(Debug, Deserialize)]
+struct DeleteQuery {
+    tool_call_id: Option<String>,
+}
+
+/// D1-6b-3: one delete outcome (LOCAL DEFINITION).
+/// `message_id` is the local `mail-N` when the message
+/// was synced, `None` when the deleted mail was never
+/// synced (Q-D1-6b-15: no empty fact row). `effect_id`
+/// is `None` only on a tombstone replay whose original
+/// Effect could not be found (the row carries no
+/// effect id).
+#[derive(Debug, Serialize)]
+struct MailDeleteResponse {
+    message_id: Option<String>,
+    source_id: String,
+    native_id: String,
+    deleted: bool,
+    effect_id: Option<String>,
+    replayed: bool,
+}
+
+fn delete_response(
+    row: Option<&crate::mail_sync::MailMessageRow>,
+    native_id: &str,
+    effect_id: Option<String>,
+    replayed: bool,
+) -> axum::response::Response {
+    Json(MailDeleteResponse {
+        message_id: row.map(|r| r.message_id.clone()),
+        source_id: crate::mail_sync::MAIL_SOURCE_ID.to_string(),
+        native_id: native_id.to_string(),
+        deleted: true,
+        effect_id,
+        replayed,
+    })
+    .into_response()
+}
+
+/// The succeeded delete Effect for one native id, when
+/// one exists (the replay branch's effect id — the
+/// tombstoned row itself carries no effect id).
+fn delete_effect_id_for(conn: &rusqlite::Connection, native_id: &str) -> Option<String> {
+    sqlite_store::list_effects(conn).ok().and_then(|effects| {
+        effects
+            .into_iter()
+            .find(|e| {
+                e.capability == "mail"
+                    && e.operation == "delete"
+                    && e.scope == native_id
+                    && e.status == "succeeded"
+            })
+            .map(|e| e.effect_id)
+    })
+}
+
+async fn email_message_delete(
+    State(state): State<AppState>,
+    axum::extract::Path(message_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DeleteQuery>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    // 1. Resolve the id: local `mail-N` first, then a row
+    // by native id, then a bare numeric native id (a
+    // never-synced message). Anything else is unknown.
+    let (row, native_id) = {
+        let conn = sqlite.lock().expect("sqlite lock");
+        match crate::mail_sync::resolve_delete_target(&conn, &message_id) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "unknown message" })),
+                )
+                    .into_response();
+            }
+            Err(detail) => {
+                eprintln!("warning: mail delete resolve failed ({detail})");
+                return sqlite_error_response();
+            }
+        }
+    };
+    let digest = crate::operation_binding::mail_delete_digest(&native_id);
+    // 2. Disconnected source rejects new writes (409).
+    if mail_source_disconnected(&state) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "source_disconnected" })),
+        )
+            .into_response();
+    }
+    // 3. Tombstone check BEFORE planning a new Effect: an
+    // already-tombstoned row is the replay — 200 current
+    // row, no second event, no second Effect.
+    if let Some(row) = &row {
+        if row.deleted {
+            let conn = sqlite.lock().expect("sqlite lock");
+            let effect_id = delete_effect_id_for(&conn, &native_id);
+            return delete_response(Some(row), &native_id, effect_id, true);
+        }
+    }
+    // 4. Approval peek (read-only, nothing burned): the
+    // digest is checked BEFORE planning, so a mismatch
+    // leaves no orphaned planned row and the approval
+    // stays unconsumed for a correct retry (the 6b-1
+    // SD3 shape).
+    let Some(approval_id) = query.tool_call_id.clone() else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "approval_required" })),
+        )
+            .into_response();
+    };
+    {
+        let approvals = state.approvals.lock().expect("approval lock");
+        let Some(record) = approvals.get(&approval_id) else {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "approval_required" })),
+            )
+                .into_response();
+        };
+        if record.tool != "mail.delete" {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "approval_required" })),
+            )
+                .into_response();
+        }
+        if record.status == ApprovalStatus::Rejected {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "approval_rejected" })),
+            )
+                .into_response();
+        }
+        if record.status != ApprovalStatus::Approved {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "approval_required" })),
+            )
+                .into_response();
+        }
+        if record.consumed {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "approval_already_consumed" })),
+            )
+                .into_response();
+        }
+        match record.operation_digest.as_deref() {
+            // A tool-only approval can never authorize a
+            // digest-bound write.
+            None => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({ "error": "approval_binding_mismatch" })),
+                )
+                    .into_response();
+            }
+            Some(bound) if bound != digest => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "approval_digest_mismatch" })),
+                )
+                    .into_response();
+            }
+            _ => {}
+        }
+    }
+    // 5. Reuse-or-plan (E2-A V1): a planned row with the
+    // same approval_id — a previous attempt that planned
+    // then failed to consume — is reused, never
+    // duplicated. Otherwise build the write Execution +
+    // single-tool Mandate (Q-D1-6b-23) and plan through
+    // the shared ledger entry. The adapter fallback is
+    // NOT used for 6b writes.
+    let (execution_id, effect) = match effect_for_approval(&state, &approval_id, Some(&digest)) {
+        Some(effect) => match effect.status.as_str() {
+            "planned" | "authorized" => {
+                let Some(execution_id) = effect.execution_id.clone() else {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({ "error": "effect_idempotency_unavailable" })),
+                    )
+                        .into_response();
+                };
+                (execution_id, effect)
+            }
+            "succeeded" => {
+                // Terminal with an unconsumed approval
+                // should not happen (consume precedes
+                // terminal), but a succeeded replay is
+                // still the original row, never a re-delete.
+                if let Some(row) = &row {
+                    return delete_response(
+                        Some(row),
+                        &native_id,
+                        Some(effect.effect_id.clone()),
+                        true,
+                    );
+                }
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "effect_terminal", "effect_id": effect.effect_id, "status": effect.status })),
+                )
+                    .into_response();
+            }
+            _ => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "effect_not_ready", "effect_id": effect.effect_id, "status": effect.status })),
+                )
+                    .into_response();
+            }
+        },
+        None => {
+            let execution = create_execution_with_binding(&state, None, None, None, None, None);
+            create_write_mandate(&state, &execution.execution_id, "mail.delete");
+            match ledger_entry(
+                &state,
+                Some(execution.execution_id.clone()),
+                "mail",
+                "delete",
+                &native_id,
+                Some(digest.clone()),
+                Some(approval_id.clone()),
+            ) {
+                LedgerEntryDecision::Entered(entry) => (entry.execution_id, entry.effect),
+                LedgerEntryDecision::Replay(other) => {
+                    if let Some(row) = &row {
+                        return delete_response(
+                            Some(row),
+                            &native_id,
+                            Some(other.effect_id.clone()),
+                            true,
+                        );
+                    }
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({ "error": "effect_idempotency_replay", "effect_id": other.effect_id, "status": other.status })),
+                    )
+                        .into_response();
+                }
+                LedgerEntryDecision::Blocked(other) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+    // 6. Consume the bound approval (binding + push to
+    // authorized), then drive the Effect to started.
+    if let Err(response) = consume_bound_approval_for_effect(
+        &state,
+        "mail.delete",
+        &query.tool_call_id,
+        &digest,
+        Some(&effect.effect_id),
+    ) {
+        return *response;
+    }
+    if let Err(response) = start_bound_effect(&state, &effect) {
+        return *response;
+    }
+    // 7. Execute outside the SQLite lock: the AppleScript
+    // call can take up to 30 s. Same spawn_blocking shape
+    // as device_set and the 6b-1 send. The native id is
+    // cloned for the blocking task; the resolved row is
+    // still needed below for the tombstone.
+    let source = Arc::clone(&state.mail_source);
+    let delete_id = native_id.clone();
+    let delete_result =
+        tokio::task::spawn_blocking(move || source.delete(&delete_id)).await;
+    let outcome = match delete_result {
+        Ok(result) => result,
+        Err(_) => Err(MailError::Timeout),
+    };
+    match outcome {
+        Ok(()) => {
+            // Record the tombstone + mail.deleted event in
+            // one transaction FIRST, then finish the
+            // Effect: a succeeded Effect must never exist
+            // without its fact record. A never-synced
+            // delete records the event alone (no empty
+            // fact row, Q-D1-6b-15).
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            let recorded = match &row {
+                Some(row) => crate::mail_sync::tombstone_mail_message(
+                    &mut conn,
+                    &row.message_id,
+                    &execution_id,
+                    &state.origin_device_id,
+                )
+                .map(|_| ()),
+                None => crate::mail_sync::record_deleted_no_row(
+                    &mut conn,
+                    &native_id,
+                    &execution_id,
+                    &state.origin_device_id,
+                ),
+            };
+            match recorded {
+                Ok(()) => {
+                    drop(conn);
+                    match ledger_entry_finish(&state, &effect.effect_id, LedgerOutcome::Succeeded) {
+                        Ok(_) => delete_response(
+                            row.as_ref(),
+                            &native_id,
+                            Some(effect.effect_id.clone()),
+                            false,
+                        ),
+                        Err(_) => {
+                            eprintln!(
+                                "warning: mail delete effect finish failed for {}",
+                                effect.effect_id
+                            );
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({ "error": "effect_transition_failed" })),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+                Err(detail) => {
+                    eprintln!("warning: mail delete record failed ({detail})");
+                    drop(conn);
+                    let _ = ledger_entry_finish(&state, &effect.effect_id, LedgerOutcome::Failed);
+                    sqlite_error_response()
+                }
+            }
+        }
+        Err(err) => {
+            // Only a killed/ambiguous script run is
+            // Unknown (P0-R): Mail.app may or may not
+            // have moved the message, so an
+            // unknown_requires_reconciliation Inbox row
+            // is opened by the transition itself. A
+            // lookup miss is Failed: the message is not
+            // in any live mailbox, so there was nothing
+            // to delete. Every other gateway-side failure
+            // is Failed.
+            let (status, error, outcome) = match err {
+                MailError::Timeout => (
+                    StatusCode::BAD_GATEWAY,
+                    "mail source error",
+                    LedgerOutcome::Unknown,
+                ),
+                MailError::NotRunning => (
+                    StatusCode::BAD_GATEWAY,
+                    "Mail is not running",
+                    LedgerOutcome::Failed,
+                ),
+                MailError::NotFound(_) => (
+                    StatusCode::NOT_FOUND,
+                    "unknown message",
+                    LedgerOutcome::Failed,
+                ),
+                MailError::Denied => (
+                    StatusCode::FORBIDDEN,
+                    "mail automation denied",
+                    LedgerOutcome::Failed,
+                ),
+                MailError::Unavailable(reason) => {
+                    let _ = ledger_entry_finish(&state, &effect.effect_id, LedgerOutcome::Failed);
+                    return (
+                        StatusCode::NOT_IMPLEMENTED,
+                        Json(serde_json::json!({ "error": reason, "effect_id": effect.effect_id })),
+                    )
+                        .into_response();
+                }
+                _ => (
+                    StatusCode::BAD_GATEWAY,
+                    "mail source error",
+                    LedgerOutcome::Failed,
+                ),
+            };
+            let _ = ledger_entry_finish(&state, &effect.effect_id, outcome);
+            (
+                status,
+                Json(serde_json::json!({ "error": error, "effect_id": effect.effect_id })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn email_synced_list(State(state): State<AppState>) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    match crate::mail_sync::list_mail_messages(&conn, crate::mail_sync::MAIL_SOURCE_ID) {
+        Ok(rows) => {
+            Json(serde_json::to_value(rows).unwrap_or(serde_json::Value::Null)).into_response()
+        }
+        Err(detail) => {
+            eprintln!("warning: synced list failed ({detail})");
+            sqlite_error_response()
+        }
+    }
+}
+
+async fn email_synced_get(
+    State(state): State<AppState>,
+    axum::extract::Path(message_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    match crate::mail_sync::get_mail_message(&conn, &message_id) {
+        Ok(Some(row)) => {
+            Json(serde_json::to_value(row).unwrap_or(serde_json::Value::Null)).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown synced message" })),
+        )
+            .into_response(),
+        Err(detail) => {
+            eprintln!("warning: synced get failed ({detail})");
             sqlite_error_response()
         }
     }
@@ -17954,6 +18461,14 @@ pub fn app(state: AppState) -> Router {
         .route("/api/email/send", post(email_send))
         .route("/api/email/sent", get(email_sent_list))
         .route("/api/email/sent/{id}", get(email_sent_get))
+        // D1-6b-3: mail delete (Trash only, tombstone) +
+        // synced readers. The DELETE shares the path with
+        // the batch-1 live message read; the tool_call_id
+        // travels as a query parameter (the desktop
+        // delete_json sends no body).
+        .route("/api/email/messages/{message_id}", delete(email_message_delete))
+        .route("/api/email/synced", get(email_synced_list))
+        .route("/api/email/synced/{id}", get(email_synced_get))
         // D1-6b-2: real calendar create (SQLite v12). The
         // POST shares the path with the 6a live list; the
         // list itself is unchanged.

@@ -7,12 +7,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   EmailGateway,
+  MailDeleteResult,
   MailSyncResult,
   MailboxInfo,
   MailboxSetup,
   MessageView,
   SendMailInput,
   SentMessage,
+  SyncedMessage,
   ThreadView,
 } from "./email_client";
 
@@ -107,6 +109,58 @@ function toSentMessage(server: ServerSentMessage): SentMessage {
   };
 }
 
+interface ServerSyncedMessage {
+  message_id: string;
+  source_id: string;
+  native_id: string;
+  thread_id: string;
+  subject: string;
+  sender: string;
+  date_ms: number;
+  body_hash: string;
+  created_ms: number;
+  origin_device_id: string;
+  deleted: boolean;
+  updated_ms: number;
+}
+
+function toSyncedMessage(server: ServerSyncedMessage): SyncedMessage {
+  return {
+    messageId: server.message_id,
+    sourceId: server.source_id,
+    nativeId: server.native_id,
+    threadId: server.thread_id,
+    subject: server.subject,
+    sender: server.sender,
+    dateMs: server.date_ms,
+    bodyHash: server.body_hash,
+    createdMs: server.created_ms,
+    originDeviceId: server.origin_device_id,
+    deleted: server.deleted,
+    updatedMs: server.updated_ms,
+  };
+}
+
+interface ServerMailDeleteResponse {
+  message_id: string | null;
+  source_id: string;
+  native_id: string;
+  deleted: boolean;
+  effect_id: string | null;
+  replayed: boolean;
+}
+
+function toMailDeleteResult(server: ServerMailDeleteResponse): MailDeleteResult {
+  return {
+    messageId: server.message_id,
+    sourceId: server.source_id,
+    nativeId: server.native_id,
+    deleted: server.deleted,
+    effectId: server.effect_id,
+    replayed: server.replayed,
+  };
+}
+
 export class InvokeEmailClient implements EmailGateway {
   mailbox(): Promise<MailboxInfo> {
     return invoke("email_mailbox");
@@ -171,5 +225,26 @@ export class InvokeEmailClient implements EmailGateway {
   async sent(sentId: string): Promise<SentMessage> {
     const row = await invoke<ServerSentMessage>("mail_sent_get", { sent_id: sentId });
     return toSentMessage(row);
+  }
+
+  async deleteMessage(messageId: string, toolCallId: string): Promise<MailDeleteResult> {
+    // D1-6b-3: Trash only, never purge (Q-D1-6b-12).
+    const result = await invoke<ServerMailDeleteResponse>("mail_delete", {
+      message_id: messageId,
+      tool_call_id: toolCallId,
+    });
+    return toMailDeleteResult(result);
+  }
+
+  async listSynced(): Promise<SyncedMessage[]> {
+    const rows = await invoke<ServerSyncedMessage[]>("mail_synced_list");
+    return rows.map(toSyncedMessage);
+  }
+
+  async synced(messageId: string): Promise<SyncedMessage> {
+    const row = await invoke<ServerSyncedMessage>("mail_synced_get", {
+      message_id: messageId,
+    });
+    return toSyncedMessage(row);
   }
 }

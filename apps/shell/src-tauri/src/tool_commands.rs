@@ -55,8 +55,8 @@ use agent_desktop::stream_client::{
     SxsSelection,
 };
 use agent_desktop::email_client::{
-    EmailClient, MailSyncResult, MailboxInfo, MailboxSetup, MessageView, SendMailInput,
-    SentMessageRow, ThreadView,
+    EmailClient, MailDeleteResponse, MailMessageRow, MailSyncResult, MailboxInfo, MailboxSetup,
+    MessageView, SendMailInput, SentMessageRow, ThreadView,
 };
 use agent_desktop::calendar_client::{
     CalendarClient, CalendarEvent, CreateCalendarEventInput, CreatedCalendarEventRow,
@@ -1656,6 +1656,30 @@ pub fn mail_sent_list() -> Result<Vec<SentMessageRow>, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn mail_sent_get(sent_id: String) -> Result<SentMessageRow, String> {
     email_client()?.sent_get(&sent_id).map_err(agent_err_string)
+}
+
+// D1-6b-3: mail delete + synced readers. The delete
+// carries the decided digest-bound approval id; the
+// gateway binds, consumes, and records the Effect +
+// tombstone. Trash only, never purge (Q-D1-6b-12).
+#[tauri::command(rename_all = "snake_case")]
+pub fn mail_delete(
+    message_id: String,
+    tool_call_id: String,
+) -> Result<MailDeleteResponse, String> {
+    email_client()?
+        .delete_message(&message_id, &tool_call_id)
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn mail_synced_list() -> Result<Vec<MailMessageRow>, String> {
+    email_client()?.list_synced().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn mail_synced_get(message_id: String) -> Result<MailMessageRow, String> {
+    email_client()?.synced_get(&message_id).map_err(agent_err_string)
 }
 
 // --- Effects / Executions / Inbox / Assignments / Evidence (P0-R R4) ---
