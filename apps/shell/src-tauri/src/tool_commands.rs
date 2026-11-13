@@ -58,7 +58,9 @@ use agent_desktop::email_client::{
     EmailClient, MailSyncResult, MailboxInfo, MailboxSetup, MessageView, SendMailInput,
     SentMessageRow, ThreadView,
 };
-use agent_desktop::calendar_client::{CalendarClient, CalendarEvent};
+use agent_desktop::calendar_client::{
+    CalendarClient, CalendarEvent, CreateCalendarEventInput, CreatedCalendarEventRow,
+};
 use agent_desktop::voice_client::{
     ActiveVoice, CatalogFilters, CatalogVoice, CustomVoice, OnboardingReset, PipelineProfile,
     PipelineSelection, VoiceClient,
@@ -1585,6 +1587,37 @@ pub fn calendar_list() -> Result<Vec<CalendarEvent>, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn calendar_get(event_id: String) -> Result<CalendarEvent, String> {
     calendar_client()?.get_event(&event_id).map_err(agent_err_string)
+}
+
+// D1-6b-2: real calendar create. The create carries the
+// decided digest-bound approval id and the
+// client-supplied idempotency key; the gateway binds,
+// consumes, and records the Effect + fact row.
+#[tauri::command(rename_all = "snake_case")]
+pub fn calendar_create(
+    calendar_id: String,
+    title: String,
+    start_ms: i64,
+    end_ms: i64,
+    all_day: bool,
+    location: Option<String>,
+    notes: Option<String>,
+    idempotency_key: String,
+    tool_call_id: Option<String>,
+) -> Result<CreatedCalendarEventRow, String> {
+    calendar_client()?
+        .create_event(&CreateCalendarEventInput {
+            calendar_id,
+            title,
+            start_ms,
+            end_ms,
+            all_day,
+            location,
+            notes,
+            idempotency_key,
+            tool_call_id,
+        })
+        .map_err(agent_err_string)
 }
 
 #[tauri::command(rename_all = "snake_case")]

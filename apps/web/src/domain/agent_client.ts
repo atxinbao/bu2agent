@@ -163,6 +163,31 @@ export class AgentClient implements AgentGateway {
       body.to = JSON.parse(args.to) as string[];
       body.subject = args.subject;
       body.body = args.body;
+    } else if (tool === "calendar.create") {
+      // D1-6b-2: a calendar create approval binds the
+      // exact event (Q-D1-6b-22). start/end/all-day
+      // arrive as strings (the invoke transport only
+      // carries string args); the server recomputes the
+      // digest from the decoded values, never from a
+      // client hash.
+      if (
+        args?.calendar_id === undefined ||
+        args?.title === undefined ||
+        args?.start_ms === undefined ||
+        args?.end_ms === undefined ||
+        args?.all_day === undefined
+      ) {
+        throw new Error(
+          "calendar.create approval requires calendar_id, title, start_ms, end_ms and all_day",
+        );
+      }
+      body.calendar_id = args.calendar_id;
+      body.title = args.title;
+      body.start_ms = Number(args.start_ms);
+      body.end_ms = Number(args.end_ms);
+      body.all_day = args.all_day === "true";
+      if (args.location !== undefined) body.location = args.location;
+      if (args.notes !== undefined) body.notes = args.notes;
     }
     const response = await this.post<ApprovalRequestResponse>("/approval/request", body);
     if (response.requires_approval !== requires) {

@@ -660,7 +660,7 @@ export function App() {
         (clients === null ? (
           <p className="empty">Choosing transport…</p>
         ) : (
-          <CalendarView client={clients.calendar} />
+          <CalendarView client={clients.calendar} agent={clients.agent} />
         ))}
       {tab === "notes" &&
         (clients === null ? (

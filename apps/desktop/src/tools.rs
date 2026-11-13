@@ -43,6 +43,9 @@ impl ToolRegistry {
         registry.tools.push(ToolSpec { name: "notes.create".to_string(), requires_approval: true, capability: "notes".to_string() });
         registry.tools.push(ToolSpec { name: "mail.list".to_string(), requires_approval: false, capability: "mail".to_string() });
         registry.tools.push(ToolSpec { name: "mail.send".to_string(), requires_approval: true, capability: "mail".to_string() });
+        // D1-6b-2: calendar create is approval-gated like
+        // mail.send (digest-bound write, Q-D1-6b-22).
+        registry.tools.push(ToolSpec { name: "calendar.create".to_string(), requires_approval: true, capability: "calendar".to_string() });
         registry.tools.push(ToolSpec { name: "reminders.set_completed".to_string(), requires_approval: true, capability: "reminders".to_string() });
         // P2: the loop mail tools were missing from phase4; the
         // desktop AgentClient reports unknown tool without them.

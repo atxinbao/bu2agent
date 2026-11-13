@@ -51,6 +51,7 @@ pub mod mail_source;
 pub mod mail_sync;
 pub mod mail_send;
 pub mod calendar_backend;
+pub mod calendar_store;
 pub mod device_store;
 pub mod device_backend;
 
@@ -113,7 +114,7 @@ pub fn start_stream(stream_id: &str, turn_id: &str, text: &str) -> Vec<Subscript
 pub fn tool_requires_approval(name: &str) -> Option<bool> {
     match name {
         "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" | "email.threads" | "email.message" | "code.search" | "git.read" | "worker.wait" => Some(false),
-        "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "fs.export" | "notes.create" | "mail.send" | "reminders.set_completed" | "worker.run" => Some(true),
+        "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "fs.export" | "notes.create" | "mail.send" | "calendar.create" | "reminders.set_completed" | "worker.run" => Some(true),
         _ => None,
     }
 }
@@ -234,6 +235,7 @@ mod tests {
         assert_eq!(tool_requires_approval("mail.list"), Some(false));
         assert_eq!(tool_requires_approval("notes.create"), Some(true));
         assert_eq!(tool_requires_approval("mail.send"), Some(true));
+        assert_eq!(tool_requires_approval("calendar.create"), Some(true));
         assert_eq!(tool_requires_approval("reminders.set_completed"), Some(true));
         assert_eq!(tool_requires_approval("email.threads"), Some(false));
         assert_eq!(tool_requires_approval("email.message"), Some(false));

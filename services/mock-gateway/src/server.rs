@@ -156,6 +156,7 @@ use crate::stream_store::{
     StreamOpen, StreamPoke, StreamSubscription, SxsSelection,
 };
 use crate::mail_source::{clamp_limit, MailError, MailSource, UnavailableMailSource};
+use crate::calendar_backend::{default_calendar_backend, CalendarBackend, CalendarError};
 use crate::voice_store::{
     append_voice_line, catalog_locales, catalog_voices, load_voice_state,
     merged_custom_voices, pipeline_profiles, ActiveVoiceRecord, CustomVoice,
@@ -522,6 +523,11 @@ pub struct AppState {
     voice_pipeline: Arc<Mutex<Option<String>>>,
     voice_state_path: Option<PathBuf>,
     mail_source: Arc<dyn MailSource>,
+    /// D1-6b-2: the calendar backend (EventKit on macOS,
+    /// the 501 stub elsewhere). Reads delegate to the
+    /// D1-6a free functions; writes go through this
+    /// trait so tests can substitute a fake.
+    pub(crate) calendar_backend: Arc<dyn CalendarBackend>,
     /// E2 slice: git binary resolved once at startup (PATH
     /// search + optional MOCK_GIT_PATH override, plan §3.4).
     /// None means Worker git commands fail closed with 503
@@ -889,6 +895,7 @@ impl AppState {
             voice_pipeline: Arc::new(Mutex::new(None)),
             voice_state_path: None,
             mail_source: Arc::new(UnavailableMailSource),
+            calendar_backend: default_calendar_backend(),
             git_path: crate::worker::resolve_git_path(),
             cargo_path: crate::worker::resolve_cargo_path(),
             worker_cancelled: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -2875,6 +2882,14 @@ impl AppState {
         self
     }
 
+    /// Test seam: replace the calendar backend (tests use
+    /// the fake backend; production macOS uses EventKit,
+    /// other platforms keep the Unavailable backend).
+    pub fn with_calendar_backend(mut self, backend: Arc<dyn CalendarBackend>) -> Self {
+        self.calendar_backend = backend;
+        self
+    }
+
     /// Test seam: load permission policy state from a tagged
     /// JSONL file, mirroring with_vault_state_path. Production
     /// state reads MOCK_POLICY_STATE_PATH.
@@ -3862,6 +3877,22 @@ struct ApprovalRequestDto {
     to: Option<Vec<String>>,
     subject: Option<String>,
     body: Option<String>,
+    /// D1-6b-2 (Q-D1-6b-22): the calendar create
+    /// presentation. The server recomputes
+    /// `calendar_create_digest` from these fields, never
+    /// from a client hash — the approval binds the exact
+    /// event, not the bare ability to create events.
+    /// `start_ms` / `end_ms` / `all_day` are typed
+    /// (the TS and desktop clients send real JSON
+    /// numbers / booleans, the mail `to` precedent);
+    /// `location` / `notes` are optional.
+    calendar_id: Option<String>,
+    title: Option<String>,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+    all_day: Option<bool>,
+    location: Option<String>,
+    notes: Option<String>,
     /// P3-C (§7): a client-presented Worker command spec.
     /// Never trusted: the handler recomputes the spec from
     /// the raw presentation below and rejects a mismatch.
@@ -4015,6 +4046,71 @@ async fn approval_request(
                     &recipients,
                     subject,
                     &body_hash,
+                ))
+            }
+        }
+        "calendar.create" => {
+            // D1-6b-2 (Q-D1-6b-22): when the calendar
+            // fields are presented, the digest is computed
+            // here from them — same normalization (empty
+            // location / notes count as absent; title /
+            // location / notes hashed server-side) as the
+            // create route, so the two digests match. When
+            // they are entirely absent the request stays
+            // tool-only (the mail.send precedent): a
+            // tool-only record can never authorize the
+            // real create — the create route rejects a
+            // missing digest with 403
+            // `approval_binding_mismatch`. A partial
+            // presentation is a client error. No planned
+            // Effect is created for calendar.create here
+            // (the `worker.run` precedent): the create
+            // route plans its own Effect on its write
+            // Execution (Q-D1-6b-23) and binds this
+            // approval to it at consume time.
+            if req.calendar_id.is_none()
+                && req.title.is_none()
+                && req.start_ms.is_none()
+                && req.end_ms.is_none()
+                && req.all_day.is_none()
+                && req.location.is_none()
+                && req.notes.is_none()
+            {
+                None
+            } else {
+                let (Some(calendar_id), Some(title), Some(start_ms), Some(end_ms), Some(all_day)) = (
+                    req.calendar_id.as_deref(),
+                    req.title.as_deref(),
+                    req.start_ms,
+                    req.end_ms,
+                    req.all_day,
+                ) else {
+                    return bad_request(
+                        "calendar.create approval requires calendar_id, title, start_ms, end_ms and all_day",
+                    );
+                };
+                if calendar_id.is_empty() || title.is_empty() {
+                    return bad_request(
+                        "calendar.create approval requires non-empty calendar_id and title",
+                    );
+                }
+                if end_ms <= start_ms {
+                    return bad_request("calendar.create approval requires end_ms after start_ms");
+                }
+                let location = req.location.as_deref().filter(|s| !s.is_empty());
+                let notes = req.notes.as_deref().filter(|s| !s.is_empty());
+                let title_hash = crate::operation_binding::sha256_hex(title.as_bytes());
+                let location_hash =
+                    crate::operation_binding::sha256_hex(location.unwrap_or("").as_bytes());
+                let notes_hash = crate::calendar_store::calendar_notes_hash(notes);
+                Some(crate::operation_binding::calendar_create_digest(
+                    calendar_id,
+                    &title_hash,
+                    start_ms,
+                    end_ms,
+                    all_day,
+                    &location_hash,
+                    &notes_hash,
                 ))
             }
         }
@@ -10743,6 +10839,472 @@ async fn email_sent_get(
     }
 }
 
+/// D1-6b-2 (Q-D1-6b-24): a disconnected calendar-source
+/// rejects new writes. Read paths are unaffected. A
+/// missing Registry row (seed never ran) is not a
+/// disconnect — the write proceeds.
+fn calendar_source_disconnected(state: &AppState) -> bool {
+    let Some(sqlite) = &state.sqlite else {
+        return false;
+    };
+    let Ok(conn) = sqlite.lock() else {
+        return false;
+    };
+    matches!(
+        sqlite_store::get_source(&conn, crate::calendar_store::CALENDAR_SOURCE_ID),
+        Ok(Some(row)) if row.status == "disconnected"
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct CalendarCreateDto {
+    // All validated fields are Option so a missing field
+    // is the route's own 400 (not the extractor's 422):
+    // the 6b-1 EmailSendDto precedent. LOCAL DEFINITION
+    // (plan §3). `location` / `notes` are optional; an
+    // empty string counts as absent in both the approval
+    // path and this route, so the two digests can never
+    // disagree about an empty field.
+    calendar_id: Option<String>,
+    title: Option<String>,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+    all_day: Option<bool>,
+    location: Option<String>,
+    notes: Option<String>,
+    idempotency_key: Option<String>,
+    tool_call_id: Option<String>,
+}
+
+fn created_row_response(
+    row: &crate::calendar_store::CalendarEventRow,
+    replayed: bool,
+) -> axum::response::Response {
+    let mut value = serde_json::to_value(row).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("replayed".to_string(), serde_json::Value::Bool(replayed));
+    }
+    Json(value).into_response()
+}
+
+async fn calendar_events_create(
+    State(state): State<AppState>,
+    Json(req): Json<CalendarCreateDto>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    // 1. Validate the DTO: empty calendar_id / title /
+    // idempotency_key → 400; missing start / end /
+    // all_day → 400; end at or before start → 400.
+    // Minimal surface only (Q-D1-6b-10): no recurrence,
+    // attendees, or alarms exist to validate.
+    let Some(calendar_id) = req.calendar_id.filter(|s| !s.is_empty()) else {
+        return bad_request("calendar_id is required");
+    };
+    let Some(title) = req.title.filter(|s| !s.is_empty()) else {
+        return bad_request("title must not be empty");
+    };
+    let Some(start_ms) = req.start_ms else {
+        return bad_request("start_ms is required");
+    };
+    let Some(end_ms) = req.end_ms else {
+        return bad_request("end_ms is required");
+    };
+    let Some(all_day) = req.all_day else {
+        return bad_request("all_day is required");
+    };
+    if end_ms <= start_ms {
+        return bad_request("end_ms must be after start_ms");
+    }
+    let Some(idempotency_key) = req.idempotency_key.filter(|k| !k.trim().is_empty()) else {
+        return bad_request("idempotency_key is required");
+    };
+    let location = req.location.filter(|s| !s.is_empty());
+    let notes = req.notes.filter(|s| !s.is_empty());
+    let title_hash = crate::operation_binding::sha256_hex(title.as_bytes());
+    let location_hash =
+        crate::operation_binding::sha256_hex(location.as_deref().unwrap_or("").as_bytes());
+    let notes_hash = crate::calendar_store::calendar_notes_hash(notes.as_deref());
+    let digest = crate::operation_binding::calendar_create_digest(
+        &calendar_id,
+        &title_hash,
+        start_ms,
+        end_ms,
+        all_day,
+        &location_hash,
+        &notes_hash,
+    );
+    // 2. Disconnected source rejects new writes (409).
+    if calendar_source_disconnected(&state) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "source_disconnected" })),
+        )
+            .into_response();
+    }
+    // 3. Idempotency replay BEFORE planning a new Effect:
+    // same key + same content → 200 original row, no
+    // second create, no second Effect; same key +
+    // different content → 409.
+    {
+        let conn = sqlite.lock().expect("sqlite lock");
+        match crate::calendar_store::find_by_idempotency_key(&conn, &idempotency_key) {
+            Ok(Some(existing)) => {
+                if existing.calendar_id == calendar_id
+                    && existing.title == title
+                    && existing.start_ms == start_ms
+                    && existing.end_ms == end_ms
+                    && existing.all_day == all_day
+                    && existing.location == location
+                    && existing.notes_hash == notes_hash
+                {
+                    return created_row_response(&existing, true);
+                }
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "idempotency_key_conflict" })),
+                )
+                    .into_response();
+            }
+            Ok(None) => {}
+            Err(detail) => {
+                eprintln!("warning: calendar create idempotency lookup failed ({detail})");
+                return sqlite_error_response();
+            }
+        }
+    }
+    // 4. Approval peek (read-only, nothing burned): the
+    // digest is checked BEFORE planning, so a mismatch
+    // leaves no orphaned planned row and the approval
+    // stays unconsumed for a correct retry (the 6b-1
+    // SD3 shape).
+    let Some(approval_id) = req.tool_call_id.clone() else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "approval_required" })),
+        )
+            .into_response();
+    };
+    {
+        let approvals = state.approvals.lock().expect("approval lock");
+        let Some(record) = approvals.get(&approval_id) else {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "approval_required" })),
+            )
+                .into_response();
+        };
+        if record.tool != "calendar.create" {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "approval_required" })),
+            )
+                .into_response();
+        }
+        if record.status == ApprovalStatus::Rejected {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "approval_rejected" })),
+            )
+                .into_response();
+        }
+        if record.status != ApprovalStatus::Approved {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "approval_required" })),
+            )
+                .into_response();
+        }
+        if record.consumed {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "approval_already_consumed" })),
+            )
+                .into_response();
+        }
+        match record.operation_digest.as_deref() {
+            // A tool-only approval can never authorize a
+            // digest-bound write.
+            None => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({ "error": "approval_binding_mismatch" })),
+                )
+                    .into_response();
+            }
+            Some(bound) if bound != digest => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "approval_digest_mismatch" })),
+                )
+                    .into_response();
+            }
+            _ => {}
+        }
+    }
+    // 5. Reuse-or-plan (E2-A V1): a planned row with the
+    // same approval_id — a previous attempt that planned
+    // then failed to consume — is reused, never
+    // duplicated. Otherwise build the write Execution +
+    // single-tool Mandate (Q-D1-6b-23) and plan through
+    // the shared ledger entry. The adapter fallback is
+    // NOT used for 6b writes.
+    let (execution_id, effect) = match effect_for_approval(&state, &approval_id, Some(&digest)) {
+        Some(effect) => match effect.status.as_str() {
+            "planned" | "authorized" => {
+                let Some(execution_id) = effect.execution_id.clone() else {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({ "error": "effect_idempotency_unavailable" })),
+                    )
+                        .into_response();
+                };
+                (execution_id, effect)
+            }
+            "succeeded" => {
+                // Terminal with an unconsumed approval
+                // should not happen (consume precedes
+                // terminal), but a succeeded replay is
+                // still the original row, never a re-create.
+                let conn = sqlite.lock().expect("sqlite lock");
+                match crate::calendar_store::find_by_idempotency_key(&conn, &idempotency_key) {
+                    Ok(Some(existing)) => return created_row_response(&existing, true),
+                    _ => {
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({ "error": "effect_terminal", "effect_id": effect.effect_id, "status": effect.status })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            _ => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "effect_not_ready", "effect_id": effect.effect_id, "status": effect.status })),
+                )
+                    .into_response();
+            }
+        },
+        None => {
+            let execution = create_execution_with_binding(&state, None, None, None, None, None);
+            create_write_mandate(&state, &execution.execution_id, "calendar.create");
+            match ledger_entry(
+                &state,
+                Some(execution.execution_id.clone()),
+                "calendar",
+                "create",
+                &idempotency_key,
+                Some(digest.clone()),
+                Some(approval_id.clone()),
+            ) {
+                LedgerEntryDecision::Entered(entry) => (entry.execution_id, entry.effect),
+                LedgerEntryDecision::Replay(other) => {
+                    let conn = sqlite.lock().expect("sqlite lock");
+                    match crate::calendar_store::find_by_idempotency_key(&conn, &idempotency_key) {
+                        Ok(Some(existing)) => return created_row_response(&existing, true),
+                        _ => {
+                            return (
+                                StatusCode::CONFLICT,
+                                Json(serde_json::json!({ "error": "effect_idempotency_replay", "effect_id": other.effect_id, "status": other.status })),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+                LedgerEntryDecision::Blocked(other) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+    // 6. Consume the bound approval (binding + push to
+    // authorized), then drive the Effect to started.
+    if let Err(response) = consume_bound_approval_for_effect(
+        &state,
+        "calendar.create",
+        &req.tool_call_id,
+        &digest,
+        Some(&effect.effect_id),
+    ) {
+        return *response;
+    }
+    if let Err(response) = start_bound_effect(&state, &effect) {
+        return *response;
+    }
+    // 7. Execute outside the SQLite lock: the EventKit
+    // save can block on the store. Same spawn_blocking
+    // shape as device_set / email_send. The create
+    // inputs are cloned for the blocking task; the
+    // originals are still needed below for the fact row.
+    let backend = Arc::clone(&state.calendar_backend);
+    let create_calendar_id = calendar_id.clone();
+    let create_title = title.clone();
+    let create_location = location.clone();
+    let create_notes = notes.clone();
+    let create_result = tokio::task::spawn_blocking(move || {
+        backend.create_event(
+            &create_calendar_id,
+            &create_title,
+            start_ms,
+            end_ms,
+            all_day,
+            create_location.as_deref(),
+            create_notes.as_deref(),
+        )
+    })
+    .await;
+    let outcome = match create_result {
+        Ok(result) => result,
+        Err(_) => {
+            // The blocking task was cancelled or panicked:
+            // the save may or may not have run, so the
+            // outcome is Unknown (P0-R), never Failed.
+            let _ = ledger_entry_finish(&state, &effect.effect_id, LedgerOutcome::Unknown);
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "calendar source error", "effect_id": effect.effect_id })),
+            )
+                .into_response();
+        }
+    };
+    let policy_version = current_policy_version_id(&state).unwrap_or_default();
+    match outcome {
+        Ok(created) => {
+            // Record the fact row + calendar.created event
+            // in one transaction FIRST, then finish the
+            // Effect: a succeeded Effect must never exist
+            // without its fact row.
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            match crate::calendar_store::record_calendar_event(
+                &mut conn,
+                &created,
+                &calendar_id,
+                &title,
+                location.as_deref(),
+                &notes_hash,
+                &idempotency_key,
+                &effect.effect_id,
+                &execution_id,
+                &policy_version,
+                &state.origin_device_id,
+            ) {
+                Ok(row) => {
+                    drop(conn);
+                    match ledger_entry_finish(&state, &effect.effect_id, LedgerOutcome::Succeeded) {
+                        Ok(_) => created_row_response(&row, false),
+                        Err(_) => {
+                            eprintln!(
+                                "warning: calendar create effect finish failed for {}",
+                                effect.effect_id
+                            );
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({ "error": "effect_transition_failed" })),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+                Err(detail) => {
+                    // A UNIQUE-key race (a concurrent create
+                    // with the same key won the row): the
+                    // event was created, so the existing row
+                    // is the replay, never a second row.
+                    drop(conn);
+                    let conn = sqlite.lock().expect("sqlite lock");
+                    match crate::calendar_store::find_by_idempotency_key(&conn, &idempotency_key) {
+                        Ok(Some(existing))
+                            if existing.calendar_id == calendar_id
+                                && existing.title == title
+                                && existing.start_ms == start_ms
+                                && existing.end_ms == end_ms
+                                && existing.all_day == all_day
+                                && existing.location == location
+                                && existing.notes_hash == notes_hash =>
+                        {
+                            drop(conn);
+                            let _ = ledger_entry_finish(
+                                &state,
+                                &effect.effect_id,
+                                LedgerOutcome::Succeeded,
+                            );
+                            created_row_response(&existing, true)
+                        }
+                        _ => {
+                            eprintln!("warning: calendar create record failed ({detail})");
+                            let _ = ledger_entry_finish(
+                                &state,
+                                &effect.effect_id,
+                                LedgerOutcome::Failed,
+                            );
+                            (
+                                StatusCode::CONFLICT,
+                                Json(serde_json::json!({ "error": "idempotency_key_conflict" })),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            // Only an ambiguous save is Unknown (P0-R):
+            // the save may or may not have landed, so an
+            // unknown_requires_reconciliation Inbox row is
+            // opened by the transition itself. Every other
+            // gateway-side failure is Failed.
+            let (status, error, outcome) = match err {
+                CalendarError::Unverified => (
+                    StatusCode::BAD_GATEWAY,
+                    "calendar source error",
+                    LedgerOutcome::Unknown,
+                ),
+                CalendarError::NotFound => (
+                    StatusCode::NOT_FOUND,
+                    "unknown calendar",
+                    LedgerOutcome::Failed,
+                ),
+                CalendarError::Denied => (
+                    StatusCode::FORBIDDEN,
+                    "calendar access denied",
+                    LedgerOutcome::Failed,
+                ),
+                CalendarError::Unavailable(reason) => {
+                    let _ = ledger_entry_finish(&state, &effect.effect_id, LedgerOutcome::Failed);
+                    return (
+                        StatusCode::NOT_IMPLEMENTED,
+                        Json(serde_json::json!({ "error": reason, "effect_id": effect.effect_id })),
+                    )
+                        .into_response();
+                }
+                CalendarError::Upstream(_) => (
+                    StatusCode::BAD_GATEWAY,
+                    "calendar source error",
+                    LedgerOutcome::Failed,
+                ),
+            };
+            let _ = ledger_entry_finish(&state, &effect.effect_id, outcome);
+            (
+                status,
+                Json(serde_json::json!({ "error": error, "effect_id": effect.effect_id })),
+            )
+                .into_response()
+        }
+    }
+}
+
 fn calendar_error_response(
     err: crate::calendar_backend::CalendarError,
 ) -> axum::response::Response {
@@ -10762,11 +11324,26 @@ fn calendar_error_response(
             Json(serde_json::json!({ "error": "calendar source error" })),
         )
             .into_response(),
+        // D1-6b-2: unknown calendar id (Q-D1-6b-09) and
+        // unrecoverable save identifier (the Effect stays
+        // Unknown, never guessed — the create route maps
+        // this one itself; the read paths never produce
+        // it, so it is unreachable here).
+        crate::calendar_backend::CalendarError::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown calendar" })),
+        )
+            .into_response(),
+        crate::calendar_backend::CalendarError::Unverified => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "calendar source error" })),
+        )
+            .into_response(),
     }
 }
 
-async fn calendar_events_list(State(_state): State<AppState>) -> impl IntoResponse {
-    match crate::calendar_backend::list_events() {
+async fn calendar_events_list(State(state): State<AppState>) -> impl IntoResponse {
+    match state.calendar_backend.list_events() {
         Ok(events) => Json(serde_json::to_value(events).unwrap_or(serde_json::Value::Null))
             .into_response(),
         Err(err) => calendar_error_response(err),
@@ -10774,10 +11351,10 @@ async fn calendar_events_list(State(_state): State<AppState>) -> impl IntoRespon
 }
 
 async fn calendar_event_get(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path(event_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    match crate::calendar_backend::get_event(&event_id) {
+    match state.calendar_backend.get_event(&event_id) {
         Ok(Some(event)) => Json(serde_json::to_value(event).unwrap_or(serde_json::Value::Null))
             .into_response(),
         Ok(None) => (
@@ -17377,6 +17954,10 @@ pub fn app(state: AppState) -> Router {
         .route("/api/email/send", post(email_send))
         .route("/api/email/sent", get(email_sent_list))
         .route("/api/email/sent/{id}", get(email_sent_get))
+        // D1-6b-2: real calendar create (SQLite v12). The
+        // POST shares the path with the 6a live list; the
+        // list itself is unchanged.
+        .route("/api/calendar/events", post(calendar_events_create))
         .route("/api/calendar/events", get(calendar_events_list))
         .route("/api/calendar/events/{id}", get(calendar_event_get))
         .route("/api/nodes/register", post(nodes_register))

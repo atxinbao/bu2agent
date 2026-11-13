@@ -240,6 +240,7 @@ fn main() {
             tool_commands::email_message_attachment,
             tool_commands::calendar_list,
             tool_commands::calendar_get,
+            tool_commands::calendar_create,
             tool_commands::mail_sync,
             tool_commands::mail_send,
             tool_commands::mail_sent_list,

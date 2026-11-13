@@ -104,6 +104,23 @@ struct ApprovalRequestDto {
     subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<String>,
+    /// D1-6b-2: the calendar create presentation. The
+    /// server recomputes `calendar_create_digest` from
+    /// these fields; a client hash is never trusted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    calendar_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    all_day: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,7 +196,7 @@ impl AgentClient {
             return Err(invalid("unknown tool").into());
         };
         self.post_approval(
-            &ApprovalRequestDto { tool: tool.to_string(), path: None, content_base64: None, append: None, to: None, subject: None, body: None },
+            &ApprovalRequestDto { tool: tool.to_string(), path: None, content_base64: None, append: None, to: None, subject: None, body: None, calendar_id: None, title: None, start_ms: None, end_ms: None, all_day: None, location: None, notes: None },
             requires,
         )
     }
@@ -211,6 +228,13 @@ impl AgentClient {
                     to: None,
                     subject: None,
                     body: None,
+                    calendar_id: None,
+                    title: None,
+                    start_ms: None,
+                    end_ms: None,
+                    all_day: None,
+                    location: None,
+                    notes: None,
                 }
             }
             "fs.delete" => {
@@ -224,6 +248,13 @@ impl AgentClient {
                     to: None,
                     subject: None,
                     body: None,
+                    calendar_id: None,
+                    title: None,
+                    start_ms: None,
+                    end_ms: None,
+                    all_day: None,
+                    location: None,
+                    notes: None,
                 }
             }
             // D1-6b-1: a mail send approval binds the exact
@@ -255,6 +286,65 @@ impl AgentClient {
                     to: Some(to),
                     subject: Some(subject.clone()),
                     body: Some(body.clone()),
+                    calendar_id: None,
+                    title: None,
+                    start_ms: None,
+                    end_ms: None,
+                    all_day: None,
+                    location: None,
+                    notes: None,
+                }
+            }
+            // D1-6b-2: a calendar create approval binds the
+            // exact event (Q-D1-6b-22). The invoke
+            // transport only carries string args, so
+            // start/end/all-day arrive as strings and are
+            // parsed here; the server recomputes the digest
+            // from the decoded values, never from a client
+            // hash.
+            "calendar.create" => {
+                let args = args.ok_or_else(|| {
+                    invalid("calendar.create approval requires calendar_id, title, start_ms, end_ms and all_day")
+                })?;
+                let calendar_id = args
+                    .get("calendar_id")
+                    .ok_or_else(|| invalid("calendar.create approval requires calendar_id"))?;
+                let title = args
+                    .get("title")
+                    .ok_or_else(|| invalid("calendar.create approval requires title"))?;
+                let start_ms_raw = args
+                    .get("start_ms")
+                    .ok_or_else(|| invalid("calendar.create approval requires start_ms"))?;
+                let start_ms: i64 = start_ms_raw
+                    .parse()
+                    .map_err(|_| invalid("calendar.create approval start_ms must be an integer"))?;
+                let end_ms_raw = args
+                    .get("end_ms")
+                    .ok_or_else(|| invalid("calendar.create approval requires end_ms"))?;
+                let end_ms: i64 = end_ms_raw
+                    .parse()
+                    .map_err(|_| invalid("calendar.create approval end_ms must be an integer"))?;
+                let all_day_raw = args
+                    .get("all_day")
+                    .ok_or_else(|| invalid("calendar.create approval requires all_day"))?;
+                let all_day: bool = all_day_raw.parse().map_err(|_| {
+                    invalid("calendar.create approval all_day must be true or false")
+                })?;
+                ApprovalRequestDto {
+                    tool: tool.to_string(),
+                    path: None,
+                    content_base64: None,
+                    append: None,
+                    to: None,
+                    subject: None,
+                    body: None,
+                    calendar_id: Some(calendar_id.clone()),
+                    title: Some(title.clone()),
+                    start_ms: Some(start_ms),
+                    end_ms: Some(end_ms),
+                    all_day: Some(all_day),
+                    location: args.get("location").cloned(),
+                    notes: args.get("notes").cloned(),
                 }
             }
             _ => {

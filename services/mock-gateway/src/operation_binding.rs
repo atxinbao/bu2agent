@@ -303,6 +303,38 @@ pub fn mail_send_digest(to_sorted: &[String], subject: &str, body_hash: &str) ->
     operation_digest("mail.send", None, &params)
 }
 
+/// Digest for a real calendar create (D1-6b-2,
+/// Q-D1-6b-22). LOCAL DEFINITION: the digest commits
+/// to the calendar id, the title hash, the exact
+/// start/end milliseconds, the all-day flag, and the
+/// location/notes hashes — raw text lives only in
+/// request memory, never in the digest inputs. Both the
+/// approval-request path and the create route call this
+/// same function over the same normalized inputs, so the
+/// two digests can never drift apart. The signature is
+/// the plan §6.2 shape: hashes in, never plaintext.
+#[allow(clippy::too_many_arguments)]
+pub fn calendar_create_digest(
+    calendar_id: &str,
+    title_hash: &str,
+    start_ms: i64,
+    end_ms: i64,
+    all_day: bool,
+    location_hash: &str,
+    notes_hash: &str,
+) -> String {
+    let params = BTreeMap::from([
+        ("all_day".to_string(), all_day.to_string()),
+        ("calendar_id".to_string(), calendar_id.to_string()),
+        ("end_ms".to_string(), end_ms.to_string()),
+        ("location_hash".to_string(), location_hash.to_string()),
+        ("notes_hash".to_string(), notes_hash.to_string()),
+        ("start_ms".to_string(), start_ms.to_string()),
+        ("title_hash".to_string(), title_hash.to_string()),
+    ]);
+    operation_digest("calendar.create", None, &params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

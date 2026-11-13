@@ -121,6 +121,25 @@ pub enum Current {
     /// P3-C: a test-run observation — the stored Test Evidence
     /// summary (source `test`), when one exists.
     TestRun { summary: Option<Value> },
+    /// D1-6b-2: a calendar create observation — the
+    /// re-read event's fields against the fact row.
+    /// `fields_match` is computed in `observe_current`
+    /// from the fact row (the expected values) and the
+    /// live re-read; the observed JSON carries ids /
+    /// lengths / flags only, never title / location /
+    /// notes plaintext.
+    CalendarEvent {
+        event_id: String,
+        title_len: usize,
+        start_ms: i64,
+        end_ms: i64,
+        all_day: bool,
+        calendar_id: Option<String>,
+        fields_match: bool,
+    },
+    /// D1-6b-2: the re-read found no event with the
+    /// fact row's identifier.
+    CalendarMissing,
 }
 
 impl Current {
@@ -167,6 +186,25 @@ impl Current {
                 "kind": "test-run",
                 "summary": summary,
             }),
+            Current::CalendarEvent {
+                event_id,
+                title_len,
+                start_ms,
+                end_ms,
+                all_day,
+                calendar_id,
+                fields_match,
+            } => json!({
+                "kind": "calendar-event",
+                "event_id": event_id,
+                "title_len": title_len,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "all_day": all_day,
+                "calendar_id": calendar_id,
+                "fields_match": fields_match,
+            }),
+            Current::CalendarMissing => json!({"kind": "absent"}),
         }
     }
 }
@@ -641,6 +679,46 @@ pub fn observe_current(
             });
             Ok(Current::TestRun { summary })
         }
+        // D1-6b-2: a calendar create re-reads by the
+        // EventKit identifier the fact row names. No fact
+        // row (no successful create was ever recorded for
+        // this Effect) means no observation is possible —
+        // MissingEvidence, never a guess. A backend error
+        // means the world could not be read — Unreadable,
+        // which verifies Inconclusive.
+        ("calendar", "create") => {
+            let Some(sqlite) = state.sqlite.as_ref() else {
+                return Err(ObserveError::MissingEvidence);
+            };
+            let conn = sqlite.lock().expect("sqlite lock");
+            let Some(row) = crate::calendar_store::find_by_effect_id(&conn, &effect.effect_id)
+                .map_err(|_| ObserveError::MissingEvidence)?
+            else {
+                return Err(ObserveError::MissingEvidence);
+            };
+            drop(conn);
+            match state.calendar_backend.get_event(&row.event_id) {
+                Ok(Some(current)) => {
+                    let fields_match = current.calendar_id.as_deref()
+                        == Some(row.calendar_id.as_str())
+                        && current.title == row.title
+                        && current.start_ms == row.start_ms
+                        && current.end_ms == row.end_ms
+                        && current.all_day == row.all_day;
+                    Ok(Current::CalendarEvent {
+                        event_id: row.event_id,
+                        title_len: row.title.chars().count(),
+                        start_ms: row.start_ms,
+                        end_ms: row.end_ms,
+                        all_day: row.all_day,
+                        calendar_id: Some(row.calendar_id),
+                        fields_match,
+                    })
+                }
+                Ok(None) => Ok(Current::CalendarMissing),
+                Err(_) => Ok(Current::Unreadable),
+            }
+        }
         _ => Err(ObserveError::NoMethod),
     }
 }
@@ -841,6 +919,22 @@ pub fn reconcile_outcome(
             Current::ReminderMissing => ReconcileOutcome::NotLanded {
                 observed: current.to_json(),
                 reason: "target_missing",
+            },
+            _ => inconclusive(&current),
+        },
+        // D1-6b-2: a calendar reconcile lands when the
+        // re-read matches the fact row; anything else is
+        // Inconclusive, never a false mismatch (the git
+        // precedent — an unknown Effect's save may still
+        // be in flight). Reachable only when a fact row
+        // exists for a non-terminal Effect (record
+        // succeeded, terminal transition failed).
+        ("calendar", "create") => match &current {
+            Current::CalendarEvent {
+                fields_match: true, ..
+            } => ReconcileOutcome::Landed {
+                observed: current.to_json(),
+                reason: "fields_match",
             },
             _ => inconclusive(&current),
         },
@@ -1214,6 +1308,28 @@ pub fn verify_outcome(
             Current::ReminderMissing => VerifyOutcome::Mismatch {
                 observed: current.to_json(),
                 reason: "target_missing",
+            },
+            _ => verify_inconclusive(&current),
+        },
+        // D1-6b-2: a calendar create verifies against the
+        // live re-read. Consistent fields → verified; a
+        // field mismatch → mismatch (P0-R); a missing
+        // event → inconclusive (the event may have been
+        // deleted after creation — the create itself is
+        // not disproven, so no Evidence row is written).
+        ("calendar", "create") => match &current {
+            Current::CalendarEvent {
+                fields_match: true, ..
+            } => VerifyOutcome::Verified {
+                observed: current.to_json(),
+                reason: "fields_match",
+            },
+            Current::CalendarEvent {
+                fields_match: false,
+                ..
+            } => VerifyOutcome::Mismatch {
+                observed: current.to_json(),
+                reason: "field_mismatch",
             },
             _ => verify_inconclusive(&current),
         },

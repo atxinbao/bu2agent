@@ -58,7 +58,7 @@ use crate::execution_store::ExecutionFileRecord;
 /// Row-level `schema_version` fields are a separate concept
 /// (the record contract version, still 1 for P0-A+ rows) and
 /// are untouched.
-pub const DB_SCHEMA_VERSION: i64 = 11;
+pub const DB_SCHEMA_VERSION: i64 = 12;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -539,6 +539,35 @@ CREATE TABLE IF NOT EXISTS sent_messages (
 );
 ";
 
+/// D1-6b-2 (Q-D1-6b-09/10/11): one table, the calendar
+/// create fact record. `event_id` is the EventKit
+/// identifier itself (the stable system id, so no local
+/// number is assigned); `idempotency_key` is UNIQUE —
+/// the replay backstop (same key + same content replays
+/// the original row, same key + different content is a
+/// 409). `title` / `location` are stored; the notes body
+/// never is — only `notes_hash`. `policy_version` is the
+/// current Policy version at write time, for the Mandate
+/// audit trail.
+const SCHEMA_V12: &str = "
+CREATE TABLE IF NOT EXISTS calendar_events (
+    event_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    calendar_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    all_day INTEGER NOT NULL,
+    location TEXT,
+    notes_hash TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    effect_id TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL
+);
+";
+
 fn err(e: rusqlite::Error) -> String {
     format!("sqlite: {e}")
 }
@@ -727,6 +756,19 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V11).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '11')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // D1-6b-2 v12 step: calendar_events table only. One
+    // transaction, v5–v11 style; a fresh database runs
+    // v1–v12 in the same transaction. The table starts
+    // empty — rows arrive only from POST /api/calendar/events.
+    if version < 12 {
+        tx.execute_batch(SCHEMA_V12).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '12')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -1811,6 +1853,25 @@ const REDACTED_PAYLOAD_FIELDS: &[&str] = &[
     // recipient list, like `sender_hash` for synced
     // mail: the set is auditable without naming anyone.
     "recipient_hash",
+    // D1-6b-2 `calendar.created` fields (each added with
+    // its reason, per this helper's own rule):
+    // `event_id` — the created event's EventKit
+    // identifier, like `message_id` for synced mail.
+    "event_id",
+    // `calendar_id` — which calendar the event landed
+    // in, an id only, never a calendar name.
+    "calendar_id",
+    // `title_len` — the title's character count, like
+    // `subject_len` for mail: the title is auditable
+    // for size without naming the event.
+    "title_len",
+    // `start_ms` / `end_ms` — the event's epoch
+    // milliseconds, timestamps only, like `date_ms`.
+    "start_ms",
+    "end_ms",
+    // `all_day` — the all-day flag, like `status`: a
+    // boolean about the event, never its content.
+    "all_day",
 ];
 
 pub(crate) fn redact_event_payload(kind: &str, payload_json: &str) -> String {

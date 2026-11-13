@@ -352,7 +352,7 @@ const BODY: &str = "Body of SD1.";
 async fn sd1_send_end_to_end() {
     let h = Harness::serve().await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    assert_eq!(DB_SCHEMA_VERSION, 11);
+    assert_eq!(DB_SCHEMA_VERSION, 12);
 
     let approval = h.approved_mail_send(&TO, SUBJECT, BODY).await;
     // The send presents the recipients in the other

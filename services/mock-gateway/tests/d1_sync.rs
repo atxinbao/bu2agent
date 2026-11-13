@@ -338,7 +338,7 @@ fn seed_60() -> Vec<MessageView> {
 async fn y1_first_sync_imports_inbox_first_50() {
     let h = Harness::serve(seed_60()).await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    assert_eq!(DB_SCHEMA_VERSION, 11);
+    assert_eq!(DB_SCHEMA_VERSION, 12);
 
     let result = h.sync_ok().await;
     assert_eq!(result["synced_count"], 50);
@@ -450,7 +450,7 @@ async fn y3_rebuild_reassigns_the_same_local_ids() {
     assert_eq!(before.len(), 50);
 
     h.restart_fresh_db().await;
-    assert_eq!(h.schema_version(), 11);
+    assert_eq!(h.schema_version(), 12);
     assert_eq!(h.mail_rows().len(), 0);
     let result = h.sync_ok().await;
     assert_eq!(result["synced_count"], 50);

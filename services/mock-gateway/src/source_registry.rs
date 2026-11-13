@@ -265,6 +265,36 @@ impl Source for MailSourceEntry {
     }
 }
 
+/// The calendar source (the `MailSourceEntry`
+/// precedent): one row for the EventKit calendar
+/// backend — the same backend serves the D1-6a live
+/// reads and the D1-6b-2 create. One row: the source
+/// has no account concept of its own (the calendar is
+/// picked per create, Q-D1-6b-09).
+pub struct CalendarSourceEntry;
+
+impl Source for CalendarSourceEntry {
+    fn source_id(&self) -> String {
+        "calendar-source".to_string()
+    }
+
+    fn kind(&self) -> &'static str {
+        "calendar"
+    }
+
+    fn display_name(&self) -> String {
+        "Calendar".to_string()
+    }
+
+    fn config_json(&self) -> Value {
+        serde_json::json!({})
+    }
+
+    fn scope(&self) -> String {
+        "calendar".to_string()
+    }
+}
+
 /// The reminder backend as one source (Q-D1-43): Fake
 /// and EventKit are two backends of this single source,
 /// never two rows. `backend` is the switch value
@@ -380,6 +410,8 @@ pub fn seed_sources(
         rows.push(row);
     }
     let (row, _) = MailSourceEntry.register(&mut *conn, &inputs.origin_device_id)?;
+    rows.push(row);
+    let (row, _) = CalendarSourceEntry.register(&mut *conn, &inputs.origin_device_id)?;
     rows.push(row);
     let (row, _) = ReminderDeviceSource {
         backend: inputs.device_backend,
