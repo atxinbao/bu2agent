@@ -36,7 +36,7 @@
 //! export functions here. `fold_matches_tables` is the test
 //! proof that `fold(events) == tables` for the migrated domains.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, types::{FromSqlError, ValueRef}, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -869,8 +869,8 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     // progress_json precedent). Old rows read NULL:
     // start_at_ms NULL means immediate (no delay),
     // priority NULL orders as 0 (COALESCE at fetch).
-    backfill_column(&tx, "worker_runs", "start_at_ms")?;
-    backfill_column(&tx, "worker_runs", "priority")?;
+    backfill_column_typed(&tx, "worker_runs", "start_at_ms", "INTEGER")?;
+    backfill_column_typed(&tx, "worker_runs", "priority", "INTEGER")?;
     // P3-C: the approval CommandSpec (JSON, like binding_json).
     // Databases migrated before P3-C have no approvals
     // .command_json; same backfill precedent, version stays 4.
@@ -5312,6 +5312,13 @@ pub fn recovery_probe(conn: &Connection) -> Result<Vec<StaleWorkerRun>, String> 
     };
     let mut out = Vec::new();
     for run in stale_runs {
+        // queued 运行尚未领取 worker，不代表执行结果未知。重启时保留
+        // 其排队状态，让新的 sweeper 按 start_at_ms/priority 继续领取；
+        // 只有 running（或已经带 pid 的排队异常行）才进入 lost/orphaned
+        // 恢复路径。否则到期前重启会错误地把合法排队任务终结为 lost。
+        if run.status == "queued" && run.pid.is_none() {
+            continue;
+        }
         let (status, detail) = match run.pid {
             None => ("lost", "worker run never started"),
             Some(pid) if crate::worker::process_alive(pid) => {
@@ -5805,6 +5812,26 @@ pub use crate::worker::WorkerRunRow;
 
 const WORKER_RUN_COLS: &str = "run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, approval_id, progress_json, start_at_ms, priority";
 
+// E2-D 批 2 的新增列是回填列。早期数据库的通用回填器把
+// 它们建成 TEXT，而新库的基表定义是 INTEGER；读取时必须兼容
+// 两种 SQLite storage class，不能让旧库的类型差异把整个读路由
+// 映射成 sqlite_unavailable。
+fn optional_i64_compat(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<i64>> {
+    match row.get_ref(index)? {
+        ValueRef::Null => Ok(None),
+        ValueRef::Integer(value) => Ok(Some(value)),
+        ValueRef::Real(value) => Ok(Some(value as i64)),
+        ValueRef::Text(value) => {
+            let text = std::str::from_utf8(value)
+                .map_err(|error| FromSqlError::Other(Box::new(error)))?;
+            text.parse::<i64>()
+                .map(Some)
+                .map_err(|error| FromSqlError::Other(Box::new(error)).into())
+        }
+        ValueRef::Blob(_) => Err(FromSqlError::InvalidType.into()),
+    }
+}
+
 fn worker_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRunRow> {
     Ok(WorkerRunRow {
         run_id: row.get(0)?,
@@ -5829,8 +5856,8 @@ fn worker_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRunRow
         schema_version: row.get(19)?,
         approval_id: row.get(20)?,
         progress_json: row.get(21)?,
-        start_at_ms: row.get(22)?,
-        priority: row.get(23)?,
+        start_at_ms: optional_i64_compat(row, 22)?,
+        priority: optional_i64_compat(row, 23)?,
     })
 }
 
@@ -6254,6 +6281,23 @@ mod tests {
             reconciliation: None,
             detail: None,
         }
+    }
+
+    #[test]
+    fn worker_run_time_fields_accept_integer_and_legacy_text_storage() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        let (null_value, text_value, integer_value): (Option<i64>, Option<i64>, Option<i64>) =
+            conn.query_row("SELECT NULL, '123', 7", [], |row| {
+                Ok((
+                    optional_i64_compat(row, 0)?,
+                    optional_i64_compat(row, 1)?,
+                    optional_i64_compat(row, 2)?,
+                ))
+            })
+            .expect("read compatible values");
+        assert_eq!(null_value, None);
+        assert_eq!(text_value, Some(123));
+        assert_eq!(integer_value, Some(7));
     }
 
     fn approval(id: &str, status: &str) -> ApprovalFileRecord {
