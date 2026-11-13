@@ -341,6 +341,8 @@ CREATE TABLE IF NOT EXISTS worker_runs (
     effect_id TEXT,
     approval_id TEXT,
     progress_json TEXT,
+    start_at_ms INTEGER,
+    priority INTEGER,
     binding_location_id TEXT,
     binding_worktree_id TEXT,
     binding_root_digest TEXT,
@@ -860,6 +862,15 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     // schema version stays 4 (column backfill, not a v5
     // migration). Old rows read NULL (no progress yet).
     backfill_column(&tx, "worker_runs", "progress_json")?;
+    // E2-D batch 2 additive columns: databases created before
+    // batch 2 have no worker_runs.start_at_ms / priority.
+    // Nullable, idempotent, schema version stays 13
+    // (column backfill, not a v14 migration — the E2-D
+    // progress_json precedent). Old rows read NULL:
+    // start_at_ms NULL means immediate (no delay),
+    // priority NULL orders as 0 (COALESCE at fetch).
+    backfill_column(&tx, "worker_runs", "start_at_ms")?;
+    backfill_column(&tx, "worker_runs", "priority")?;
     // P3-C: the approval CommandSpec (JSON, like binding_json).
     // Databases migrated before P3-C have no approvals
     // .command_json; same backfill precedent, version stays 4.
@@ -5792,7 +5803,7 @@ fn transition_execution_with_event(
 
 pub use crate::worker::WorkerRunRow;
 
-const WORKER_RUN_COLS: &str = "run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, approval_id, progress_json";
+const WORKER_RUN_COLS: &str = "run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, approval_id, progress_json, start_at_ms, priority";
 
 fn worker_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRunRow> {
     Ok(WorkerRunRow {
@@ -5818,6 +5829,8 @@ fn worker_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRunRow
         schema_version: row.get(19)?,
         approval_id: row.get(20)?,
         progress_json: row.get(21)?,
+        start_at_ms: row.get(22)?,
+        priority: row.get(23)?,
     })
 }
 
@@ -5865,9 +5878,9 @@ pub fn create_worker_run(
     let seq = tx_seq(&tx, "worker_runs", &inserted.run_id)?;
     let now = now_ms() as i64;
     tx.execute(
-        "INSERT INTO worker_runs (seq, run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, created_ms, updated_at_ms, approval_id, progress_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22, ?23, ?24)",
-        params![seq, inserted.run_id, inserted.execution_id, inserted.assignment_id, inserted.worker_session_id, inserted.command, inserted.argv_json, inserted.cwd, inserted.timeout_ms, inserted.status, inserted.exit_code, inserted.pid, inserted.started_ms, inserted.finished_ms, inserted.tail, inserted.truncated as i64, inserted.effect_id, inserted.binding_location_id, inserted.binding_worktree_id, inserted.binding_root_digest, inserted.schema_version, now, inserted.approval_id, inserted.progress_json],
+        "INSERT INTO worker_runs (seq, run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, created_ms, updated_at_ms, approval_id, progress_json, start_at_ms, priority)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22, ?23, ?24, ?25, ?26)",
+        params![seq, inserted.run_id, inserted.execution_id, inserted.assignment_id, inserted.worker_session_id, inserted.command, inserted.argv_json, inserted.cwd, inserted.timeout_ms, inserted.status, inserted.exit_code, inserted.pid, inserted.started_ms, inserted.finished_ms, inserted.tail, inserted.truncated as i64, inserted.effect_id, inserted.binding_location_id, inserted.binding_worktree_id, inserted.binding_root_digest, inserted.schema_version, now, inserted.approval_id, inserted.progress_json, inserted.start_at_ms, inserted.priority],
     )
     .map_err(err)?;
     // E2-A §2.7: write the consuming worker session back onto
@@ -5940,6 +5953,56 @@ pub fn get_worker_run(conn: &Connection, run_id: &str) -> Result<Option<WorkerRu
     )
     .optional()
     .map_err(err)
+}
+
+/// E2-D batch 2: deferred runs whose due time has arrived,
+/// in the order the sweeper starts them — higher priority
+/// first, then oldest first (`(priority DESC, seq ASC)`).
+/// Only rows with a stored `start_at_ms` can match, so
+/// immediate runs (NULL) never appear here. `COALESCE`
+/// orders pre-batch-2 rows (NULL priority) as 0.
+/// Returns full rows; the sweeper applies the
+/// per-Execution gate before spawning each one.
+pub fn due_deferred_worker_runs(
+    conn: &Connection,
+    now_ms: i64,
+) -> Result<Vec<WorkerRunRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {WORKER_RUN_COLS} FROM worker_runs WHERE status = 'queued' AND start_at_ms IS NOT NULL AND start_at_ms <= ?1 ORDER BY COALESCE(priority, 0) DESC, seq ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![now_ms], worker_run_from_row)
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+/// E2-D batch 2: the run ids of an Execution's
+/// queued/running runs — the per-Execution gate's raw
+/// material. The caller (the sweeper) filters out the
+/// current due set and executions it already started
+/// this pass; a run id left over after that filtering
+/// means the Execution is genuinely busy (a running run,
+/// or a queued immediate run about to be claimed) and
+/// the due candidate must wait for a later tick.
+pub fn active_run_ids_for_execution(
+    conn: &Connection,
+    execution_id: &str,
+) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT run_id FROM worker_runs WHERE execution_id = ?1 AND status IN ('queued', 'running')",
+        )
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![execution_id], |row| row.get::<_, String>(0))
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+    Ok(rows)
 }
 
 /// The run that produced an Effect, by the run row's

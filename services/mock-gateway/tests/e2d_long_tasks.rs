@@ -1,18 +1,23 @@
 //! E2-D batch-1 tests (plan §7, D3–D6): the >1 h strategy
 //! lock (D3), in-flight progress (D4), and the loop
-//! `worker.wait` tool (D5–D6). D1/D2 (deferred start,
-//! priority) are batch 2 — gated on a named use case —
-//! and are NOT in this file.
+//! `worker.wait` tool (D5–D6). Batch-2 tests (D1/D2:
+//! deferred start, priority — plus the §8.3
+//! same-Execution gate test) are in this file too.
 //!
-//! HTTP routes only (plus `sqlite_store` reads after the
-//! fact, never to fake a production step). Real git and real
-//! cargo for the execution path; the native fake `cargo`
-//! executable (test fixture, never a production execution
-//! path) for the long-running runs D4/D6 need — no template
-//! sleeps, so a run that must survive past the driver's
-//! first 5 s progress write is a fake cargo sleeping 60 s
-//! with a short run timeout. The production 5 s write
-//! cadence is never changed for the tests.
+//! HTTP routes only, plus direct-SQL time simulation for
+//! D1/D2 (plan §7.3, the B1/B2 precedent: move
+//! `start_at_ms` into the past through `Harness::db()`;
+//! the starts themselves are real) and direct-SQL reads
+//! after the fact (the Execution deadline, which no HTTP
+//! view carries; and the §8.3 store fixture, which the API
+//! cannot build by design). Real git and real cargo for
+//! the execution path; the native fake `cargo` executable
+//! (test fixture, never a production execution path) for
+//! the long-running runs D4/D6 need — no template sleeps,
+//! so a run that must survive past the driver's first 5 s
+//! progress write is a fake cargo sleeping 60 s with a
+//! short run timeout. The production 5 s write cadence is
+//! never changed for the tests.
 //!
 //! The loop tool result body is not exposed by the loop
 //! view — only `result.body_digest` (sha256 + bytes) is —
@@ -160,6 +165,13 @@ fn real_cargo() -> PathBuf {
     mock_gateway::worker::resolve_cargo_path().expect("cargo on PATH")
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_millis() as i64
+}
+
 struct ScriptModel {
     steps: Mutex<VecDeque<ModelReply>>,
 }
@@ -247,6 +259,10 @@ struct Harness {
     client: reqwest::Client,
     server: tokio::task::JoinHandle<()>,
     model: Arc<ScriptModel>,
+    /// Retained for the batch-2 tests: the real sweeper
+    /// (`spawn_assignment_sweeper`) and the direct
+    /// `start_due_worker_runs` pass (§8.3 gate test).
+    state: AppState,
 }
 
 impl Harness {
@@ -297,7 +313,44 @@ impl Harness {
                 .unwrap(),
             server,
             model,
+            state,
         }
+    }
+
+    /// Direct SQLite connection to this harness's DB
+    /// (e2b precedent: 5 s busy timeout).
+    fn db(&self) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(self.dir.join("gateway.sqlite3")).unwrap();
+        conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        conn
+    }
+
+    /// Move a deferred run's due time into the past (plan
+    /// §7.3, B1/B2 time-simulation precedent): the start
+    /// itself is real — only the clock is simulated.
+    fn simulate_due(&self, run_id: &str) {
+        let due = now_ms() - 1000;
+        let conn = self.db();
+        let changed = conn
+            .execute(
+                "UPDATE worker_runs SET start_at_ms = ?1 WHERE run_id = ?2",
+                rusqlite::params![due, run_id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "simulate_due {run_id}");
+    }
+
+    /// The Execution's stored deadline, read from SQLite
+    /// (the HTTP execution view carries no deadline_ms).
+    fn execution_deadline(&self, execution_id: &str) -> Option<i64> {
+        let conn = self.db();
+        conn.query_row(
+            "SELECT deadline_ms FROM executions WHERE execution_id = ?1",
+            rusqlite::params![execution_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten()
     }
 
     /// Replace the scripted model's remaining replies. The
@@ -838,4 +891,221 @@ async fn e2d_loop_wait_budget_returns_still_running() {
     assert_eq!(effects[0]["effect_id"], effect_id);
     assert_eq!(effects[0]["status"], "unknown");
     assert_eq!(h.open_inbox("unknown_requires_reconciliation").await.len(), 1);
+}
+
+/// D1 (batch 2, plan §7): a deferred run is only a row
+/// until its due time — creation must not spawn it, the
+/// deadline anchors at start (Q-D2 (b)), and the sweeper
+/// starts it once due. Time is simulated (B1/B2
+/// precedent); the start itself is real.
+#[tokio::test]
+async fn e2d_deferred_start_runs_after_due() {
+    let dir = temp_dir("d1");
+    let repo = init_repo(&dir);
+    // The worktree-add precondition requires the target's
+    // parent to exist (P3-C C16).
+    std::fs::create_dir_all(repo.join("scratch")).unwrap();
+    let h = Harness::serve(vec![], Some(real_git()), Some(real_cargo())).await;
+    let worktree = h.setup_worktree(&repo).await;
+    let approval = h
+        .approve_worker_run(
+            &worktree,
+            "git-worktree-add",
+            json!({"path": "scratch/w1", "branch": "d1-branch"}),
+            Some(60_000),
+        )
+        .await;
+    let start_at = now_ms() + 3_600_000;
+    let (status, run) = h
+        .create_run(json!({
+            "worktree_id": worktree,
+            "command": "git-worktree-add",
+            "params": {"path": "scratch/w1", "branch": "d1-branch"},
+            "timeout_ms": 60_000,
+            "approval_id": approval,
+            "start_at_ms": start_at,
+        }))
+        .await;
+    assert_eq!(status, 201, "{run}");
+    let run_id = run["run_id"].as_str().unwrap().to_string();
+    assert_eq!(run["status"], "queued", "{run}");
+    assert_eq!(run["start_at_ms"].as_i64(), Some(start_at), "{run}");
+    assert_eq!(run["priority"].as_i64(), Some(0), "{run}");
+    // Q-D2 (b): the deadline anchors at start, not
+    // creation — a run deferred an hour with a 60 s
+    // timeout must not expire before it starts.
+    let execution_id = run["execution_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        h.execution_deadline(&execution_id),
+        Some(start_at + 60_000),
+        "deadline anchored at creation, not start"
+    );
+    // Not due yet: no sweeper runs in this server, so the
+    // only way the run could start is the creation spawn.
+    // Poll ~3 s: still queued, never started.
+    for _ in 0..30 {
+        let row = h.run(&run_id).await;
+        assert_eq!(row["status"], "queued", "{row}");
+        assert!(row["started_ms"].is_null(), "{row}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Simulate time passing; the start itself is real.
+    h.simulate_due(&run_id);
+    let sweeper = mock_gateway::server::spawn_assignment_sweeper(h.state.clone());
+    let row = h.wait_run(&run_id, 30).await;
+    sweeper.abort();
+    assert_eq!(row["status"], "succeeded", "{row}");
+    assert!(row["effect_id"].as_str().is_some(), "{row}");
+    assert!(repo.join("scratch").join("w1").join(".git").exists());
+}
+
+/// D2 (batch 2, plan §7): due runs start in
+/// (priority DESC, seq ASC) order. Three deferred runs,
+/// different Executions (the per-Execution gate would
+/// block a second queued run for one Execution), created
+/// low-priority-first so seq order disagrees with
+/// priority order, same due time. Time is simulated;
+/// the starts are real, via the sweeper.
+#[tokio::test]
+async fn e2d_priority_ordering() {
+    let dir = temp_dir("d2");
+    let repo = init_repo(&dir);
+    std::fs::create_dir_all(repo.join("scratch")).unwrap();
+    let h = Harness::serve(vec![], Some(real_git()), Some(real_cargo())).await;
+    let worktree = h.setup_worktree(&repo).await;
+    let start_at = now_ms() + 3_600_000;
+    // (priority, path, branch) in creation order: seq
+    // asc is [0, 5, 10]; priority desc is [10, 5, 0].
+    let specs = [
+        (0_i64, "scratch/w1", "d2-b1"),
+        (5_i64, "scratch/w2", "d2-b2"),
+        (10_i64, "scratch/w3", "d2-b3"),
+    ];
+    let mut run_ids = Vec::new();
+    for (priority, path, branch) in specs {
+        let approval = h
+            .approve_worker_run(
+                &worktree,
+                "git-worktree-add",
+                json!({"path": path, "branch": branch}),
+                Some(60_000),
+            )
+            .await;
+        let (status, run) = h
+            .create_run(json!({
+                "worktree_id": worktree,
+                "command": "git-worktree-add",
+                "params": {"path": path, "branch": branch},
+                "timeout_ms": 60_000,
+                "approval_id": approval,
+                "start_at_ms": start_at,
+                "priority": priority,
+            }))
+            .await;
+        assert_eq!(status, 201, "{run}");
+        assert_eq!(run["priority"].as_i64(), Some(priority), "{run}");
+        run_ids.push(run["run_id"].as_str().unwrap().to_string());
+    }
+    for run_id in &run_ids {
+        h.simulate_due(run_id);
+    }
+    let sweeper = mock_gateway::server::spawn_assignment_sweeper(h.state.clone());
+    let mut rows = Vec::new();
+    for run_id in &run_ids {
+        rows.push(h.wait_run(run_id, 30).await);
+    }
+    sweeper.abort();
+    for (row, (priority, path, _)) in rows.iter().zip(specs.iter()) {
+        assert_eq!(row["status"], "succeeded", "{row}");
+        assert_eq!(row["priority"].as_i64(), Some(*priority), "{row}");
+        assert!(row["effect_id"].as_str().is_some(), "{row}");
+        assert!(repo.join(path).join(".git").exists());
+    }
+    // Start order is priority order, not creation order:
+    // the sweeper's sequential claim-wait makes
+    // `started_ms` non-decreasing in (priority DESC,
+    // seq ASC) order; ties (same ms) are allowed.
+    let started_ms = |row: &Value| row["started_ms"].as_i64().unwrap();
+    assert!(
+        started_ms(&rows[2]) <= started_ms(&rows[1])
+            && started_ms(&rows[1]) <= started_ms(&rows[0]),
+        "started_ms not in priority order (p10, p5, p0): {:?}",
+        rows.iter().map(|r| r["started_ms"].clone()).collect::<Vec<_>>()
+    );
+}
+
+/// E2-D batch 2, plan §8.3: two deferred runs for one
+/// Execution never start together — one pass starts at
+/// most one. The state cannot be built via the API (the
+/// creation gate refuses a second queued run for an
+/// Execution), so the second row is a store fixture: a
+/// direct copy of the first row with a new run id, no
+/// approval (the UNIQUE index), and a higher priority.
+/// The pass starts the higher-priority copy and leaves
+/// the first queued. The copy runs the slow fake-cargo
+/// command (60 s sleep, 8 s timeout, D4/D6 fixture) so
+/// it is deterministically still running when the second
+/// pass checks the gate.
+#[tokio::test]
+async fn e2d_deferred_same_execution_gate() {
+    let dir = temp_dir("d2gate");
+    let repo = init_repo_with_cargo_packages(&dir);
+    let h = Harness::serve(vec![], Some(real_git()), Some(fake_cargo_sleeping(&dir))).await;
+    let worktree = h.setup_worktree(&repo).await;
+    let approval = h
+        .approve_worker_run(
+            &worktree,
+            "cargo-test",
+            json!({"package": "testpkg-pass"}),
+            Some(8000),
+        )
+        .await;
+    let start_at = now_ms() + 3_600_000;
+    let (status, run) = h
+        .create_run(json!({
+            "worktree_id": worktree,
+            "command": "cargo-test",
+            "params": {"package": "testpkg-pass"},
+            "timeout_ms": 8000,
+            "approval_id": approval,
+            "start_at_ms": start_at,
+            "priority": 0,
+        }))
+        .await;
+    assert_eq!(status, 201, "{run}");
+    let first = run["run_id"].as_str().unwrap().to_string();
+    // Store fixture: a second deferred run for the SAME
+    // Execution, higher priority, no approval (the UNIQUE
+    // index on approval_id forbids copying it).
+    {
+        let conn = h.db();
+        let changed = conn
+            .execute(
+                "INSERT INTO worker_runs (seq, run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, approval_id, progress_json, start_at_ms, priority, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, created_ms, updated_at_ms)
+                 SELECT (SELECT COALESCE(MAX(seq), 0) + 1 FROM worker_runs), 'run-2', execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, 'queued', NULL, NULL, NULL, NULL, '', 0, NULL, NULL, NULL, start_at_ms, 99, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, created_ms, updated_at_ms
+                 FROM worker_runs WHERE run_id = ?1",
+                rusqlite::params![first],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    h.simulate_due(&first);
+    h.simulate_due("run-2");
+    // One direct pass (not the 10 s loop): the
+    // higher-priority copy starts, the first waits.
+    let started = h.state.start_due_worker_runs().await;
+    assert_eq!(started, 1, "one pass starts exactly one run");
+    let second = h.run("run-2").await;
+    assert_ne!(second["status"], "queued", "{second}");
+    assert_eq!(h.run(&first).await["status"], "queued");
+    // A second pass while the copy runs must not start
+    // the first either (its Execution is genuinely busy).
+    let started = h.state.start_due_worker_runs().await;
+    assert_eq!(started, 0, "busy execution starts nothing");
+    assert_eq!(h.run(&first).await["status"], "queued");
+    // The copy finishes on its own (8 s timeout); the
+    // first is left queued for a later tick (this test
+    // does not start it — the gate assertion is made).
+    let row = h.wait_run("run-2", 30).await;
+    assert_eq!(row["status"], "timeout", "{row}");
 }

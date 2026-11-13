@@ -1689,6 +1689,12 @@ impl AppState {
                     .as_ref()
                     .and_then(|b| execution_for_loop(self, &b.loop_id)),
                 approval_id: approval_id.clone(),
+                // E2-D batch 2: loop runs are immediate and
+                // unprioritized — the loop has no deferred
+                // start or priority vocabulary (no new loop
+                // tool, plan §2.2).
+                start_at_ms: None,
+                priority: None,
             };
             return match create_worker_run_internal(self, dto).await {
                 Ok(run) => ToolOutcome::success(
@@ -2456,6 +2462,123 @@ impl AppState {
                 eprintln!("warning: D1-3 outbox deliver failed: {detail}");
                 0
             }
+        }
+    }
+
+    /// E2-D batch 2: start due deferred runs, one pass.
+    /// Rides the assignment sweeper's 10 s tick (plan
+    /// §2.2) — no second scheduler. Fetches due runs in
+    /// `(priority DESC, seq ASC)` order and spawns the
+    /// existing driver for each one that passes the
+    /// per-Execution gate (plan §2.5/§8.3): an Execution
+    /// runs at most one run at a time, so a candidate
+    /// waits when its Execution is already busy — a
+    /// running run, a queued immediate run about to be
+    /// claimed, or an execution this pass already started.
+    /// The gate reads the due set, not just the candidate:
+    /// two due deferred runs for one Execution must not
+    /// block each other (the first starts, the second
+    /// waits for a later tick). The conditional claim
+    /// (`mark_worker_run_running`, `WHERE status='queued'`)
+    /// is the atomic guard against a double start; the
+    /// gate check only decides which runs this pass starts.
+    /// Claims are awaited one at a time (bounded, below),
+    /// so the start order is the fetch order and the gate
+    /// check for the next run sees the previous run
+    /// already claimed. A failure for one run is logged
+    /// and never aborts the pass. Returns how many runs
+    /// were started. SQLite mode only.
+    pub async fn start_due_worker_runs(&self) -> usize {
+        if self.sqlite_mode() != StateBackend::Sqlite || self.sqlite_is_broken() {
+            return 0;
+        }
+        let Some(sqlite) = &self.sqlite else {
+            return 0;
+        };
+        let due = {
+            let conn = sqlite.lock().expect("sqlite lock");
+            match sqlite_store::due_deferred_worker_runs(&conn, sqlite_store::now_ms() as i64) {
+                Ok(rows) => rows,
+                Err(detail) => {
+                    eprintln!("warning: E2-D deferred start list failed: {detail}");
+                    return 0;
+                }
+            }
+        };
+        let due_ids: std::collections::HashSet<&str> =
+            due.iter().map(|row| row.run_id.as_str()).collect();
+        let mut started_executions: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut started = 0;
+        for row in &due {
+            if let Some(execution_id) = &row.execution_id {
+                // Already started one for this Execution
+                // this pass — the next waits for a later
+                // tick (the first run's claim lands before
+                // this check runs, so the DB check below
+                // would block it too; the set keeps the
+                // reason explicit).
+                if started_executions.contains(execution_id) {
+                    continue;
+                }
+                let blocked = {
+                    let conn = sqlite.lock().expect("sqlite lock");
+                    sqlite_store::active_run_ids_for_execution(&conn, execution_id)
+                };
+                match blocked {
+                    Ok(active) if active.iter().any(|id| !due_ids.contains(id.as_str())) => {
+                        // Genuinely busy: a running run, or
+                        // a queued immediate run about to
+                        // be claimed. Wait for a later tick.
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(detail) => {
+                        eprintln!(
+                            "warning: E2-D deferred start gate check failed for {}: {detail}",
+                            row.run_id
+                        );
+                        continue;
+                    }
+                }
+                started_executions.insert(execution_id.clone());
+            }
+            tokio::spawn(crate::worker::drive_worker_run(
+                self.clone(),
+                row.run_id.clone(),
+            ));
+            started += 1;
+            self.await_run_claim(&row.run_id).await;
+        }
+        started
+    }
+
+    /// E2-D batch 2: wait (bounded) for a run's claim to
+    /// land — the row leaving `queued` — so the next due
+    /// run starts after this one and the start order is
+    /// the fetch order. A timeout just moves on (the
+    /// claim lands or the driver exits on its own);
+    /// correctness never depends on this wait — the
+    /// conditional claim is the guard, this only orders
+    /// starts.
+    async fn await_run_claim(&self, run_id: &str) {
+        let Some(sqlite) = &self.sqlite else {
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
+        loop {
+            let claimed = {
+                let conn = sqlite.lock().expect("sqlite lock");
+                sqlite_store::get_worker_run(&conn, run_id)
+                    .ok()
+                    .flatten()
+                    .map(|row| row.status != "queued")
+                    .unwrap_or(true)
+            };
+            if claimed || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -17352,6 +17475,22 @@ pub(crate) struct WorkerRunCreateDto {
     /// Stored on the run row for Effect attribution.
     #[serde(default)]
     approval_id: Option<String>,
+    /// E2-D batch 2: run-at time (epoch ms). A future value
+    /// defers the run until the sweeper's due pass; a past
+    /// or absent value means immediate. Normalized at
+    /// creation: only a future value is stored (NULL
+    /// otherwise), so `start_at_ms IS NOT NULL` is exactly
+    /// "deferred run awaiting due". Not covered by the
+    /// approval digest (a scheduling parameter, not the
+    /// executed command — plan §2.2).
+    #[serde(default)]
+    start_at_ms: Option<i64>,
+    /// E2-D batch 2: plain integer priority, default 0,
+    /// larger first. Effective only at the sweeper's
+    /// due-fetch ordering (`(priority DESC, seq ASC)`).
+    /// Not covered by the approval digest (plan §2.2).
+    #[serde(default)]
+    priority: Option<i64>,
 }
 
 /// P3-C run-creation failure: an HTTP status + a short
@@ -18020,16 +18159,28 @@ pub(crate) async fn create_worker_run_internal(
             _ => (None, state.current_worker_session()),
         }
     };
-    // Budget (plan §2.4): the Execution deadline is now +
-    // this run's timeout, or the stored (earlier) deadline —
-    // never extended by a later run.
+    // E2-D batch 2 (Q-D2 (b)): normalize the deferred start
+    // here, once. Only a future `start_at_ms` is a deferred
+    // run; a past or absent value is immediate (NULL in the
+    // row, so `start_at_ms IS NOT NULL` is exactly
+    // "deferred run awaiting due"). The deadline anchors at
+    // START, not at creation — a deferred run's budget
+    // starts when it starts, so a run deferred an hour
+    // cannot expire before it runs. `set_execution_deadline`
+    // still takes the min, so a later run never extends an
+    // Execution's budget.
     let now = crate::effect_store::now_ms() as i64;
+    let deferred_start_at = req.start_at_ms.filter(|&at| at > now);
     {
         let mut conn = sqlite.lock().expect("sqlite lock");
+        let deadline = match deferred_start_at {
+            Some(at) => at + resolved.timeout_ms as i64,
+            None => now + resolved.timeout_ms as i64,
+        };
         if let Err(detail) = sqlite_store::set_execution_deadline(
             &mut conn,
             &execution_id,
-            now + resolved.timeout_ms as i64,
+            deadline,
         ) {
             eprintln!("warning: E2 worker run deadline write failed: {detail}");
             return Err(worker_create_error(
@@ -18061,6 +18212,8 @@ pub(crate) async fn create_worker_run_internal(
         binding_root_digest: Some(binding.root_digest),
         schema_version: 1,
         progress_json: None,
+        start_at_ms: deferred_start_at,
+        priority: Some(req.priority.unwrap_or(0)),
     };
     let row = {
         let mut conn = sqlite.lock().expect("sqlite lock");
@@ -18102,10 +18255,18 @@ pub(crate) async fn create_worker_run_internal(
             approval.consumed_by_worker_session_id = Some(worker_session_id.clone());
         }
     }
-    tokio::spawn(crate::worker::drive_worker_run(
-        state.clone(),
-        row.run_id.clone(),
-    ));
+    // E2-D batch 2: a deferred run is only a row until its
+    // due time — the sweeper starts it. An immediate run
+    // spawns here, as before. Double-spawn is impossible by
+    // construction: immediate runs have NULL `start_at_ms`
+    // (the sweeper's due query never matches them) and
+    // deferred runs are never spawned here.
+    if deferred_start_at.is_none() {
+        tokio::spawn(crate::worker::drive_worker_run(
+            state.clone(),
+            row.run_id.clone(),
+        ));
+    }
     Ok(row)
 }
 
@@ -20315,6 +20476,9 @@ pub fn spawn_assignment_sweeper(state: AppState) -> tokio::task::JoinHandle<()> 
             // D1-3: the Outbox deliverer rides the same
             // 10 s tick — no second scheduler.
             state.deliver_pending_outbox();
+            // E2-D batch 2: due deferred runs start from
+            // the same tick — no second scheduler.
+            state.start_due_worker_runs().await;
         }
     })
 }

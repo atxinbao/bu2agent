@@ -114,6 +114,19 @@ pub struct WorkerRunRow {
     /// NULL (column backfill, SQLite stays v4).
     #[serde(default)]
     pub progress_json: Option<String>,
+    /// E2-D batch 2: run-at time (epoch ms). Some only for
+    /// deferred runs (a future `start_at_ms` at creation);
+    /// None means immediate (no delay). Old rows read NULL
+    /// (column backfill, SQLite stays v13).
+    #[serde(default)]
+    pub start_at_ms: Option<i64>,
+    /// E2-D batch 2: plain integer priority, default 0,
+    /// larger first. Effective only at the sweeper's
+    /// due-fetch ordering (`(priority DESC, seq ASC)`).
+    /// Old rows read NULL (column backfill); the fetch
+    /// orders NULL as 0 (COALESCE).
+    #[serde(default)]
+    pub priority: Option<i64>,
 }
 
 /// Terminal run statuses: no further driving (plan §3.2).
