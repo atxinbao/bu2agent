@@ -376,6 +376,8 @@ impl Harness {
     /// Serve with the production default source (the
     /// non-macOS stub on Linux): every Notes call 501s.
     /// The fake is kept in the struct but never wired.
+    /// Exists only for nt5, which is non-macOS-only.
+    #[cfg(not(target_os = "macos"))]
     async fn serve_default() -> Self {
         let dir = temp_dir("notes-default");
         std::fs::create_dir_all(dir.join("files")).unwrap();
