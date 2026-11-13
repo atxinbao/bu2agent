@@ -1532,6 +1532,11 @@ async fn nt5_error_mapping() {
 /// NT5 (non-macOS): the production default source on
 /// Linux is the unavailable stub — sync 501s, and a
 /// write 501s with a failed Effect recorded.
+/// The gate below is a real attribute, not a comment:
+/// on macOS the default source is AppleScript, so the
+/// 501 assertions are impossible there (this was the
+/// ci #109 macOS failure).
+#[cfg(not(target_os = "macos"))]
 #[tokio::test]
 async fn nt5_non_macos_unavailable() {
     let h = Harness::serve_default().await;
