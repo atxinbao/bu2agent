@@ -5988,6 +5988,11 @@ pub fn get_worker_run(conn: &Connection, run_id: &str) -> Result<Option<WorkerRu
 /// Only rows with a stored `start_at_ms` can match, so
 /// immediate runs (NULL) never appear here. `COALESCE`
 /// orders pre-batch-2 rows (NULL priority) as 0.
+/// Both comparisons are CAST to INTEGER: old databases
+/// store these two columns as TEXT (the generic backfiller
+/// created them untyped), and without the CAST the ORDER BY
+/// compares lexicographically ('5' before '10') while the
+/// WHERE relies on 13-digit strings sorting numerically.
 /// Returns full rows; the sweeper applies the
 /// per-Execution gate before spawning each one.
 pub fn due_deferred_worker_runs(
@@ -5996,7 +6001,7 @@ pub fn due_deferred_worker_runs(
 ) -> Result<Vec<WorkerRunRow>, String> {
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT {WORKER_RUN_COLS} FROM worker_runs WHERE status = 'queued' AND start_at_ms IS NOT NULL AND start_at_ms <= ?1 ORDER BY COALESCE(priority, 0) DESC, seq ASC"
+            "SELECT {WORKER_RUN_COLS} FROM worker_runs WHERE status = 'queued' AND start_at_ms IS NOT NULL AND CAST(start_at_ms AS INTEGER) <= ?1 ORDER BY CAST(COALESCE(priority, 0) AS INTEGER) DESC, seq ASC"
         ))
         .map_err(err)?;
     let rows = stmt
@@ -6298,6 +6303,87 @@ mod tests {
         assert_eq!(null_value, None);
         assert_eq!(text_value, Some(123));
         assert_eq!(integer_value, Some(7));
+    }
+
+    #[test]
+    fn due_deferred_worker_runs_orders_legacy_text_priorities_numerically() {
+        // Regression test for the E2-D batch 2 window finding:
+        // old databases store start_at_ms/priority as TEXT (the
+        // generic backfiller created them untyped), so the due
+        // query must compare them numerically, not
+        // lexicographically ('5' sorts before '10' as TEXT).
+        // Build the legacy column typing by hand: running
+        // apply_migrations would create INTEGER columns and
+        // TEXT-looking inserts would be converted on storage.
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE worker_runs (
+                seq INTEGER NOT NULL,
+                run_id TEXT PRIMARY KEY,
+                execution_id TEXT,
+                assignment_id TEXT,
+                worker_session_id TEXT,
+                command TEXT NOT NULL,
+                argv_json TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                timeout_ms INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                exit_code INTEGER,
+                pid INTEGER,
+                started_ms INTEGER,
+                finished_ms INTEGER,
+                tail TEXT NOT NULL,
+                truncated INTEGER NOT NULL,
+                effect_id TEXT,
+                approval_id TEXT,
+                progress_json TEXT,
+                start_at_ms TEXT,
+                priority TEXT,
+                binding_location_id TEXT,
+                binding_worktree_id TEXT,
+                binding_root_digest TEXT,
+                schema_version INTEGER NOT NULL,
+                created_ms INTEGER,
+                updated_at_ms INTEGER
+            );",
+        )
+        .expect("create legacy worker_runs");
+        // Same due time for all three, created low-priority
+        // first so seq order disagrees with priority order.
+        let start_at = "1794601299000";
+        for (seq, run_id, priority) in [
+            (1_i64, "run-0", "0"),
+            (2_i64, "run-5", "5"),
+            (3_i64, "run-10", "10"),
+        ] {
+            conn.execute(
+                "INSERT INTO worker_runs (seq, run_id, command, argv_json, cwd, timeout_ms, status, tail, truncated, schema_version, start_at_ms, priority) VALUES (?1, ?2, 'git-worktree-add', '[]', '.', 60000, 'queued', '', 0, 1, ?3, ?4)",
+                rusqlite::params![seq, run_id, start_at, priority],
+            )
+            .expect("insert legacy run");
+        }
+        // A TEXT start_at_ms in the future must stay out.
+        conn.execute(
+            "INSERT INTO worker_runs (seq, run_id, command, argv_json, cwd, timeout_ms, status, tail, truncated, schema_version, start_at_ms, priority) VALUES (4, 'run-future', 'git-worktree-add', '[]', '.', 60000, 'queued', '', 0, 1, '1794601400000', '99')",
+            [],
+        )
+        .expect("insert future run");
+        // Sanity: the values really are stored as TEXT.
+        let stored: String = conn
+            .query_row(
+                "SELECT typeof(priority) FROM worker_runs WHERE run_id = 'run-10'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("typeof");
+        assert_eq!(stored, "text");
+        let due = due_deferred_worker_runs(&conn, 1_794_601_300_000).expect("due");
+        let ids: Vec<&str> = due.iter().map(|row| row.run_id.as_str()).collect();
+        assert_eq!(ids, vec!["run-10", "run-5", "run-0"]);
+        assert_eq!(
+            due.iter().map(|row| row.priority).collect::<Vec<_>>(),
+            vec![Some(10), Some(5), Some(0)]
+        );
     }
 
     fn approval(id: &str, status: &str) -> ApprovalFileRecord {
