@@ -61,6 +61,9 @@ use agent_desktop::email_client::{
 use agent_desktop::calendar_client::{
     CalendarClient, CalendarEvent, CreateCalendarEventInput, CreatedCalendarEventRow,
 };
+use agent_desktop::notes_client::{
+    AppendNoteInput, CreateNoteInput, NoteDeleteResponse, NoteRow, NoteSyncResult, NotesClient,
+};
 use agent_desktop::voice_client::{
     ActiveVoice, CatalogFilters, CatalogVoice, CustomVoice, OnboardingReset, PipelineProfile,
     PipelineSelection, VoiceClient,
@@ -1680,6 +1683,85 @@ pub fn mail_synced_list() -> Result<Vec<MailMessageRow>, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn mail_synced_get(message_id: String) -> Result<MailMessageRow, String> {
     email_client()?.synced_get(&message_id).map_err(agent_err_string)
+}
+
+// --- Notes surface (D1-6b-4, read + write) ---
+//
+// All commands carry rename_all = "snake_case" (Task 9
+// lesson): the invoke client sends snake_case params.
+fn notes_client() -> Result<NotesClient, String> {
+    NotesClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn notes_sync(folder: String) -> Result<NoteSyncResult, String> {
+    notes_client()?.sync_notes(&folder).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn notes_list() -> Result<Vec<NoteRow>, String> {
+    notes_client()?.list_notes().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn notes_get(note_id: String) -> Result<NoteRow, String> {
+    notes_client()?.get_note(&note_id).map_err(agent_err_string)
+}
+
+// D1-6b-4: real note create / append / delete. Each
+// write carries the decided digest-bound approval id
+// and the client-supplied idempotency key; the gateway
+// binds, consumes, and records the Effect + fact row
+// (or tombstone). Append 409s `note_changed` when the
+// live text moved since the approved base.
+#[tauri::command(rename_all = "snake_case")]
+pub fn notes_create(
+    folder: String,
+    name: String,
+    body: String,
+    idempotency_key: String,
+    tool_call_id: Option<String>,
+) -> Result<NoteRow, String> {
+    notes_client()?
+        .create_note(&CreateNoteInput {
+            folder,
+            name,
+            body,
+            idempotency_key,
+            tool_call_id,
+        })
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn notes_append(
+    note_id: String,
+    text: String,
+    base_body_hash: String,
+    idempotency_key: String,
+    tool_call_id: Option<String>,
+) -> Result<NoteRow, String> {
+    notes_client()?
+        .append_note(
+            &note_id,
+            &AppendNoteInput {
+                text,
+                base_body_hash,
+                idempotency_key,
+                tool_call_id,
+            },
+        )
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn notes_delete(
+    note_id: String,
+    tool_call_id: String,
+) -> Result<NoteDeleteResponse, String> {
+    notes_client()?
+        .delete_note(&note_id, &tool_call_id)
+        .map_err(agent_err_string)
 }
 
 // --- Effects / Executions / Inbox / Assignments / Evidence (P0-R R4) ---

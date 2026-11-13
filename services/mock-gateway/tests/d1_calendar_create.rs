@@ -463,7 +463,8 @@ const NOTES: &str = "Bring the quarterly numbers.";
 async fn cc1_create_end_to_end() {
     let h = Harness::serve().await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    assert_eq!(DB_SCHEMA_VERSION, 12);
+    // 6b-4 bumps the schema to v13 (notes table).
+    assert_eq!(DB_SCHEMA_VERSION, 13);
 
     let approval = h
         .approved_calendar_create(CAL, TITLE, START, END, false, Some(LOCATION), Some(NOTES))

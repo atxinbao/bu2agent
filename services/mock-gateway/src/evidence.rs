@@ -146,6 +146,23 @@ pub enum Current {
     /// the id and the flag only, never subject / sender
     /// / body.
     MailMessage { message_id: String, present: bool },
+    /// D1-6b-4: a notes observation — the re-read note's
+    /// fields against the fact row. `body_hash` is the
+    /// hash of the live `plaintext`; `fields_match` is
+    /// computed in `observe_current` from the fact row
+    /// (the expected hash) and the live re-read; the
+    /// observed JSON carries ids / lengths / hashes /
+    /// flags only, never folder / name / body plaintext.
+    Note {
+        note_id: String,
+        name_len: usize,
+        body_hash: String,
+        present: bool,
+        fields_match: bool,
+    },
+    /// D1-6b-4: the re-read found no note with the fact
+    /// row's native id.
+    NoteMissing,
 }
 
 impl Current {
@@ -219,6 +236,21 @@ impl Current {
                 "message_id": message_id,
                 "present": present,
             }),
+            Current::Note {
+                note_id,
+                name_len,
+                body_hash,
+                present,
+                fields_match,
+            } => json!({
+                "kind": "note",
+                "note_id": note_id,
+                "name_len": name_len,
+                "body_hash": body_hash,
+                "present": present,
+                "fields_match": fields_match,
+            }),
+            Current::NoteMissing => json!({"kind": "absent"}),
         }
     }
 }
@@ -752,6 +784,52 @@ pub fn observe_current(
             }),
             Err(_) => Ok(Current::Unreadable),
         },
+        // D1-6b-4: a notes create re-reads by the native
+        // id the fact row names (the row is found by the
+        // create Effect's idempotency-key scope); an
+        // append / delete re-reads the same way, with the
+        // row found by the note-id scope. No fact row
+        // means no observation is possible —
+        // MissingEvidence, never a guess. A backend error
+        // means the world could not be read — Unreadable,
+        // which verifies Inconclusive. The observed hash
+        // is the live `plaintext` hash; the name length
+        // is the fact row's, never live text.
+        ("notes", "create") | ("notes", "append") | ("notes", "delete") => {
+            let Some(sqlite) = state.sqlite.as_ref() else {
+                return Err(ObserveError::MissingEvidence);
+            };
+            let conn = sqlite.lock().expect("sqlite lock");
+            let row = if effect.operation == "create" {
+                crate::notes_sync::find_by_idempotency_key(&conn, &effect.scope)
+                    .map_err(|_| ObserveError::MissingEvidence)?
+            } else {
+                crate::notes_sync::get_note_row(&conn, &effect.scope)
+                    .map_err(|_| ObserveError::MissingEvidence)?
+            };
+            let Some(row) = row else {
+                return Err(ObserveError::MissingEvidence);
+            };
+            drop(conn);
+            match state
+                .notes_source
+                .get_note(&row.folder, &row.native_id)
+            {
+                Ok(Some(live)) => {
+                    let live_hash =
+                        crate::operation_binding::sha256_hex(live.plaintext.as_bytes());
+                    Ok(Current::Note {
+                        note_id: row.note_id,
+                        name_len: row.name.chars().count(),
+                        body_hash: live_hash.clone(),
+                        present: true,
+                        fields_match: live_hash == row.body_hash,
+                    })
+                }
+                Ok(None) => Ok(Current::NoteMissing),
+                Err(_) => Ok(Current::Unreadable),
+            }
+        }
         _ => Err(ObserveError::NoMethod),
     }
 }
@@ -980,6 +1058,33 @@ pub fn reconcile_outcome(
             Current::MailMessage {
                 present: false, ..
             } => ReconcileOutcome::Landed {
+                observed: current.to_json(),
+                reason: "target_absent",
+            },
+            _ => inconclusive(&current),
+        },
+        // D1-6b-4: a notes create / append reconciles
+        // when the re-read hash matches the fact row;
+        // a delete reconciles when the note is gone.
+        // Anything else is Inconclusive, never a false
+        // mismatch (the calendar precedent — an unknown
+        // Effect's write may still be in flight).
+        ("notes", "create") | ("notes", "append") => match &current {
+            Current::Note {
+                present: true,
+                fields_match: true,
+                ..
+            } => ReconcileOutcome::Landed {
+                observed: current.to_json(),
+                reason: "fields_match",
+            },
+            _ => inconclusive(&current),
+        },
+        ("notes", "delete") => match &current {
+            Current::Note {
+                present: false, ..
+            }
+            | Current::NoteMissing => ReconcileOutcome::Landed {
                 observed: current.to_json(),
                 reason: "target_absent",
             },
@@ -1394,6 +1499,49 @@ pub fn verify_outcome(
                 reason: "target_absent",
             },
             Current::MailMessage {
+                present: true, ..
+            } => VerifyOutcome::Mismatch {
+                observed: current.to_json(),
+                reason: "target_present",
+            },
+            _ => verify_inconclusive(&current),
+        },
+        // D1-6b-4: a notes create / append verifies
+        // against the live re-read hash. Consistent →
+        // verified; a hash mismatch → mismatch (P0-R); a
+        // missing note → inconclusive (the note may have
+        // been deleted after the write — the write itself
+        // is not disproven, so no Evidence row is
+        // written). A delete verifies by absence, the
+        // same shape as mail delete.
+        ("notes", "create") | ("notes", "append") => match &current {
+            Current::Note {
+                present: true,
+                fields_match: true,
+                ..
+            } => VerifyOutcome::Verified {
+                observed: current.to_json(),
+                reason: "fields_match",
+            },
+            Current::Note {
+                present: true,
+                fields_match: false,
+                ..
+            } => VerifyOutcome::Mismatch {
+                observed: current.to_json(),
+                reason: "field_mismatch",
+            },
+            _ => verify_inconclusive(&current),
+        },
+        ("notes", "delete") => match &current {
+            Current::Note {
+                present: false, ..
+            }
+            | Current::NoteMissing => VerifyOutcome::Verified {
+                observed: current.to_json(),
+                reason: "target_absent",
+            },
+            Current::Note {
                 present: true, ..
             } => VerifyOutcome::Mismatch {
                 observed: current.to_json(),

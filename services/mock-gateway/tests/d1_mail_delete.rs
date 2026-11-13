@@ -455,8 +455,9 @@ impl Harness {
 async fn md1_delete_end_to_end() {
     let h = Harness::serve().await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    // 6b-3 adds no version bump: the schema stays v12.
-    assert_eq!(DB_SCHEMA_VERSION, 12);
+    // 6b-3 added no version bump (the schema stayed
+    // v12); 6b-4 bumps it to v13 (notes table).
+    assert_eq!(DB_SCHEMA_VERSION, 13);
 
     let (status, synced) = h.sync().await;
     assert_eq!(status, 200, "sync: {synced}");

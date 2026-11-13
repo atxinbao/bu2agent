@@ -57,6 +57,9 @@ import { CalendarClient } from "./domain/calendar_client";
 import type { CalendarGateway } from "./domain/calendar_client";
 import { InvokeCalendarClient } from "./domain/invoke_calendar_client";
 import { CalendarView } from "./views/CalendarView";
+import { NotesClient } from "./domain/notes_client";
+import type { NotesGateway } from "./domain/notes_client";
+import { InvokeNotesClient } from "./domain/invoke_notes_client";
 import { NotesView } from "./views/NotesView";
 import { NodeClient, type NodeGateway } from "./domain/node_client";
 import { InvokeNodeClient } from "./domain/invoke_node_client";
@@ -166,6 +169,7 @@ interface Clients {
   sources: SourceGateway;
   memories: MemoryGateway;
   calendar: CalendarGateway;
+  notes: NotesGateway;
   feed: FeedGateway;
   chatRecords: ChatRecordsGateway;
   nodes: NodeGateway;
@@ -271,6 +275,7 @@ export function App() {
           sources: new InvokeSourceClient(),
           memories: new InvokeMemoryClient(),
           calendar: new InvokeCalendarClient(),
+          notes: new InvokeNotesClient(),
           feed: new InvokeFeedClient(),
           chatRecords: new InvokeChatRecordsClient(),
           nodes: new InvokeNodeClient(),
@@ -304,6 +309,7 @@ export function App() {
           sources: new SourceClient(MOCK_BASE_URL),
           memories: new MemoryClient(MOCK_BASE_URL),
           calendar: new CalendarClient(MOCK_BASE_URL),
+          notes: new NotesClient(MOCK_BASE_URL),
           feed: new FeedClient(MOCK_BASE_URL),
           chatRecords: new ChatRecordsClient(MOCK_BASE_URL),
           nodes: new NodeClient(MOCK_BASE_URL),
@@ -666,7 +672,7 @@ export function App() {
         (clients === null ? (
           <p className="empty">Choosing transport…</p>
         ) : (
-          <NotesView files={clients.files} effects={clients.effects} evidence={clients.evidence} />
+          <NotesView files={clients.files} effects={clients.effects} evidence={clients.evidence} notes={clients.notes} agent={clients.agent} />
         ))}
       {tab === "engineering" &&
         (clients === null ? (

@@ -58,7 +58,7 @@ use crate::execution_store::ExecutionFileRecord;
 /// Row-level `schema_version` fields are a separate concept
 /// (the record contract version, still 1 for P0-A+ rows) and
 /// are untouched.
-pub const DB_SCHEMA_VERSION: i64 = 12;
+pub const DB_SCHEMA_VERSION: i64 = 13;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -541,7 +541,41 @@ CREATE TABLE IF NOT EXISTS sent_messages (
 );
 ";
 
-/// D1-6b-2 (Q-D1-6b-09/10/11): one table, the calendar
+/// D1-6b-4 (Q-D1-6b-16–21): one table, the Notes fact
+/// record. `note_id` is the local stable id (`note-N`,
+/// a distinct shape from `mail-N` / `sent-N`);
+/// `idempotency_key` is UNIQUE on created rows — the
+/// create replay backstop (the 6b-2 D-1 precedent: the
+/// plan's §3 column list omits it, but the §5 replay
+/// rule needs it stored). `effect_id` / `policy_version`
+/// are the create Effect and the Policy version at
+/// write time (the 6b-1/6b-2 audit trail). The
+/// `last_append_*` columns are the append replay state
+/// (same key + same (note_id, base, new text) replays
+/// 200); sync rows carry empty keys / effect ids.
+/// `body_hash` is a SHA-256 hex of the re-read
+/// `plaintext`; the body itself is never stored.
+const SCHEMA_V13: &str = "
+CREATE TABLE IF NOT EXISTS notes (
+    note_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    native_id TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    name TEXT NOT NULL,
+    body_hash TEXT NOT NULL,
+    idempotency_key TEXT UNIQUE,
+    effect_id TEXT NOT NULL DEFAULT '',
+    policy_version TEXT NOT NULL DEFAULT '',
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    origin_device_id TEXT NOT NULL,
+    last_append_key TEXT,
+    last_append_base_hash TEXT,
+    last_append_text_hash TEXT,
+    UNIQUE (source_id, native_id)
+);
+";
 /// create fact record. `event_id` is the EventKit
 /// identifier itself (the stable system id, so no local
 /// number is assigned); `idempotency_key` is UNIQUE —
@@ -771,6 +805,20 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V12).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '12')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // D1-6b-4 v13 step: notes table only. One
+    // transaction, v5–v12 style; a fresh database runs
+    // v1–v13 in the same transaction. The table starts
+    // empty — rows arrive only from POST /api/notes/sync
+    // and POST /api/notes/create.
+    if version < 13 {
+        tx.execute_batch(SCHEMA_V13).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '13')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -1883,6 +1931,19 @@ const REDACTED_PAYLOAD_FIELDS: &[&str] = &[
     // `all_day` — the all-day flag, like `status`: a
     // boolean about the event, never its content.
     "all_day",
+    // D1-6b-4 `note.*` fields (each added with its
+    // reason, per this helper's own rule):
+    // `note_id` — the note's local id, like
+    // `message_id` for synced mail.
+    "note_id",
+    // `folder_hash` — sha256 of the folder name, like
+    // `sender_hash` for synced mail: the folder is
+    // auditable without naming it.
+    "folder_hash",
+    // `name_len` — the title's character count, like
+    // `subject_len` for mail: the title is auditable
+    // for size without naming the note.
+    "name_len",
 ];
 
 pub(crate) fn redact_event_payload(kind: &str, payload_json: &str) -> String {

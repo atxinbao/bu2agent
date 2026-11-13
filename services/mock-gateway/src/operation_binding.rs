@@ -348,6 +348,66 @@ pub fn calendar_create_digest(
     operation_digest("calendar.create", None, &params)
 }
 
+/// Digest for a real note create (D1-6b-4,
+/// Q-D1-6b-22). LOCAL DEFINITION: the digest commits
+/// to the folder hash, the name hash, and the body
+/// hash — raw text lives only in request memory, never
+/// in the digest inputs. Both the approval-request path
+/// and the create route call this same function over
+/// the same normalized inputs, so the two digests can
+/// never drift apart. The signature is the plan §6.2
+/// shape: hashes in, never plaintext. The body hash
+/// here is sha256 of the REQUEST body; the fact row
+/// records the hash of the re-read stored plaintext
+/// (which Notes may normalize), so the two hashes can
+/// differ — the digest binds the request, the row
+/// records the stored truth.
+pub fn note_create_digest(folder_hash: &str, name_hash: &str, body_hash: &str) -> String {
+    let params = BTreeMap::from([
+        ("body_hash".to_string(), body_hash.to_string()),
+        ("folder_hash".to_string(), folder_hash.to_string()),
+        ("name_hash".to_string(), name_hash.to_string()),
+    ]);
+    operation_digest("notes.create", None, &params)
+}
+
+/// Digest for a real note append (D1-6b-4,
+/// Q-D1-6b-22). LOCAL DEFINITION: the digest commits
+/// to the note id, the base body hash (the version the
+/// approver saw), and the hash of the APPENDED text.
+/// `new_body_hash` in the plan's §6.2 signature is the
+/// appended-text hash, not the resulting full-body
+/// hash: the approving client holds only the base hash
+/// (never the plaintext), so the full resulting body is
+/// unknowable at approval time. The route recomputes
+/// the same digest from the same inputs, and the
+/// Evidence readback compares the post-write re-read
+/// hash against the fact row.
+pub fn note_append_digest(note_id: &str, base_body_hash: &str, new_body_hash: &str) -> String {
+    let params = BTreeMap::from([
+        ("base_body_hash".to_string(), base_body_hash.to_string()),
+        ("new_body_hash".to_string(), new_body_hash.to_string()),
+        ("note_id".to_string(), note_id.to_string()),
+    ]);
+    operation_digest("notes.append", None, &params)
+}
+
+/// Digest for a real note delete (D1-6b-4,
+/// Q-D1-6b-22). LOCAL DEFINITION: the digest commits
+/// to the local note id — the note's stable identity
+/// (the native id is only an alias, so it never enters
+/// the digest; the mail delete precedent commits to
+/// the native id because mail routes are addressed by
+/// it, while notes routes are addressed by `note-N`).
+/// Both the approval-request path and the delete route
+/// call this same function over the same id, so the two
+/// digests can never drift apart. The signature is the
+/// plan §6.2 shape.
+pub fn note_delete_digest(note_id: &str) -> String {
+    let params = BTreeMap::from([("note_id".to_string(), note_id.to_string())]);
+    operation_digest("notes.delete", None, &params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +429,25 @@ mod tests {
         assert_eq!(normalize_path("a//b"), Some("a/b".to_string()));
         assert_eq!(normalize_path("a/b/"), Some("a/b".to_string()));
         assert_eq!(normalize_path("report.md"), Some("report.md".to_string()));
+    }
+
+    #[test]
+    fn note_digests_are_stable_but_sensitive_to_every_parameter() {
+        let create = note_create_digest("fh", "nh", "bh");
+        assert_eq!(note_create_digest("fh", "nh", "bh"), create);
+        assert_ne!(note_create_digest("FH", "nh", "bh"), create);
+        assert_ne!(note_create_digest("fh", "NH", "bh"), create);
+        assert_ne!(note_create_digest("fh", "nh", "BH"), create);
+        let append = note_append_digest("note-1", "base", "new");
+        assert_eq!(note_append_digest("note-1", "base", "new"), append);
+        assert_ne!(note_append_digest("note-2", "base", "new"), append);
+        assert_ne!(note_append_digest("note-1", "BASE", "new"), append);
+        assert_ne!(note_append_digest("note-1", "base", "NEW"), append);
+        assert_ne!(note_append_digest("note-1", "base", "new"), create);
+        let delete = note_delete_digest("note-1");
+        assert_eq!(note_delete_digest("note-1"), delete);
+        assert_ne!(note_delete_digest("note-2"), delete);
+        assert_ne!(delete, append);
     }
 
     #[test]

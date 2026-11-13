@@ -80,6 +80,11 @@ function requiresApproval(tool: string): boolean | undefined {
     case "fs.write":
     case "fs.delete":
     case "mail.send":
+    case "mail.delete":
+    case "calendar.create":
+    case "notes.create":
+    case "notes.append":
+    case "notes.delete":
     case "reminders.set_completed":
     case "worker.run":
       return true;
@@ -196,6 +201,41 @@ export class AgentClient implements AgentGateway {
         throw new Error("mail.delete approval requires native_id");
       }
       body.native_id = args.native_id;
+    } else if (tool === "notes.create") {
+      // D1-6b-4: a note create approval binds the exact
+      // note (Q-D1-6b-22): folder, name and body. The
+      // server recomputes the digest from these fields,
+      // never from a client hash.
+      if (args?.folder === undefined || args?.name === undefined || args?.body === undefined) {
+        throw new Error("notes.create approval requires folder, name and body");
+      }
+      body.folder = args.folder;
+      body.name = args.name;
+      body.body = args.body;
+    } else if (tool === "notes.append") {
+      // D1-6b-4: a note append approval binds the note
+      // id, the base body hash (the version the approver
+      // saw), and the appended text (Q-D1-6b-22). The
+      // server recomputes the digest from these fields,
+      // never from a client hash.
+      if (
+        args?.note_id === undefined ||
+        args?.base_body_hash === undefined ||
+        args?.body === undefined
+      ) {
+        throw new Error("notes.append approval requires note_id, base_body_hash and body");
+      }
+      body.note_id = args.note_id;
+      body.base_body_hash = args.base_body_hash;
+      body.body = args.body;
+    } else if (tool === "notes.delete") {
+      // D1-6b-4: a note delete approval binds the note
+      // id (Q-D1-6b-22). The server recomputes the digest
+      // from it, never from a client hash.
+      if (args?.note_id === undefined) {
+        throw new Error("notes.delete approval requires note_id");
+      }
+      body.note_id = args.note_id;
     }
     const response = await this.post<ApprovalRequestResponse>("/approval/request", body);
     if (response.requires_approval !== requires) {

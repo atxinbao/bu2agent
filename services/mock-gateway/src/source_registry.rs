@@ -295,6 +295,36 @@ impl Source for CalendarSourceEntry {
     }
 }
 
+/// The notes source (the `MailSourceEntry`
+/// precedent): one row for the Notes.app backend — the
+/// same backend serves the D1-6b-4 sync and the
+/// create/append/delete writes. One row: the source has
+/// no account concept of its own (the folder is picked
+/// per sync/create, Q-D1-6b-19).
+pub struct NotesSourceEntry;
+
+impl Source for NotesSourceEntry {
+    fn source_id(&self) -> String {
+        "notes-source".to_string()
+    }
+
+    fn kind(&self) -> &'static str {
+        "notes"
+    }
+
+    fn display_name(&self) -> String {
+        "Notes".to_string()
+    }
+
+    fn config_json(&self) -> Value {
+        serde_json::json!({})
+    }
+
+    fn scope(&self) -> String {
+        "notes".to_string()
+    }
+}
+
 /// The reminder backend as one source (Q-D1-43): Fake
 /// and EventKit are two backends of this single source,
 /// never two rows. `backend` is the switch value
@@ -412,6 +442,8 @@ pub fn seed_sources(
     let (row, _) = MailSourceEntry.register(&mut *conn, &inputs.origin_device_id)?;
     rows.push(row);
     let (row, _) = CalendarSourceEntry.register(&mut *conn, &inputs.origin_device_id)?;
+    rows.push(row);
+    let (row, _) = NotesSourceEntry.register(&mut *conn, &inputs.origin_device_id)?;
     rows.push(row);
     let (row, _) = ReminderDeviceSource {
         backend: inputs.device_backend,

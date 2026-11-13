@@ -126,6 +126,19 @@ struct ApprovalRequestDto {
     /// id; a client hash is never trusted.
     #[serde(skip_serializing_if = "Option::is_none")]
     native_id: Option<String>,
+    /// D1-6b-4: the note create / append / delete
+    /// presentation. The server recomputes the note
+    /// digests from these fields; a client hash is never
+    /// trusted. `body` (the shared mail.send field) is
+    /// reused for the note body / appended text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    folder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_body_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,7 +214,7 @@ impl AgentClient {
             return Err(invalid("unknown tool").into());
         };
         self.post_approval(
-            &ApprovalRequestDto { tool: tool.to_string(), path: None, content_base64: None, append: None, to: None, subject: None, body: None, calendar_id: None, title: None, start_ms: None, end_ms: None, all_day: None, location: None, notes: None, native_id: None },
+            &ApprovalRequestDto { tool: tool.to_string(), path: None, content_base64: None, append: None, to: None, subject: None, body: None, calendar_id: None, title: None, start_ms: None, end_ms: None, all_day: None, location: None, notes: None, native_id: None, folder: None, name: None, note_id: None, base_body_hash: None },
             requires,
         )
     }
@@ -241,6 +254,10 @@ impl AgentClient {
                     location: None,
                     notes: None,
                     native_id: None,
+                    folder: None,
+                    name: None,
+                    note_id: None,
+                    base_body_hash: None,
                 }
             }
             "fs.delete" => {
@@ -262,6 +279,10 @@ impl AgentClient {
                     location: None,
                     notes: None,
                     native_id: None,
+                    folder: None,
+                    name: None,
+                    note_id: None,
+                    base_body_hash: None,
                 }
             }
             // D1-6b-1: a mail send approval binds the exact
@@ -301,6 +322,10 @@ impl AgentClient {
                     location: None,
                     notes: None,
                     native_id: None,
+                    folder: None,
+                    name: None,
+                    note_id: None,
+                    base_body_hash: None,
                 }
             }
             // D1-6b-2: a calendar create approval binds the
@@ -354,6 +379,10 @@ impl AgentClient {
                     location: args.get("location").cloned(),
                     notes: args.get("notes").cloned(),
                     native_id: None,
+                    folder: None,
+                    name: None,
+                    note_id: None,
+                    base_body_hash: None,
                 }
             }
             // D1-6b-3: a mail delete approval binds the
@@ -382,6 +411,121 @@ impl AgentClient {
                     location: None,
                     notes: None,
                     native_id: Some(native_id.clone()),
+                    folder: None,
+                    name: None,
+                    note_id: None,
+                    base_body_hash: None,
+                }
+            }
+            // D1-6b-4: a note create approval binds the
+            // exact note (Q-D1-6b-22): folder, name and
+            // body. The server recomputes the digest
+            // from these fields, never from a client hash.
+            "notes.create" => {
+                let args = args.ok_or_else(|| {
+                    invalid("notes.create approval requires folder, name and body")
+                })?;
+                let folder = args
+                    .get("folder")
+                    .ok_or_else(|| invalid("notes.create approval requires folder"))?;
+                let name = args
+                    .get("name")
+                    .ok_or_else(|| invalid("notes.create approval requires name"))?;
+                let body = args
+                    .get("body")
+                    .ok_or_else(|| invalid("notes.create approval requires body"))?;
+                ApprovalRequestDto {
+                    tool: tool.to_string(),
+                    path: None,
+                    content_base64: None,
+                    append: None,
+                    to: None,
+                    subject: None,
+                    body: Some(body.clone()),
+                    calendar_id: None,
+                    title: None,
+                    start_ms: None,
+                    end_ms: None,
+                    all_day: None,
+                    location: None,
+                    notes: None,
+                    native_id: None,
+                    folder: Some(folder.clone()),
+                    name: Some(name.clone()),
+                    note_id: None,
+                    base_body_hash: None,
+                }
+            }
+            // D1-6b-4: a note append approval binds the
+            // note id, the base body hash (the version
+            // the approver saw), and the appended text
+            // (Q-D1-6b-22). The server recomputes the
+            // digest from these fields, never from a
+            // client hash.
+            "notes.append" => {
+                let args = args.ok_or_else(|| {
+                    invalid("notes.append approval requires note_id, base_body_hash and body")
+                })?;
+                let note_id = args
+                    .get("note_id")
+                    .ok_or_else(|| invalid("notes.append approval requires note_id"))?;
+                let base_body_hash = args.get("base_body_hash").ok_or_else(|| {
+                    invalid("notes.append approval requires base_body_hash")
+                })?;
+                let body = args
+                    .get("body")
+                    .ok_or_else(|| invalid("notes.append approval requires body"))?;
+                ApprovalRequestDto {
+                    tool: tool.to_string(),
+                    path: None,
+                    content_base64: None,
+                    append: None,
+                    to: None,
+                    subject: None,
+                    body: Some(body.clone()),
+                    calendar_id: None,
+                    title: None,
+                    start_ms: None,
+                    end_ms: None,
+                    all_day: None,
+                    location: None,
+                    notes: None,
+                    native_id: None,
+                    folder: None,
+                    name: None,
+                    note_id: Some(note_id.clone()),
+                    base_body_hash: Some(base_body_hash.clone()),
+                }
+            }
+            // D1-6b-4: a note delete approval binds the
+            // note id (Q-D1-6b-22). The server recomputes
+            // the digest from it, never from a client hash.
+            "notes.delete" => {
+                let args = args
+                    .ok_or_else(|| invalid("notes.delete approval requires note_id"))?;
+                let note_id = args
+                    .get("note_id")
+                    .ok_or_else(|| invalid("notes.delete approval requires note_id"))?;
+                ApprovalRequestDto {
+                    tool: tool.to_string(),
+                    path: None,
+                    content_base64: None,
+                    append: None,
+                    to: None,
+                    subject: None,
+                    body: None,
+                    calendar_id: None,
+                    title: None,
+                    start_ms: None,
+                    end_ms: None,
+                    all_day: None,
+                    location: None,
+                    notes: None,
+                    native_id: None,
+                    folder: None,
+                    name: None,
+                    note_id: Some(note_id.clone()),
+                    base_body_hash: None,
                 }
             }
             _ => {

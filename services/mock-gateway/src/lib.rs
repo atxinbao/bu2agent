@@ -50,6 +50,8 @@ pub mod code_search;
 pub mod mail_source;
 pub mod mail_sync;
 pub mod mail_send;
+pub mod notes_source;
+pub mod notes_sync;
 pub mod calendar_backend;
 pub mod calendar_store;
 pub mod device_store;
@@ -114,7 +116,7 @@ pub fn start_stream(stream_id: &str, turn_id: &str, text: &str) -> Vec<Subscript
 pub fn tool_requires_approval(name: &str) -> Option<bool> {
     match name {
         "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" | "email.threads" | "email.message" | "code.search" | "git.read" | "worker.wait" => Some(false),
-        "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "fs.export" | "notes.create" | "mail.send" | "mail.delete" | "calendar.create" | "reminders.set_completed" | "worker.run" => Some(true),
+        "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "fs.export" | "notes.create" | "notes.append" | "notes.delete" | "mail.send" | "mail.delete" | "calendar.create" | "reminders.set_completed" | "worker.run" => Some(true),
         _ => None,
     }
 }
@@ -234,6 +236,13 @@ mod tests {
         assert_eq!(tool_requires_approval("notes.list"), Some(false));
         assert_eq!(tool_requires_approval("mail.list"), Some(false));
         assert_eq!(tool_requires_approval("notes.create"), Some(true));
+        // D1-6b-4: the real-notes write tools are
+        // approval-gated (the Mock `notes.create` is
+        // the only notes tool the loop may call; the
+        // real append / delete go through the HTTP
+        // routes + approval, Q-D1-6b-25).
+        assert_eq!(tool_requires_approval("notes.append"), Some(true));
+        assert_eq!(tool_requires_approval("notes.delete"), Some(true));
         assert_eq!(tool_requires_approval("mail.send"), Some(true));
         assert_eq!(tool_requires_approval("calendar.create"), Some(true));
         assert_eq!(tool_requires_approval("reminders.set_completed"), Some(true));
