@@ -34,7 +34,7 @@
 //! - POST /approval/request      -> open a pending approval record (approval tools)
 //! - POST /approval/decide       -> decide an approval record (approved/rejected/edited)
 //! - GET  /approvals             -> current approval records, one per id
-//! - GET  /approvals/history     -> approval event history (JSONL order)
+//! - GET  /approvals/history     -> current approval records, one per id (same as /approvals; the event log is the audit source, not this route)
 //! - GET  /approvals/{id}        -> one approval record
 //! - GET  /approvals/{id}/editable-message -> message + whether it may be edited
 //! - POST /approvals/{id}/edit-message     -> edit an unbound pending approval's message
@@ -4742,10 +4742,15 @@ async fn approvals_list(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn approvals_history(State(state): State<AppState>) -> impl IntoResponse {
-    // P0-D: in SQLite mode history is the approval event log in
-    // global order (each payload is a full approval row), not
-    // the generated export file (which holds one snapshot row
-    // per approval). A broken database fails closed.
+    // FU-1 (Q-R0-02): in SQLite mode history reads the `approvals`
+    // table — one row per approval, latest state — exactly like
+    // `GET /approvals`. The old read (the approval event log in
+    // global order) was a lossy projection: `ApprovalView` drops
+    // `event_type` and timestamps, so callers could not tell a
+    // requested row from a decided one. The real audit source is
+    // the `events` table itself (fold + `list_events_for` still
+    // read it); this route no longer pretends to be it. A broken
+    // database fails closed.
     if state.sqlite_mode() == StateBackend::Sqlite {
         if state.sqlite_is_broken() {
             return sqlite_error_response();
@@ -4754,19 +4759,11 @@ async fn approvals_history(State(state): State<AppState>) -> impl IntoResponse {
             return sqlite_error_response();
         };
         let conn = sqlite.lock().expect("sqlite lock");
-        return match sqlite_store::list_events(&conn) {
-            Ok(events) => {
-                let mut views = Vec::new();
-                for event in events {
-                    if event.aggregate_kind != "approval" {
-                        continue;
-                    }
-                    if let Ok(record) =
-                        serde_json::from_str::<ApprovalFileRecord>(&event.payload_json)
-                    {
-                        views.push(approval_view_from_file(&record));
-                    }
-                }
+        return match sqlite_store::list_approvals(&conn) {
+            Ok(rows) => {
+                let mut views: Vec<ApprovalView> =
+                    rows.iter().map(approval_view_from_file).collect();
+                views.sort_by_key(|view| approval_number(&view.approval_id));
                 Json(views).into_response()
             }
             Err(_) => sqlite_error_response(),

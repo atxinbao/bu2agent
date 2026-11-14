@@ -649,6 +649,112 @@ async fn p3_approval_version_and_single_decision() {
     assert_eq!(body["error"], "loop_approval_already_decided_or_invalid");
 }
 
+/// P6 (FU-1, Q-R0-02): in SQLite mode `GET /approvals/history`
+/// reads the `approvals` table — one row per approval, latest
+/// state — identical to `GET /approvals`. The same approval is
+/// driven through request → edit → decide → consume (device
+/// set), which writes several event-log rows for it; the old
+/// history read would have returned one row per event. The
+/// event log itself keeps the superseded payloads, and
+/// `fold_matches_tables` still holds.
+#[tokio::test]
+async fn p6_approvals_history_reads_table() {
+    let h = Harness::serve(vec![]).await;
+    // A device action on the seeded Fake reminder.
+    let action = h
+        .ok(
+            "/devices/actions/create",
+            json!({"reminder_id": "reminder-demo", "target_completed": true}),
+        )
+        .await;
+    let action_id = action["action_id"].as_str().unwrap().to_string();
+    // `reminders.set_completed` requires approval but takes no
+    // digest: the request stays unbound (and therefore editable).
+    let (status, body) = h
+        .post(
+            "/approval/request",
+            json!({"tool": "reminders.set_completed"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["tool_call_id"].as_str().unwrap().to_string();
+    let view = h.approval(&id).await;
+    assert_eq!(view["version"], 1);
+    assert_eq!(view["status"], "pending");
+
+    // Edit: version 1 -> 2, status Edited. (The edit response
+    // itself is built from the in-memory record, whose version
+    // fields are null by design — read the stored row instead.)
+    let (status, _) = h
+        .post(
+            &format!("/approvals/{id}/edit-message"),
+            json!({"message": "revised draft"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let edited = h.approval(&id).await;
+    assert_eq!(edited["status"], "edited");
+    assert_eq!(edited["message"], "revised draft");
+    assert_eq!(edited["version"], 2);
+    assert_eq!(edited["supersedes_version"], 1);
+
+    // Decide approve: version 2 -> 3, supersedes 2.
+    let (status, _) = h
+        .post(
+            "/approval/decide",
+            json!({"tool_call_id": id, "status": "approved"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let view = h.approval(&id).await;
+    assert_eq!(view["version"], 3);
+    assert_eq!(view["supersedes_version"], 2);
+
+    // Consume via the device set.
+    h.ok(
+        "/devices/reminders/set",
+        json!({"action_id": action_id, "tool_call_id": id}),
+    )
+    .await;
+
+    // History is now the table, not the event log: exactly the
+    // same rows as the list, latest state only.
+    let history = h.ok_get("/approvals/history").await;
+    let list = h.ok_get("/approvals").await;
+    assert_eq!(history, list, "history must equal list");
+    let rows = history.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{history}");
+    let row = &rows[0];
+    assert_eq!(row["approval_id"], id);
+    assert_eq!(row["status"], "approved");
+    assert_eq!(row["message"], "revised draft");
+    assert_eq!(row["version"], 3);
+    assert_eq!(row["supersedes_version"], 2);
+
+    // The event log still holds the superseded payloads: at
+    // least the v1 requested snapshot survives under the v3 row.
+    let events = {
+        let conn = h.db();
+        sqlite_store::list_events(&conn).expect("list events")
+    };
+    let mine: Vec<_> = events
+        .iter()
+        .filter(|e| e.aggregate_kind == "approval" && e.aggregate_id == id)
+        .collect();
+    assert!(mine.len() >= 3, "expected several events for {id}, got {}", mine.len());
+    let has_v1 = mine.iter().any(|e| {
+        serde_json::from_str::<Value>(&e.payload_json)
+            .map(|p| p["version"] == 1)
+            .unwrap_or(false)
+    });
+    assert!(has_v1, "superseded v1 payload must remain in the event log");
+    let conn = h.db();
+    assert!(
+        sqlite_store::fold_matches_tables(&conn).expect("fold"),
+        "fold must still hold after the history read change"
+    );
+}
+
 /// P4: the `consumed_by_worker_session_id` backfill emits
 /// an `approval.bound` event (findable in the event
 /// stream) whose payload names the consuming session.
