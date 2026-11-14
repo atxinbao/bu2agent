@@ -188,6 +188,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
   const [inboxExecutions, setInboxExecutions] = useState<ExecutionRecord[]>([]);
   const [inboxEffects, setInboxEffects] = useState<EffectRecord[]>([]);
   const [inboxEvidence, setInboxEvidence] = useState<EvidenceRow[]>([]);
+  const [exportingEvidence, setExportingEvidence] = useState(false);
 
   async function refreshInbox() {
     if (!inboxClient) return;
@@ -235,6 +236,30 @@ export function WorkbenchView(props: WorkbenchViewProps) {
       await refreshInbox();
     } catch (e) {
       setInboxError(errText(e));
+    }
+  }
+
+  // FU-3D evidence export: download the full Evidence table
+  // as JSONL (one row per line) via the already-wired
+  // evidence client. Blob-anchor download, following
+  // MailView's downloadAttachment.
+  async function exportEvidence() {
+    if (!evidenceClient) return;
+    setExportingEvidence(true);
+    setInboxError("");
+    try {
+      const text = await evidenceClient.export();
+      const blob = new Blob([text], { type: "application/jsonl" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "evidence.jsonl";
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setInboxError(errText(e));
+    } finally {
+      setExportingEvidence(false);
     }
   }
 
@@ -1309,6 +1334,13 @@ export function WorkbenchView(props: WorkbenchViewProps) {
             <p>未关闭待办 {inboxRows.length} 条。点一行在行内展开执行详情，不跳新页面。</p>
             <button type="button" onClick={() => void refreshInbox()}>
               刷新待办
+            </button>{" "}
+            <button
+              type="button"
+              onClick={() => void exportEvidence()}
+              disabled={!evidenceClient || exportingEvidence}
+            >
+              导出 JSONL
             </button>
             {inboxError && <p className="error" role="alert">{inboxError}</p>}
             {inboxNotice && <p className="note">{inboxNotice}</p>}

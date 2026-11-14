@@ -19,4 +19,8 @@ export class InvokeEvidenceClient implements EvidenceGateway {
     });
     return toEvidenceRow(row);
   }
+
+  async export(): Promise<string> {
+    return invoke<string>("evidence_export", {});
+  }
 }

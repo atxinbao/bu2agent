@@ -1983,3 +1983,8 @@ pub fn evidence_list() -> Result<Vec<EvidenceRow>, String> {
 pub fn evidence_get(evidence_id: String) -> Result<EvidenceRow, String> {
     evidence_client()?.get(&evidence_id).map_err(|e| err_string(&e))
 }
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn evidence_export() -> Result<String, String> {
+    evidence_client()?.export().map_err(|e| err_string(&e))
+}

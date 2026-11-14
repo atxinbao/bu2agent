@@ -323,7 +323,8 @@ fn main() {
             tool_commands::assignment_get,
             tool_commands::assignment_takeover,
             tool_commands::evidence_list,
-            tool_commands::evidence_get
+            tool_commands::evidence_get,
+            tool_commands::evidence_export
         ])
         .setup(|_app| {
             #[cfg(not(test))]

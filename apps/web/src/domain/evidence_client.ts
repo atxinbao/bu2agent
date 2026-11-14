@@ -1,6 +1,6 @@
 // Evidence client for the TS Domain Store.
 //
-// Evidence rows only: list, get. Evidence is SQLite-only
+// Evidence rows only: list, get, export. Evidence is SQLite-only
 // (P0-R plan §2.4, following the event-table precedent): it
 // is never mirrored to JSONL. Each row is one observation of
 // a write's post-state -- a write-time observation, a
@@ -64,6 +64,8 @@ export function toEvidenceRow(server: ServerEvidenceRow): EvidenceRow {
 export interface EvidenceGateway {
   list(): Promise<EvidenceRow[]>;
   get(evidenceId: string): Promise<EvidenceRow>;
+  // Full Evidence table as JSONL text, one row per line.
+  export(): Promise<string>;
 }
 
 export class EvidenceClient implements EvidenceGateway {
@@ -91,5 +93,13 @@ export class EvidenceClient implements EvidenceGateway {
       `/evidence/get?evidence_id=${evidenceId}`,
     );
     return toEvidenceRow(row);
+  }
+
+  async export(): Promise<string> {
+    const response = await fetch(`${this.baseUrl}/evidence/export`);
+    if (!response.ok) {
+      throw new Error(`mock gateway returned HTTP ${response.status}`);
+    }
+    return response.text();
   }
 }

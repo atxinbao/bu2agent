@@ -1,6 +1,6 @@
 //! Evidence client: Rust shell -> Mock Gateway evidence endpoints.
 //!
-//! Evidence rows only: list, get. Evidence is SQLite-only
+//! Evidence rows only: list, get, export. Evidence is SQLite-only
 //! (P0-R plan §2.4, following the event-table precedent): it
 //! is never mirrored to JSONL. Each row is one observation of
 //! a write's post-state -- a write-time observation, a
@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::http_client::HttpClient;
+use crate::http_client::{gateway_error_with_body, HttpClient};
 use crate::Result;
 
 /// One Evidence row, snake_case as served. `observed_json`
@@ -57,5 +57,17 @@ impl EvidenceClient {
 
     pub fn get(&self, evidence_id: &str) -> Result<EvidenceRow> {
         self.http.get_json(&format!("/evidence/get?evidence_id={evidence_id}"))
+    }
+
+    /// Full Evidence table as JSONL text, one row per line
+    /// (the gateway's `/evidence/export`, a live read of the
+    /// store -- not a served file). Pure pass-through: no DTO
+    /// decoding, so the caller downloads the text as-is.
+    pub fn export(&self) -> Result<String> {
+        let (status, body) = self.http.request("GET", "/evidence/export", None)?;
+        if !(200..300).contains(&status) {
+            return Err(gateway_error_with_body(status, &body));
+        }
+        Ok(body)
     }
 }
