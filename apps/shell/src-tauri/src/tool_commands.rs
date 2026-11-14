@@ -1795,6 +1795,7 @@ use agent_desktop::effects_client::{EffectRecord, EffectsClient};
 use agent_desktop::executions_client::{ExecutionRecord, ExecutionsClient};
 use agent_desktop::inbox_client::{InboxClient, InboxRow};
 use agent_desktop::approvals_client::{ApprovalView, ApprovalsClient, EditableMessage};
+use agent_desktop::outbox_client::{OutboxClient, OutboxRow};
 use agent_desktop::assignments_client::{AssignmentRow, AssignmentsClient, TakeoverOutcome};
 use agent_desktop::evidence_client::{EvidenceClient, EvidenceRow};
 
@@ -1812,6 +1813,10 @@ fn inbox_client() -> Result<InboxClient, String> {
 
 fn approvals_client() -> Result<ApprovalsClient, String> {
     ApprovalsClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+fn outbox_client() -> Result<OutboxClient, String> {
+    OutboxClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
 }
 
 fn assignments_client() -> Result<AssignmentsClient, String> {
@@ -1902,6 +1907,26 @@ pub fn approvals_edit_message(
     approvals_client()?
         .edit_message(&approval_id, &message)
         .map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn outbox_list() -> Result<Vec<OutboxRow>, String> {
+    outbox_client()?.list().map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn outbox_get(outbox_id: String) -> Result<OutboxRow, String> {
+    outbox_client()?.get(&outbox_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn outbox_deliver(outbox_id: String) -> Result<OutboxRow, String> {
+    outbox_client()?.deliver(&outbox_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn outbox_requeue(outbox_id: String) -> Result<OutboxRow, String> {
+    outbox_client()?.requeue(&outbox_id).map_err(|e| err_string(&e))
 }
 
 #[tauri::command(rename_all = "snake_case")]

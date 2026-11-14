@@ -30,6 +30,7 @@ import type {
   ApprovalView,
   ApprovalsGateway,
 } from "../domain/approvals_client";
+import type { OutboxGateway, OutboxRow } from "../domain/outbox_client";
 import { ExecutionDetail } from "./ExecutionDetail";
 
 // Workbench (Round 3, 3a+3b): one list on the left, a timeline in
@@ -112,6 +113,7 @@ export interface WorkbenchViewProps {
   onNavigate: (tab: "tasks" | "loops" | "files") => void;
   inbox?: InboxGateway | null;
   approvals?: ApprovalsGateway | null;
+  outbox?: OutboxGateway | null;
   executions?: ExecutionsGateway | null;
   effects?: EffectsGateway | null;
   evidence?: EvidenceGateway | null;
@@ -122,6 +124,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
   const { sessions, tasks, loops, agent, files, chatRecords, streams, onNavigate } = props;
   const inboxClient = props.inbox ?? null;
   const approvalsClient = props.approvals ?? null;
+  const outboxClient = props.outbox ?? null;
   const executionsClient = props.executions ?? null;
   const effectsClient = props.effects ?? null;
   const evidenceClient = props.evidence ?? null;
@@ -308,6 +311,90 @@ export function WorkbenchView(props: WorkbenchViewProps) {
     }
   }
 
+  // FU-3B outbox section: read-only list + detail, with a
+  // deliver action on pending rows and a requeue action on
+  // failed rows. Deliver does NOT revive a failed row (a
+  // sent/failed row is returned unchanged); only requeue
+  // revives a failed row, back to pending. Neither operation
+  // creates an Effect and neither needs an approval. After
+  // an operation the row is re-read with get() and the list
+  // is refreshed, so the notice reports the row's real
+  // status instead of assuming the operation changed it.
+  const [outboxRows, setOutboxRows] = useState<OutboxRow[]>([]);
+  const [outboxError, setOutboxError] = useState("");
+  const [outboxNotice, setOutboxNotice] = useState("");
+  const [expandedOutboxId, setExpandedOutboxId] = useState<string | null>(null);
+  const [outboxDetail, setOutboxDetail] = useState<OutboxRow | null>(null);
+  const [outboxBusyId, setOutboxBusyId] = useState<string | null>(null);
+
+  async function refreshOutbox() {
+    if (!outboxClient) return;
+    setOutboxError("");
+    try {
+      setOutboxRows(await outboxClient.list());
+    } catch (e) {
+      setOutboxError(errText(e));
+    }
+  }
+
+  async function expandOutboxRow(row: OutboxRow) {
+    if (!outboxClient) return;
+    setOutboxNotice("");
+    if (expandedOutboxId === row.outboxId) {
+      setExpandedOutboxId(null);
+      setOutboxDetail(null);
+      return;
+    }
+    setExpandedOutboxId(row.outboxId);
+    try {
+      setOutboxDetail(await outboxClient.get(row.outboxId));
+    } catch (e) {
+      setOutboxError(errText(e));
+    }
+  }
+
+  async function deliverOutboxRow(row: OutboxRow) {
+    if (!outboxClient) return;
+    const id = row.outboxId;
+    setOutboxBusyId(id);
+    setOutboxError("");
+    setOutboxNotice("");
+    try {
+      await outboxClient.deliver(id);
+      const fresh = await outboxClient.get(id);
+      setOutboxDetail(fresh);
+      setOutboxNotice(`已投递 ${id}，当前状态为 ${fresh.status}。`);
+      await refreshOutbox();
+    } catch (e) {
+      setOutboxError(errText(e));
+    } finally {
+      setOutboxBusyId(null);
+    }
+  }
+
+  async function requeueOutboxRow(row: OutboxRow) {
+    if (!outboxClient) return;
+    const id = row.outboxId;
+    setOutboxBusyId(id);
+    setOutboxError("");
+    setOutboxNotice("");
+    try {
+      await outboxClient.requeue(id);
+      const fresh = await outboxClient.get(id);
+      setOutboxDetail(fresh);
+      setOutboxNotice(
+        fresh.status === "pending"
+          ? `已重新排队 ${id} 为 pending，等待投递。`
+          : `已操作 ${id}，当前状态为 ${fresh.status}。`,
+      );
+      await refreshOutbox();
+    } catch (e) {
+      setOutboxError(errText(e));
+    } finally {
+      setOutboxBusyId(null);
+    }
+  }
+
   // 详情查询与显式操作共用同一快照更新列表，避免已执行项仍被标为待审批。
   function updateLoop(snapshot: LoopSnapshot) {
     setLoopDetail(snapshot);
@@ -448,6 +535,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
     void refreshUnread();
     void refreshInbox();
     void refreshApprovals();
+    void refreshOutbox();
     // Mount only: refreshes come from explicit actions below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1252,6 +1340,77 @@ export function WorkbenchView(props: WorkbenchViewProps) {
                     )}
                     {expanded && !execution && (
                       <p className="note">该执行记录尚未载入：点“刷新待办”后重试，或到任务页查看。</p>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
+      </div>
+      <div>
+        <h3>Outbox（待投递）</h3>
+        {!outboxClient && (
+          <p className="note">Outbox 客户端尚未接入：待 App 接线传入客户端后，这里显示全部待投递行（含已发送与失败的行）。</p>
+        )}
+        {outboxClient && (
+          <div>
+            <p>
+              Outbox {outboxRows.length} 条。点一行展开详情；pending 行可“立即投递”，failed 行可“重新排队”。
+              立即投递救不活失败行；失败行请用“重新排队”复活为 pending，再由投递器或手动投递。
+              这些操作不新建 Effect、不走审批。
+            </p>
+            <button type="button" onClick={() => void refreshOutbox()}>
+              刷新 Outbox
+            </button>
+            {outboxError && <p className="error" role="alert">{outboxError}</p>}
+            {outboxNotice && <p className="note">{outboxNotice}</p>}
+            {outboxRows.length === 0 && <p className="empty">暂无 Outbox 行。</p>}
+            <ul>
+              {outboxRows.map((row) => {
+                const expanded = expandedOutboxId === row.outboxId;
+                const summary = row.payloadSummaryJson.length > 80
+                  ? `${row.payloadSummaryJson.slice(0, 80)}…`
+                  : row.payloadSummaryJson;
+                return (
+                  <li key={row.outboxId}>
+                    <button type="button" onClick={() => void expandOutboxRow(row)}>
+                      {row.outboxId} · {row.status} · 尝试 {row.attempts} 次
+                      {` · 执行 ${row.executionId}`}
+                      {` · ${row.destinationKind}`}
+                      {summary ? ` · ${summary}` : ""}
+                      {` · ${new Date(row.createdMs).toLocaleString()}`}
+                    </button>
+                    {expanded && outboxDetail && outboxDetail.outboxId === row.outboxId && (
+                      <div>
+                        <p>执行：{outboxDetail.executionId}</p>
+                        <p>目标类型：{outboxDetail.destinationKind}</p>
+                        <p>状态：{outboxDetail.status}</p>
+                        <p>尝试次数：{outboxDetail.attempts}</p>
+                        <p>去重键：{outboxDetail.dedupKey}</p>
+                        <p>创建时间：{new Date(outboxDetail.createdMs).toLocaleString()}</p>
+                        <p>更新时间：{new Date(outboxDetail.updatedAtMs).toLocaleString()}</p>
+                        <p>摘要：</p>
+                        <pre className="result">{outboxDetail.payloadSummaryJson}</pre>
+                        {outboxDetail.status === "pending" && (
+                          <button
+                            type="button"
+                            disabled={outboxBusyId === row.outboxId}
+                            onClick={() => void deliverOutboxRow(row)}
+                          >
+                            立即投递
+                          </button>
+                        )}
+                        {outboxDetail.status === "failed" && (
+                          <button
+                            type="button"
+                            disabled={outboxBusyId === row.outboxId}
+                            onClick={() => void requeueOutboxRow(row)}
+                          >
+                            重新排队
+                          </button>
+                        )}
+                      </div>
                     )}
                   </li>
                 );

@@ -97,6 +97,11 @@ import {
 } from "./domain/approvals_client";
 import { InvokeApprovalsClient } from "./domain/invoke_approvals_client";
 import {
+  OutboxClient,
+  type OutboxGateway,
+} from "./domain/outbox_client";
+import { InvokeOutboxClient } from "./domain/invoke_outbox_client";
+import {
   AssignmentsClient,
   type AssignmentsGateway,
 } from "./domain/assignments_client";
@@ -184,6 +189,7 @@ interface Clients {
   executions: ExecutionsGateway;
   inbox: InboxGateway;
   approvals: ApprovalsGateway;
+  outbox: OutboxGateway;
   assignments: AssignmentsGateway;
   evidence: EvidenceGateway;
   engineering: EngineeringGateway;
@@ -291,6 +297,7 @@ export function App() {
           executions: new InvokeExecutionsClient(),
           inbox: new InvokeInboxClient(),
           approvals: new InvokeApprovalsClient(),
+          outbox: new InvokeOutboxClient(),
           assignments: new InvokeAssignmentsClient(),
           evidence: new InvokeEvidenceClient(),
           engineering: new InvokeEngineeringClient(),
@@ -326,6 +333,7 @@ export function App() {
           executions: new ExecutionsClient(MOCK_BASE_URL),
           inbox: new InboxClient(MOCK_BASE_URL),
           approvals: new ApprovalsClient(MOCK_BASE_URL),
+          outbox: new OutboxClient(MOCK_BASE_URL),
           assignments: new AssignmentsClient(MOCK_BASE_URL),
           evidence: new EvidenceClient(MOCK_BASE_URL),
           engineering: new EngineeringClient(MOCK_BASE_URL),
@@ -598,6 +606,7 @@ export function App() {
             streams={clients.streams}
             inbox={clients.inbox}
             approvals={clients.approvals}
+            outbox={clients.outbox}
             executions={clients.executions}
             effects={clients.effects}
             evidence={clients.evidence}
