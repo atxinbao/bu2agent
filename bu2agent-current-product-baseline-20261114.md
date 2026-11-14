@@ -64,6 +64,8 @@
 - **已核实，非缺陷：** 不存在 `/connectors/list` 路由（客户端正确走 `GET /connectors` 与 `POST /v1/custom-connectors/list`）；TS 孤儿 `/api/email/threads{id}` 是 `${suffix}` 模板的提取 artifact；shell 注册 243/243 全对。
 - **两个审批读路由读 SQLite 内的两个不同源（真实缺口，已按主代理核对修正）：** `approvals_list` 读 `approvals` 表，`approvals_history` 在 SQLite 模式下读 `events` 表（只取 `aggregate_kind == "approval"`；JSONL 读只在非 SQLite 模式才走）。是否让 history 直接读表，待用户定（R0-Q2）。
 
+`/approvals/history`（审计视角，全量事件日志）、`/effects/transition`（原始状态机驱动，绕过 reconcile/verify 语义）、`/files/raw`（裸字节直出，供 `<img>`/调试）三条路由无 UI 入口，为管理/测试入口；其余 13 条的 UI 见 FU-3 各批。
+
 ## 四、SQLite / JSONL 领域边界
 
 ### SQLite 是事实源的域（26 张表，v13）

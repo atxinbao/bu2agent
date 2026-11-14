@@ -1794,6 +1794,7 @@ pub fn notes_delete(
 use agent_desktop::effects_client::{EffectRecord, EffectsClient};
 use agent_desktop::executions_client::{ExecutionRecord, ExecutionsClient};
 use agent_desktop::inbox_client::{InboxClient, InboxRow};
+use agent_desktop::approvals_client::{ApprovalView, ApprovalsClient, EditableMessage};
 use agent_desktop::assignments_client::{AssignmentRow, AssignmentsClient, TakeoverOutcome};
 use agent_desktop::evidence_client::{EvidenceClient, EvidenceRow};
 
@@ -1807,6 +1808,10 @@ fn executions_client() -> Result<ExecutionsClient, String> {
 
 fn inbox_client() -> Result<InboxClient, String> {
     InboxClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+fn approvals_client() -> Result<ApprovalsClient, String> {
+    ApprovalsClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
 }
 
 fn assignments_client() -> Result<AssignmentsClient, String> {
@@ -1868,6 +1873,35 @@ pub fn inbox_get(inbox_id: String) -> Result<InboxRow, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn inbox_ack(inbox_id: String) -> Result<InboxRow, String> {
     inbox_client()?.ack(&inbox_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn approvals_list() -> Result<Vec<ApprovalView>, String> {
+    approvals_client()?.list().map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn approvals_get(approval_id: String) -> Result<ApprovalView, String> {
+    approvals_client()?
+        .get(&approval_id)
+        .map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn approvals_editable_message(approval_id: String) -> Result<EditableMessage, String> {
+    approvals_client()?
+        .editable_message(&approval_id)
+        .map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn approvals_edit_message(
+    approval_id: String,
+    message: String,
+) -> Result<ApprovalView, String> {
+    approvals_client()?
+        .edit_message(&approval_id, &message)
+        .map_err(|e| err_string(&e))
 }
 
 #[tauri::command(rename_all = "snake_case")]

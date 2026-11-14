@@ -92,6 +92,11 @@ import {
 } from "./domain/inbox_client";
 import { InvokeInboxClient } from "./domain/invoke_inbox_client";
 import {
+  ApprovalsClient,
+  type ApprovalsGateway,
+} from "./domain/approvals_client";
+import { InvokeApprovalsClient } from "./domain/invoke_approvals_client";
+import {
   AssignmentsClient,
   type AssignmentsGateway,
 } from "./domain/assignments_client";
@@ -178,6 +183,7 @@ interface Clients {
   effects: EffectsGateway;
   executions: ExecutionsGateway;
   inbox: InboxGateway;
+  approvals: ApprovalsGateway;
   assignments: AssignmentsGateway;
   evidence: EvidenceGateway;
   engineering: EngineeringGateway;
@@ -284,6 +290,7 @@ export function App() {
           effects: new InvokeEffectsClient(),
           executions: new InvokeExecutionsClient(),
           inbox: new InvokeInboxClient(),
+          approvals: new InvokeApprovalsClient(),
           assignments: new InvokeAssignmentsClient(),
           evidence: new InvokeEvidenceClient(),
           engineering: new InvokeEngineeringClient(),
@@ -318,6 +325,7 @@ export function App() {
           effects: new EffectsClient(MOCK_BASE_URL),
           executions: new ExecutionsClient(MOCK_BASE_URL),
           inbox: new InboxClient(MOCK_BASE_URL),
+          approvals: new ApprovalsClient(MOCK_BASE_URL),
           assignments: new AssignmentsClient(MOCK_BASE_URL),
           evidence: new EvidenceClient(MOCK_BASE_URL),
           engineering: new EngineeringClient(MOCK_BASE_URL),
@@ -589,6 +597,7 @@ export function App() {
             chatRecords={clients.chatRecords}
             streams={clients.streams}
             inbox={clients.inbox}
+            approvals={clients.approvals}
             executions={clients.executions}
             effects={clients.effects}
             evidence={clients.evidence}

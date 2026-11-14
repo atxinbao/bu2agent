@@ -26,6 +26,10 @@ import type {
   ExecutionsGateway,
 } from "../domain/executions_client";
 import type { InboxGateway, InboxRow } from "../domain/inbox_client";
+import type {
+  ApprovalView,
+  ApprovalsGateway,
+} from "../domain/approvals_client";
 import { ExecutionDetail } from "./ExecutionDetail";
 
 // Workbench (Round 3, 3a+3b): one list on the left, a timeline in
@@ -107,6 +111,7 @@ export interface WorkbenchViewProps {
   streams: StreamGateway;
   onNavigate: (tab: "tasks" | "loops" | "files") => void;
   inbox?: InboxGateway | null;
+  approvals?: ApprovalsGateway | null;
   executions?: ExecutionsGateway | null;
   effects?: EffectsGateway | null;
   evidence?: EvidenceGateway | null;
@@ -116,6 +121,7 @@ export interface WorkbenchViewProps {
 export function WorkbenchView(props: WorkbenchViewProps) {
   const { sessions, tasks, loops, agent, files, chatRecords, streams, onNavigate } = props;
   const inboxClient = props.inbox ?? null;
+  const approvalsClient = props.approvals ?? null;
   const executionsClient = props.executions ?? null;
   const effectsClient = props.effects ?? null;
   const evidenceClient = props.evidence ?? null;
@@ -223,6 +229,82 @@ export function WorkbenchView(props: WorkbenchViewProps) {
       await refreshInbox();
     } catch (e) {
       setInboxError(errText(e));
+    }
+  }
+
+  // FU-3A approvals section: read-only list + detail, with an
+  // edit-message entry that only appears when the gateway says
+  // the row is editable (pending, unconsumed, unbound). A
+  // successful edit re-reads the row with get(): the edit
+  // response itself carries null versions, so its version
+  // fields must never be trusted for the refresh.
+  const [approvalRows, setApprovalRows] = useState<ApprovalView[]>([]);
+  const [approvalsError, setApprovalsError] = useState("");
+  const [approvalsNotice, setApprovalsNotice] = useState("");
+  const [expandedApprovalId, setExpandedApprovalId] = useState<string | null>(null);
+  const [approvalDetail, setApprovalDetail] = useState<ApprovalView | null>(null);
+  const [approvalEditable, setApprovalEditable] = useState(false);
+  const [editingApproval, setEditingApproval] = useState(false);
+  const [editDraft, setEditDraft] = useState("");
+  const [editBusy, setEditBusy] = useState(false);
+
+  async function refreshApprovals() {
+    if (!approvalsClient) return;
+    setApprovalsError("");
+    try {
+      setApprovalRows(await approvalsClient.list());
+    } catch (e) {
+      setApprovalsError(errText(e));
+    }
+  }
+
+  async function expandApprovalRow(row: ApprovalView) {
+    if (!approvalsClient) return;
+    setApprovalsNotice("");
+    if (expandedApprovalId === row.approvalId) {
+      setExpandedApprovalId(null);
+      setApprovalDetail(null);
+      setApprovalEditable(false);
+      setEditingApproval(false);
+      return;
+    }
+    setExpandedApprovalId(row.approvalId);
+    setEditingApproval(false);
+    try {
+      const [detail, editable] = await Promise.all([
+        approvalsClient.get(row.approvalId),
+        approvalsClient.editableMessage(row.approvalId),
+      ]);
+      setApprovalDetail(detail);
+      setApprovalEditable(editable.editable);
+      setEditDraft(editable.message ?? detail.message ?? "");
+    } catch (e) {
+      setApprovalsError(errText(e));
+    }
+  }
+
+  async function submitApprovalEdit() {
+    if (!approvalsClient || !approvalDetail) return;
+    const id = approvalDetail.approvalId;
+    if (!editDraft.trim()) {
+      setApprovalsError("消息不能为空。");
+      return;
+    }
+    setEditBusy(true);
+    setApprovalsError("");
+    try {
+      await approvalsClient.editMessage(id, editDraft);
+      // The edit response carries null versions; re-read.
+      const fresh = await approvalsClient.get(id);
+      setApprovalDetail(fresh);
+      setApprovalEditable(false);
+      setEditingApproval(false);
+      setApprovalsNotice(`审批 ${id} 已改为 Edited。`);
+      await refreshApprovals();
+    } catch (e) {
+      setApprovalsError(errText(e));
+    } finally {
+      setEditBusy(false);
     }
   }
 
@@ -365,6 +447,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
     void refreshList();
     void refreshUnread();
     void refreshInbox();
+    void refreshApprovals();
     // Mount only: refreshes come from explicit actions below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1169,6 +1252,88 @@ export function WorkbenchView(props: WorkbenchViewProps) {
                     )}
                     {expanded && !execution && (
                       <p className="note">该执行记录尚未载入：点“刷新待办”后重试，或到任务页查看。</p>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
+      </div>
+      <div>
+        <h3>审批</h3>
+        {!approvalsClient && (
+          <p className="note">审批客户端尚未接入：待 App 接线传入客户端后，这里显示全部审批（含已绑定与已编辑的行）。</p>
+        )}
+        {approvalsClient && (
+          <div>
+            <p>审批 {approvalRows.length} 条。点一行展开详情；只有未绑定、未消费、待审批的行才可编辑消息。</p>
+            <button type="button" onClick={() => void refreshApprovals()}>
+              刷新审批
+            </button>
+            {approvalsError && <p className="error" role="alert">{approvalsError}</p>}
+            {approvalsNotice && <p className="note">{approvalsNotice}</p>}
+            {approvalRows.length === 0 && <p className="empty">暂无审批。</p>}
+            <ul>
+              {approvalRows.map((row) => {
+                const expanded = expandedApprovalId === row.approvalId;
+                return (
+                  <li key={row.approvalId}>
+                    <button type="button" onClick={() => void expandApprovalRow(row)}>
+                      {row.approvalId} · {row.tool} · {row.status}
+                      {row.bound ? " · 已绑定" : " · 未绑定"}
+                      {row.message ? ` · ${row.message}` : ""}
+                      {row.version !== null ? ` · v${row.version}` : ""}
+                    </button>
+                    {expanded && approvalDetail && approvalDetail.approvalId === row.approvalId && (
+                      <div>
+                        <p>tool_call_id：{approvalDetail.toolCallId}</p>
+                        <p>状态：{approvalDetail.status}</p>
+                        <p>已消费：{approvalDetail.consumed ? "是" : "否"}</p>
+                        <p>已绑定：{approvalDetail.bound ? "是" : "否"}</p>
+                        {approvalDetail.binding && (
+                          <p>
+                            绑定：{approvalDetail.binding.loopId} · 调用 {approvalDetail.binding.callId}
+                            {" · "}{approvalDetail.binding.tool}
+                            {" · "}{approvalDetail.binding.argsSha256}
+                          </p>
+                        )}
+                        <p>操作摘要：{approvalDetail.operationDigest ?? "—"}</p>
+                        <p>Effect 绑定：{approvalDetail.effectBinding ?? "—"}</p>
+                        <p>消息：{approvalDetail.message ?? "—"}</p>
+                        <p>消费方 Worker 会话：{approvalDetail.consumedByWorkerSessionId ?? "—"}</p>
+                        {approvalDetail.version !== null && (
+                          <p>版本：v{approvalDetail.version}</p>
+                        )}
+                        {approvalDetail.supersedesVersion !== null && (
+                          <p>取代版本：v{approvalDetail.supersedesVersion}</p>
+                        )}
+                        {approvalEditable && !editingApproval && (
+                          <button type="button" onClick={() => setEditingApproval(true)}>
+                            编辑消息
+                          </button>
+                        )}
+                        {editingApproval && (
+                          <div>
+                            <input
+                              type="text"
+                              value={editDraft}
+                              onChange={(e) => setEditDraft(e.target.value)}
+                              aria-label="审批消息"
+                            />{" "}
+                            <button
+                              type="button"
+                              disabled={editBusy}
+                              onClick={() => void submitApprovalEdit()}
+                            >
+                              保存
+                            </button>{" "}
+                            <button type="button" onClick={() => setEditingApproval(false)}>
+                              取消
+                            </button>
+                          </div>
+                        )}
+                      </div>
                     )}
                   </li>
                 );
