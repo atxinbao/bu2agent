@@ -59,6 +59,8 @@ pub mod engineering_client;
 pub mod inbox_client;
 pub mod approvals_client;
 pub mod outbox_client;
+pub mod policies_client;
+pub mod mandates_client;
 pub mod assignments_client;
 pub mod evidence_client;
 pub mod effect_presentation;

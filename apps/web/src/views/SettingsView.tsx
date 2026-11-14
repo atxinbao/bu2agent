@@ -16,6 +16,10 @@ import type {
   Policy,
 } from "../domain/permission_policy_client";
 import type { InvokePermissionPolicyClient } from "../domain/invoke_permission_policy_client";
+import type {
+  PoliciesGateway,
+  PolicyVersionRow,
+} from "../domain/policies_client";
 import type { ModelState } from "../domain/model_client";
 import type { InvokeModelClient } from "../domain/invoke_model_client";
 import type { InvokeVoiceClient } from "../domain/invoke_voice_client";
@@ -51,6 +55,12 @@ interface SettingsViewProps {
   settings: InvokeSettingsClient;
   vault: InvokeCredentialVaultClient;
   policy: InvokePermissionPolicyClient;
+  // FU-3C (Q-R0-01): policy versions client for the versions
+  // list in the policy section below. Transport-neutral
+  // gateway interface, like the other domain clients; App.tsx
+  // passes the invoke client, matching this page's invoke-only
+  // construction for the rest of its props.
+  policies: PoliciesGateway;
   model: InvokeModelClient;
   config: InvokeConfigClient;
   chatRecords: InvokeChatRecordsClient;
@@ -87,6 +97,7 @@ export function SettingsView({
   settings,
   vault,
   policy,
+  policies,
   model,
   config,
   chatRecords,
@@ -135,6 +146,12 @@ export function SettingsView({
   const [snoozeMs, setSnoozeMs] = useState("");
   const [pendingPolicyReset, setPendingPolicyReset] = useState(false);
   const [pendingRevokeAll, setPendingRevokeAll] = useState(false);
+  // Policy versions (FU-3C, Q-R0-01). Read-only list from
+  // GET /policies/versions (SQLite only); expanding a row
+  // shows the full version document. Loaded with the rest of
+  // the page state; the existing switches above are untouched.
+  const [policyVersions, setPolicyVersions] = useState<PolicyVersionRow[] | null>(null);
+  const [expandedVersionId, setExpandedVersionId] = useState<string | null>(null);
   // Model section (Task 12). POST stages a selection that
   // takes effect only after a gateway restart; the key is
   // never shown or edited here (Settings key management above
@@ -187,6 +204,14 @@ export function SettingsView({
       setPolicyDoc(await policy.getPolicy());
     } catch {
       setPolicyDoc(null);
+    }
+  }
+
+  async function refreshPolicyVersions() {
+    try {
+      setPolicyVersions(await policies.listVersions());
+    } catch {
+      setPolicyVersions(null);
     }
   }
 
@@ -263,6 +288,7 @@ export function SettingsView({
       }
       await refreshVault();
       await refreshPolicy();
+      await refreshPolicyVersions();
       await refreshModel();
       await refreshConfig();
       await refreshTheme();
@@ -1430,6 +1456,45 @@ export function SettingsView({
             )}
           </div>
         </div>
+      )}
+
+      <h4>策略版本</h4>
+      <p className="note">
+        只读：策略版本由网关写入、旧版本永不删除；当前版本即 version 最大的一行。
+        点一行展开查看该版本的完整策略文档（document_json）。
+      </p>
+      {policyVersions === null ? (
+        <p className="empty">策略版本未知（状态查询失败）。</p>
+      ) : policyVersions.length === 0 ? (
+        <p className="empty">暂无策略版本。</p>
+      ) : (
+        <ul>
+          {policyVersions.map((row) => {
+            const expanded = expandedVersionId === row.versionId;
+            return (
+              <li key={row.versionId}>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setExpandedVersionId(expanded ? null : row.versionId)
+                  }
+                  disabled={busy}
+                >
+                  v{row.version} · {row.versionId} · 摘要 {row.digest}
+                  {` · ${new Date(row.createdMs).toLocaleString()}`}
+                  {row.supersedes ? ` · 取代 ${row.supersedes}` : ""}
+                </button>
+                {expanded && (
+                  <div>
+                    <p>来源设备：{row.originDeviceId}</p>
+                    <p>策略文档：</p>
+                    <pre className="result">{row.documentJson}</pre>
+                  </div>
+                )}
+              </li>
+            );
+          })}
+        </ul>
       )}
 
       <h3>模型（Model）</h3>

@@ -31,6 +31,8 @@ import type {
 } from "../domain/executions_client";
 import type { EvidenceRow } from "../domain/evidence_client";
 import type { AssignmentsGateway } from "../domain/assignments_client";
+import type { MandatesGateway } from "../domain/mandates_client";
+import { MandatesSection } from "./MandatesSection";
 
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -136,6 +138,10 @@ export interface ExecutionDetailProps {
   effectsClient?: EffectsGateway | null;
   executionsClient?: ExecutionsGateway | null;
   assignmentsClient?: AssignmentsGateway | null;
+  // FU-3C (Q-R0-01): mandates client, threaded from the parent
+  // like effects/evidence. Optional, same as the other clients:
+  // until App.tsx passes it the section below says so.
+  mandatesClient?: MandatesGateway | null;
   showActions?: boolean;
   onRefresh?: () => void;
   onError?: (message: string) => void;
@@ -155,6 +161,7 @@ export function ExecutionDetail(props: ExecutionDetailProps) {
     effectsClient,
     executionsClient,
     assignmentsClient,
+    mandatesClient = null,
     showActions = true,
     onRefresh,
     onError,
@@ -278,6 +285,7 @@ export function ExecutionDetail(props: ExecutionDetailProps) {
           </li>
         ))}
       </ul>
+      <MandatesSection mandates={mandatesClient} executionId={execution.executionId} />
     </div>
   );
 }

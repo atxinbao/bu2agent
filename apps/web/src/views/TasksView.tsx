@@ -18,7 +18,9 @@ import type {
   ExecutionRecord,
   ExecutionsGateway,
 } from "../domain/executions_client";
+import type { MandatesGateway } from "../domain/mandates_client";
 import { ExecutionDetail } from "./ExecutionDetail";
+import { MandatesSection } from "./MandatesSection";
 
 // Tasks view: the deterministic task loop, driven step by step
 // from the frontend (see the task-loop design doc). No model
@@ -53,6 +55,11 @@ interface TasksViewProps {
   effects?: EffectsGateway | null;
   evidence?: EvidenceGateway | null;
   assignments?: AssignmentsGateway | null;
+  // FU-3C (Q-R0-01): mandates client for the task-level
+  // "授权范围" section below and for ExecutionDetail. Optional,
+  // same as the other clients: until App.tsx passes it the
+  // sections below say so.
+  mandates?: MandatesGateway | null;
   // Settings page's default working directory (root-relative,
   // "" = file root). Only the initial directory for a new
   // task and its default artifact path; an explicitly typed
@@ -82,6 +89,7 @@ export function TasksView({
   effects: effectsClient = null,
   evidence: evidenceClient = null,
   assignments: assignmentsClient = null,
+  mandates: mandatesClient = null,
   defaultDir = "",
   defaultDirValid = true,
 }: TasksViewProps) {
@@ -621,12 +629,14 @@ export function TasksView({
                   effectsClient={effectsClient}
                   executionsClient={executionsClient}
                   assignmentsClient={assignmentsClient}
+                  mandatesClient={mandatesClient}
                   onRefresh={() => void refreshExecutionData(current.taskId)}
                   onError={(message) => setExecError(message)}
                 />
               ))}
             </div>
           )}
+          <MandatesSection mandates={mandatesClient} taskId={current.taskId} />
         </div>
       )}
       {artifactContent !== "" && (

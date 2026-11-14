@@ -31,6 +31,7 @@ import type {
   ApprovalsGateway,
 } from "../domain/approvals_client";
 import type { OutboxGateway, OutboxRow } from "../domain/outbox_client";
+import type { MandatesGateway } from "../domain/mandates_client";
 import { ExecutionDetail } from "./ExecutionDetail";
 
 // Workbench (Round 3, 3a+3b): one list on the left, a timeline in
@@ -114,6 +115,7 @@ export interface WorkbenchViewProps {
   inbox?: InboxGateway | null;
   approvals?: ApprovalsGateway | null;
   outbox?: OutboxGateway | null;
+  mandates?: MandatesGateway | null;
   executions?: ExecutionsGateway | null;
   effects?: EffectsGateway | null;
   evidence?: EvidenceGateway | null;
@@ -125,6 +127,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
   const inboxClient = props.inbox ?? null;
   const approvalsClient = props.approvals ?? null;
   const outboxClient = props.outbox ?? null;
+  const mandatesClient = props.mandates ?? null;
   const executionsClient = props.executions ?? null;
   const effectsClient = props.effects ?? null;
   const evidenceClient = props.evidence ?? null;
@@ -1334,6 +1337,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
                         effectsClient={effectsClient}
                         executionsClient={executionsClient}
                         assignmentsClient={assignmentsClient}
+                        mandatesClient={mandatesClient}
                         onRefresh={() => void refreshInbox()}
                         onError={(message) => setInboxError(message)}
                       />

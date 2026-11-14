@@ -1796,6 +1796,8 @@ use agent_desktop::executions_client::{ExecutionRecord, ExecutionsClient};
 use agent_desktop::inbox_client::{InboxClient, InboxRow};
 use agent_desktop::approvals_client::{ApprovalView, ApprovalsClient, EditableMessage};
 use agent_desktop::outbox_client::{OutboxClient, OutboxRow};
+use agent_desktop::policies_client::{PoliciesClient, PolicyVersionRow};
+use agent_desktop::mandates_client::{MandateRow, MandatesClient};
 use agent_desktop::assignments_client::{AssignmentRow, AssignmentsClient, TakeoverOutcome};
 use agent_desktop::evidence_client::{EvidenceClient, EvidenceRow};
 
@@ -1817,6 +1819,14 @@ fn approvals_client() -> Result<ApprovalsClient, String> {
 
 fn outbox_client() -> Result<OutboxClient, String> {
     OutboxClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+fn policies_client() -> Result<PoliciesClient, String> {
+    PoliciesClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+fn mandates_client() -> Result<MandatesClient, String> {
+    MandatesClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
 }
 
 fn assignments_client() -> Result<AssignmentsClient, String> {
@@ -1927,6 +1937,26 @@ pub fn outbox_deliver(outbox_id: String) -> Result<OutboxRow, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn outbox_requeue(outbox_id: String) -> Result<OutboxRow, String> {
     outbox_client()?.requeue(&outbox_id).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn policies_versions_list() -> Result<Vec<PolicyVersionRow>, String> {
+    policies_client()?.list_versions().map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn mandates_list(
+    task_id: Option<String>,
+    execution_id: Option<String>,
+) -> Result<Vec<MandateRow>, String> {
+    mandates_client()?
+        .list(task_id.as_deref(), execution_id.as_deref())
+        .map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn mandates_get(mandate_id: String) -> Result<MandateRow, String> {
+    mandates_client()?.get(&mandate_id).map_err(|e| err_string(&e))
 }
 
 #[tauri::command(rename_all = "snake_case")]

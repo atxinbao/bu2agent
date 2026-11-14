@@ -102,6 +102,16 @@ import {
 } from "./domain/outbox_client";
 import { InvokeOutboxClient } from "./domain/invoke_outbox_client";
 import {
+  PoliciesClient,
+  type PoliciesGateway,
+} from "./domain/policies_client";
+import { InvokePoliciesClient } from "./domain/invoke_policies_client";
+import {
+  MandatesClient,
+  type MandatesGateway,
+} from "./domain/mandates_client";
+import { InvokeMandatesClient } from "./domain/invoke_mandates_client";
+import {
   AssignmentsClient,
   type AssignmentsGateway,
 } from "./domain/assignments_client";
@@ -190,6 +200,8 @@ interface Clients {
   inbox: InboxGateway;
   approvals: ApprovalsGateway;
   outbox: OutboxGateway;
+  policies: PoliciesGateway;
+  mandates: MandatesGateway;
   assignments: AssignmentsGateway;
   evidence: EvidenceGateway;
   engineering: EngineeringGateway;
@@ -298,6 +310,8 @@ export function App() {
           inbox: new InvokeInboxClient(),
           approvals: new InvokeApprovalsClient(),
           outbox: new InvokeOutboxClient(),
+          policies: new InvokePoliciesClient(),
+          mandates: new InvokeMandatesClient(),
           assignments: new InvokeAssignmentsClient(),
           evidence: new InvokeEvidenceClient(),
           engineering: new InvokeEngineeringClient(),
@@ -334,6 +348,8 @@ export function App() {
           inbox: new InboxClient(MOCK_BASE_URL),
           approvals: new ApprovalsClient(MOCK_BASE_URL),
           outbox: new OutboxClient(MOCK_BASE_URL),
+          policies: new PoliciesClient(MOCK_BASE_URL),
+          mandates: new MandatesClient(MOCK_BASE_URL),
           assignments: new AssignmentsClient(MOCK_BASE_URL),
           evidence: new EvidenceClient(MOCK_BASE_URL),
           engineering: new EngineeringClient(MOCK_BASE_URL),
@@ -607,6 +623,7 @@ export function App() {
             inbox={clients.inbox}
             approvals={clients.approvals}
             outbox={clients.outbox}
+            mandates={clients.mandates}
             executions={clients.executions}
             effects={clients.effects}
             evidence={clients.evidence}
@@ -717,6 +734,7 @@ export function App() {
             effects={clients.effects}
             evidence={clients.evidence}
             assignments={clients.assignments}
+            mandates={clients.mandates}
             defaultDir={defaultDir ?? ""}
             defaultDirValid={defaultDirValid}
           />
@@ -739,6 +757,7 @@ export function App() {
           settings={new InvokeSettingsClient()}
           vault={new InvokeCredentialVaultClient()}
           policy={new InvokePermissionPolicyClient()}
+          policies={new InvokePoliciesClient()}
           model={new InvokeModelClient()}
           config={new InvokeConfigClient()}
           chatRecords={new InvokeChatRecordsClient()}
