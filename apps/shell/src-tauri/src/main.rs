@@ -166,6 +166,7 @@ fn main() {
             tool_commands::source_list,
             tool_commands::source_get,
             tool_commands::source_disconnect,
+            tool_commands::source_reconnect,
             tool_commands::memory_save,
             tool_commands::memory_list,
             tool_commands::memory_get,

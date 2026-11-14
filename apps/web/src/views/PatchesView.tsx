@@ -498,6 +498,15 @@ export function PatchesView({
                           重试应用
                         </button>
                       )}
+                      {file.status === "applied" && (
+                        <button
+                          type="button"
+                          onClick={() => void handleApproveAndApply(file)}
+                          disabled={busy}
+                        >
+                          再次应用
+                        </button>
+                      )}
                       {effectsClient && (
                         <p>
                           Effect：

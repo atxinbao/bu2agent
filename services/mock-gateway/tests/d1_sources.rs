@@ -8,10 +8,12 @@
 //! HTTP routes only, plus `sqlite_store` reads and the
 //! pub store seams (`reconnect_source`,
 //! `fold_matches_tables`) where HTTP cannot reach the
-//! state (there is no HTTP reconnect route in this batch
-//! — only disconnect — and the 10 s sweeper tick is not
-//! the files-watcher). No loops are started, so the model
-//! never gets a call.
+//! state (the 10 s sweeper tick is not the
+//! files-watcher). The HTTP reconnect route
+//! (`POST /sources/{id}/reconnect`, S2b) is the tails
+//! follow-up to D1-4 — D1-4 itself shipped disconnect
+//! only. No loops are started, so the model never gets
+//! a call.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -395,8 +397,8 @@ async fn test_s2_disconnect_flag_flip_only() {
     // Unknown id 404s.
     let (status, _) = h.post("/sources/no-such-source/disconnect", json!({})).await;
     assert_eq!(status, 404);
-    // Reconnect (store-level: no HTTP reconnect route in
-    // this batch) restores the flag.
+    // Reconnect (store-level seam; the HTTP route is
+    // covered by S2b below) restores the flag.
     let mut conn = h.db();
     let restored = sqlite_store::reconnect_source(&mut conn, "device-reminders", "test")
         .unwrap()
@@ -404,6 +406,55 @@ async fn test_s2_disconnect_flag_flip_only() {
     assert_eq!(restored.status, "active");
     let row = h.ok_get("/sources/device-reminders").await;
     assert_eq!(row["status"], "active");
+    assert!(
+        sqlite_store::fold_matches_tables(&conn).unwrap(),
+        "fold must hold after disconnect + reconnect"
+    );
+}
+
+/// S2b (tails): the HTTP reconnect route restores a
+/// disconnected source — the mirror of S2's disconnect.
+/// Reconnect flips the flag + appends one
+/// `source.registered` event; re-reconnect is a 200
+/// no-op (no second event); unknown id 404s; the fold
+/// holds. This is the route the 6b R2 steps had been
+/// working around with direct sqlite3.
+#[tokio::test]
+async fn test_s2b_reconnect_http_route() {
+    let h = Harness::serve(vec![]).await;
+    // Disconnect first (S2's route), then reconnect.
+    let disconnected = h
+        .ok("/sources/device-reminders/disconnect", json!({}))
+        .await;
+    assert_eq!(disconnected["status"], "disconnected");
+    let conn = h.db();
+    let events = sqlite_store::list_events_for(&conn, "source", "device-reminders").unwrap();
+    assert_eq!(events.len(), 2, "registered + disconnected: {events:?}");
+    // Reconnect via HTTP restores the flag + one event.
+    let reconnected = h
+        .ok("/sources/device-reminders/reconnect", json!({}))
+        .await;
+    assert_eq!(reconnected["status"], "active");
+    assert_eq!(reconnected["source_id"], "device-reminders");
+    let row = h.ok_get("/sources/device-reminders").await;
+    assert_eq!(row["status"], "active");
+    let events = sqlite_store::list_events_for(&conn, "source", "device-reminders").unwrap();
+    assert_eq!(
+        events.len(),
+        3,
+        "registered + disconnected + registered: {events:?}"
+    );
+    assert_eq!(events.last().unwrap().event_type, "source.registered");
+    // Re-reconnect is a 200 no-op (no second event).
+    let again = h
+        .ok("/sources/device-reminders/reconnect", json!({}))
+        .await;
+    assert_eq!(again["status"], "active");
+    let events = sqlite_store::list_events_for(&conn, "source", "device-reminders").unwrap();
+    assert_eq!(events.len(), 3, "re-reconnect must not append an event");
+    // Unknown id 404s.
+    let (status, _) = h.post("/sources/no-such-source/reconnect", json!({})).await;
+    assert_eq!(status, 404);
     assert!(
         sqlite_store::fold_matches_tables(&conn).unwrap(),
         "fold must hold after disconnect + reconnect"

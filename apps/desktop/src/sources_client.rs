@@ -1,5 +1,6 @@
 //! Source client: Rust shell -> Mock Gateway sources surface
-//! (D1-4, minimal list/detail/disconnect).
+//! (D1-4, minimal list/detail/disconnect; tails adds
+//! reconnect, the mirror of disconnect).
 //!
 //! Mirrors the goal client: no approval loop (local
 //! metadata records, like the other management surfaces),
@@ -59,5 +60,14 @@ impl SourceClient {
         Ok(self
             .http
             .post_json(&format!("/sources/{source_id}/disconnect"), "{}")?)
+    }
+
+    pub fn reconnect_source(
+        &self,
+        source_id: &str,
+    ) -> std::result::Result<Source, AgentError> {
+        Ok(self
+            .http
+            .post_json(&format!("/sources/{source_id}/reconnect"), "{}")?)
     }
 }

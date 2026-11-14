@@ -50,4 +50,10 @@ export class InvokeSourceClient implements SourceGateway {
       await invoke<ServerSource>("source_disconnect", { source_id: sourceId }),
     );
   }
+
+  async reconnectSource(sourceId: string): Promise<Source> {
+    return toSource(
+      await invoke<ServerSource>("source_reconnect", { source_id: sourceId }),
+    );
+  }
 }

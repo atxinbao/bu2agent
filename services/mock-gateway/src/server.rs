@@ -1996,12 +1996,11 @@ impl AppState {
     /// in-memory map to resume; the file is a derived audit
     /// copy, regenerated at every Evidence write point, and the
     /// export route reads SQLite directly. Production reads
-    /// MOCK_EVIDENCE_PATH. The packaged-app shell
-    /// (`gateway_home.rs`) does not wire this variable yet — it
-    /// wires only the record files the app needs for restart
-    /// persistence — so until that follow-up lands, the file is
-    /// written only when the variable is set explicitly; no
-    /// behaviour is lost, because the route never reads the file.
+    /// MOCK_EVIDENCE_PATH, and the packaged-app shell
+    /// (`gateway_home.rs`) wires it (tails follow-up to
+    /// E2-C) so the file is written in the packaged app
+    /// too; no behaviour is lost either way, because the
+    /// route never reads the file.
     pub fn with_evidence_path(mut self, path: PathBuf) -> Self {
         self.evidence_path = Some(path);
         self
@@ -9400,6 +9399,49 @@ async fn sources_disconnect(
             Ok(None) => return unknown_record("source"),
             Err(detail) => {
                 eprintln!("warning: source disconnect failed ({detail})");
+                return sqlite_error_response();
+            }
+        }
+    };
+    // Refresh the read cache after the write (the lock
+    // above is released, so no lock-order inversion).
+    if let Ok(conn) = sqlite.lock() {
+        let _ = state.source_registry.load(&conn);
+    }
+    Json(record).into_response()
+}
+
+/// Reconnect a source (tails follow-up to D1-4): the
+/// mirror of `sources_disconnect` — the store-level
+/// `reconnect_source` flips `status` back to `active`
+/// and records a `source.registered` event in the same
+/// transaction. Re-connecting an already-active source
+/// is a 200 no-op (no rewrite, no second event), and an
+/// unknown id 404s — both are the store function's own
+/// rules, not a new rule invented here. Memories the
+/// disconnect cascade tombstoned stay tombstoned:
+/// reconnect restores the source, it does not resurrect
+/// history (red line 9).
+async fn sources_reconnect(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let record = {
+        let mut conn = sqlite.lock().expect("sqlite lock");
+        match sqlite_store::reconnect_source(&mut conn, &id, &state.origin_device_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => return unknown_record("source"),
+            Err(detail) => {
+                eprintln!("warning: source reconnect failed ({detail})");
                 return sqlite_error_response();
             }
         }
@@ -18931,8 +18973,8 @@ async fn evidence_get(
 /// reads: 500 without a configured SQLite database, 500 on a
 /// broken one. Generating live — rather than serving the file —
 /// keeps the export consistent with list/get even where the
-/// audit file is not wired (the packaged app does not set
-/// MOCK_EVIDENCE_PATH yet).
+/// audit file is not wired (the packaged app now sets
+/// MOCK_EVIDENCE_PATH via the shell, tails follow-up).
 async fn evidence_export(State(state): State<AppState>) -> impl IntoResponse {
     if state.sqlite_is_broken() {
         return sqlite_error_response();
@@ -20284,10 +20326,11 @@ pub fn app(state: AppState) -> Router {
         .route("/policies/versions", get(policies_versions_list))
         .route("/mandates", get(mandates_list))
         .route("/mandates/{id}", get(mandates_get))
-        // D1-4: sources (3 routes).
+        // D1-4: sources (3 routes) + tails reconnect (1 route).
         .route("/sources/list", get(sources_list))
         .route("/sources/{id}", get(sources_get))
         .route("/sources/{id}/disconnect", post(sources_disconnect))
+        .route("/sources/{id}/reconnect", post(sources_reconnect))
         .route("/locations/create", post(locations_create))
         .route("/locations/list", get(locations_list))
         .route("/locations/{id}", get(locations_get))

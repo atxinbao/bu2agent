@@ -800,6 +800,13 @@ pub fn source_disconnect(source_id: String) -> Result<Source, String> {
         .map_err(agent_err_string)
 }
 
+#[tauri::command(rename_all = "snake_case")]
+pub fn source_reconnect(source_id: String) -> Result<Source, String> {
+    source_client()?
+        .reconnect_source(&source_id)
+        .map_err(agent_err_string)
+}
+
 // --- Memories surface (D1-5, minimal save/list/detail/delete) ---
 //
 // All commands carry rename_all = "snake_case" (Task 9

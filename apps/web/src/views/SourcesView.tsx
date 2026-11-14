@@ -2,8 +2,8 @@ import { useEffect, useState } from "react";
 import type { Source, SourceGateway } from "../domain/sources_client";
 
 // Sources view over the SourceGateway interface (D1-4,
-// minimal list/detail/disconnect). A source is one
-// concrete instance — a connector account, a device
+// minimal list/detail/disconnect; tails adds reconnect).
+// A source is one concrete instance — a connector account, a device
 // backend, a mail source, a file root — never a
 // capability group. Disconnect flips only the row's
 // status flag: the source's history Effect/Inbox rows
@@ -116,6 +116,22 @@ export function SourcesView({ client }: { client: SourceGateway }) {
               }
             >
               Disconnect
+            </button>
+          )}
+          {selected.status === "disconnected" && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() =>
+                void run(
+                  async () => {
+                    setSelected(await client.reconnectSource(selected.sourceId));
+                  },
+                  "Source reconnected.",
+                )
+              }
+            >
+              Reconnect
             </button>
           )}
         </div>

@@ -1,5 +1,5 @@
 // Source client for the TS Domain Store (D1-4, minimal
-// list/detail/disconnect): list, get, disconnect.
+// list/detail/disconnect/reconnect): list, get, disconnect, reconnect.
 //
 // Same shape as the other domain clients: the gateway
 // returns snake_case; the domain shape is camelCase, so
@@ -59,6 +59,7 @@ export interface SourceGateway {
   listSources(): Promise<Source[]>;
   getSource(sourceId: string): Promise<Source>;
   disconnectSource(sourceId: string): Promise<Source>;
+  reconnectSource(sourceId: string): Promise<Source>;
 }
 
 const ALLOWED_HOSTS = ["127.0.0.1", "localhost"];
@@ -102,6 +103,12 @@ export class SourceClient implements SourceGateway {
   async disconnectSource(sourceId: string): Promise<Source> {
     return toSource(
       await this.request<ServerSource>("POST", `/sources/${sourceId}/disconnect`, {}),
+    );
+  }
+
+  async reconnectSource(sourceId: string): Promise<Source> {
+    return toSource(
+      await this.request<ServerSource>("POST", `/sources/${sourceId}/reconnect`, {}),
     );
   }
 }
