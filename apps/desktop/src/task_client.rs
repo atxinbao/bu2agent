@@ -11,6 +11,13 @@ use crate::http_client::{transport_error, HttpClient};
 use crate::Result;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskExecuteBinding {
+    pub location_id: String,
+    pub worktree_id: String,
+    pub root_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub task_id: String,
     pub directory: String,
@@ -25,6 +32,17 @@ pub struct TaskRecord {
     pub draft_sha256: Option<String>,
     #[serde(default)]
     pub draft_bytes: Option<u64>,
+    /// D1-1 link fields (FU-2, Q-R0-03): the gateway has carried these
+    /// since D1-1, but the desktop record silently dropped them
+    /// (serde tolerates unknown fields). Manual tasks carry None.
+    #[serde(default)]
+    pub execute_binding: Option<TaskExecuteBinding>,
+    #[serde(default)]
+    pub goal_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 /// A gateway-run task's draft, fetched separately: the record
@@ -128,5 +146,47 @@ impl TaskClient {
         let body = serde_json::to_string(&TaskIdRequest { task_id: task_id.to_string() })
             .map_err(|_| transport_error("cannot encode task id request"))?;
         self.http.post_json(path, &body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // FU-2 (Q-R0-03): the gateway has emitted all 12 fields since D1-1;
+    // the desktop record used to drop the last four silently.
+    const FULL_JSON: &str = r#"{
+        "task_id": "task-1", "directory": "/tmp/x", "artifact_path": null,
+        "status": "created", "error": null, "approval_id": null,
+        "draft_sha256": null, "draft_bytes": null,
+        "execute_binding": {"location_id": "loc-1", "worktree_id": "wt-a", "root_digest": "abc"},
+        "goal_id": "goal-1", "project_id": "proj-1", "workspace_id": "ws-1"
+    }"#;
+
+    const LEGACY_JSON: &str = r#"{
+        "task_id": "task-1", "directory": "/tmp/x", "artifact_path": null,
+        "status": "created", "error": null, "approval_id": null,
+        "draft_sha256": null, "draft_bytes": null
+    }"#;
+
+    #[test]
+    fn task_record_decodes_all_twelve_fields() {
+        let record: TaskRecord = serde_json::from_str(FULL_JSON).expect("full record");
+        let binding = record.execute_binding.as_ref().expect("binding present");
+        assert_eq!(binding.location_id, "loc-1");
+        assert_eq!(binding.worktree_id, "wt-a");
+        assert_eq!(binding.root_digest, "abc");
+        assert_eq!(record.goal_id.as_deref(), Some("goal-1"));
+        assert_eq!(record.project_id.as_deref(), Some("proj-1"));
+        assert_eq!(record.workspace_id.as_deref(), Some("ws-1"));
+    }
+
+    #[test]
+    fn task_record_legacy_eight_fields_default_to_none() {
+        let record: TaskRecord = serde_json::from_str(LEGACY_JSON).expect("legacy record");
+        assert_eq!(record.execute_binding, None);
+        assert_eq!(record.goal_id, None);
+        assert_eq!(record.project_id, None);
+        assert_eq!(record.workspace_id, None);
     }
 }

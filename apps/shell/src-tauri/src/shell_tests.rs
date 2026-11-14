@@ -331,6 +331,13 @@ fn task_commands_roundtrip() {
     assert!(task.task_id.starts_with("task-"), "task id: {}", task.task_id);
     assert_eq!(task.status, "created");
     assert_eq!(task.artifact_path, None);
+    // FU-2 (Q-R0-03): explicit field assertions — the whole-JSON
+    // equality assertions below are blind to symmetric truncation
+    // (both sides drop the same fields and still compare equal).
+    assert_eq!(task.execute_binding, None);
+    assert_eq!(task.goal_id, None);
+    assert_eq!(task.project_id, None);
+    assert_eq!(task.workspace_id, None);
     let tasks = task_list().expect("list tasks");
     assert!(tasks.iter().any(|t| t.task_id == task.task_id));
     let fetched = task_get(task.task_id.clone()).expect("get task");

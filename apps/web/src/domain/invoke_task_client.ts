@@ -3,6 +3,12 @@ import type { TaskDraft, TaskGateway, TaskRecord } from "./task_client";
 
 // The Rust task record serializes snake_case; the domain shape
 // is camelCase, so the mapping lives here, not in the view.
+interface ServerTaskExecuteBinding {
+  location_id: string;
+  worktree_id: string;
+  root_digest: string;
+}
+
 interface ServerTaskRecord {
   task_id: string;
   directory: string;
@@ -12,6 +18,10 @@ interface ServerTaskRecord {
   approval_id: string | null;
   draft_sha256: string | null;
   draft_bytes: number | null;
+  execute_binding: ServerTaskExecuteBinding | null;
+  goal_id: string | null;
+  project_id: string | null;
+  workspace_id: string | null;
 }
 
 interface ServerTaskDraft {
@@ -31,6 +41,16 @@ function toRecord(server: ServerTaskRecord): TaskRecord {
     approvalId: server.approval_id,
     draftSha256: server.draft_sha256,
     draftBytes: server.draft_bytes,
+    executeBinding: server.execute_binding
+      ? {
+          locationId: server.execute_binding.location_id,
+          worktreeId: server.execute_binding.worktree_id,
+          rootDigest: server.execute_binding.root_digest,
+        }
+      : null,
+    goalId: server.goal_id,
+    projectId: server.project_id,
+    workspaceId: server.workspace_id,
   };
 }
 

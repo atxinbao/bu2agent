@@ -535,6 +535,11 @@ export function TasksView({
             当前任务：{current.taskId} · 目录 {current.directory || "（根）"} ·
             状态 {current.status}
             {current.artifactPath ? ` · 产物 ${current.artifactPath}` : ""}
+            {current.goalId ? ` · 目标 ${current.goalId}` : ""}
+            {current.projectId ? ` · 项目 ${current.projectId}` : ""}
+            {current.executeBinding
+              ? ` · 冻结绑定 ${current.executeBinding.worktreeId}`
+              : ""}
           </p>
           {current.status === "failed" && current.error && (
             <p>失败原因：{current.error}</p>

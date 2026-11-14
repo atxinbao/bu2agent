@@ -1010,6 +1010,11 @@ export function WorkbenchView(props: WorkbenchViewProps) {
               <p>
                 状态：{taskLabels[taskDetail.status] ?? taskDetail.status} · 目录：
                 {taskDetail.directory || "文件根"}
+                {taskDetail.goalId ? ` · 目标 ${taskDetail.goalId}` : ""}
+                {taskDetail.projectId ? ` · 项目 ${taskDetail.projectId}` : ""}
+                {taskDetail.executeBinding
+                  ? ` · 冻结绑定 ${taskDetail.executeBinding.worktreeId}`
+                  : ""}
               </p>
               {taskDetail.status === "failed" && taskDetail.error && (
                 <p className="error">失败原因：{taskDetail.error}</p>

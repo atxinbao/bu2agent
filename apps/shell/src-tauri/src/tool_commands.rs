@@ -69,7 +69,7 @@ use agent_desktop::voice_client::{
     PipelineSelection, VoiceClient,
 };
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
-use agent_desktop::task_client::{TaskClient, TaskRecord};
+use agent_desktop::task_client::{TaskClient, TaskExecuteBinding, TaskRecord};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
 use agent_desktop::{ErrorCode, UnifiedError, UserAction};
 
@@ -917,6 +917,12 @@ pub struct TaskOut {
     pub approval_id: Option<String>,
     pub draft_sha256: Option<String>,
     pub draft_bytes: Option<u64>,
+    /// FU-2 (Q-R0-03): D1-1 link fields, previously dropped here too —
+    /// the shell is the second silent truncation on the invoke path.
+    pub execute_binding: Option<TaskExecuteBinding>,
+    pub goal_id: Option<String>,
+    pub project_id: Option<String>,
+    pub workspace_id: Option<String>,
 }
 
 impl From<TaskRecord> for TaskOut {
@@ -930,6 +936,10 @@ impl From<TaskRecord> for TaskOut {
             approval_id: value.approval_id,
             draft_sha256: value.draft_sha256,
             draft_bytes: value.draft_bytes,
+            execute_binding: value.execute_binding,
+            goal_id: value.goal_id,
+            project_id: value.project_id,
+            workspace_id: value.workspace_id,
         }
     }
 }
