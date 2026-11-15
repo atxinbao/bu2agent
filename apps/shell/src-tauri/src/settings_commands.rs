@@ -215,3 +215,15 @@ pub fn device_authorization() -> Result<String, String> {
     let client = DeviceClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))?;
     client.authorization().map_err(|e| err_string(&e))
 }
+
+/// Ask the system for Reminders authorization (FU-3E, Q-R0-01 #16).
+/// The UI button lives in the Devices view, not Settings; the
+/// command lives here next to the read-only status command.
+/// The gateway may block up to 30 s while the OS prompt waits for
+/// an answer, so the view must show a pending state meanwhile.
+/// Returns the resulting status string; writes no reminder.
+#[tauri::command]
+pub fn device_authorization_request() -> Result<String, String> {
+    let client = DeviceClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))?;
+    client.request_authorization().map_err(|e| err_string(&e))
+}

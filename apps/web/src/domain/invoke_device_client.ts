@@ -93,4 +93,12 @@ export class InvokeDeviceClient implements DeviceGateway {
     });
     return toRecord(record);
   }
+
+  async authorization(): Promise<string> {
+    return invoke<string>("device_authorization");
+  }
+
+  async requestAuthorization(): Promise<string> {
+    return invoke<string>("device_authorization_request");
+  }
 }

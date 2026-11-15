@@ -55,6 +55,15 @@ export function DevicesView({
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // FU-3E (Q-R0-01 #16): Reminders authorization. Read on mount;
+  // the request button shows only while the status is not
+  // authorized. The request may block up to 30 s on the OS
+  // prompt, so it has its own pending state (authBusy) and does
+  // not reuse the shared `busy` flag.
+  const [authStatus, setAuthStatus] = useState<string | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authMessage, setAuthMessage] = useState("");
+  const [authError, setAuthError] = useState("");
   // Nodes section (Task 19): the node registry lives on
   // the Devices tab (concept-adjacent, no new tab). Unpair
   // is a tombstone: the record stays in nodes.jsonl but
@@ -187,6 +196,37 @@ export function DevicesView({
     }
   }
 
+  function authStatusLabel(status: string): string {
+    if (status === "authorized") return "已授权";
+    if (status === "not_determined") return "未决定";
+    if (status === "denied") return "已拒绝";
+    return status;
+  }
+
+  async function refreshAuthorization() {
+    setAuthError("");
+    try {
+      setAuthStatus(await devices.authorization());
+    } catch (e) {
+      setAuthError(`授权状态读取失败：${errText(e)}`);
+    }
+  }
+
+  async function handleRequestAuthorization() {
+    setAuthError("");
+    setAuthMessage("");
+    setAuthBusy(true);
+    try {
+      const status = await devices.requestAuthorization();
+      setAuthStatus(status);
+      setAuthMessage(`授权状态：${authStatusLabel(status)}。`);
+    } catch (e) {
+      setAuthError(`请求授权失败：${errText(e)}`);
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
   function confirmedMessage(action: DeviceActionRecord, latest: DeviceReminder[] | null) {
     // 动作记录与此刻查询分开表述，避免把旧记录或查询失败说成最新状态确认。
     if (latest === null) return "动作记录为完成，但当前提醒查询失败，状态尚未核对。";
@@ -209,6 +249,7 @@ export function DevicesView({
     void refreshReminders();
     void refreshActions();
     void refreshEffectRows();
+    void refreshAuthorization();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -346,6 +387,25 @@ export function DevicesView({
         单设备验证：选提醒 → 创建动作 → 审批后执行 → 重查确认。
         默认后端是 Fake，含一条演示提醒 reminder-demo；真实提醒写入待 EventKit 验证，本视图不创建真实提醒。
       </p>
+      <div>
+        <p>
+          提醒事项授权：
+          {authStatus === null ? "读取中…" : authStatusLabel(authStatus)}
+        </p>
+        {authStatus !== null && authStatus !== "authorized" && (
+          <button
+            onClick={() => void handleRequestAuthorization()}
+            disabled={authBusy}
+          >
+            {authBusy ? "请求中…" : "请求提醒事项授权"}
+          </button>
+        )}
+        {authBusy && (
+          <p>正在请求系统授权（系统提示最长等待 30 秒），请勿重复点击。</p>
+        )}
+        {authMessage !== "" && <p>{authMessage}</p>}
+        {authError !== "" && <p>错误：{authError}</p>}
+      </div>
       <div>
         <button onClick={() => void refreshReminders()} disabled={busy}>
           列出提醒

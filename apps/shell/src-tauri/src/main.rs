@@ -298,6 +298,7 @@ fn main() {
             settings_commands::settings_key_save,
             settings_commands::settings_key_remove,
             settings_commands::device_authorization,
+            settings_commands::device_authorization_request,
             tool_commands::effect_list,
             tool_commands::effect_get,
             tool_commands::effect_reconcile,

@@ -77,6 +77,12 @@ export interface DeviceGateway {
   refreshAction(actionId: string): Promise<DeviceActionRecord>;
   listActions(): Promise<DeviceActionRecord[]>;
   getAction(actionId: string): Promise<DeviceActionRecord>;
+  // FU-3E (Q-R0-01 #16): Reminders authorization state.
+  // authorization() reads it; requestAuthorization() asks the
+  // system (OS prompt only when NotDetermined) and returns the
+  // resulting status. Neither writes a reminder.
+  authorization(): Promise<string>;
+  requestAuthorization(): Promise<string>;
 }
 
 export class DeviceClient implements DeviceGateway {
@@ -175,5 +181,20 @@ export class DeviceClient implements DeviceGateway {
       `/devices/actions/get?action_id=${actionId}`,
     );
     return toRecord(record);
+  }
+
+  async authorization(): Promise<string> {
+    const dto = await this.request<{ status: string }>(
+      "/devices/authorization",
+    );
+    return dto.status;
+  }
+
+  async requestAuthorization(): Promise<string> {
+    const dto = await this.request<{ status: string }>(
+      "/devices/authorization/request",
+      { method: "POST" },
+    );
+    return dto.status;
   }
 }

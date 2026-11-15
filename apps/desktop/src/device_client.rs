@@ -2,7 +2,8 @@
 //!
 //! Device records only: list reminders, create an action, execute a
 //! set, record a rejection, refresh an unknown action, list/get
-//! actions. The frontend drives these step by step; the gateway
+//! actions, read the Reminders authorization status and request it
+//! (FU-3E, Q-R0-01 #16). The frontend drives these step by step; the gateway
 //! stores the records (see server.rs). Localhost only, no TLS,
 //! Mock only -- same transport rules as the other desktop clients.
 
@@ -57,15 +58,28 @@ struct AuthorizationStatusDto {
     status: String,
 }
 
+/// The gateway's authorization request may block up to 30 s while
+/// the OS prompt waits for an answer, so it gets a longer timeout
+/// than the shared 10 s client (EmailClient's 120 s sync client
+/// is the same precedent).
+const AUTHORIZATION_REQUEST_TIMEOUT_MS: u64 = 60_000;
+
 /// `base_url` must look like `http://127.0.0.1:3001`.
 #[derive(Debug, Clone)]
 pub struct DeviceClient {
     http: HttpClient,
+    request_http: HttpClient,
 }
 
 impl DeviceClient {
     pub fn new(base_url: &str) -> Result<Self> {
-        Ok(Self { http: HttpClient::new(base_url)? })
+        Ok(Self {
+            http: HttpClient::new(base_url)?,
+            request_http: HttpClient::with_timeout(
+                base_url,
+                AUTHORIZATION_REQUEST_TIMEOUT_MS,
+            )?,
+        })
     }
 
     pub fn list_reminders(&self) -> Result<Vec<DeviceReminder>> {
@@ -76,6 +90,17 @@ impl DeviceClient {
     /// reports it: "authorized" | "denied" | "not_determined".
     pub fn authorization(&self) -> Result<String> {
         let dto: AuthorizationStatusDto = self.http.get_json("/devices/authorization")?;
+        Ok(dto.status)
+    }
+
+    /// Ask the system for Reminders authorization and report the
+    /// resulting status. Only a `NotDetermined` backend shows the
+    /// OS prompt; it writes no reminder. Uses the long-timeout
+    /// client: the gateway may block up to 30 s for the answer.
+    pub fn request_authorization(&self) -> Result<String> {
+        let dto: AuthorizationStatusDto = self
+            .request_http
+            .post_json("/devices/authorization/request", "{}")?;
         Ok(dto.status)
     }
 

@@ -720,6 +720,21 @@ fn device_authorization_roundtrip() {
     );
 }
 
+/// FU-3E: the authorization *request* command, same gateway.
+/// The Fake backend answers immediately with its current
+/// status (no OS prompt in tests); only enum membership is
+/// asserted, as above.
+#[test]
+fn device_authorization_request_roundtrip() {
+    use crate::settings_commands::device_authorization_request;
+    crate::gateway_endpoint::reset_base_url();
+    let status = device_authorization_request().expect("authorization request");
+    assert!(
+        ["authorized", "denied", "not_determined"].contains(&status.as_str()),
+        "unexpected status: {status}"
+    );
+}
+
 /// 会话命令通过真实 IPC 验证字段命名、DTO、隔离与删除；使用回归服务的假模型。
 #[test]
 fn session_workflow_invoke_roundtrip() {
