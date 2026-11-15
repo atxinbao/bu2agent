@@ -21,6 +21,8 @@ pub mod loop_store;
 pub mod deepseek;
 pub mod deepseek_loop;
 pub mod server;
+pub mod routes_common;
+pub mod routes_misc;
 pub mod task_store;
 pub mod task_runner;
 pub mod execution_store;
