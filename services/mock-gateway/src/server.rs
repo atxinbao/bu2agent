@@ -15,7 +15,6 @@
 //! - GET  /approvals/{id}        -> one approval record
 //! - GET  /approvals/{id}/editable-message -> message + whether it may be edited
 //! - POST /approvals/{id}/edit-message     -> edit an unbound pending approval's message
-//! - POST /agent/tool/call       -> execute a tool, server re-checks its own approval record
 //!
 //! File scope: every file path is relative to one root (default
 //! `./mock-files`, overridable with MOCK_FILES_ROOT). Absolute
@@ -60,8 +59,8 @@ use crate::routes_files::FileEntryDto;
 use crate::routes_chat::StreamState;
 use crate::routes_connectors::{MockNote, MockMessage};
 use crate::loop_engine::{
-    loop_tool_requires_approval, ApprovalBinding, LoopEngine, LoopError, LoopModel, LoopStatus,
-    LoopTools, LoopView, Timeouts, ToolOutcome, ErrorCode,
+    loop_tool_requires_approval, ApprovalBinding, LoopEngine, LoopError, LoopModel,
+    LoopTools, Timeouts, ToolOutcome, ErrorCode,
 };
 use crate::device_backend::{
     execute_set, resolve_unknown, ExecuteOutcome, FakeReminderBackend,
@@ -3099,10 +3098,10 @@ struct ApprovalDecideDto {
 }
 
 #[derive(Debug, Deserialize)]
-struct ToolCallDto {
-    tool: String,
-    args: HashMap<String, String>,
-    tool_call_id: Option<String>,
+pub(crate) struct ToolCallDto {
+    pub(crate) tool: String,
+    pub(crate) args: HashMap<String, String>,
+    pub(crate) tool_call_id: Option<String>,
 }
 
 async fn approval_request(
@@ -3971,7 +3970,7 @@ pub(crate) fn decide_approval_rejected(state: &AppState, approval_id: &str) -> R
 
 /// Reverse of `parse_approval_status`: the string form stored in
 /// the JSONL file. Every variant must round-trip through parse.
-fn approval_status_name(status: ApprovalStatus) -> &'static str {
+pub(crate) fn approval_status_name(status: ApprovalStatus) -> &'static str {
     match status {
         ApprovalStatus::NotRequired => "not_required",
         ApprovalStatus::Pending => "pending",
@@ -4406,123 +4405,7 @@ pub(crate) fn start_bound_effect(
     }
 }
 
-async fn agent_tool_call(
-    State(state): State<AppState>,
-    Json(req): Json<ToolCallDto>,
-) -> impl IntoResponse {
-    let Some(requires) = tool_requires_approval(&req.tool) else {
-        return bad_request("unknown tool");
-    };
-    if requires {
-        // File tools go through the bound gate: the digest is computed
-        // from the very args about to be dispatched, so an approval
-        // for one write can never authorize a different write. Other
-        // approval tools keep the status-only gate (their endpoints
-        // are not file execution paths).
-        let bound = match req.tool.as_str() {
-            "fs.write" => {
-                let (Some(path), Some(text)) = (req.args.get("path"), req.args.get("text")) else {
-                    return bad_request("fs.write requires path and text args");
-                };
-                crate::operation_binding::write_digest(path, text.as_bytes(), false)
-            }
-            "fs.delete" => {
-                let Some(path) = req.args.get("path") else {
-                    return bad_request("fs.delete requires a path arg");
-                };
-                crate::operation_binding::delete_digest(path)
-            }
-            _ => None,
-        };
-        if let Some(digest) = bound {
-            // P0-C: resolve the bound Effect before consuming.
-            // A terminal Effect replays without dispatching; an
-            // unsettled one refuses; a planned/authorized one is
-            // consumed bound to it and driven forward. Legacy
-            // approvals with no planned row keep the old gate
-            // and terminal-row recording.
-            let gate = match bound_write_gate(&state, &req.tool_call_id, &digest) {
-                Ok(gate) => gate,
-                Err(response) => return *response,
-            };
-            let bound_effect = match gate {
-                WriteGate::Replay(effect) => {
-                    return Json(serde_json::json!({
-                        "result": "replayed",
-                        "effect_id": effect.effect_id,
-                        "replayed": true,
-                    }))
-                    .into_response();
-                }
-                WriteGate::Proceed(effect) => effect,
-            };
-            if let Some(effect) = &bound_effect {
-                if let Err(response) = consume_bound_approval_for_effect(
-                    &state,
-                    &req.tool,
-                    &req.tool_call_id,
-                    &digest,
-                    Some(&effect.effect_id),
-                ) {
-                    return *response;
-                }
-                if let Err(response) = start_bound_effect(&state, effect) {
-                    return *response;
-                }
-            } else if let Err(response) =
-                consume_bound_approval(&state, &req.tool, &req.tool_call_id, &digest)
-            {
-                return *response;
-            }
-            // Dispatch the normalized path so the executed path is
-            // exactly the path the digest bound.
-            let mut req = req;
-            if let Some(path) = req.args.get("path").cloned() {
-                if let Some(normalized) = crate::operation_binding::normalize_path(&path) {
-                    req.args.insert("path".to_string(), normalized);
-                }
-            }
-            let scope = req.args.get("path").cloned().unwrap_or_default();
-            let operation = match req.tool.as_str() {
-                "fs.write" => "write",
-                _ => "delete",
-            };
-            let approval_id = req.tool_call_id.clone();
-            let response = dispatch_agent_tool(&state, req);
-            let succeeded = response.status().is_success();
-            if let Some(effect) = &bound_effect {
-                let _ = transition_effect(
-                    &state,
-                    &effect.effect_id,
-                    if succeeded { "succeeded" } else { "failed" },
-                    None,
-                    None,
-                );
-            } else if succeeded {
-                // Legacy fallback: one terminal row, new word.
-                record_effect(
-                    &state,
-                    NewEffect {
-                        execution_id: Some(adapter_execution(&state)),
-                        capability: "fs".to_string(),
-                        operation: operation.to_string(),
-                        scope,
-                        input_digest: Some(digest),
-                        approval_id,
-                        status: "succeeded".to_string(),
-                    },
-                );
-            }
-            return response;
-        }
-        if let Err(response) = check_approval(&state, &req.tool, &req.tool_call_id) {
-            return *response;
-        }
-    }
-    dispatch_agent_tool(&state, req)
-}
-
-fn dispatch_agent_tool(state: &AppState, req: ToolCallDto) -> axum::response::Response {
+pub(crate) fn dispatch_agent_tool(state: &AppState, req: ToolCallDto) -> axum::response::Response {
     let arg = |name: &str| req.args.get(name).cloned();
     let result: Result<serde_json::Value, axum::response::Response> = match req.tool.as_str() {
         "echo" => Ok(serde_json::json!(arg("text").unwrap_or_default())),
@@ -11377,139 +11260,6 @@ pub(crate) fn persist_action(state: &AppState, record: &DeviceActionRecord) {
     append_action(path, record);
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LoopIdDto {
-    loop_id: String,
-}
-
-fn loop_response(
-    state: &AppState,
-    result: Result<crate::loop_engine::LoopView, LoopError>,
-) -> axum::response::Response {
-    match result {
-        Ok(mut view) => {
-            if view.pending_write.is_some() || view.pending_reminder.is_some() {
-                if let Some(call) = view.record.calls.get(view.record.queue_position) {
-                    if let (Some(id), Some(binding)) = (&call.approval_id, &call.binding) {
-                        view.approval_status = state.loop_approval_status(id, binding).ok()
-                            .map(|status| approval_status_name(status).to_string());
-                    }
-                }
-            }
-            fill_pending_reminder_title(state, &mut view);
-            Json(view).into_response()
-        },
-        Err(LoopError(status, code)) => (
-            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            Json(serde_json::json!({"error":code})),
-        )
-            .into_response(),
-    }
-}
-
-fn fill_pending_reminder_title(state: &AppState, view: &mut LoopView) {
-    if let Some(pending) = view.pending_reminder.as_mut() {
-        if let Ok(Some(reminder)) = state.device_backend.get(&pending.reminder_id) {
-            pending.title = reminder.title;
-        }
-    }
-}
-
-/// Start an auto-run driver unless auto-drive is off (loop_smoke)
-/// or the loop already stopped. The driver re-checks the flag and
-/// the loop state itself, so a redundant spawn exits at once.
-fn spawn_driver(state: &AppState, loop_id: &str) {
-    if !state.loops.auto_drive() {
-        return;
-    }
-    let engine = Arc::clone(&state.loops);
-    let app = state.clone();
-    let loop_id = loop_id.to_string();
-    tokio::spawn(async move {
-        engine.drive_until_stopped(app, loop_id).await;
-    });
-}
-
-async fn loop_start(
-    State(state): State<AppState>,
-    Json(req): Json<crate::loop_engine::StartLoop>,
-) -> axum::response::Response {
-    // P3-A: an explicitly bound worktree must exist and be
-    // active; its binding freezes into the Execution snapshot.
-    // A bad id is a caller error, before the loop starts.
-    let binding = match &req.worktree_id {
-        None => None,
-        Some(worktree_id) => match resolve_worktree_binding(&state, worktree_id) {
-            Ok(binding) => Some(binding),
-            Err(detail) => return bad_request(detail),
-        },
-    };
-    let session_id = req.session_id.clone();
-    let goal_id = req.goal_id.clone();
-    let result = state.loops.start(req);
-    if let Ok(view) = &result {
-        // P0 phase 1: the loop attempt gets its Execution shell record.
-        create_execution_with_binding(
-            &state,
-            None,
-            Some(view.record.loop_id.clone()),
-            binding,
-            session_id,
-            goal_id,
-        );
-        spawn_driver(&state, &view.record.loop_id);
-    }
-    loop_response(&state, result)
-}
-async fn loop_get(
-    State(state): State<AppState>,
-    Query(req): Query<LoopIdDto>,
-) -> axum::response::Response {
-    loop_response(&state, state.loops.get(&req.loop_id))
-}
-async fn loop_resume(
-    State(state): State<AppState>,
-    Json(req): Json<crate::loop_engine::ResumeLoop>,
-) -> axum::response::Response {
-    let engine = Arc::clone(&state.loops);
-    let result = engine.resume(state.clone(), req).await;
-    // A manual resume runs one step, then hands over to the
-    // driver; a stopping view needs no driver. Frontend copy
-    // says "run to next stopping point", not "step once".
-    if let Ok(view) = &result {
-        if view.record.status.terminal() {
-            // E2-A §2.3: the manual resume ended the loop;
-            // close its Execution (the driver never runs for
-            // a stopping view, so this route owns the close).
-            close_execution_for_loop(&state, &view.record.loop_id, &view.record.status);
-        } else if view.record.status != LoopStatus::AwaitingApproval {
-            spawn_driver(&state, &view.record.loop_id);
-        }
-    }
-    loop_response(&state, result)
-}
-async fn loop_cancel(
-    State(state): State<AppState>,
-    Json(req): Json<LoopIdDto>,
-) -> axum::response::Response {
-    let result = state.loops.cancel(&req.loop_id);
-    // E2-A §2.3: a cancelled loop closes its Execution.
-    if let Ok(view) = &result {
-        if view.record.status.terminal() {
-            close_execution_for_loop(&state, &view.record.loop_id, &view.record.status);
-        }
-    }
-    loop_response(&state, result)
-}
-async fn loops_list(State(state): State<AppState>) -> Json<Vec<LoopView>> {
-    let mut views = state.loops.list();
-    for view in &mut views {
-        fill_pending_reminder_title(&state, view);
-    }
-    Json(views)
-}
-
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(crate::routes_misc::health))
@@ -11657,12 +11407,12 @@ pub fn app(state: AppState) -> Router {
         .route("/approvals/{approval_id}", get(approvals_get))
         .route("/approvals/{approval_id}/editable-message", get(approval_editable_message))
         .route("/approvals/{approval_id}/edit-message", post(approval_edit_message))
-        .route("/agent/tool/call", post(agent_tool_call))
-        .route("/agent/loop/start", post(loop_start))
-        .route("/agent/loop/get", get(loop_get))
-        .route("/agent/loop/resume", post(loop_resume))
-        .route("/agent/loop/cancel", post(loop_cancel))
-        .route("/agent/loop/list", get(loops_list))
+        .route("/agent/tool/call", post(crate::routes_loop::agent_tool_call))
+        .route("/agent/loop/start", post(crate::routes_loop::loop_start))
+        .route("/agent/loop/get", get(crate::routes_loop::loop_get))
+        .route("/agent/loop/resume", post(crate::routes_loop::loop_resume))
+        .route("/agent/loop/cancel", post(crate::routes_loop::loop_cancel))
+        .route("/agent/loop/list", get(crate::routes_loop::loops_list))
         .route("/connectors/notes/list", get(crate::routes_connectors::notes_list))
         .route("/connectors/notes/create", post(crate::routes_connectors::notes_create))
         .route("/connectors/mail/list", get(crate::routes_connectors::mail_list))

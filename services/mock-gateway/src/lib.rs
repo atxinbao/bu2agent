@@ -34,6 +34,7 @@ pub mod routes_engineering;
 pub mod routes_chat;
 pub mod routes_peers;
 pub mod routes_connectors;
+pub mod routes_loop;
 pub mod task_store;
 pub mod task_runner;
 pub mod execution_store;
