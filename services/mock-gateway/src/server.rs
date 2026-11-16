@@ -121,20 +121,16 @@ use crate::node_store::{
     append_node, load_nodes, next_node_number, Node, NODE_DISCONNECTED, NODE_ONLINE,
 };
 use crate::binding_store::{
-    append_binding, load_bindings, next_workspace_number, WorkspaceBinding, BINDING_ACTIVE,
-    BINDING_ARCHIVED,
+    append_binding, load_bindings, next_workspace_number, WorkspaceBinding,
 };
 use crate::project_store::{
-    append_project, load_projects, next_project_number, Project, PROJECT_ACTIVE,
-    PROJECT_ARCHIVED,
+    append_project, load_projects, next_project_number, Project,
 };
 use crate::location_store::{
     append_location, load_locations, next_location_number, Location, LOCATION_ACTIVE,
-    LOCATION_ARCHIVED,
 };
 use crate::worktree_store::{
     append_worktree, load_worktrees, next_worktree_number, Worktree, WORKTREE_ACTIVE,
-    WORKTREE_ARCHIVED,
 };
 use crate::stream_store::{
     append_stream_line, events_after, last_event_id, load_stream_state, next_poke_order,
@@ -274,7 +270,7 @@ pub(crate) struct ApprovalState {
     /// the gate checks both, never the execution device and
     /// never the action record alone. None for legacy approvals
     /// issued before P0-C, which keep their old gate.
-    effect_binding: Option<String>,
+    pub(crate) effect_binding: Option<String>,
     message: Option<String>,
     /// P3-C (§7): the resolved Worker command this approval
     /// authorizes. None for every other tool.
@@ -457,11 +453,11 @@ pub struct AppState {
     nodes: Arc<Mutex<HashMap<String, Node>>>,
     next_node_id: Arc<Mutex<u64>>,
     node_state_path: Option<PathBuf>,
-    bindings: Arc<Mutex<HashMap<String, WorkspaceBinding>>>,
-    next_workspace_id: Arc<Mutex<u64>>,
+    pub(crate) bindings: Arc<Mutex<HashMap<String, WorkspaceBinding>>>,
+    pub(crate) next_workspace_id: Arc<Mutex<u64>>,
     binding_state_path: Option<PathBuf>,
-    projects: Arc<Mutex<HashMap<String, Project>>>,
-    next_project_id: Arc<Mutex<u64>>,
+    pub(crate) projects: Arc<Mutex<HashMap<String, Project>>>,
+    pub(crate) next_project_id: Arc<Mutex<u64>>,
     project_state_path: Option<PathBuf>,
     // D1-1: goals live in SQLite only (no JSONL mirror, no
     // in-memory map); the counter is the id allocator,
@@ -488,11 +484,11 @@ pub struct AppState {
     // clears it, so the first post-restart subscribe
     // re-establishes the baseline instead of replaying.
     pub(crate) files_last_tree: Arc<Mutex<HashMap<String, Vec<FileEntryDto>>>>,
-    locations: Arc<Mutex<HashMap<String, Location>>>,
-    next_location_id: Arc<Mutex<u64>>,
+    pub(crate) locations: Arc<Mutex<HashMap<String, Location>>>,
+    pub(crate) next_location_id: Arc<Mutex<u64>>,
     location_state_path: Option<PathBuf>,
-    worktrees: Arc<Mutex<HashMap<String, Worktree>>>,
-    next_worktree_id: Arc<Mutex<u64>>,
+    pub(crate) worktrees: Arc<Mutex<HashMap<String, Worktree>>>,
+    pub(crate) next_worktree_id: Arc<Mutex<u64>>,
     worktree_state_path: Option<PathBuf>,
     stream_subscriptions: Arc<Mutex<HashMap<String, StreamSubscription>>>,
     next_subscription_id: Arc<Mutex<u64>>,
@@ -7401,22 +7397,22 @@ fn persist_node(state: &AppState, record: &Node) {
     append_node(path, record);
 }
 
-fn persist_binding(state: &AppState, record: &WorkspaceBinding) {
+pub(crate) fn persist_binding(state: &AppState, record: &WorkspaceBinding) {
     let Some(path) = &state.binding_state_path else { return };
     append_binding(path, record);
 }
 
-fn persist_project(state: &AppState, record: &Project) {
+pub(crate) fn persist_project(state: &AppState, record: &Project) {
     let Some(path) = &state.project_state_path else { return };
     append_project(path, record);
 }
 
-fn persist_location(state: &AppState, record: &Location) {
+pub(crate) fn persist_location(state: &AppState, record: &Location) {
     let Some(path) = &state.location_state_path else { return };
     append_location(path, record);
 }
 
-fn persist_worktree(state: &AppState, record: &Worktree) {
+pub(crate) fn persist_worktree(state: &AppState, record: &Worktree) {
     let Some(path) = &state.worktree_state_path else { return };
     append_worktree(path, record);
 }
@@ -7540,380 +7536,12 @@ async fn nodes_unpair(
     Json(record.clone()).into_response()
 }
 
-// --- Engineering record surface (P3-A, record subset) ---
-//
-// WorkspaceBinding + Project + Location + Worktree: four
-// JSONL record stores, no Effect, no approval loop (direct
-// management actions, like the Task 9 connector surface).
-// List hides archived rows; get returns archived rows with
-// their status. Archive is a status flip, never a delete:
-// there is no hard-delete route and directories are never
-// removed. Creation validation failures are all 400.
-
-fn workspace_number(id: &str) -> u64 {
-    id.strip_prefix("workspace-").and_then(|s| s.parse().ok()).unwrap_or(0)
-}
-
-fn project_number(id: &str) -> u64 {
-    id.strip_prefix("project-").and_then(|s| s.parse().ok()).unwrap_or(0)
-}
-
-fn location_number(id: &str) -> u64 {
-    id.strip_prefix("location-").and_then(|s| s.parse().ok()).unwrap_or(0)
-}
-
-fn worktree_number(id: &str) -> u64 {
-    id.strip_prefix("worktree-").and_then(|s| s.parse().ok()).unwrap_or(0)
-}
-
 pub(crate) fn unknown_record(what: &str) -> Response {
     (
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({ "error": format!("unknown {what}") })),
     )
         .into_response()
-}
-
-/// P3-B archive check (plan §3.8 "non-terminal Patch"): a
-/// Worktree is blocked while any of its PatchFiles is pending
-/// or failed — the work the Patch still owes. A stale Patch
-/// with no pending/failed file does not block: its files are
-/// terminally refused and the Patch is an audit row. Without
-/// SQLite there is no Patch store, so nothing blocks.
-fn worktree_archive_blocked(state: &AppState, worktree_id: &str) -> Option<&'static str> {
-    if state.sqlite_mode() != StateBackend::Sqlite || state.sqlite_is_broken() {
-        return None;
-    }
-    let Some(sqlite) = &state.sqlite else {
-        return None;
-    };
-    let conn = sqlite.lock().expect("sqlite lock");
-    match sqlite_store::worktree_has_actionable_patch(&conn, worktree_id) {
-        Ok(true) => Some("worktree_has_active_patch"),
-        _ => None,
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct BindingCreateDto {
-    display_name: Option<String>,
-    path: Option<String>,
-}
-
-async fn bindings_create(
-    State(state): State<AppState>,
-    Json(req): Json<BindingCreateDto>,
-) -> impl IntoResponse {
-    let Some(display_name) = req.display_name.filter(|n| !n.trim().is_empty()) else {
-        return bad_request("display_name is required");
-    };
-    let Some(raw_path) = req.path.filter(|p| !p.trim().is_empty()) else {
-        return bad_request("path is required");
-    };
-    // The picked directory is canonicalized at creation (a
-    // symlinked pick binds its real target); a missing path
-    // or a non-directory is a 400.
-    let Ok(canonical) = Path::new(&raw_path).canonicalize() else {
-        return bad_request("directory does not exist");
-    };
-    if !canonical.is_dir() {
-        return bad_request("path is not a directory");
-    }
-    let canonical_root = canonical.to_string_lossy().into_owned();
-    let mut next = state.next_workspace_id.lock().expect("workspace id lock");
-    let id = format!("workspace-{}", *next);
-    *next += 1;
-    drop(next);
-    let now = now_ms();
-    let record = WorkspaceBinding {
-        workspace_id: id.clone(),
-        display_name,
-        allowed_roots: vec![canonical_root],
-        policy_digest: compute_policy_digest(&state),
-        status: BINDING_ACTIVE.to_string(),
-        created_ms: now,
-        updated_ms: now,
-    };
-    state
-        .bindings
-        .lock()
-        .expect("binding lock")
-        .insert(record.workspace_id.clone(), record.clone());
-    persist_binding(&state, &record);
-    Json(record).into_response()
-}
-
-async fn bindings_list(State(state): State<AppState>) -> Json<Vec<WorkspaceBinding>> {
-    let bindings = state.bindings.lock().expect("binding lock");
-    let mut records: Vec<WorkspaceBinding> = bindings
-        .values()
-        .filter(|b| b.status == BINDING_ACTIVE)
-        .cloned()
-        .collect();
-    records.sort_by_key(|b| workspace_number(&b.workspace_id));
-    Json(records)
-}
-
-async fn bindings_get(
-    State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    let bindings = state.bindings.lock().expect("binding lock");
-    match bindings.get(&id) {
-        Some(record) => Json(record.clone()).into_response(),
-        None => unknown_record("binding"),
-    }
-}
-
-async fn bindings_archive(
-    State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    let mut bindings = state.bindings.lock().expect("binding lock");
-    let Some(record) = bindings.get_mut(&id) else {
-        return unknown_record("binding");
-    };
-    if record.status == BINDING_ARCHIVED {
-        return Json(record.clone()).into_response();
-    }
-    // Archive guard (plan §3.8): an active Location blocks.
-    let blocked = state
-        .locations
-        .lock()
-        .expect("location lock")
-        .values()
-        .any(|l| l.workspace_id == id && l.status == LOCATION_ACTIVE);
-    if blocked {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "binding_has_active_locations" })),
-        )
-            .into_response();
-    }
-    record.status = BINDING_ARCHIVED.to_string();
-    record.updated_ms = now_ms();
-    let updated = record.clone();
-    persist_binding(&state, &updated);
-    Json(updated).into_response()
-}
-
-#[derive(Debug, Deserialize)]
-struct ProjectCreateDto {
-    name: Option<String>,
-    description: Option<String>,
-}
-
-async fn projects_create(
-    State(state): State<AppState>,
-    Json(req): Json<ProjectCreateDto>,
-) -> impl IntoResponse {
-    let Some(name) = req.name.filter(|n| !n.trim().is_empty()) else {
-        return bad_request("name is required");
-    };
-    let Some(description) = req.description.filter(|d| !d.trim().is_empty()) else {
-        return bad_request("description is required");
-    };
-    let mut next = state.next_project_id.lock().expect("project id lock");
-    let id = format!("project-{}", *next);
-    *next += 1;
-    drop(next);
-    let now = now_ms();
-    let record = Project {
-        project_id: id.clone(),
-        name,
-        description,
-        status: PROJECT_ACTIVE.to_string(),
-        created_ms: now,
-        updated_ms: now,
-    };
-    state
-        .projects
-        .lock()
-        .expect("project lock")
-        .insert(record.project_id.clone(), record.clone());
-    persist_project(&state, &record);
-    Json(record).into_response()
-}
-
-async fn projects_list(State(state): State<AppState>) -> Json<Vec<Project>> {
-    let projects = state.projects.lock().expect("project lock");
-    let mut records: Vec<Project> = projects
-        .values()
-        .filter(|p| p.status == PROJECT_ACTIVE)
-        .cloned()
-        .collect();
-    records.sort_by_key(|p| project_number(&p.project_id));
-    Json(records)
-}
-
-async fn projects_get(
-    State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    let projects = state.projects.lock().expect("project lock");
-    match projects.get(&id) {
-        Some(record) => Json(record.clone()).into_response(),
-        None => unknown_record("project"),
-    }
-}
-
-async fn projects_archive(
-    State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    // A project is pure metadata: archive is always allowed.
-    // Existing references keep reading back with status
-    // archived; nothing is deleted or unlinked.
-    let mut projects = state.projects.lock().expect("project lock");
-    let Some(record) = projects.get_mut(&id) else {
-        return unknown_record("project");
-    };
-    if record.status == PROJECT_ARCHIVED {
-        return Json(record.clone()).into_response();
-    }
-    record.status = PROJECT_ARCHIVED.to_string();
-    record.updated_ms = now_ms();
-    let updated = record.clone();
-    persist_project(&state, &updated);
-    Json(updated).into_response()
-}
-
-#[derive(Debug, Deserialize)]
-struct LocationCreateDto {
-    workspace_id: Option<String>,
-    name: Option<String>,
-    path: Option<String>,
-}
-
-async fn locations_create(
-    State(state): State<AppState>,
-    Json(req): Json<LocationCreateDto>,
-) -> impl IntoResponse {
-    let Some(workspace_id) = req.workspace_id.filter(|w| !w.trim().is_empty()) else {
-        return bad_request("workspace_id is required");
-    };
-    let Some(name) = req.name.filter(|n| !n.trim().is_empty()) else {
-        return bad_request("name is required");
-    };
-    let Some(raw_path) = req.path.filter(|p| !p.trim().is_empty()) else {
-        return bad_request("path is required");
-    };
-    // The binding must exist and be active.
-    let allowed_roots = {
-        let bindings = state.bindings.lock().expect("binding lock");
-        let Some(binding) = bindings.get(&workspace_id) else {
-            return bad_request("unknown workspace");
-        };
-        if binding.status != BINDING_ACTIVE {
-            return bad_request("workspace is archived");
-        }
-        binding.allowed_roots.clone()
-    };
-    // The candidate must exist and be a directory, and after
-    // canonicalizing BOTH sides it must sit inside one of the
-    // binding's allowed roots (settings_store's
-    // validate_working_dir pattern: a symlinked escape
-    // canonicalizes outside the root and fails here).
-    let Ok(candidate) = Path::new(&raw_path).canonicalize() else {
-        return bad_request("directory does not exist");
-    };
-    if !candidate.is_dir() {
-        return bad_request("path is not a directory");
-    }
-    let inside = allowed_roots.iter().any(|root| {
-        Path::new(root)
-            .canonicalize()
-            .is_ok_and(|canonical_root| candidate.strip_prefix(&canonical_root).is_ok())
-    });
-    if !inside {
-        return bad_request("directory is outside the workspace binding");
-    }
-    let canonical_root = candidate.to_string_lossy().into_owned();
-    let root_sha256 = location_root_sha256(&workspace_id, &canonical_root);
-    let mut next = state.next_location_id.lock().expect("location id lock");
-    let id = format!("location-{}", *next);
-    *next += 1;
-    drop(next);
-    let now = now_ms();
-    let record = Location {
-        location_id: id.clone(),
-        workspace_id,
-        name,
-        canonical_root,
-        root_sha256,
-        status: LOCATION_ACTIVE.to_string(),
-        created_ms: now,
-        updated_ms: now,
-    };
-    state
-        .locations
-        .lock()
-        .expect("location lock")
-        .insert(record.location_id.clone(), record.clone());
-    persist_location(&state, &record);
-    Json(record).into_response()
-}
-
-async fn locations_list(State(state): State<AppState>) -> Json<Vec<Location>> {
-    let locations = state.locations.lock().expect("location lock");
-    let mut records: Vec<Location> = locations
-        .values()
-        .filter(|l| l.status == LOCATION_ACTIVE)
-        .cloned()
-        .collect();
-    records.sort_by_key(|l| location_number(&l.location_id));
-    Json(records)
-}
-
-async fn locations_get(
-    State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    let locations = state.locations.lock().expect("location lock");
-    match locations.get(&id) {
-        Some(record) => Json(record.clone()).into_response(),
-        None => unknown_record("location"),
-    }
-}
-
-async fn locations_archive(
-    State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    let mut locations = state.locations.lock().expect("location lock");
-    let Some(record) = locations.get_mut(&id) else {
-        return unknown_record("location");
-    };
-    if record.status == LOCATION_ARCHIVED {
-        return Json(record.clone()).into_response();
-    }
-    // Archive guard (plan §3.8): an active Worktree blocks.
-    let blocked = state
-        .worktrees
-        .lock()
-        .expect("worktree lock")
-        .values()
-        .any(|w| w.location_id == id && w.status == WORKTREE_ACTIVE);
-    if blocked {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "location_has_active_worktrees" })),
-        )
-            .into_response();
-    }
-    record.status = LOCATION_ARCHIVED.to_string();
-    record.updated_ms = now_ms();
-    let updated = record.clone();
-    persist_location(&state, &updated);
-    Json(updated).into_response()
-}
-
-#[derive(Debug, Deserialize)]
-struct WorktreeCreateDto {
-    location_id: Option<String>,
-    directory_relative: Option<String>,
-    branch_label: Option<String>,
-    project_id: Option<String>,
 }
 
 /// Create a Worktree record (P3-A records, P3-C driver):
@@ -7995,75 +7623,6 @@ pub(crate) fn create_worktree_record(
         .insert(record.worktree_id.clone(), record.clone());
     persist_worktree(state, &record);
     Ok(record)
-}
-
-async fn worktrees_create(
-    State(state): State<AppState>,
-    Json(req): Json<WorktreeCreateDto>,
-) -> impl IntoResponse {
-    let Some(location_id) = req.location_id.filter(|l| !l.trim().is_empty()) else {
-        return bad_request("location_id is required");
-    };
-    match create_worktree_record(
-        &state,
-        location_id,
-        req.directory_relative.unwrap_or_default(),
-        req.branch_label.unwrap_or_default(),
-        req.project_id,
-    ) {
-        Ok(record) => Json(record).into_response(),
-        Err(code) => bad_request(code),
-    }
-}
-
-async fn worktrees_list(State(state): State<AppState>) -> Json<Vec<Worktree>> {
-    let worktrees = state.worktrees.lock().expect("worktree lock");
-    let mut records: Vec<Worktree> = worktrees
-        .values()
-        .filter(|w| w.status == WORKTREE_ACTIVE)
-        .cloned()
-        .collect();
-    records.sort_by_key(|w| worktree_number(&w.worktree_id));
-    Json(records)
-}
-
-async fn worktrees_get(
-    State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    let worktrees = state.worktrees.lock().expect("worktree lock");
-    match worktrees.get(&id) {
-        Some(record) => Json(record.clone()).into_response(),
-        None => unknown_record("worktree"),
-    }
-}
-
-async fn worktrees_archive(
-    State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    let mut worktrees = state.worktrees.lock().expect("worktree lock");
-    let Some(record) = worktrees.get_mut(&id) else {
-        return unknown_record("worktree");
-    };
-    if record.status == WORKTREE_ARCHIVED {
-        return Json(record.clone()).into_response();
-    }
-    // Archive guard (plan §3.8): a non-terminal Patch blocks.
-    // P3-A has no Patch store; the check point lives in
-    // worktree_archive_blocked for P3-B to wire.
-    if let Some(code) = worktree_archive_blocked(&state, &id) {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": code })),
-        )
-            .into_response();
-    }
-    record.status = WORKTREE_ARCHIVED.to_string();
-    record.updated_ms = now_ms();
-    let updated = record.clone();
-    persist_worktree(&state, &updated);
-    Json(updated).into_response()
 }
 
 // --- Chat record surface (Task 18, record subset) ---
@@ -10441,7 +10000,7 @@ pub(crate) fn record_evidence_best_effort(state: &AppState, draft: &crate::evide
 /// holds, when an export path is configured. Best-effort,
 /// warn-only — an export failure never changes the caller's
 /// response.
-fn export_evidence_best_effort(state: &AppState, conn: &Connection) {
+pub(crate) fn export_evidence_best_effort(state: &AppState, conn: &Connection) {
     if let Some(path) = &state.evidence_path {
         if let Err(detail) = crate::sqlite_store::export_evidence(conn, path) {
             eprintln!("warning: evidence export failed: {detail}");
@@ -10791,7 +10350,7 @@ pub(crate) fn check_idempotency(
 /// and `AlreadyNew` are the only outcomes that may land the
 /// proposed content; `Stale` and `Unavailable` never write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PatchCheck {
+pub(crate) enum PatchCheck {
     /// Current bytes equal the proposal-time old bytes (or
     /// the file is still absent when old_sha256 is null).
     Write,
@@ -10911,7 +10470,7 @@ fn resolve_patch_target(
 /// either entry. The returned target is the resolved path
 /// the check read (Some whenever the check could read the
 /// current state, None on Unavailable).
-fn check_patch_write(
+pub(crate) fn check_patch_write(
     state: &AppState,
     patch: &sqlite_store::PatchRecord,
     file: &sqlite_store::PatchFileRecord,
@@ -10938,7 +10497,7 @@ fn check_patch_write(
 /// its own transaction. Used by the loop entry's sync and by
 /// the apply's stale marking; the apply success/failure
 /// record updates use their own single-tx helpers instead.
-fn sync_patch_file_status(
+pub(crate) fn sync_patch_file_status(
     state: &AppState,
     patch_file_id: &str,
     status: &str,
@@ -11290,291 +10849,6 @@ fn link_patch_file_rejected_on_approval(state: &AppState, approval_id: &str) {
     {
         eprintln!("warning: patch file reject linkage failed: {detail}");
     }
-}
-
-/// Apply one PatchFile under ONE approvals lock hold (plan
-/// §4.4). The three-way check, the approval burn and the
-/// Effect authorize/start all serialize here, so a
-/// concurrent apply of the same file cannot double-write.
-/// `consume_loop_approval` and
-/// `consume_bound_approval_for_effect` cannot be called
-/// from inside this hold (a std Mutex is not reentrant — it
-/// would deadlock), so the loop-approval validation below
-/// mirrors their checks; keep in sync: Approved only (a
-/// bound approval can never be Edited), unconsumed,
-/// `effect_binding` is this file's Effect, the Effect
-/// exists with the same digest at planned/authorized, and
-/// the approval's `tool` is fs.write. Error codes reuse the
-/// existing bound-gate replies (`approval_required`,
-/// `approval_rejected`, `approval_binding_mismatch`,
-/// `approval_audit_failed`, `effect_transition_failed`).
-fn apply_patch_file_locked(
-    state: &AppState,
-    patch_id: &str,
-    patch_file_id: &str,
-    expected_old_sha256: Option<&str>,
-    approval_id: &str,
-) -> Result<(sqlite_store::PatchFileRecord, EffectFileRecord, bool), Box<Response>> {
-    let not_found = |error: &str| -> Box<Response> {
-        Box::new((StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": error }))).into_response())
-    };
-    let forbidden = |error: &str| -> Box<Response> {
-        Box::new((StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": error }))).into_response())
-    };
-    let conflict = |error: &str| -> Box<Response> {
-        Box::new((StatusCode::CONFLICT, Json(serde_json::json!({ "error": error }))).into_response())
-    };
-    let bad_request = |error: &str| -> Box<Response> {
-        Box::new((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": error }))).into_response())
-    };
-    let internal = |error: &str| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": error })),
-        )
-            .into_response()
-    };
-    // Patches are SQLite-only (plan §4.6).
-    if state.sqlite_mode() != StateBackend::Sqlite {
-        return Err(Box::new(sqlite_not_configured()));
-    }
-    if state.sqlite_is_broken() {
-        return Err(Box::new(sqlite_error_response()));
-    }
-    let Some(sqlite) = &state.sqlite else {
-        return Err(Box::new(sqlite_not_configured()));
-    };
-    let mut approvals = state.approvals.lock().expect("approval lock");
-    let (patch, file) = {
-        let conn = sqlite.lock().expect("sqlite lock");
-        let patch = match sqlite_store::get_patch(&conn, patch_id) {
-            Ok(Some(patch)) => patch,
-            Ok(None) => return Err(not_found("unknown patch")),
-            Err(_) => return Err(Box::new(internal("sqlite_unavailable"))),
-        };
-        let file = match sqlite_store::get_patch_file(&conn, patch_file_id) {
-            Ok(Some(file)) => file,
-            Ok(None) => return Err(not_found("unknown patch file")),
-            Err(_) => return Err(Box::new(internal("sqlite_unavailable"))),
-        };
-        if file.patch_id != patch.patch_id {
-            return Err(not_found("unknown patch file"));
-        }
-        (patch, file)
-    };
-    // Idempotent replay (plan §4.4): an already-applied file
-    // returns 200 + replayed:true with no re-check/re-write.
-    if file.status == "applied" {
-        let effect = effect_by_id(state, &file.effect_id)
-            .ok_or_else(|| internal("unknown effect"))?;
-        return Ok((file, effect, true));
-    }
-    if patch.status == "rejected" {
-        return Err(conflict("patch_rejected"));
-    }
-    if file.status == "rejected" {
-        return Err(conflict("patch_file_rejected"));
-    }
-    if file.status == "stale" {
-        return Err(conflict("patch_stale"));
-    }
-    if file.status != "pending" && file.status != "failed" {
-        return Err(conflict("patch_file_not_appliable"));
-    }
-    if expected_old_sha256 != file.old_sha256.as_deref() {
-        return Err(bad_request("expected_old_sha256_mismatch"));
-    }
-    // Loop-approval validation (mirror of
-    // consume_loop_approval + consume_bound_approval_for_effect).
-    let Some(record) = approvals.get_mut(approval_id) else {
-        return Err(forbidden("approval_required"));
-    };
-    if record.tool != "fs.write" {
-        return Err(forbidden("approval_required"));
-    }
-    if record.status == ApprovalStatus::Rejected {
-        return Err(forbidden("approval_rejected"));
-    }
-    if record.status != ApprovalStatus::Approved {
-        return Err(forbidden("approval_required"));
-    }
-    if record.consumed {
-        return Err(forbidden("approval_binding_mismatch"));
-    }
-    if record.effect_binding.as_deref() != Some(file.effect_id.as_str()) {
-        return Err(forbidden("approval_binding_mismatch"));
-    }
-    let digest = record.operation_digest.clone();
-    let effect = match effect_by_id(state, &file.effect_id) {
-        Some(effect)
-            if effect.input_digest.as_deref() == digest.as_deref()
-                && (effect.status == "planned" || effect.status == "authorized") => effect,
-        _ => return Err(forbidden("approval_binding_mismatch")),
-    };
-    // E2-A §2.4: idempotency is the second door behind the
-    // stale check — a replayed apply (same approval, same
-    // input_digest) must not rewrite the file. The bound
-    // Effect itself is excluded: it is the current attempt
-    // (planned/authorized), not a prior write. A *different*
-    // terminal Effect with the same key (same execution,
-    // fs.write, scope, digest) proves the write already
-    // landed, so the apply returns replayed without touching
-    // the file. A bound Effect without an execution id or
-    // digest has no key to check: 409, not a silent Proceed.
-    if idempotency_key_missing(effect.execution_id.as_deref(), effect.input_digest.as_deref()) {
-        return Err(Box::new(
-            (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "error": "effect_idempotency_unavailable" })),
-            )
-                .into_response(),
-        ));
-    }
-    match check_idempotency(
-        state,
-        effect.execution_id.as_deref(),
-        "fs",
-        "write",
-        &file.path_relative,
-        effect.input_digest.as_deref(),
-        Some(&effect.effect_id),
-    ) {
-        IdempotencyDecision::Proceed => {}
-        IdempotencyDecision::Replay(other) => {
-            return Ok((file, other, true));
-        }
-        IdempotencyDecision::Blocked(other) => {
-            return Err(Box::new(
-                (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({ "error": "effect_idempotency_blocked", "effect_id": other.effect_id, "status": other.status })),
-                )
-                    .into_response(),
-            ));
-        }
-        // Store broken: fail closed, never guess.
-        IdempotencyDecision::Unavailable => {
-            return Err(Box::new(internal("sqlite_unavailable")));
-        }
-    }
-    // Three-way check, before the approval is burned: a
-    // drifted proposal never consumes its approval.
-    let (check, target) = check_patch_write(state, &patch, &file);
-    if check == PatchCheck::Stale {
-        if let Err(detail) = sync_patch_file_status(state, &file.patch_file_id, "stale") {
-            eprintln!("warning: patch file stale-marking failed: {detail}");
-        }
-        return Err(conflict("patch_stale"));
-    }
-    if check == PatchCheck::Unavailable {
-        return Err(Box::new(internal("patch_target_unavailable")));
-    }
-    // Burn the approval (persist failure -> 500 with the
-    // in-memory consumed flag kept, the P0-C fail-closed
-    // rule), then drive planned -> authorized -> started.
-    record.consumed = true;
-    if let Err(detail) = persist_approval(state, approval_id, record) {
-        eprintln!("warning: bound approval consumption persistence failed: {detail}");
-        return Err(Box::new(internal("approval_audit_failed")));
-    }
-    if effect.status == "planned"
-        && transition_effect(state, &effect.effect_id, "authorized", None, None).is_err()
-    {
-        return Err(Box::new(internal("effect_transition_failed")));
-    }
-    start_bound_effect(state, &effect)?;
-    // Write (or skip it on the AlreadyNew branch), then one
-    // SQLite transaction for the records.
-    let replayed = check == PatchCheck::AlreadyNew;
-    if !replayed {
-        let target = target.ok_or_else(|| internal("patch_target_unavailable"))?;
-        if let Some(parent) = target.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
-                return Err(Box::new(internal("patch_write_failed")));
-            }
-        }
-        if std::fs::write(&target, &file.new_text).is_err() {
-            // The approval is spent and the Effect is started;
-            // leave an honest failed state (best-effort tx) so
-            // the file is retryable through a fresh proposal.
-            let mut failed = effect.clone();
-            failed.status = "failed".to_string();
-            let now = now_ms() as i64;
-            let mut conn = sqlite.lock().expect("sqlite lock");
-            if let Ok(tx) = conn.transaction() {
-                let _ = sqlite_store::fail_patch_records_tx(
-                    &tx,
-                    &failed,
-                    &file.patch_file_id,
-                    now,
-                );
-                let _ = tx.commit();
-            }
-            state
-                .effects
-                .lock()
-                .expect("effect lock")
-                .insert(failed.effect_id.clone(), failed.clone());
-            return Err(Box::new(internal("patch_write_failed")));
-        }
-    }
-    let mut succeeded = effect.clone();
-    succeeded.status = "succeeded".to_string();
-    let owned_evidence = crate::evidence::write_time_observation(state, &succeeded);
-    let evidence_draft = owned_evidence.as_ref().map(|o| o.as_draft());
-    let now = now_ms() as i64;
-    let (file, _patch) = {
-        let mut conn = sqlite.lock().expect("sqlite lock");
-        let tx = match conn.transaction() {
-            Ok(tx) => tx,
-            Err(_) => return Err(Box::new(internal("sqlite_unavailable"))),
-        };
-        let out = match sqlite_store::apply_patch_records_tx(
-            &tx,
-            &succeeded,
-            evidence_draft.as_ref(),
-            &file.patch_file_id,
-            now,
-        ) {
-            Ok(out) => out,
-            Err(detail) => {
-                eprintln!("warning: patch apply records failed: {detail}");
-                drop(tx);
-                // The file is written (or was already new) but
-                // the records did not land; mark the file failed
-                // (best-effort) so a fresh proposal can recover
-                // it instead of leaving it pending forever.
-                let mut failed = effect.clone();
-                failed.status = "failed".to_string();
-                let mut conn = sqlite.lock().expect("sqlite lock");
-                if let Ok(tx) = conn.transaction() {
-                    let _ = sqlite_store::fail_patch_records_tx(
-                        &tx,
-                        &failed,
-                        &file.patch_file_id,
-                        now,
-                    );
-                    let _ = tx.commit();
-                }
-                state
-                    .effects
-                    .lock()
-                    .expect("effect lock")
-                    .insert(failed.effect_id.clone(), failed.clone());
-                return Err(Box::new(internal("sqlite_unavailable")));
-            }
-        };
-        if tx.commit().is_err() {
-            return Err(Box::new(internal("sqlite_unavailable")));
-        }
-        out
-    };
-    state
-        .effects
-        .lock()
-        .expect("effect lock")
-        .insert(succeeded.effect_id.clone(), succeeded.clone());
-    Ok((file, succeeded, replayed))
 }
 
 /// P0-C loop planning: a proposed gated call gets its planned
@@ -14012,188 +13286,6 @@ async fn effects_verify(
     }
 }
 
-// --- P3-B patches (plan §4.7) ---
-//
-// Patches exist only in SQLite (plan §4.6): the routes
-// answer 500 `sqlite_not_configured` without a configured
-// SQLite database, and 500 `sqlite_unavailable` on a broken
-// one — the same fail-closed gate as the Evidence routes.
-// List/get read; apply/reject mutate and are SQLite-mode
-// only (in Shadow mode there is no Patch store to mutate).
-
-#[derive(Debug, Deserialize)]
-struct PatchListQuery {
-    status: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PatchApplyRequest {
-    #[serde(default)]
-    expected_old_sha256: Option<String>,
-    approval_id: String,
-}
-
-async fn patches_list(
-    State(state): State<AppState>,
-    Query(query): Query<PatchListQuery>,
-) -> impl IntoResponse {
-    if let Some(status) = &query.status {
-        if !crate::patch_store::PATCH_STATUSES.contains(&status.as_str()) {
-            return bad_request("unknown patch status");
-        }
-    }
-    if state.sqlite_is_broken() {
-        return sqlite_error_response();
-    }
-    let Some(sqlite) = &state.sqlite else {
-        return sqlite_not_configured();
-    };
-    if state.sqlite_mode() != StateBackend::Sqlite && state.sqlite_mode() != StateBackend::Shadow {
-        return sqlite_not_configured();
-    }
-    let conn = sqlite.lock().expect("sqlite lock");
-    match sqlite_store::list_patches(&conn) {
-        Ok(rows) => {
-            let rows: Vec<_> = match &query.status {
-                Some(status) => rows
-                    .into_iter()
-                    .filter(|r| &r.status == status)
-                    .collect(),
-                None => rows,
-            };
-            Json(rows).into_response()
-        }
-        Err(_) => sqlite_error_response(),
-    }
-}
-
-async fn patches_get(
-    State(state): State<AppState>,
-    axum::extract::Path(patch_id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if state.sqlite_is_broken() {
-        return sqlite_error_response();
-    }
-    let Some(sqlite) = &state.sqlite else {
-        return sqlite_not_configured();
-    };
-    if state.sqlite_mode() != StateBackend::Sqlite && state.sqlite_mode() != StateBackend::Shadow {
-        return sqlite_not_configured();
-    }
-    let conn = sqlite.lock().expect("sqlite lock");
-    let patch = match sqlite_store::get_patch(&conn, &patch_id) {
-        Ok(Some(patch)) => patch,
-        Ok(None) => {
-            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown patch" })))
-                .into_response()
-        }
-        Err(_) => return sqlite_error_response(),
-    };
-    let files = match sqlite_store::list_patch_files(&conn, &patch_id) {
-        Ok(files) => files,
-        Err(_) => return sqlite_error_response(),
-    };
-    Json(serde_json::json!({ "patch": patch, "files": files })).into_response()
-}
-
-async fn patches_apply(
-    State(state): State<AppState>,
-    axum::extract::Path((patch_id, patch_file_id)): axum::extract::Path<(String, String)>,
-    Json(req): Json<PatchApplyRequest>,
-) -> impl IntoResponse {
-    if req.approval_id.trim().is_empty() {
-        return bad_request("approval_id is required");
-    }
-    match apply_patch_file_locked(
-        &state,
-        &patch_id,
-        &patch_file_id,
-        req.expected_old_sha256.as_deref(),
-        &req.approval_id,
-    ) {
-        Ok((patch_file, effect, replayed)) => {
-            // E2-C §4.5: a fresh apply writes Evidence in-tx
-            // (the export regenerates from SQLite, so on a
-            // replay this is a no-op rewrite of the same rows).
-            if let Some(sqlite) = &state.sqlite {
-                if let Ok(conn) = sqlite.lock() {
-                    export_evidence_best_effort(&state, &conn);
-                }
-            }
-            Json(serde_json::json!({
-                "patch_file": patch_file,
-                "effect": effect,
-                "replayed": replayed,
-            }))
-            .into_response()
-        }
-        Err(response) => *response,
-    }
-}
-
-async fn patches_reject(
-    State(state): State<AppState>,
-    axum::extract::Path(patch_id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if state.sqlite_mode() != StateBackend::Sqlite {
-        return sqlite_not_configured();
-    }
-    if state.sqlite_is_broken() {
-        return sqlite_error_response();
-    }
-    let Some(sqlite) = &state.sqlite else {
-        return sqlite_not_configured();
-    };
-    let patch = {
-        let conn = sqlite.lock().expect("sqlite lock");
-        match sqlite_store::get_patch(&conn, &patch_id) {
-            Ok(Some(patch)) => patch,
-            Ok(None) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": "unknown patch" })),
-                )
-                    .into_response()
-            }
-            Err(_) => return sqlite_error_response(),
-        }
-    };
-    // Already rejected -> 200 idempotent (the get shape).
-    if patch.status == "rejected" {
-        let conn = sqlite.lock().expect("sqlite lock");
-        let files = sqlite_store::list_patch_files(&conn, &patch_id).unwrap_or_default();
-        return Json(serde_json::json!({ "patch": patch, "files": files })).into_response();
-    }
-    let mut conn = sqlite.lock().expect("sqlite lock");
-    let tx = match conn.transaction() {
-        Ok(tx) => tx,
-        Err(_) => return sqlite_error_response(),
-    };
-    let patch = match sqlite_store::reject_patch_tx(&tx, &patch_id, now_ms() as i64) {
-        Ok(patch) => patch,
-        Err(code) if code == "patch_has_applied_files" => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "error": "patch_has_applied_files" })),
-            )
-                .into_response()
-        }
-        Err(code) if code == "patch_not_found" => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "unknown patch" })),
-            )
-                .into_response()
-        }
-        Err(_) => return sqlite_error_response(),
-    };
-    if tx.commit().is_err() {
-        return sqlite_error_response();
-    }
-    let files = sqlite_store::list_patch_files(&conn, &patch_id).unwrap_or_default();
-    Json(serde_json::json!({ "patch": patch, "files": files })).into_response()
-}
-
 #[derive(Debug, Deserialize)]
 struct EvidenceIdQuery {
     evidence_id: String,
@@ -14998,14 +14090,14 @@ pub fn app(state: AppState) -> Router {
         .route("/api/nodes/disconnect", post(nodes_disconnect))
         .route("/api/nodes/unpair", post(nodes_unpair))
         // P3-A: engineering records (16 routes).
-        .route("/bindings/create", post(bindings_create))
-        .route("/bindings/list", get(bindings_list))
-        .route("/bindings/{id}", get(bindings_get))
-        .route("/bindings/{id}/archive", post(bindings_archive))
-        .route("/projects/create", post(projects_create))
-        .route("/projects/list", get(projects_list))
-        .route("/projects/{id}", get(projects_get))
-        .route("/projects/{id}/archive", post(projects_archive))
+        .route("/bindings/create", post(crate::routes_engineering::bindings_create))
+        .route("/bindings/list", get(crate::routes_engineering::bindings_list))
+        .route("/bindings/{id}", get(crate::routes_engineering::bindings_get))
+        .route("/bindings/{id}/archive", post(crate::routes_engineering::bindings_archive))
+        .route("/projects/create", post(crate::routes_engineering::projects_create))
+        .route("/projects/list", get(crate::routes_engineering::projects_list))
+        .route("/projects/{id}", get(crate::routes_engineering::projects_get))
+        .route("/projects/{id}/archive", post(crate::routes_engineering::projects_archive))
         // D1-1: goals (4 routes).
         .route("/goals/create", post(crate::routes_data::goals_create))
         .route("/goals/list", get(crate::routes_data::goals_list))
@@ -15024,21 +14116,21 @@ pub fn app(state: AppState) -> Router {
         .route("/sources/{id}", get(crate::routes_data::sources_get))
         .route("/sources/{id}/disconnect", post(crate::routes_data::sources_disconnect))
         .route("/sources/{id}/reconnect", post(crate::routes_data::sources_reconnect))
-        .route("/locations/create", post(locations_create))
-        .route("/locations/list", get(locations_list))
-        .route("/locations/{id}", get(locations_get))
-        .route("/locations/{id}/archive", post(locations_archive))
-        .route("/worktrees/create", post(worktrees_create))
-        .route("/worktrees/list", get(worktrees_list))
-        .route("/worktrees/{id}", get(worktrees_get))
-        .route("/worktrees/{id}/archive", post(worktrees_archive))
-        .route("/patches/list", get(patches_list))
-        .route("/patches/{id}", get(patches_get))
+        .route("/locations/create", post(crate::routes_engineering::locations_create))
+        .route("/locations/list", get(crate::routes_engineering::locations_list))
+        .route("/locations/{id}", get(crate::routes_engineering::locations_get))
+        .route("/locations/{id}/archive", post(crate::routes_engineering::locations_archive))
+        .route("/worktrees/create", post(crate::routes_engineering::worktrees_create))
+        .route("/worktrees/list", get(crate::routes_engineering::worktrees_list))
+        .route("/worktrees/{id}", get(crate::routes_engineering::worktrees_get))
+        .route("/worktrees/{id}/archive", post(crate::routes_engineering::worktrees_archive))
+        .route("/patches/list", get(crate::routes_engineering::patches_list))
+        .route("/patches/{id}", get(crate::routes_engineering::patches_get))
         .route(
             "/patches/{patch_id}/files/{patch_file_id}/apply",
-            post(patches_apply),
+            post(crate::routes_engineering::patches_apply),
         )
-        .route("/patches/{id}/reject", post(patches_reject))
+        .route("/patches/{id}/reject", post(crate::routes_engineering::patches_reject))
         .route("/approval/check", post(approval_check))
         .route("/files/list", get(crate::routes_files::files_list))
         .route("/files/read", get(crate::routes_files::files_read))
