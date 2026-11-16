@@ -29,6 +29,7 @@ pub mod routes_voice;
 pub mod routes_feed;
 pub mod routes_data;
 pub mod routes_tasks;
+pub mod routes_files;
 pub mod task_store;
 pub mod task_runner;
 pub mod execution_store;
