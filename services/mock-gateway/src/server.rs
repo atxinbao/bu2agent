@@ -160,11 +160,7 @@ use crate::stream_store::{
 use crate::mail_source::{clamp_limit, MailError, MailSource, UnavailableMailSource};
 use crate::notes_source::NotesSource;
 use crate::calendar_backend::{default_calendar_backend, CalendarBackend, CalendarError};
-use crate::voice_store::{
-    append_voice_line, catalog_locales, catalog_voices, load_voice_state,
-    merged_custom_voices, pipeline_profiles, ActiveVoiceRecord, CustomVoice,
-    PipelineSelectionRecord, VoiceLine,
-};
+use crate::voice_store::{load_voice_state, merged_custom_voices, CustomVoice};
 use agent_desktop::credential_store::{CredentialStore, KeychainCredentialStore};
 use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepseekOutcome};
 use crate::{apply_records, may_execute_tool, seed_history, start_stream, tool_requires_approval, ChatMessage, CancellableStream};
@@ -521,10 +517,10 @@ pub struct AppState {
     next_poke_order: Arc<Mutex<u64>>,
     stream_selections: Arc<Mutex<HashMap<String, SxsSelection>>>,
     stream_state_path: Option<PathBuf>,
-    voice_custom: Arc<Mutex<HashMap<String, CustomVoice>>>,
-    voice_active: Arc<Mutex<Option<String>>>,
-    voice_pipeline: Arc<Mutex<Option<String>>>,
-    voice_state_path: Option<PathBuf>,
+    pub(crate) voice_custom: Arc<Mutex<HashMap<String, CustomVoice>>>,
+    pub(crate) voice_active: Arc<Mutex<Option<String>>>,
+    pub(crate) voice_pipeline: Arc<Mutex<Option<String>>>,
+    pub(crate) voice_state_path: Option<PathBuf>,
     /// D1-6b-3: `pub(crate)` like `calendar_backend`
     /// below — the Evidence readback in `evidence.rs`
     /// needs the mail source for the delete re-read.
@@ -9940,200 +9936,6 @@ async fn chat_sxs_select(
     .into_response()
 }
 
-// --- Voice record surface (Task 21, record subset, D2) ---
-//
-// Local semantics only (see voice_store.rs and the Task 21
-// plan): static [Mock] catalog and pipeline seeds, custom
-// voice rename/delete over seeds, record-only active voice
-// and pipeline selections, and an onboarding reset that
-// clears just those two selections. No audio plays here.
-
-fn persist_voice_line(state: &AppState, line: &VoiceLine) {
-    let Some(path) = &state.voice_state_path else {
-        return;
-    };
-    append_voice_line(path, line);
-}
-
-fn custom_voice_view(voice: &CustomVoice) -> serde_json::Value {
-    serde_json::json!({
-        "saved_voice_id": voice.saved_voice_id,
-        "name": voice.name,
-        "created_ms": voice.created_ms,
-        "updated_ms": voice.updated_ms,
-        "deleted": voice.deleted,
-    })
-}
-
-async fn voice_catalog() -> Json<Vec<crate::voice_store::CatalogVoice>> {
-    Json(catalog_voices())
-}
-
-async fn voice_catalog_filters() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "locales": catalog_locales() }))
-}
-
-async fn voice_available_voices() -> Json<Vec<crate::voice_store::CatalogVoice>> {
-    Json(catalog_voices().into_iter().filter(|v| v.available).collect())
-}
-
-async fn voice_pipeline_profiles() -> Json<Vec<crate::voice_store::PipelineProfile>> {
-    Json(pipeline_profiles())
-}
-
-#[derive(Debug, Deserialize)]
-struct VoiceProfileSelectDto {
-    profile_id: String,
-}
-
-async fn voice_pipeline_profile_select(
-    State(state): State<AppState>,
-    Json(req): Json<VoiceProfileSelectDto>,
-) -> impl IntoResponse {
-    if !pipeline_profiles().iter().any(|p| p.profile_id == req.profile_id) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "unknown pipeline profile" })),
-        )
-            .into_response();
-    }
-    *state.voice_pipeline.lock().expect("voice pipeline lock") = Some(req.profile_id.clone());
-    persist_voice_line(
-        &state,
-        &VoiceLine::PipelineSelection(PipelineSelectionRecord {
-            profile_id: Some(req.profile_id.clone()),
-            updated_ms: now_ms(),
-        }),
-    );
-    Json(serde_json::json!({ "profile_id": req.profile_id })).into_response()
-}
-
-async fn voice_custom_voices_list(State(state): State<AppState>) -> Json<Vec<serde_json::Value>> {
-    let customs = state.voice_custom.lock().expect("voice custom lock");
-    let mut voices: Vec<&CustomVoice> = customs.values().filter(|v| !v.deleted).collect();
-    voices.sort_by(|a, b| a.saved_voice_id.cmp(&b.saved_voice_id));
-    Json(voices.iter().map(|v| custom_voice_view(v)).collect())
-}
-
-#[derive(Debug, Deserialize)]
-struct VoiceRenameDto {
-    name: String,
-}
-
-async fn voice_custom_voice_rename(
-    State(state): State<AppState>,
-    axum::extract::Path(saved_voice_id): axum::extract::Path<String>,
-    Json(req): Json<VoiceRenameDto>,
-) -> impl IntoResponse {
-    let mut customs = state.voice_custom.lock().expect("voice custom lock");
-    let Some(voice) = customs.get_mut(&saved_voice_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "unknown custom voice" })),
-        )
-            .into_response();
-    };
-    if voice.deleted {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "unknown custom voice" })),
-        )
-            .into_response();
-    }
-    if req.name.trim().is_empty() {
-        return bad_request("name must not be empty").into_response();
-    }
-    voice.name = req.name.clone();
-    voice.updated_ms = now_ms();
-    let updated = voice.clone();
-    drop(customs);
-    persist_voice_line(&state, &VoiceLine::CustomVoice(updated.clone()));
-    Json(custom_voice_view(&updated)).into_response()
-}
-
-async fn voice_custom_voice_delete(
-    State(state): State<AppState>,
-    axum::extract::Path(saved_voice_id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    let mut customs = state.voice_custom.lock().expect("voice custom lock");
-    let Some(voice) = customs.get_mut(&saved_voice_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "unknown custom voice" })),
-        )
-            .into_response();
-    };
-    if !voice.deleted {
-        voice.deleted = true;
-        voice.updated_ms = now_ms();
-        let updated = voice.clone();
-        drop(customs);
-        persist_voice_line(&state, &VoiceLine::CustomVoice(updated.clone()));
-        return Json(custom_voice_view(&updated)).into_response();
-    }
-    let view = custom_voice_view(voice);
-    Json(view).into_response()
-}
-
-async fn voice_active_voice_get(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let voice_id = state.voice_active.lock().expect("voice active lock").clone();
-    Json(serde_json::json!({ "voice_id": voice_id }))
-}
-
-#[derive(Debug, Deserialize)]
-struct VoiceActiveSaveDto {
-    voice_id: String,
-}
-
-async fn voice_active_voice_save(
-    State(state): State<AppState>,
-    Json(req): Json<VoiceActiveSaveDto>,
-) -> impl IntoResponse {
-    let in_catalog = catalog_voices().iter().any(|v| v.voice_id == req.voice_id);
-    let in_custom = state
-        .voice_custom
-        .lock()
-        .expect("voice custom lock")
-        .get(&req.voice_id)
-        .is_some_and(|v| !v.deleted);
-    if !in_catalog && !in_custom {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "unknown voice" })),
-        )
-            .into_response();
-    }
-    *state.voice_active.lock().expect("voice active lock") = Some(req.voice_id.clone());
-    persist_voice_line(
-        &state,
-        &VoiceLine::ActiveVoice(ActiveVoiceRecord {
-            voice_id: Some(req.voice_id.clone()),
-            updated_ms: now_ms(),
-        }),
-    );
-    Json(serde_json::json!({ "voice_id": req.voice_id })).into_response()
-}
-
-async fn voice_onboarding_reset(State(state): State<AppState>) -> Json<serde_json::Value> {
-    // D2: clears only the two selections, back to null.
-    // Custom voices are untouched.
-    *state.voice_active.lock().expect("voice active lock") = None;
-    *state.voice_pipeline.lock().expect("voice pipeline lock") = None;
-    let now = now_ms();
-    persist_voice_line(
-        &state,
-        &VoiceLine::ActiveVoice(ActiveVoiceRecord { voice_id: None, updated_ms: now }),
-    );
-    persist_voice_line(
-        &state,
-        &VoiceLine::PipelineSelection(PipelineSelectionRecord {
-            profile_id: None,
-            updated_ms: now,
-        }),
-    );
-    Json(serde_json::json!({ "voice_id": null, "profile_id": null }))
-}
-
 // --- Email read surface (Task 22, batch 1, option A) ---
 //
 // Live queries against the configured MailSource, no
@@ -17799,23 +17601,23 @@ pub fn app(state: AppState) -> Router {
         .route("/chat/stream", post(chat_stream_open))
         .route("/chat/poke", post(chat_poke))
         .route("/api/chat/sxs/select", post(chat_sxs_select))
-        .route("/api/voice/catalog", get(voice_catalog))
-        .route("/api/voice/catalog/filters", get(voice_catalog_filters))
-        .route("/api/voice/available-voices", get(voice_available_voices))
-        .route("/api/voice/pipeline-profiles", get(voice_pipeline_profiles))
-        .route("/api/voice/pipeline-profile", post(voice_pipeline_profile_select))
-        .route("/api/voice/custom-voices", get(voice_custom_voices_list))
+        .route("/api/voice/catalog", get(crate::routes_voice::voice_catalog))
+        .route("/api/voice/catalog/filters", get(crate::routes_voice::voice_catalog_filters))
+        .route("/api/voice/available-voices", get(crate::routes_voice::voice_available_voices))
+        .route("/api/voice/pipeline-profiles", get(crate::routes_voice::voice_pipeline_profiles))
+        .route("/api/voice/pipeline-profile", post(crate::routes_voice::voice_pipeline_profile_select))
+        .route("/api/voice/custom-voices", get(crate::routes_voice::voice_custom_voices_list))
         .route(
             "/api/voice/custom-voices/{saved_voice_id}",
-            patch(voice_custom_voice_rename),
+            patch(crate::routes_voice::voice_custom_voice_rename),
         )
         .route(
             "/api/voice/custom-voices/{saved_voice_id}",
-            delete(voice_custom_voice_delete),
+            delete(crate::routes_voice::voice_custom_voice_delete),
         )
-        .route("/api/voice/active-voice", get(voice_active_voice_get))
-        .route("/api/voice/active-voice", post(voice_active_voice_save))
-        .route("/api/voice/onboarding/reset", post(voice_onboarding_reset))
+        .route("/api/voice/active-voice", get(crate::routes_voice::voice_active_voice_get))
+        .route("/api/voice/active-voice", post(crate::routes_voice::voice_active_voice_save))
+        .route("/api/voice/onboarding/reset", post(crate::routes_voice::voice_onboarding_reset))
         .route("/api/email/mailbox", get(email_mailbox))
         .route("/api/email/mailbox/setup", get(email_mailbox_setup))
         .route("/api/email/threads", get(email_threads_list))
