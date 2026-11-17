@@ -377,6 +377,17 @@ export function WorkbenchView(props: WorkbenchViewProps) {
     setOutboxError("");
     try {
       setOutboxRows(await outboxClient.list());
+      // W4-3: the expanded detail is a snapshot taken at expand
+      // time. Re-read it here so a list refresh also refreshes
+      // the detail — otherwise a row delivered since expansion
+      // keeps showing pending with its deliver/reschedule
+      // buttons. The schedule input follows the fresh due time,
+      // the same as in expandOutboxRow/scheduleOutboxRow.
+      if (expandedOutboxId !== null) {
+        const fresh = await outboxClient.get(expandedOutboxId);
+        setOutboxDetail(fresh);
+        setScheduleInput(fresh.deliverAtMs === null ? "" : toDatetimeLocal(fresh.deliverAtMs));
+      }
     } catch (e) {
       setOutboxError(errText(e));
     }
