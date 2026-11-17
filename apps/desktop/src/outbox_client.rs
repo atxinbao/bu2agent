@@ -39,6 +39,11 @@ pub struct OutboxRow {
     pub dedup_key: String,
     pub created_ms: i64,
     pub updated_at_ms: i64,
+    /// D1-3 C-1: epoch ms the row becomes deliverable;
+    /// None = immediate row. `default` so rows recorded
+    /// before C-1 (no field in the JSON) still decode.
+    #[serde(default)]
+    pub deliver_at_ms: Option<i64>,
 }
 
 /// `base_url` must look like `http://127.0.0.1:3001`.
@@ -67,6 +72,14 @@ impl OutboxClient {
     pub fn requeue(&self, outbox_id: &str) -> Result<OutboxRow> {
         self.http.post_json(&format!("/outbox/{outbox_id}/requeue"), "{}")
     }
+
+    /// D1-3 C-1: set (or reschedule) a pending row's due
+    /// time, epoch ms. A past value is already due.
+    pub fn schedule(&self, outbox_id: &str, deliver_at_ms: i64) -> Result<OutboxRow> {
+        let body = serde_json::json!({ "deliver_at_ms": deliver_at_ms }).to_string();
+        self.http
+            .post_json(&format!("/outbox/{outbox_id}/schedule"), &body)
+    }
 }
 
 #[cfg(test)]
@@ -82,7 +95,7 @@ mod tests {
         "payload_summary_json": "{\"kind\":\"mail.send\"}",
         "destination_kind": "mail", "status": "failed", "attempts": 2,
         "dedup_key": "dedup-1", "created_ms": 1794611497606,
-        "updated_at_ms": 1794611497630
+        "updated_at_ms": 1794611497630, "deliver_at_ms": 1794611498000
     }"#;
 
     const MINIMAL_JSON: &str = r#"{
@@ -104,6 +117,7 @@ mod tests {
         assert_eq!(row.dedup_key, "dedup-1");
         assert_eq!(row.created_ms, 1794611497606);
         assert_eq!(row.updated_at_ms, 1794611497630);
+        assert_eq!(row.deliver_at_ms, Some(1794611498000));
     }
 
     #[test]
@@ -118,5 +132,8 @@ mod tests {
         assert_eq!(row.dedup_key, "dedup-2");
         assert_eq!(row.created_ms, 1794611497700);
         assert_eq!(row.updated_at_ms, 1794611497700);
+        // Pre-C-1 rows carry no due field: None, not an
+        // error — the `#[serde(default)]` on the field.
+        assert_eq!(row.deliver_at_ms, None);
     }
 }

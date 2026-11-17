@@ -1,6 +1,6 @@
 //! Ledger routes: /executions (3) + /worker/runs (4) +
 //! /assignments (3) + /effects (5) + /evidence (3) +
-//! /inbox (3) + /outbox (4) = 25.
+//! /inbox (3) + /outbox (5) = 26.
 //!
 //! The handlers moved here from `server.rs` (FU-5 S-9g, the last
 //! ledger batch). No `//!` directory lines move with this batch:
@@ -1039,6 +1039,41 @@ pub(crate) async fn outbox_requeue(
     };
     let mut conn = sqlite.lock().expect("sqlite lock");
     match sqlite_store::requeue_outbox(&mut conn, &id) {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown outbox item" })))
+            .into_response(),
+        Err(_) => sqlite_error_response(),
+    }
+}
+
+/// D1-3 C-1 (plan §3): set (or reschedule) a pending
+/// Outbox row's due time. Body `{deliver_at_ms}` (epoch
+/// ms, any integer — a past value is already due and the
+/// next tick delivers it, the E2-D `start_at_ms`
+/// normalization). The body is read as a plain JSON value
+/// and validated by hand so a missing or non-integer
+/// `deliver_at_ms` is a 400 with the usual error shape,
+/// not axum's default extractor rejection. A sent/failed
+/// row is returned unchanged (no write, no event);
+/// unknown id is 404, same shape as `outbox_get`. The
+/// response carries only the updated Outbox row — no
+/// Effect row (the Effect, if any, is built at delivery).
+pub(crate) async fn outbox_schedule(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    let Some(deliver_at_ms) = body.get("deliver_at_ms").and_then(|v| v.as_i64()) else {
+        return bad_request("deliver_at_ms must be an integer (epoch milliseconds)");
+    };
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    match sqlite_store::schedule_outbox(&mut conn, &id, deliver_at_ms) {
         Ok(Some(row)) => Json(row).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown outbox item" })))
             .into_response(),

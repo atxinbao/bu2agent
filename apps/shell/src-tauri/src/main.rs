@@ -317,6 +317,7 @@ fn main() {
             tool_commands::outbox_get,
             tool_commands::outbox_deliver,
             tool_commands::outbox_requeue,
+            tool_commands::outbox_schedule,
             tool_commands::policies_versions_list,
             tool_commands::mandates_list,
             tool_commands::mandates_get,

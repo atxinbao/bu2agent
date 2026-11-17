@@ -240,7 +240,8 @@ CREATE TABLE IF NOT EXISTS outbox (
     attempts INTEGER NOT NULL,
     dedup_key TEXT NOT NULL UNIQUE,
     created_ms INTEGER NOT NULL,
-    updated_at_ms INTEGER
+    updated_at_ms INTEGER,
+    deliver_at_ms INTEGER
 );
 ";
 
@@ -871,6 +872,16 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     // priority NULL orders as 0 (COALESCE at fetch).
     backfill_column_typed(&tx, "worker_runs", "start_at_ms", "INTEGER")?;
     backfill_column_typed(&tx, "worker_runs", "priority", "INTEGER")?;
+    // D1-3 C-1 additive column: databases created before
+    // C-1 have no outbox.deliver_at_ms. Nullable, idempotent,
+    // schema version stays 13 (column backfill, not a v14
+    // migration — the E2-D progress_json precedent). Old rows
+    // read NULL: deliver_at_ms NULL means immediate (no
+    // delay), non-NULL means timed (deliver at/after it).
+    // Typed INTEGER, not the generic TEXT backfill: the due
+    // query CASTs anyway (the E2-D TEXT lesson), but the
+    // column must never be TEXT by construction.
+    backfill_column_typed(&tx, "outbox", "deliver_at_ms", "INTEGER")?;
     // P3-C: the approval CommandSpec (JSON, like binding_json).
     // Databases migrated before P3-C have no approvals
     // .command_json; same backfill precedent, version stays 4.
@@ -3191,6 +3202,10 @@ pub struct OutboxRow {
     pub dedup_key: String,
     pub created_ms: i64,
     pub updated_at_ms: i64,
+    /// D1-3 C-1: epoch ms the row becomes deliverable.
+    /// NULL = immediate row (all pre-C-1 rows); non-NULL =
+    /// timed row, delivered by the row scan at/after it.
+    pub deliver_at_ms: Option<i64>,
 }
 
 fn inbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxRow> {
@@ -3995,12 +4010,16 @@ fn outbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
         dedup_key: row.get(6)?,
         created_ms: row.get(7)?,
         updated_at_ms: row.get(8)?,
+        // Storage-class compatible: a pre-C-1 backfill (or a
+        // hand-built legacy table) may hold this column as
+        // TEXT; the E2-D `optional_i64_compat` precedent.
+        deliver_at_ms: optional_i64_compat(row, 9)?,
     })
 }
 
 pub fn list_outbox(conn: &Connection) -> Result<Vec<OutboxRow>, String> {
     let mut stmt = conn
-        .prepare("SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms FROM outbox ORDER BY seq ASC")
+        .prepare("SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox ORDER BY seq ASC")
         .map_err(err)?;
     let rows = stmt
         .query_map([], outbox_from_row)
@@ -4012,7 +4031,7 @@ pub fn list_outbox(conn: &Connection) -> Result<Vec<OutboxRow>, String> {
 
 pub fn get_outbox(conn: &Connection, outbox_id: &str) -> Result<Option<OutboxRow>, String> {
     conn.query_row(
-        "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms FROM outbox WHERE outbox_id = ?1",
+        "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE outbox_id = ?1",
         params![outbox_id],
         outbox_from_row,
     )
@@ -4039,7 +4058,7 @@ pub fn enqueue_outbox_tx(
     let dedup_key = format!("{execution_id}:local_notification");
     if let Some(existing) = tx
         .query_row(
-            "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms FROM outbox WHERE dedup_key = ?1",
+            "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE dedup_key = ?1",
             params![dedup_key],
             outbox_from_row,
         )
@@ -4052,8 +4071,8 @@ pub fn enqueue_outbox_tx(
     let seq = next_seq_for(tx, "outbox", "outbox_id")?;
     let outbox_id = format!("outbox-{seq}");
     tx.execute(
-        "INSERT INTO outbox (seq, outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms)
-         VALUES (?1, ?2, ?3, ?4, 'local_notification', 'pending', 0, ?5, ?6, ?6)",
+        "INSERT INTO outbox (seq, outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms)
+         VALUES (?1, ?2, ?3, ?4, 'local_notification', 'pending', 0, ?5, ?6, ?6, NULL)",
         params![seq, outbox_id, execution_id, payload_summary_json, dedup_key, now],
     )
     .map_err(err)?;
@@ -4067,6 +4086,7 @@ pub fn enqueue_outbox_tx(
         dedup_key,
         created_ms: now,
         updated_at_ms: now,
+        deliver_at_ms: None,
     };
     let payload = serde_json::to_string(&row).map_err(|e| e.to_string())?;
     append_event(tx, "outbox", &outbox_id, "outbox.enqueued", &payload, "unknown", now, 1)?;
@@ -4092,7 +4112,7 @@ fn set_outbox_status(
 ) -> Result<Option<OutboxRow>, String> {
     let current: Option<OutboxRow> = tx
         .query_row(
-            "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms FROM outbox WHERE outbox_id = ?1",
+            "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE outbox_id = ?1",
             params![outbox_id],
             outbox_from_row,
         )
@@ -4142,7 +4162,7 @@ pub fn requeue_outbox(conn: &mut Connection, outbox_id: &str) -> Result<Option<O
     let tx = conn.transaction().map_err(err)?;
     let current: Option<OutboxRow> = tx
         .query_row(
-            "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms FROM outbox WHERE outbox_id = ?1",
+            "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE outbox_id = ?1",
             params![outbox_id],
             outbox_from_row,
         )
@@ -4184,6 +4204,73 @@ pub fn deliver_outbox_via_log_sink(
     Ok(row)
 }
 
+/// D1-3 C-1: timed rows whose due time has arrived, in
+/// delivery order — earliest due first, then oldest first
+/// (`(deliver_at_ms ASC, seq ASC)`; no priority column,
+/// Q-C-10). Only rows with a stored `deliver_at_ms` can
+/// match, so immediate rows (NULL) never appear here.
+/// The comparison is CAST to INTEGER: old databases may
+/// store this column as TEXT (the generic backfiller
+/// created it untyped before the typed backfill), and
+/// without the CAST the ORDER BY compares
+/// lexicographically ('9…' before '10…' as TEXT) — the
+/// E2-D batch 2 lesson (`due_deferred_worker_runs`).
+pub fn due_outbox_rows(conn: &Connection, now_ms: i64) -> Result<Vec<OutboxRow>, String> {
+    let mut stmt = conn
+        .prepare("SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE status = 'pending' AND deliver_at_ms IS NOT NULL AND CAST(deliver_at_ms AS INTEGER) <= ?1 ORDER BY CAST(deliver_at_ms AS INTEGER) ASC, seq ASC")
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![now_ms], outbox_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+/// D1-3 C-1: set (or reschedule) a pending row's due
+/// time, one transaction. A non-pending row is returned
+/// unchanged — no write, no event (the deliver/requeue
+/// idempotence precedent). A repeated call moves the due
+/// time; every write appends an `outbox.rescheduled`
+/// event carrying the post-state row, so the old due time
+/// stays auditable. The payload is a row serialization
+/// (`outbox` is in `ROW_SERIALIZATION_KINDS`), so it
+/// passes the redact choke point byte-identical — no
+/// allowlist change. Unknown id returns None.
+pub fn schedule_outbox(
+    conn: &mut Connection,
+    outbox_id: &str,
+    deliver_at_ms: i64,
+) -> Result<Option<OutboxRow>, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let current: Option<OutboxRow> = tx
+        .query_row(
+            "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE outbox_id = ?1",
+            params![outbox_id],
+            outbox_from_row,
+        )
+        .optional()
+        .map_err(err)?;
+    let Some(mut row) = current else {
+        return Ok(None);
+    };
+    if row.status != "pending" {
+        return Ok(Some(row));
+    }
+    let now = now_ms() as i64;
+    tx.execute(
+        "UPDATE outbox SET deliver_at_ms = ?1, updated_at_ms = ?2 WHERE outbox_id = ?3",
+        params![deliver_at_ms, now, outbox_id],
+    )
+    .map_err(err)?;
+    row.deliver_at_ms = Some(deliver_at_ms);
+    row.updated_at_ms = now;
+    let payload = serde_json::to_string(&row).map_err(|e| e.to_string())?;
+    append_event(&tx, "outbox", outbox_id, "outbox.rescheduled", &payload, "unknown", now, 1)?;
+    tx.commit().map_err(err)?;
+    Ok(Some(row))
+}
+
 // --- D1-3: event_cursors + the Outbox consumer ---
 //
 // The consumer (`outbox-deliverer`) reads the event log
@@ -4216,7 +4303,12 @@ pub fn deliver_outbox_via_log_sink(
 // format, so log and state cannot split.
 //
 // Timed delivery is NOT here: it hooks on after
-// E2-D batch 2 lands (Q-D1-35).
+// E2-D batch 2 lands (Q-D1-35). — D1-3 C-1 landed it:
+// the event channel above skips timed rows (the guard
+// in `consume_outbox_events`), and the row scan
+// (`due_outbox_rows`, driven by
+// `AppState::deliver_due_outbox` on the same sweeper
+// tick) delivers them when due.
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EventCursorRow {
@@ -4306,16 +4398,22 @@ pub fn consume_outbox_events(
         if kind != "outbox" || (event_type != "outbox.enqueued" && event_type != "outbox.requeued") {
             continue;
         }
-        let pending: bool = tx
+        // D1-3 C-1 dual-channel split: the event channel
+        // owns immediate rows only (`deliver_at_ms IS
+        // NULL`). A timed row is skipped here — the cursor
+        // still advances past its enqueued event (the
+        // row scan owns it from then on, so a row whose
+        // event the cursor has passed is never lost).
+        let (pending, timed): (bool, bool) = tx
             .query_row(
-                "SELECT status = 'pending' FROM outbox WHERE outbox_id = ?1",
+                "SELECT status = 'pending', deliver_at_ms IS NOT NULL FROM outbox WHERE outbox_id = ?1",
                 params![aggregate_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(err)?
-            .unwrap_or(false);
-        if !pending {
+            .unwrap_or((false, false));
+        if !pending || timed {
             continue;
         }
         if let Some(row) = set_outbox_status(&tx, aggregate_id, "sent", "outbox.sent")? {

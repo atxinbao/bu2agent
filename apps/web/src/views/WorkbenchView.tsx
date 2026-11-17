@@ -354,6 +354,23 @@ export function WorkbenchView(props: WorkbenchViewProps) {
   const [expandedOutboxId, setExpandedOutboxId] = useState<string | null>(null);
   const [outboxDetail, setOutboxDetail] = useState<OutboxRow | null>(null);
   const [outboxBusyId, setOutboxBusyId] = useState<string | null>(null);
+  // D1-3 C-1: the schedule input for the expanded row,
+  // a datetime-local value (local time). Prefilled from
+  // the row's due time when one is set, so the same
+  // control schedules and reschedules.
+  const [scheduleInput, setScheduleInput] = useState("");
+
+  function toDatetimeLocal(ms: number): string {
+    const d = new Date(ms);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  function dueText(row: OutboxRow): string {
+    return row.deliverAtMs === null
+      ? "即时"
+      : `定时 ${new Date(row.deliverAtMs).toLocaleString()}`;
+  }
 
   async function refreshOutbox() {
     if (!outboxClient) return;
@@ -371,9 +388,11 @@ export function WorkbenchView(props: WorkbenchViewProps) {
     if (expandedOutboxId === row.outboxId) {
       setExpandedOutboxId(null);
       setOutboxDetail(null);
+      setScheduleInput("");
       return;
     }
     setExpandedOutboxId(row.outboxId);
+    setScheduleInput(row.deliverAtMs === null ? "" : toDatetimeLocal(row.deliverAtMs));
     try {
       setOutboxDetail(await outboxClient.get(row.outboxId));
     } catch (e) {
@@ -415,6 +434,35 @@ export function WorkbenchView(props: WorkbenchViewProps) {
           ? `已重新排队 ${id} 为 pending，等待投递。`
           : `已操作 ${id}，当前状态为 ${fresh.status}。`,
       );
+      await refreshOutbox();
+    } catch (e) {
+      setOutboxError(errText(e));
+    } finally {
+      setOutboxBusyId(null);
+    }
+  }
+
+  // D1-3 C-1: schedule (or reschedule) a pending row's
+  // due time. A past time is already due — the next tick
+  // delivers it. The row is re-read with get() after the
+  // call, so the notice reports the row's real due time.
+  async function scheduleOutboxRow(row: OutboxRow) {
+    if (!outboxClient) return;
+    const id = row.outboxId;
+    const dueMs = scheduleInput.trim() === "" ? NaN : new Date(scheduleInput).getTime();
+    if (Number.isNaN(dueMs)) {
+      setOutboxError("请先选择一个定时投递时间。");
+      return;
+    }
+    setOutboxBusyId(id);
+    setOutboxError("");
+    setOutboxNotice("");
+    try {
+      await outboxClient.schedule(id, dueMs);
+      const fresh = await outboxClient.get(id);
+      setOutboxDetail(fresh);
+      setScheduleInput(fresh.deliverAtMs === null ? "" : toDatetimeLocal(fresh.deliverAtMs));
+      setOutboxNotice(`已定时 ${id} 到 ${new Date(dueMs).toLocaleString()}。`);
       await refreshOutbox();
     } catch (e) {
       setOutboxError(errText(e));
@@ -1412,6 +1460,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
                   <li key={row.outboxId}>
                     <button type="button" onClick={() => void expandOutboxRow(row)}>
                       {row.outboxId} · {row.status} · 尝试 {row.attempts} 次
+                      {` · ${dueText(row)}`}
                       {` · 执行 ${row.executionId}`}
                       {` · ${row.destinationKind}`}
                       {summary ? ` · ${summary}` : ""}
@@ -1422,6 +1471,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
                         <p>执行：{outboxDetail.executionId}</p>
                         <p>目标类型：{outboxDetail.destinationKind}</p>
                         <p>状态：{outboxDetail.status}</p>
+                        <p>定时投递：{dueText(outboxDetail)}</p>
                         <p>尝试次数：{outboxDetail.attempts}</p>
                         <p>去重键：{outboxDetail.dedupKey}</p>
                         <p>创建时间：{new Date(outboxDetail.createdMs).toLocaleString()}</p>
@@ -1436,6 +1486,23 @@ export function WorkbenchView(props: WorkbenchViewProps) {
                           >
                             立即投递
                           </button>
+                        )}
+                        {outboxDetail.status === "pending" && (
+                          <span>
+                            <input
+                              aria-label="定时投递时间"
+                              type="datetime-local"
+                              value={scheduleInput}
+                              onChange={(e) => setScheduleInput(e.target.value)}
+                            />
+                            <button
+                              type="button"
+                              disabled={outboxBusyId === row.outboxId}
+                              onClick={() => void scheduleOutboxRow(row)}
+                            >
+                              {outboxDetail.deliverAtMs === null ? "定时" : "改期"}
+                            </button>
+                          </span>
                         )}
                         {outboxDetail.status === "failed" && (
                           <button

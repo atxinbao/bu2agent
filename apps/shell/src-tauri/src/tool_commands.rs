@@ -1940,6 +1940,13 @@ pub fn outbox_requeue(outbox_id: String) -> Result<OutboxRow, String> {
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub fn outbox_schedule(outbox_id: String, deliver_at_ms: i64) -> Result<OutboxRow, String> {
+    outbox_client()?
+        .schedule(&outbox_id, deliver_at_ms)
+        .map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub fn policies_versions_list() -> Result<Vec<PolicyVersionRow>, String> {
     policies_client()?.list_versions().map_err(|e| err_string(&e))
 }

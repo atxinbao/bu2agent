@@ -13,6 +13,7 @@ interface ServerOutboxRow {
   dedup_key: string;
   created_ms: number;
   updated_at_ms: number;
+  deliver_at_ms?: number | null;
 }
 
 function toRow(server: ServerOutboxRow): OutboxRow {
@@ -26,6 +27,7 @@ function toRow(server: ServerOutboxRow): OutboxRow {
     dedupKey: server.dedup_key,
     createdMs: server.created_ms,
     updatedAtMs: server.updated_at_ms,
+    deliverAtMs: server.deliver_at_ms ?? null,
   };
 }
 
@@ -55,6 +57,14 @@ export class InvokeOutboxClient implements OutboxGateway {
   async requeue(outboxId: string): Promise<OutboxRow> {
     const row = await invoke<ServerOutboxRow>("outbox_requeue", {
       outbox_id: outboxId,
+    });
+    return toRow(row);
+  }
+
+  async schedule(outboxId: string, deliverAtMs: number): Promise<OutboxRow> {
+    const row = await invoke<ServerOutboxRow>("outbox_schedule", {
+      outbox_id: outboxId,
+      deliver_at_ms: deliverAtMs,
     });
     return toRow(row);
   }

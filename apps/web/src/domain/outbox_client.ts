@@ -29,6 +29,9 @@ export interface OutboxRow {
   dedupKey: string;
   createdMs: number;
   updatedAtMs: number;
+  // D1-3 C-1: epoch ms the row becomes deliverable;
+  // null = immediate row (no due time set).
+  deliverAtMs: number | null;
 }
 
 interface ServerOutboxRow {
@@ -41,6 +44,7 @@ interface ServerOutboxRow {
   dedup_key: string;
   created_ms: number;
   updated_at_ms: number;
+  deliver_at_ms?: number | null;
 }
 
 function toRow(server: ServerOutboxRow): OutboxRow {
@@ -54,6 +58,7 @@ function toRow(server: ServerOutboxRow): OutboxRow {
     dedupKey: server.dedup_key,
     createdMs: server.created_ms,
     updatedAtMs: server.updated_at_ms,
+    deliverAtMs: server.deliver_at_ms ?? null,
   };
 }
 
@@ -65,6 +70,9 @@ export interface OutboxGateway {
   get(outboxId: string): Promise<OutboxRow>;
   deliver(outboxId: string): Promise<OutboxRow>;
   requeue(outboxId: string): Promise<OutboxRow>;
+  // D1-3 C-1: set (or reschedule) a pending row's due
+  // time, epoch ms. A past value is already due.
+  schedule(outboxId: string, deliverAtMs: number): Promise<OutboxRow>;
 }
 
 export class OutboxClient implements OutboxGateway {
@@ -106,6 +114,18 @@ export class OutboxClient implements OutboxGateway {
     const row = await this.request<ServerOutboxRow>(
       `/outbox/${encodeURIComponent(outboxId)}/requeue`,
       { method: "POST" },
+    );
+    return toRow(row);
+  }
+
+  async schedule(outboxId: string, deliverAtMs: number): Promise<OutboxRow> {
+    const row = await this.request<ServerOutboxRow>(
+      `/outbox/${encodeURIComponent(outboxId)}/schedule`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deliver_at_ms: deliverAtMs }),
+      },
     );
     return toRow(row);
   }

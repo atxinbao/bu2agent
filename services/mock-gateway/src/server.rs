@@ -2307,6 +2307,52 @@ impl AppState {
         }
     }
 
+    /// D1-3 C-1: the timed-Outbox row scan, run from the
+    /// assignment sweeper's 10 s tick — no second
+    /// scheduler. Delivers due timed rows
+    /// (`deliver_at_ms <= now`) through the same log sink
+    /// as the event channel; the pending-only guard in
+    /// `set_outbox_status` is the anti-double-delivery
+    /// guard, so a row the event channel just delivered
+    /// (or a manual deliver just sent) is a no-op here.
+    /// A failed row scan (DB error) only warns and
+    /// returns 0 — the next tick retries, and no row is
+    /// marked failed. A single row's failure never aborts
+    /// the pass. Returns the number of rows delivered.
+    pub fn deliver_due_outbox(&self) -> usize {
+        if self.sqlite_mode() != StateBackend::Sqlite || self.sqlite_is_broken() {
+            return 0;
+        }
+        let Some(sqlite) = &self.sqlite else {
+            return 0;
+        };
+        let due = {
+            let conn = sqlite.lock().expect("sqlite lock");
+            match sqlite_store::due_outbox_rows(&conn, sqlite_store::now_ms() as i64) {
+                Ok(rows) => rows,
+                Err(detail) => {
+                    eprintln!("warning: D1-3 C-1 due outbox list failed: {detail}");
+                    return 0;
+                }
+            }
+        };
+        let mut delivered = 0;
+        for row in &due {
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            match sqlite_store::deliver_outbox_via_log_sink(&mut conn, &row.outbox_id) {
+                Ok(Some(sent)) if sent.status == "sent" => delivered += 1,
+                Ok(_) => {}
+                Err(detail) => {
+                    eprintln!(
+                        "warning: D1-3 C-1 due outbox deliver failed for {}: {detail}",
+                        row.outbox_id
+                    );
+                }
+            }
+        }
+        delivered
+    }
+
     /// E2-D batch 2: start due deferred runs, one pass.
     /// Rides the assignment sweeper's 10 s tick (plan
     /// §2.2) — no second scheduler. Fetches due runs in
@@ -7927,6 +7973,7 @@ pub fn app(state: AppState) -> Router {
         .route("/outbox/get", get(crate::routes_ledger::outbox_get))
         .route("/outbox/{id}/deliver", post(crate::routes_ledger::outbox_deliver))
         .route("/outbox/{id}/requeue", post(crate::routes_ledger::outbox_requeue))
+        .route("/outbox/{id}/schedule", post(crate::routes_ledger::outbox_schedule))
         .route("/sessions/create", post(crate::routes_chat::sessions_create))
         .route("/sessions/list", get(crate::routes_chat::sessions_list))
         .route("/sessions/get", get(crate::routes_chat::sessions_get))
@@ -7964,6 +8011,10 @@ pub fn spawn_assignment_sweeper(state: AppState) -> tokio::task::JoinHandle<()> 
             // D1-3: the Outbox deliverer rides the same
             // 10 s tick — no second scheduler.
             state.deliver_pending_outbox();
+            // D1-3 C-1: due timed Outbox rows ride the
+            // same tick, after the event channel and
+            // before due worker runs — no second scheduler.
+            state.deliver_due_outbox();
             // E2-D batch 2: due deferred runs start from
             // the same tick — no second scheduler.
             state.start_due_worker_runs().await;
