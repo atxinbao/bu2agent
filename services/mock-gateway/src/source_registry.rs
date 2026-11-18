@@ -385,6 +385,37 @@ impl Source for ContactsSourceEntry {
     }
 }
 
+/// The location source (MCL-3, the `MailSourceEntry`
+/// precedent): one row for the Core Location backend —
+/// the same backend serves the record route. One row:
+/// the source has no account concept of its own (the
+/// fix is picked per read). Disconnect is a flag flip
+/// only; reads are unaffected (6b Q-24) — only NEW
+/// records are rejected while disconnected.
+pub struct LocationSourceEntry;
+
+impl Source for LocationSourceEntry {
+    fn source_id(&self) -> String {
+        "location-source".to_string()
+    }
+
+    fn kind(&self) -> &'static str {
+        "location"
+    }
+
+    fn display_name(&self) -> String {
+        "Location".to_string()
+    }
+
+    fn config_json(&self) -> Value {
+        serde_json::json!({})
+    }
+
+    fn scope(&self) -> String {
+        "location".to_string()
+    }
+}
+
 /// The reminder backend as one source (Q-D1-43): Fake
 /// and EventKit are two backends of this single source,
 /// never two rows. `backend` is the switch value
@@ -508,6 +539,8 @@ pub fn seed_sources(
     let (row, _) = IMessageSourceEntry.register(&mut *conn, &inputs.origin_device_id)?;
     rows.push(row);
     let (row, _) = ContactsSourceEntry.register(&mut *conn, &inputs.origin_device_id)?;
+    rows.push(row);
+    let (row, _) = LocationSourceEntry.register(&mut *conn, &inputs.origin_device_id)?;
     rows.push(row);
     let (row, _) = ReminderDeviceSource {
         backend: inputs.device_backend,

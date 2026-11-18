@@ -525,7 +525,7 @@ pub fn loop_tool_requires_approval(tool: &str) -> bool {
 }
 
 pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, ErrorCode> {
-    if !matches!(tool, "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "imessage.threads" | "contacts.search" | "code.search" | "git.read" | "worker.run" | "worker.wait") {
+    if !matches!(tool, "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "imessage.threads" | "contacts.search" | "location.current" | "code.search" | "git.read" | "worker.run" | "worker.wait") {
         return Err(ErrorCode::InvalidTool);
     }
     let object = args.as_object().ok_or(ErrorCode::InvalidArguments)?;
@@ -636,6 +636,18 @@ pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, E
             ("limit".into(), limit),
             ("offset".into(), offset),
         ]));
+    }
+    if tool == "location.current" {
+        // MCL-3: read the latest recorded sample. No
+        // args at all (the reminders.list pattern): the
+        // tool never triggers a live fix (Q-MCL-18), it
+        // reads the newest `device_locations` row from
+        // SQLite. No args means no normalized values —
+        // the dispatcher takes no parameters.
+        if !object.is_empty() {
+            return Err(ErrorCode::InvalidArguments);
+        }
+        return Ok(BTreeMap::new());
     }
     if tool == "email.message" {
         // P2: read one message by id. The id is validated like
@@ -1653,7 +1665,7 @@ impl LoopEngine {
                                 // joins them here.
                                 let tool = if matches!(
                                     proposal.tool.as_str(),
-                                    "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "imessage.threads" | "contacts.search" | "code.search" | "git.read" | "worker.run" | "worker.wait"
+                                    "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "imessage.threads" | "contacts.search" | "location.current" | "code.search" | "git.read" | "worker.run" | "worker.wait"
                                 ) {
                                     proposal.tool.clone()
                                 } else {

@@ -60,6 +60,7 @@ use agent_desktop::email_client::{
 };
 use agent_desktop::imessage_client::{IMessageClient, IMessageSyncResult, IMessageThreadRow};
 use agent_desktop::contacts_client::{ContactRow, ContactsClient, ContactsSyncResult};
+use agent_desktop::location_client::{DeviceLocationRow, LocationClient};
 use agent_desktop::calendar_client::{
     CalendarClient, CalendarEvent, CreateCalendarEventInput, CreatedCalendarEventRow,
 };
@@ -1771,6 +1772,37 @@ pub fn contacts_search(
     offset: Option<usize>,
 ) -> Result<Vec<ContactRow>, String> {
     contacts_client()?.contacts_search(&query, limit, offset).map_err(agent_err_string)
+}
+
+// --- Location surface (MCL-3, manual record + read) ---
+//
+// Three commands mirror the three gateway routes
+// (record / list / get). Manual trigger only: record
+// takes one Core Location sample; there is no
+// auto-collection and no background track. Raw
+// coordinates are stored in SQLite (Q-MCL-17); the
+// UI shows exact values only locally in the packaged
+// app.
+fn location_client() -> Result<LocationClient, String> {
+    LocationClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn location_record() -> Result<DeviceLocationRow, String> {
+    location_client()?.record_location().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn location_list(
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<DeviceLocationRow>, String> {
+    location_client()?.samples_list(limit, offset).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn location_get(sample_id: String) -> Result<DeviceLocationRow, String> {
+    location_client()?.sample_get(&sample_id).map_err(agent_err_string)
 }
 
 // --- Notes surface (D1-6b-4, read + write) ---

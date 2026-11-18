@@ -59,8 +59,12 @@ import { InvokeIMessageClient } from "./domain/invoke_imessage_client";
 import { ContactsClient } from "./domain/contacts_client";
 import type { ContactsGateway } from "./domain/contacts_client";
 import { InvokeContactsClient } from "./domain/invoke_contacts_client";
+import { LocationClient } from "./domain/location_client";
+import type { LocationGateway } from "./domain/location_client";
+import { InvokeLocationClient } from "./domain/invoke_location_client";
 import MessagesView from "./views/MessagesView";
 import ContactsView from "./views/ContactsView";
+import LocationView from "./views/LocationView";
 import { CalendarClient } from "./domain/calendar_client";
 import type { CalendarGateway } from "./domain/calendar_client";
 import { InvokeCalendarClient } from "./domain/invoke_calendar_client";
@@ -205,6 +209,7 @@ interface Clients {
   email: EmailGateway;
   imessage: IMessageGateway;
   contacts: ContactsGateway;
+  location: LocationGateway;
   effects: EffectsGateway;
   executions: ExecutionsGateway;
   inbox: InboxGateway;
@@ -217,7 +222,7 @@ interface Clients {
   engineering: EngineeringGateway;
 }
 
-type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "goals" | "sources" | "memories" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "messages" | "contacts" | "calendar" | "notes" | "engineering" | "patches" | "settings";
+type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "goals" | "sources" | "memories" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "messages" | "contacts" | "location" | "calendar" | "notes" | "engineering" | "patches" | "settings";
 
 // Visible navigation: the workbench (sessions) is the only
 // chat entry and the default view (R1, 2026-10-28). The legacy
@@ -241,6 +246,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "mail", label: "Mail" },
   { id: "messages", label: "信息" },
   { id: "contacts", label: "通讯录" },
+  { id: "location", label: "定位" },
   { id: "calendar", label: "Calendar" },
   { id: "notes", label: "Notes" },
   { id: "engineering", label: "工程" },
@@ -319,6 +325,7 @@ export function App() {
           email: new InvokeEmailClient(),
           imessage: new InvokeIMessageClient(),
           contacts: new InvokeContactsClient(),
+          location: new InvokeLocationClient(),
           effects: new InvokeEffectsClient(),
           executions: new InvokeExecutionsClient(),
           inbox: new InvokeInboxClient(),
@@ -359,6 +366,7 @@ export function App() {
           email: new EmailClient(MOCK_BASE_URL),
           imessage: new IMessageClient(MOCK_BASE_URL),
           contacts: new ContactsClient(MOCK_BASE_URL),
+          location: new LocationClient(MOCK_BASE_URL),
           effects: new EffectsClient(MOCK_BASE_URL),
           executions: new ExecutionsClient(MOCK_BASE_URL),
           inbox: new InboxClient(MOCK_BASE_URL),
@@ -724,6 +732,12 @@ export function App() {
           <p className="empty">Choosing transport…</p>
         ) : (
           <ContactsView contacts={clients.contacts} />
+        ))}
+      {tab === "location" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : (
+          <LocationView location={clients.location} />
         ))}
       {tab === "calendar" &&
         (clients === null ? (

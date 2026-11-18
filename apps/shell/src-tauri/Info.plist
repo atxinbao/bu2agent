@@ -6,5 +6,7 @@
 	<string>bu2agent 需要访问提醒事项，以便在你批准后更新指定提醒的完成状态。</string>
 	<key>NSRemindersUsageDescription</key>
 	<string>bu2agent 需要访问提醒事项，以便在你批准后更新指定提醒的完成状态。</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>bu2agent 仅在你点击“记录当前位置”时读取一次当前位置，用于在本地记录一条样本；不会后台追踪，也不会上传位置。</string>
 </dict>
 </plist>

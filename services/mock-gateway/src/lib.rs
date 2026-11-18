@@ -74,6 +74,9 @@ pub mod routes_imessage;
 pub mod contacts_source;
 pub mod contacts_sync;
 pub mod routes_contacts;
+pub mod location_source;
+pub mod location_record;
+pub mod routes_location;
 pub mod notes_source;
 pub mod notes_sync;
 pub mod calendar_backend;
@@ -139,7 +142,7 @@ pub fn start_stream(stream_id: &str, turn_id: &str, text: &str) -> Vec<Subscript
 /// (never a real tool). `None` means the tool is unknown.
 pub fn tool_requires_approval(name: &str) -> Option<bool> {
     match name {
-        "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" | "email.threads" | "email.message" | "imessage.threads" | "contacts.search" | "code.search" | "git.read" | "worker.wait" => Some(false),
+        "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" | "email.threads" | "email.message" | "imessage.threads" | "contacts.search" | "location.current" | "code.search" | "git.read" | "worker.wait" => Some(false),
         "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "fs.export" | "notes.create" | "notes.append" | "notes.delete" | "mail.send" | "mail.delete" | "calendar.create" | "reminders.set_completed" | "worker.run" => Some(true),
         _ => None,
     }
@@ -275,6 +278,10 @@ mod tests {
         assert_eq!(tool_requires_approval("imessage.threads"), Some(false));
         // MCL-2: the contacts search is a read, no approval.
         assert_eq!(tool_requires_approval("contacts.search"), Some(false));
+        // MCL-3: the current-location read is a read, no
+        // approval (it reads the latest recorded row, never
+        // a live fix — Q-MCL-18).
+        assert_eq!(tool_requires_approval("location.current"), Some(false));
         assert_eq!(tool_requires_approval("email.message"), Some(false));
         // P3-A: code.search is a read-only loop tool, no approval.
         assert_eq!(tool_requires_approval("code.search"), Some(false));

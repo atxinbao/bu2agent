@@ -455,8 +455,8 @@ impl Harness {
 async fn md1_delete_end_to_end() {
     let h = Harness::serve().await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    // MCL-2 bumps the schema to v15 (contacts table).
-    assert_eq!(DB_SCHEMA_VERSION, 15);
+    // MCL-3 bumps the schema to v16 (device_locations table).
+    assert_eq!(DB_SCHEMA_VERSION, 16);
 
     let (status, synced) = h.sync().await;
     assert_eq!(status, 200, "sync: {synced}");

@@ -84,6 +84,9 @@ function requiresApproval(tool: string): boolean | undefined {
     // MCL-2: the contacts search is a read, no
     // approval (mirrors the gateway's Some(false)).
     case "contacts.search":
+    // MCL-3: the location current read is a read, no
+    // approval (mirrors the gateway's Some(false)).
+    case "location.current":
       return false;
     case "fs.write":
     case "fs.delete":

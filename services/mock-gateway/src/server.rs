@@ -112,6 +112,7 @@ use crate::stream_store::{
 use crate::mail_source::{MailError, MailSource, UnavailableMailSource};
 use crate::contacts_source::{ContactsSource, UnavailableContactsSource};
 use crate::imessage_source::{IMessageError, IMessageSource, UnavailableIMessageSource};
+use crate::location_source::{LocationSource, UnavailableLocationSource};
 use crate::notes_source::NotesSource;
 use crate::calendar_backend::{default_calendar_backend, CalendarBackend};
 use crate::voice_store::{load_voice_state, merged_custom_voices, CustomVoice};
@@ -384,6 +385,13 @@ pub struct AppState {
     /// substitute a fake; the sync route reads through
     /// it (the loop tool reads SQLite, not the source).
     pub(crate) contacts_source: Arc<dyn ContactsSource>,
+    /// MCL-3: the location source (Core Location
+    /// in-process binding on macOS, the 501 stub
+    /// elsewhere). Reads go through this trait so tests
+    /// can substitute a fake; the record route reads
+    /// through it (the loop tool reads SQLite, not the
+    /// source — Q-MCL-18: no live fix from the loop).
+    pub(crate) location_source: Arc<dyn LocationSource>,
     /// D1-6b-2: the calendar backend (EventKit on macOS,
     /// the 501 stub elsewhere). Reads delegate to the
     /// D1-6a free functions; writes go through this
@@ -609,6 +617,17 @@ impl AppState {
                 crate::contacts_source::AppleScriptContactsSource::new(),
             ));
         }
+        // MCL-3: on macOS the production location source
+        // asks Core Location in-process (the packaged-app
+        // identity, Q-MCL-15); every other platform keeps
+        // the Unavailable source (501, never fake data).
+        // Tests override via with_location_source.
+        #[cfg(target_os = "macos")]
+        {
+            state = state.with_location_source(Arc::new(
+                crate::location_source::CoreLocationSource::new(),
+            ));
+        }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
         }
@@ -783,6 +802,7 @@ impl AppState {
             mail_source: Arc::new(UnavailableMailSource),
             imessage_source: Arc::new(UnavailableIMessageSource),
             contacts_source: Arc::new(UnavailableContactsSource),
+            location_source: Arc::new(UnavailableLocationSource),
             calendar_backend: default_calendar_backend(),
             notes_source: crate::notes_source::default_notes_source(),
             git_path: crate::worker::resolve_git_path(),
@@ -1492,6 +1512,56 @@ impl AppState {
                         out.push_str("（通讯录暂无匹配联系人。）\n");
                     }
                     ToolOutcome::success(email_rendered(out))
+                }
+                Err(detail) => ToolOutcome {
+                    status: crate::loop_engine::CallStatus::Failed,
+                    error: Some(ErrorCode::ToolFailed),
+                    body: detail,
+                },
+            };
+        }
+        // MCL-3: the latest recorded sample, read from
+        // SQLite (the contacts.search arm is the model).
+        // Deliberately NOT a live fix: a loop call must
+        // never trigger Core Location (Q-MCL-18, manual
+        // trigger only), and the render carries the grid
+        // hash — never raw coordinates (Q-MCL-17: exact
+        // values are shown only locally in the packaged
+        // app, never exported; the model is an export).
+        // Reads produce no Effect and need no approval
+        // (registered Some(false)). Deliberately not
+        // added to dispatch_agent_tool, like the mail
+        // tools.
+        if tool == "location.current" {
+            let Some(sqlite) = &self.sqlite else {
+                return ToolOutcome {
+                    status: crate::loop_engine::CallStatus::Failed,
+                    error: Some(ErrorCode::ToolFailed),
+                    body: "location current unavailable: SQLite is not configured".to_string(),
+                };
+            };
+            let conn = sqlite.lock().expect("sqlite lock");
+            return match crate::location_record::latest_device_location(
+                &conn,
+                crate::location_record::LOCATION_SOURCE_ID,
+            ) {
+                Ok(Some(row)) => {
+                    let grid_hash = crate::location_source::grid_hash_for(
+                        row.latitude,
+                        row.longitude,
+                    );
+                    let out = format!(
+                        "sample: {} | grid_hash: {} | locality_hash: {} | accuracy_meters: {} | recorded_ms: {}\n",
+                        row.sample_id,
+                        grid_hash,
+                        row.locality_hash,
+                        row.accuracy_meters,
+                        row.recorded_ms,
+                    );
+                    ToolOutcome::success(email_rendered(out))
+                }
+                Ok(None) => {
+                    ToolOutcome::success(email_rendered("（尚未记录当前位置。）\n".to_string()))
                 }
                 Err(detail) => ToolOutcome {
                     status: crate::loop_engine::CallStatus::Failed,
@@ -3072,6 +3142,15 @@ impl AppState {
         self
     }
 
+    /// Test seam: replace the location source (tests use
+    /// the fake source; production macOS uses Core
+    /// Location in-process, other platforms keep the
+    /// Unavailable source).
+    pub fn with_location_source(mut self, source: Arc<dyn LocationSource>) -> Self {
+        self.location_source = source;
+        self
+    }
+
     /// Test seam: replace the calendar backend (tests use
     /// the fake backend; production macOS uses EventKit,
     /// other platforms keep the Unavailable backend).
@@ -4147,6 +4226,7 @@ const MANDATE_TOOLS: &[&str] = &[
     "email.message",
     "imessage.threads",
     "contacts.search",
+    "location.current",
     "code.search",
     "git.read",
     "worker.run",
@@ -7986,6 +8066,14 @@ pub fn app(state: AppState) -> Router {
         .route("/api/contacts", get(crate::routes_contacts::contacts_list))
         .route("/api/contacts/search", get(crate::routes_contacts::contacts_search))
         .route("/api/contacts/{id}", get(crate::routes_contacts::contacts_get))
+        // MCL-3: current-location record + samples
+        // (SQLite v16). Record is the manual trigger
+        // (fact recording only — no Effect, no approval,
+        // no Outbox, like POST /api/email/sync); list /
+        // get read the recorded rows, newest first.
+        .route("/api/location/record", post(crate::routes_location::location_record))
+        .route("/api/location/samples", get(crate::routes_location::location_samples_list))
+        .route("/api/location/samples/{id}", get(crate::routes_location::location_sample_get))
         .route("/api/nodes/register", post(crate::routes_peers::nodes_register))
         .route("/api/nodes/list", post(crate::routes_peers::nodes_list))
         .route("/api/nodes/heartbeat", post(crate::routes_peers::nodes_heartbeat))

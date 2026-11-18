@@ -31,6 +31,27 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # Fake backend there.
 [target.'cfg(target_os = "macos")'.dependencies]
 eventkit = "0.4"
+# MCL-3: Core Location binding, macOS only (same gate as
+# EventKit). The gateway sidecar runs inside the signed
+# .app bundle, so the in-process binding requests
+# authorization as com.bu2ai.bu2agent — the packaged-app
+# identity Q-MCL-15 requires. No helper subprocess: a
+# helper would be a second executable with its own TCC
+# attribution question, and the MCL-0 S2 evidence covers
+# a standalone Swift app, not a helper. objc2 0.3.x is
+# the binding family the MCL-0 probe verified exists
+# (0.3.2 on crates.io). The macOS body cannot be
+# compiled on this VM at all (objc2 hard-errors on
+# non-Apple targets, eventkit's build script needs
+# macOS): CI's macOS job is the only compile check,
+# like eventkit.
+objc2-core-location = "0.3.2"
+# MCL-3: the binding's companions — `define_class!` /
+# `ProtocolObject` (objc2) and `NSRunLoop` / `NSDate` /
+# `NSError` / `NSArray` (objc2-foundation) for the
+# one-shot delegate + runloop pump in location_source.rs.
+objc2 = "0.6"
+objc2-foundation = "0.3"
 
 # The build script queries the Swift toolchain for its runtime
 # library paths (macOS only). serde_json is already a main

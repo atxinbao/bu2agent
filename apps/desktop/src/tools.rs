@@ -74,6 +74,10 @@ impl ToolRegistry {
         // like imessage.threads (no approval); the
         // capability is "contacts" (the source scope).
         registry.tools.push(ToolSpec { name: "contacts.search".to_string(), requires_approval: false, capability: "contacts".to_string() });
+        // MCL-3: the loop location current tool, a read
+        // like contacts.search (no approval); the
+        // capability is "location" (the source scope).
+        registry.tools.push(ToolSpec { name: "location.current".to_string(), requires_approval: false, capability: "location".to_string() });
         // P3-A: read-only code search, no approval.
         registry.tools.push(ToolSpec { name: "code.search".to_string(), requires_approval: false, capability: "code".to_string() });
         // P3-C: read-only git status/diff, no approval;

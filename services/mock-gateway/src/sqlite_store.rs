@@ -58,8 +58,9 @@ use crate::execution_store::ExecutionFileRecord;
 /// Row-level `schema_version` fields are a separate concept
 /// (the record contract version, still 1 for P0-A+ rows) and
 /// are untouched. v15 adds the MCL-2 `contacts` table
-/// (see SCHEMA_V15).
-pub const DB_SCHEMA_VERSION: i64 = 15;
+/// (see SCHEMA_V15); v16 adds the MCL-3
+/// `device_locations` table (see SCHEMA_V16).
+pub const DB_SCHEMA_VERSION: i64 = 16;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -648,6 +649,35 @@ CREATE TABLE IF NOT EXISTS contacts (
     UNIQUE (source_id, native_id)
 );
 ";
+/// MCL-3 v16 step: `device_locations` fact table.
+/// `sample_id` is the local `loc-sample-N` id
+/// (max-suffix + 1 in the record transaction — COUNT +
+/// 1 would reuse ids after a 30-day prune, and rows ARE
+/// deleted here, Q-MCL-16). `latitude` / `longitude` /
+/// `accuracy_meters` are the raw fix (Q-MCL-17: SQLite
+/// stores raw coordinates; events get the grid hash
+/// only); `locality_hash` is the sha256 of the 1 km grid
+/// cell index, `country_code` the source-reported
+/// country (NULL in MCL-3: Core Location alone has no
+/// country). Typed DDL for every ms / real column (the
+/// E2-D batch-2 lesson: untyped backfill columns land as
+/// TEXT on old DBs). NO `deleted` column: deletion is
+/// the 30-day rolling prune at record time (Q-MCL-16),
+/// not a tombstone.
+const SCHEMA_V16: &str = "
+CREATE TABLE IF NOT EXISTS device_locations (
+    sample_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    latitude REAL NOT NULL,
+    longitude REAL NOT NULL,
+    accuracy_meters REAL NOT NULL,
+    locality_hash TEXT NOT NULL,
+    country_code TEXT,
+    recorded_ms INTEGER NOT NULL,
+    created_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL
+);
+";
 /// create fact record. `event_id` is the EventKit
 /// identifier itself (the stable system id, so no local
 /// number is assigned); `idempotency_key` is UNIQUE —
@@ -917,6 +947,19 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V15).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '15')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // MCL-3 v16 step: device_locations table only. One
+    // transaction, v5–v15 style; a fresh database runs
+    // v1–v16 in the same transaction. The table starts
+    // empty — rows arrive only from POST /api/location/record.
+    if version < 16 {
+        tx.execute_batch(SCHEMA_V16).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '16')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -2087,6 +2130,24 @@ const REDACTED_PAYLOAD_FIELDS: &[&str] = &[
     // `recipient_hash` for sent mail: the set is
     // auditable without naming anyone.
     "participant_hash",
+    // MCL-3 `location.recorded` fields (each added with
+    // its reason, per this helper's own rule):
+    // `sample_id` — the recorded sample's local id, like
+    // `message_id` for synced mail.
+    "sample_id",
+    // `grid_hash` — sha256 of the 1 km grid cell center,
+    // like `participant_hash`: the blurred position is
+    // auditable without naming the fix.
+    "grid_hash",
+    // `locality_hash` — sha256 of the 1 km grid cell
+    // index, a place key, never a coordinate.
+    "locality_hash",
+    // `accuracy_meters` — the fix's horizontal accuracy
+    // in meters, a measurement only, never a position.
+    "accuracy_meters",
+    // `recorded_ms` — the record time, a timestamp only,
+    // like `date_ms`.
+    "recorded_ms",
 ];
 
 pub(crate) fn redact_event_payload(kind: &str, payload_json: &str) -> String {
