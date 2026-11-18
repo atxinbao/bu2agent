@@ -309,15 +309,35 @@ fn contacts_dump_script() -> String {
       set addrVals to ""
       repeat with a in addresses of p
         set aStreet to street of a
-        if aStreet is missing value then set aStreet to "" else set aStreet to (aStreet as string)
+        if aStreet is missing value then
+          set aStreet to ""
+        else
+          set aStreet to (aStreet as string)
+        end if
         set aCity to city of a
-        if aCity is missing value then set aCity to "" else set aCity to (aCity as string)
+        if aCity is missing value then
+          set aCity to ""
+        else
+          set aCity to (aCity as string)
+        end if
         set aState to state of a
-        if aState is missing value then set aState to "" else set aState to (aState as string)
+        if aState is missing value then
+          set aState to ""
+        else
+          set aState to (aState as string)
+        end if
         set aZip to zip of a
-        if aZip is missing value then set aZip to "" else set aZip to (aZip as string)
+        if aZip is missing value then
+          set aZip to ""
+        else
+          set aZip to (aZip as string)
+        end if
         set aCountry to country of a
-        if aCountry is missing value then set aCountry to "" else set aCountry to (aCountry as string)
+        if aCountry is missing value then
+          set aCountry to ""
+        else
+          set aCountry to (aCountry as string)
+        end if
         set addrVals to addrVals & aStreet & "|" & aCity & "|" & aState & "|" & aZip & "|" & aCountry & ";"
       end repeat
       set bdVal to birth date of p
@@ -326,9 +346,17 @@ fn contacts_dump_script() -> String {
       else
         set bdYear to (year of bdVal as string)
         set bdMonth to (month of bdVal as integer)
-        if bdMonth < 10 then set bdMonthStr to "0" & (bdMonth as string) else set bdMonthStr to (bdMonth as string)
+        if bdMonth < 10 then
+          set bdMonthStr to "0" & (bdMonth as string)
+        else
+          set bdMonthStr to (bdMonth as string)
+        end if
         set bdDay to (day of bdVal as integer)
-        if bdDay < 10 then set bdDayStr to "0" & (bdDay as string) else set bdDayStr to (bdDay as string)
+        if bdDay < 10 then
+          set bdDayStr to "0" & (bdDay as string)
+        else
+          set bdDayStr to (bdDay as string)
+        end if
         set bdStr to bdYear & "-" & bdMonthStr & "-" & bdDayStr
       end if
       set out to out & pid & (character id 31) & pname & (character id 31) & orgVal & (character id 31) & titleVal & (character id 31) & phoneVals & (character id 31) & emailVals & (character id 31) & addrVals & (character id 31) & bdStr & return
@@ -512,6 +540,28 @@ mod tests {
             assert!(
                 !script.to_lowercase().contains(forbidden),
                 "must never ask for {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn dump_script_has_no_single_line_if_else() {
+        // AppleScript's single-line `if` form takes no
+        // `else`: `if c then s1 else s2` on one line is a
+        // -2741 compile error ("Expected end of line, etc.
+        // but found 'else'"), so the whole dump script
+        // fails to compile and every sync 502s with
+        // Upstream "Contacts automation failed". The MCL-2
+        // window validation on real Contacts data caught
+        // this (round 2, W1-1); the substring guard test
+        // above cannot see it. Every `else` must sit on
+        // its own line.
+        let script = contacts_dump_script();
+        for (i, line) in script.lines().enumerate() {
+            assert!(
+                !(line.contains("then") && line.contains("else")),
+                "line {} is a single-line if-then-else: {line}",
+                i + 1
             );
         }
     }
