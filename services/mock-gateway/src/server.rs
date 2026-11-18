@@ -110,6 +110,7 @@ use crate::stream_store::{
     StreamPoke, StreamSubscription, SxsSelection,
 };
 use crate::mail_source::{MailError, MailSource, UnavailableMailSource};
+use crate::imessage_source::{IMessageError, IMessageSource, UnavailableIMessageSource};
 use crate::notes_source::NotesSource;
 use crate::calendar_backend::{default_calendar_backend, CalendarBackend};
 use crate::voice_store::{load_voice_state, merged_custom_voices, CustomVoice};
@@ -370,6 +371,12 @@ pub struct AppState {
     /// below — the Evidence readback in `evidence.rs`
     /// needs the mail source for the delete re-read.
     pub(crate) mail_source: Arc<dyn MailSource>,
+    /// MCL-1: the iMessage source (AppleScript
+    /// Messages.app on macOS, the 501 stub elsewhere).
+    /// Reads go through this trait so tests can
+    /// substitute a fake; the loop tool and the sync
+    /// route both read through it.
+    pub(crate) imessage_source: Arc<dyn IMessageSource>,
     /// D1-6b-2: the calendar backend (EventKit on macOS,
     /// the 501 stub elsewhere). Reads delegate to the
     /// D1-6a free functions; writes go through this
@@ -575,6 +582,16 @@ impl AppState {
         {
             state = state.with_mail_source(Arc::new(crate::mail_source::AppleScriptMailSource::new()));
         }
+        // MCL-1: on macOS the production iMessage source
+        // asks Messages.app via AppleScript; every other
+        // platform keeps the Unavailable source (501, never
+        // fake data). Tests override via with_imessage_source.
+        #[cfg(target_os = "macos")]
+        {
+            state = state.with_imessage_source(Arc::new(
+                crate::imessage_source::AppleScriptIMessageSource::new(),
+            ));
+        }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
         }
@@ -747,6 +764,7 @@ impl AppState {
             voice_pipeline: Arc::new(Mutex::new(None)),
             voice_state_path: None,
             mail_source: Arc::new(UnavailableMailSource),
+            imessage_source: Arc::new(UnavailableIMessageSource),
             calendar_backend: default_calendar_backend(),
             notes_source: crate::notes_source::default_notes_source(),
             git_path: crate::worker::resolve_git_path(),
@@ -1343,6 +1361,59 @@ impl AppState {
                     status: crate::loop_engine::CallStatus::Failed,
                     error: Some(ErrorCode::ToolFailed),
                     body: email_error_text(err),
+                },
+                Err(_) => ToolOutcome::unknown(),
+            };
+        }
+        // MCL-1: read-only iMessage thread listing. The
+        // email.threads arm is the model: the source is
+        // AppState.imessage_source (the same source the
+        // /api/imessage/* routes use), the call runs on a
+        // blocking thread because AppleScript is
+        // synchronous. Reads produce no Effect and need no
+        // approval (registered Some(false)). The render
+        // carries the thread's native id + service +
+        // participant count / hash as the citation anchor;
+        // there is no message content to render (message
+        // history is not readable). Deliberately not added
+        // to dispatch_agent_tool, like the mail tools.
+        if tool == "imessage.threads" {
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(50);
+            let offset = args
+                .get("offset")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let source = Arc::clone(&self.imessage_source);
+            return match tokio::task::spawn_blocking(move || source.threads(limit, offset))
+                .await
+            {
+                Ok(Ok(threads)) => {
+                    let mut out = String::new();
+                    for t in &threads {
+                        out.push_str(&format!(
+                            "thread: {} | service: {} | participants: {} | group: {} | participants_hash: {}\n",
+                            t.native_id,
+                            t.service,
+                            t.participant_count,
+                            t.is_group,
+                            t.participant_hash,
+                        ));
+                    }
+                    if out.is_empty() {
+                        out.push_str("（信息暂无会话。）\n");
+                    }
+                    // `email_rendered` is the shared 4096-char
+                    // truncation helper (the notice is generic);
+                    // no mail-specific text is rendered here.
+                    ToolOutcome::success(email_rendered(out))
+                }
+                Ok(Err(err)) => ToolOutcome {
+                    status: crate::loop_engine::CallStatus::Failed,
+                    error: Some(ErrorCode::ToolFailed),
+                    body: imessage_error_text(err),
                 },
                 Err(_) => ToolOutcome::unknown(),
             };
@@ -2903,6 +2974,14 @@ impl AppState {
         self
     }
 
+    /// Test seam: replace the iMessage source (tests use
+    /// the fake source; production macOS uses AppleScript,
+    /// other platforms keep the Unavailable source).
+    pub fn with_imessage_source(mut self, source: Arc<dyn IMessageSource>) -> Self {
+        self.imessage_source = source;
+        self
+    }
+
     /// Test seam: replace the calendar backend (tests use
     /// the fake backend; production macOS uses EventKit,
     /// other platforms keep the Unavailable backend).
@@ -3967,7 +4046,7 @@ fn seed_sources_from(
 /// — the only tools an entry point can invoke today.
 /// Local definition (no runtime evidence behind the
 /// choice beyond the whitelist itself); keep in sync with
-/// `loop_engine::normalize` (same 11 names, same order).
+/// `loop_engine::normalize` (same 12 names, same order).
 const MANDATE_TOOLS: &[&str] = &[
     "fs.list",
     "fs.read",
@@ -3976,6 +4055,7 @@ const MANDATE_TOOLS: &[&str] = &[
     "reminders.set_completed",
     "email.threads",
     "email.message",
+    "imessage.threads",
     "code.search",
     "git.read",
     "worker.run",
@@ -4438,6 +4518,19 @@ fn email_error_text(err: MailError) -> String {
         // D1-6b-1: the loop-tool text stays generic —
         // the send route distinguishes these itself.
         MailError::NotRunning | MailError::Timeout => "mail source error".to_string(),
+    }
+}
+
+/// MCL-1: the imessage loop-tool error text (the
+/// `email_error_text` precedent — generic, never a
+/// mail error string).
+fn imessage_error_text(err: IMessageError) -> String {
+    match err {
+        IMessageError::NotFound(what) => format!("unknown {what}"),
+        IMessageError::Unavailable(_) => "imessage source unavailable".to_string(),
+        IMessageError::Denied => "imessage automation denied".to_string(),
+        IMessageError::Upstream(_) => "imessage source error".to_string(),
+        IMessageError::NotRunning | IMessageError::Timeout => "imessage source error".to_string(),
     }
 }
 
@@ -7790,6 +7883,14 @@ pub fn app(state: AppState) -> Router {
         .route("/api/notes/create", post(crate::routes_notes::notes_api_create))
         .route("/api/notes/{id}/append", post(crate::routes_notes::notes_api_append))
         .route("/api/notes/{id}/delete", post(crate::routes_notes::notes_api_delete))
+        // MCL-1: iMessage threads (SQLite v14). Sync is
+        // the manual trigger (fact recording only — no
+        // Effect, no approval, no Outbox, like
+        // POST /api/email/sync); list / get read the
+        // synced rows, tombstones visible.
+        .route("/api/imessage/sync", post(crate::routes_imessage::imessage_sync))
+        .route("/api/imessage/threads", get(crate::routes_imessage::imessage_threads_list))
+        .route("/api/imessage/threads/{id}", get(crate::routes_imessage::imessage_thread_get))
         .route("/api/nodes/register", post(crate::routes_peers::nodes_register))
         .route("/api/nodes/list", post(crate::routes_peers::nodes_list))
         .route("/api/nodes/heartbeat", post(crate::routes_peers::nodes_heartbeat))

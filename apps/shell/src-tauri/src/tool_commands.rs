@@ -58,6 +58,7 @@ use agent_desktop::email_client::{
     EmailClient, MailDeleteResponse, MailMessageRow, MailSyncResult, MailboxInfo, MailboxSetup,
     MessageView, SendMailInput, SentMessageRow, ThreadView,
 };
+use agent_desktop::imessage_client::{IMessageClient, IMessageSyncResult, IMessageThreadRow};
 use agent_desktop::calendar_client::{
     CalendarClient, CalendarEvent, CreateCalendarEventInput, CreatedCalendarEventRow,
 };
@@ -1700,6 +1701,38 @@ pub fn mail_synced_list() -> Result<Vec<MailMessageRow>, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn mail_synced_get(message_id: String) -> Result<MailMessageRow, String> {
     email_client()?.synced_get(&message_id).map_err(agent_err_string)
+}
+
+// --- iMessage surface (MCL-1, threads-only) ---
+//
+// Three commands mirror the three gateway routes
+// (sync / list / get). Reads only; no message detail
+// exists — the list method is `threads_list` in the
+// desktop client and `threads` in the TS clients (the
+// plan's "threads" token), not a fourth command: the
+// gateway has one SQLite-backed list route, so a
+// separate live-threads command would duplicate
+// `imessage_list`.
+fn imessage_client() -> Result<IMessageClient, String> {
+    IMessageClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn imessage_sync() -> Result<IMessageSyncResult, String> {
+    imessage_client()?.sync_imessage().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn imessage_list(
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<IMessageThreadRow>, String> {
+    imessage_client()?.threads_list(limit, offset).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn imessage_get(thread_id: String) -> Result<IMessageThreadRow, String> {
+    imessage_client()?.thread_get(&thread_id).map_err(agent_err_string)
 }
 
 // --- Notes surface (D1-6b-4, read + write) ---

@@ -66,6 +66,10 @@ impl ToolRegistry {
         // desktop AgentClient reports unknown tool without them.
         registry.tools.push(ToolSpec { name: "email.threads".to_string(), requires_approval: false, capability: "mail".to_string() });
         registry.tools.push(ToolSpec { name: "email.message".to_string(), requires_approval: false, capability: "mail".to_string() });
+        // MCL-1: the loop iMessage threads tool, a read
+        // like email.threads (no approval); the
+        // capability is "imessage" (the source scope).
+        registry.tools.push(ToolSpec { name: "imessage.threads".to_string(), requires_approval: false, capability: "imessage".to_string() });
         // P3-A: read-only code search, no approval.
         registry.tools.push(ToolSpec { name: "code.search".to_string(), requires_approval: false, capability: "code".to_string() });
         // P3-C: read-only git status/diff, no approval;

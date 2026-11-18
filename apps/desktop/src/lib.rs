@@ -36,6 +36,7 @@ pub mod node_client;
 pub mod stream_client;
 pub mod voice_client;
 pub mod email_client;
+pub mod imessage_client;
 pub mod credential_store;
 pub mod egress;
 pub mod retry;

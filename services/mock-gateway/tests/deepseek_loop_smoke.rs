@@ -395,9 +395,9 @@ async fn multi_call_ids_history_schema_and_bound_write_roundtrip() {
     // P2 adds email_threads/email_message to the model-facing
     // tool list (7 tools); P3-A adds code_search (8 tools);
     // P3-C adds git_read + worker_run (10 tools); E2-D adds
-    // worker_wait (11 tools); the order matches
-    // tool_schemas().
-    assert_eq!(first["tools"].as_array().unwrap().len(), 11);
+    // worker_wait (11 tools); MCL-1 adds imessage_threads
+    // (12 tools); the order matches tool_schemas().
+    assert_eq!(first["tools"].as_array().unwrap().len(), 12);
     for (i, name) in [
         "fs_list",
         "fs_read",
@@ -406,6 +406,7 @@ async fn multi_call_ids_history_schema_and_bound_write_roundtrip() {
         "reminders_set_completed",
         "email_threads",
         "email_message",
+        "imessage_threads",
         "code_search",
         "git_read",
         "worker_run",

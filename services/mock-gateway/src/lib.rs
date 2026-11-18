@@ -68,6 +68,9 @@ pub mod code_search;
 pub mod mail_source;
 pub mod mail_sync;
 pub mod mail_send;
+pub mod imessage_source;
+pub mod imessage_sync;
+pub mod routes_imessage;
 pub mod notes_source;
 pub mod notes_sync;
 pub mod calendar_backend;
@@ -133,7 +136,7 @@ pub fn start_stream(stream_id: &str, turn_id: &str, text: &str) -> Vec<Subscript
 /// (never a real tool). `None` means the tool is unknown.
 pub fn tool_requires_approval(name: &str) -> Option<bool> {
     match name {
-        "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" | "email.threads" | "email.message" | "code.search" | "git.read" | "worker.wait" => Some(false),
+        "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" | "email.threads" | "email.message" | "imessage.threads" | "code.search" | "git.read" | "worker.wait" => Some(false),
         "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "fs.export" | "notes.create" | "notes.append" | "notes.delete" | "mail.send" | "mail.delete" | "calendar.create" | "reminders.set_completed" | "worker.run" => Some(true),
         _ => None,
     }
@@ -265,6 +268,8 @@ mod tests {
         assert_eq!(tool_requires_approval("calendar.create"), Some(true));
         assert_eq!(tool_requires_approval("reminders.set_completed"), Some(true));
         assert_eq!(tool_requires_approval("email.threads"), Some(false));
+        // MCL-1: the threads list is a read, no approval.
+        assert_eq!(tool_requires_approval("imessage.threads"), Some(false));
         assert_eq!(tool_requires_approval("email.message"), Some(false));
         // P3-A: code.search is a read-only loop tool, no approval.
         assert_eq!(tool_requires_approval("code.search"), Some(false));

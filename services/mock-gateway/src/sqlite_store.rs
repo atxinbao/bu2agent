@@ -58,7 +58,7 @@ use crate::execution_store::ExecutionFileRecord;
 /// Row-level `schema_version` fields are a separate concept
 /// (the record contract version, still 1 for P0-A+ rows) and
 /// are untouched.
-pub const DB_SCHEMA_VERSION: i64 = 13;
+pub const DB_SCHEMA_VERSION: i64 = 14;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -579,6 +579,38 @@ CREATE TABLE IF NOT EXISTS notes (
     UNIQUE (source_id, native_id)
 );
 ";
+/// MCL-1 v14 step: `imessage_threads` fact table
+/// (threads-only). `thread_id` is the local `thread-N`
+/// id; `native_id` is the chat's AppleScript id;
+/// `service` stores the account's service type verbatim
+/// ("iMessage" / "SMS" / "RCS"); `participant_hash` is
+/// the sha256 of the canonical JSON of the sorted
+/// per-handle sha256 hexes (Q-MCL-07) — no handle or
+/// name is ever stored. `last_message_ms` /
+/// `unread_count` stay NULL under AppleScript sync (no
+/// message data source — never fabricated). Typed DDL
+/// for every ms/count column (the E2-D batch-2 lesson:
+/// untyped backfill columns land as TEXT on old DBs).
+/// `(source_id, native_id)` is UNIQUE — the tombstone
+/// anti-resurrect key.
+const SCHEMA_V14: &str = "
+CREATE TABLE IF NOT EXISTS imessage_threads (
+    thread_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    native_id TEXT NOT NULL,
+    service TEXT NOT NULL,
+    is_group INTEGER NOT NULL DEFAULT 0,
+    participant_count INTEGER NOT NULL DEFAULT 0,
+    participant_hash TEXT NOT NULL,
+    last_message_ms INTEGER,
+    unread_count INTEGER,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    origin_device_id TEXT NOT NULL,
+    UNIQUE (source_id, native_id)
+);
+";
 /// create fact record. `event_id` is the EventKit
 /// identifier itself (the stable system id, so no local
 /// number is assigned); `idempotency_key` is UNIQUE —
@@ -822,6 +854,19 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V13).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '13')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // MCL-1 v14 step: imessage_threads table only. One
+    // transaction, v5–v13 style; a fresh database runs
+    // v1–v14 in the same transaction. The table starts
+    // empty — rows arrive only from POST /api/imessage/sync.
+    if version < 14 {
+        tx.execute_batch(SCHEMA_V14).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '14')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -1966,6 +2011,23 @@ const REDACTED_PAYLOAD_FIELDS: &[&str] = &[
     // `subject_len` for mail: the title is auditable
     // for size without naming the note.
     "name_len",
+    // MCL-1 `imessage.synced` fields (each added with
+    // its reason, per this helper's own rule):
+    // `service` — the chat account's service type
+    // ("iMessage" / "SMS" / "RCS"), a kind only, never
+    // a handle or a name.
+    "service",
+    // `is_group` — the group flag, a boolean about the
+    // thread, like `all_day`: no content.
+    "is_group",
+    // `participant_count` — how many participants, a
+    // count only, never the handles themselves.
+    "participant_count",
+    // `participant_hash` — sha256 of the canonical
+    // JSON of the sorted per-handle sha256 hexes, like
+    // `recipient_hash` for sent mail: the set is
+    // auditable without naming anyone.
+    "participant_hash",
 ];
 
 pub(crate) fn redact_event_payload(kind: &str, payload_json: &str) -> String {

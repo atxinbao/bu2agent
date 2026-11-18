@@ -76,6 +76,11 @@ function requiresApproval(tool: string): boolean | undefined {
     case "code.search":
     case "git.read":
     case "worker.wait":
+    // MCL-1: the iMessage threads list is a read, no
+    // approval (mirrors the gateway's Some(false)).
+    // (email.threads / email.message are missing here
+    // too — a pre-existing gap, out of scope.)
+    case "imessage.threads":
       return false;
     case "fs.write":
     case "fs.delete":

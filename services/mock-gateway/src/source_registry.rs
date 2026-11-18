@@ -325,6 +325,36 @@ impl Source for NotesSourceEntry {
     }
 }
 
+/// The iMessage source (MCL-1, the `MailSourceEntry`
+/// precedent): one row for the Messages.app backend —
+/// the same backend serves the threads sync. One row:
+/// the source has no account concept of its own (the
+/// thread is picked per read). Disconnect is a flag
+/// flip only; reads are unaffected (6b Q-24).
+pub struct IMessageSourceEntry;
+
+impl Source for IMessageSourceEntry {
+    fn source_id(&self) -> String {
+        "imessage-source".to_string()
+    }
+
+    fn kind(&self) -> &'static str {
+        "message"
+    }
+
+    fn display_name(&self) -> String {
+        "Messages".to_string()
+    }
+
+    fn config_json(&self) -> Value {
+        serde_json::json!({})
+    }
+
+    fn scope(&self) -> String {
+        "imessage".to_string()
+    }
+}
+
 /// The reminder backend as one source (Q-D1-43): Fake
 /// and EventKit are two backends of this single source,
 /// never two rows. `backend` is the switch value
@@ -444,6 +474,8 @@ pub fn seed_sources(
     let (row, _) = CalendarSourceEntry.register(&mut *conn, &inputs.origin_device_id)?;
     rows.push(row);
     let (row, _) = NotesSourceEntry.register(&mut *conn, &inputs.origin_device_id)?;
+    rows.push(row);
+    let (row, _) = IMessageSourceEntry.register(&mut *conn, &inputs.origin_device_id)?;
     rows.push(row);
     let (row, _) = ReminderDeviceSource {
         backend: inputs.device_backend,

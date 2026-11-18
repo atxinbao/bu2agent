@@ -53,6 +53,10 @@ import { EmailClient } from "./domain/email_client";
 import type { EmailGateway } from "./domain/email_client";
 import { InvokeEmailClient } from "./domain/invoke_email_client";
 import { MailView } from "./views/MailView";
+import { IMessageClient } from "./domain/imessage_client";
+import type { IMessageGateway } from "./domain/imessage_client";
+import { InvokeIMessageClient } from "./domain/invoke_imessage_client";
+import MessagesView from "./views/MessagesView";
 import { CalendarClient } from "./domain/calendar_client";
 import type { CalendarGateway } from "./domain/calendar_client";
 import { InvokeCalendarClient } from "./domain/invoke_calendar_client";
@@ -195,6 +199,7 @@ interface Clients {
   nodes: NodeGateway;
   streams: StreamGateway;
   email: EmailGateway;
+  imessage: IMessageGateway;
   effects: EffectsGateway;
   executions: ExecutionsGateway;
   inbox: InboxGateway;
@@ -207,7 +212,7 @@ interface Clients {
   engineering: EngineeringGateway;
 }
 
-type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "goals" | "sources" | "memories" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "calendar" | "notes" | "engineering" | "patches" | "settings";
+type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "goals" | "sources" | "memories" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "messages" | "calendar" | "notes" | "engineering" | "patches" | "settings";
 
 // Visible navigation: the workbench (sessions) is the only
 // chat entry and the default view (R1, 2026-10-28). The legacy
@@ -229,6 +234,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "spaces", label: "Spaces" },
   { id: "feed", label: "Feed" },
   { id: "mail", label: "Mail" },
+  { id: "messages", label: "信息" },
   { id: "calendar", label: "Calendar" },
   { id: "notes", label: "Notes" },
   { id: "engineering", label: "工程" },
@@ -305,6 +311,7 @@ export function App() {
           nodes: new InvokeNodeClient(),
           streams: new InvokeStreamClient(),
           email: new InvokeEmailClient(),
+          imessage: new InvokeIMessageClient(),
           effects: new InvokeEffectsClient(),
           executions: new InvokeExecutionsClient(),
           inbox: new InvokeInboxClient(),
@@ -343,6 +350,7 @@ export function App() {
           nodes: new NodeClient(MOCK_BASE_URL),
           streams: new StreamClient(MOCK_BASE_URL),
           email: new EmailClient(MOCK_BASE_URL),
+          imessage: new IMessageClient(MOCK_BASE_URL),
           effects: new EffectsClient(MOCK_BASE_URL),
           executions: new ExecutionsClient(MOCK_BASE_URL),
           inbox: new InboxClient(MOCK_BASE_URL),
@@ -696,6 +704,12 @@ export function App() {
           <p className="empty">Choosing transport…</p>
         ) : (
           <MailView email={clients.email} loops={clients.loops} agent={clients.agent} onNavigate={(target) => setTab(target)} />
+        ))}
+      {tab === "messages" &&
+        (clients === null ? (
+          <p className="empty">Choosing transport…</p>
+        ) : (
+          <MessagesView imessage={clients.imessage} />
         ))}
       {tab === "calendar" &&
         (clients === null ? (

@@ -525,7 +525,7 @@ pub fn loop_tool_requires_approval(tool: &str) -> bool {
 }
 
 pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, ErrorCode> {
-    if !matches!(tool, "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "code.search" | "git.read" | "worker.run" | "worker.wait") {
+    if !matches!(tool, "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "imessage.threads" | "code.search" | "git.read" | "worker.run" | "worker.wait") {
         return Err(ErrorCode::InvalidTool);
     }
     let object = args.as_object().ok_or(ErrorCode::InvalidArguments)?;
@@ -545,6 +545,40 @@ pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, E
             Some(Value::Number(n)) => {
                 let v = n.as_u64().ok_or(ErrorCode::InvalidArguments)?;
                 crate::mail_source::clamp_limit(Some(v as usize)).to_string()
+            }
+            Some(_) => return Err(ErrorCode::InvalidArguments),
+        };
+        let offset = match object.get("offset") {
+            None => "0".to_string(),
+            Some(Value::Number(n)) => {
+                let v = n.as_u64().ok_or(ErrorCode::InvalidArguments)?;
+                v.to_string()
+            }
+            Some(_) => return Err(ErrorCode::InvalidArguments),
+        };
+        return Ok(BTreeMap::from([
+            ("limit".into(), limit),
+            ("offset".into(), offset),
+        ]));
+    }
+    if tool == "imessage.threads" {
+        // MCL-1: read-only iMessage thread listing. Both
+        // args optional; limit clamps like the
+        // /api/imessage/threads route (default 50, max
+        // 200), offset defaults to 0. Values stay strings
+        // in the normalized map; the dispatcher parses
+        // them back. The email.threads arm is the model.
+        if object
+            .keys()
+            .any(|k| !matches!(k.as_str(), "limit" | "offset"))
+        {
+            return Err(ErrorCode::InvalidArguments);
+        }
+        let limit = match object.get("limit") {
+            None => crate::imessage_source::clamp_limit(None).to_string(),
+            Some(Value::Number(n)) => {
+                let v = n.as_u64().ok_or(ErrorCode::InvalidArguments)?;
+                crate::imessage_source::clamp_limit(Some(v as usize)).to_string()
             }
             Some(_) => return Err(ErrorCode::InvalidArguments),
         };
@@ -1577,7 +1611,7 @@ impl LoopEngine {
                                 // joins them here.
                                 let tool = if matches!(
                                     proposal.tool.as_str(),
-                                    "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "code.search" | "git.read" | "worker.run" | "worker.wait"
+                                    "fs.list" | "fs.read" | "fs.write" | "reminders.list" | "reminders.set_completed" | "email.threads" | "email.message" | "imessage.threads" | "code.search" | "git.read" | "worker.run" | "worker.wait"
                                 ) {
                                     proposal.tool.clone()
                                 } else {
