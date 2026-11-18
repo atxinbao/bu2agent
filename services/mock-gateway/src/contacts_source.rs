@@ -276,7 +276,7 @@ impl ContactsSource for UnavailableContactsSource {
 /// no organization, job title, address, or birthday).
 #[cfg(any(target_os = "macos", test))]
 fn contacts_dump_script() -> String {
-    r#"with timeout of 60 seconds
+    r#"with timeout of 120 seconds
   tell application "Contacts"
     set totalCount to count people
     if totalCount is 0 then
@@ -369,8 +369,15 @@ end timeout"#
 
 /// Hard cap on one `osascript` invocation (the
 /// mail_source.rs pattern). Expiry maps to `Timeout`.
+/// 120 s, not mail's 30 s: a full dump over ~184 cards
+/// takes ~30 s, so 30 s straddled the real duration —
+/// the identical first sync passed while the second
+/// timed out (MCL-2 round 4, W3-1). Matches the desktop
+/// sync client's 120 s timeout. Keep in step with the
+/// script's own `with timeout` (see the
+/// `dump_script_timeout_covers_gateway_cap` test).
 #[cfg(target_os = "macos")]
-const SCRIPT_TIMEOUT_SECS: u64 = 30;
+const SCRIPT_TIMEOUT_SECS: u64 = 120;
 
 /// Uniqueness for the temp files `run_script` captures
 /// output in (gateway requests run concurrently).
@@ -564,6 +571,31 @@ mod tests {
                 i + 1
             );
         }
+    }
+
+    #[test]
+    fn dump_script_timeout_covers_gateway_cap() {
+        // The gateway kills osascript at SCRIPT_TIMEOUT_SECS
+        // (120 s); the script's own `with timeout` must be
+        // at least that long, or a slow dump fails inside
+        // AppleScript (-1712) instead of surfacing the
+        // gateway's clean `Timeout` error. The literal 120
+        // here is SCRIPT_TIMEOUT_SECS — the const itself is
+        // macOS-only, so this platform-independent test pins
+        // the number; change both together.
+        let script = contacts_dump_script();
+        let marker = "with timeout of ";
+        let start = script.find(marker).expect("script must set a timeout");
+        let rest = &script[start + marker.len()..];
+        let end = rest.find(" seconds").expect("timeout must be in seconds");
+        let script_secs: u64 = rest[..end]
+            .trim()
+            .parse()
+            .expect("script timeout must be a number");
+        assert!(
+            script_secs >= 120,
+            "script timeout ({script_secs}s) must cover the gateway cap (120s)"
+        );
     }
 
     #[test]
