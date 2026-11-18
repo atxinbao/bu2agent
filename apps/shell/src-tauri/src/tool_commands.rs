@@ -59,6 +59,7 @@ use agent_desktop::email_client::{
     MessageView, SendMailInput, SentMessageRow, ThreadView,
 };
 use agent_desktop::imessage_client::{IMessageClient, IMessageSyncResult, IMessageThreadRow};
+use agent_desktop::contacts_client::{ContactRow, ContactsClient, ContactsSyncResult};
 use agent_desktop::calendar_client::{
     CalendarClient, CalendarEvent, CreateCalendarEventInput, CreatedCalendarEventRow,
 };
@@ -1733,6 +1734,43 @@ pub fn imessage_list(
 #[tauri::command(rename_all = "snake_case")]
 pub fn imessage_get(thread_id: String) -> Result<IMessageThreadRow, String> {
     imessage_client()?.thread_get(&thread_id).map_err(agent_err_string)
+}
+
+// --- Contacts surface (MCL-2, read-only) ---
+//
+// Four commands mirror the four gateway routes
+// (sync / list / get / search). Reads only; address /
+// birthday values are never stored, so they cannot be
+// searched or returned.
+fn contacts_client() -> Result<ContactsClient, String> {
+    ContactsClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn contacts_sync() -> Result<ContactsSyncResult, String> {
+    contacts_client()?.sync_contacts().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn contacts_list(
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<ContactRow>, String> {
+    contacts_client()?.contacts_list(limit, offset).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn contacts_get(contact_id: String) -> Result<ContactRow, String> {
+    contacts_client()?.contact_get(&contact_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn contacts_search(
+    query: String,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<ContactRow>, String> {
+    contacts_client()?.contacts_search(&query, limit, offset).map_err(agent_err_string)
 }
 
 // --- Notes surface (D1-6b-4, read + write) ---

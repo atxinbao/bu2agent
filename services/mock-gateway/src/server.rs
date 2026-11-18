@@ -110,6 +110,7 @@ use crate::stream_store::{
     StreamPoke, StreamSubscription, SxsSelection,
 };
 use crate::mail_source::{MailError, MailSource, UnavailableMailSource};
+use crate::contacts_source::{ContactsSource, UnavailableContactsSource};
 use crate::imessage_source::{IMessageError, IMessageSource, UnavailableIMessageSource};
 use crate::notes_source::NotesSource;
 use crate::calendar_backend::{default_calendar_backend, CalendarBackend};
@@ -377,6 +378,12 @@ pub struct AppState {
     /// substitute a fake; the loop tool and the sync
     /// route both read through it.
     pub(crate) imessage_source: Arc<dyn IMessageSource>,
+    /// MCL-2: the contacts source (AppleScript
+    /// Contacts.app on macOS, the 501 stub elsewhere).
+    /// Reads go through this trait so tests can
+    /// substitute a fake; the sync route reads through
+    /// it (the loop tool reads SQLite, not the source).
+    pub(crate) contacts_source: Arc<dyn ContactsSource>,
     /// D1-6b-2: the calendar backend (EventKit on macOS,
     /// the 501 stub elsewhere). Reads delegate to the
     /// D1-6a free functions; writes go through this
@@ -592,6 +599,16 @@ impl AppState {
                 crate::imessage_source::AppleScriptIMessageSource::new(),
             ));
         }
+        // MCL-2: on macOS the production contacts source
+        // asks Contacts.app via AppleScript; every other
+        // platform keeps the Unavailable source (501, never
+        // fake data). Tests override via with_contacts_source.
+        #[cfg(target_os = "macos")]
+        {
+            state = state.with_contacts_source(Arc::new(
+                crate::contacts_source::AppleScriptContactsSource::new(),
+            ));
+        }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
         }
@@ -765,6 +782,7 @@ impl AppState {
             voice_state_path: None,
             mail_source: Arc::new(UnavailableMailSource),
             imessage_source: Arc::new(UnavailableIMessageSource),
+            contacts_source: Arc::new(UnavailableContactsSource),
             calendar_backend: default_calendar_backend(),
             notes_source: crate::notes_source::default_notes_source(),
             git_path: crate::worker::resolve_git_path(),
@@ -1416,6 +1434,70 @@ impl AppState {
                     body: imessage_error_text(err),
                 },
                 Err(_) => ToolOutcome::unknown(),
+            };
+        }
+        // MCL-2: read-only contacts search. Unlike the
+        // imessage.threads arm, this reads the SQLite
+        // table (not the live source): the search is a
+        // fact-table query, so it works off a synced
+        // snapshot and never touches Contacts.app. Reads
+        // produce no Effect and need no approval
+        // (registered Some(false)). The render carries
+        // contact_id + display_name + organization +
+        // phones + emails (plaintext per Q-MCL-11) plus
+        // the has_address / has_birthday flags; address
+        // and birthday VALUES are never rendered (they
+        // are never stored). Deliberately not added to
+        // dispatch_agent_tool, like the mail tools.
+        if tool == "contacts.search" {
+            let query = args.get("q").cloned().unwrap_or_default();
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(50);
+            let offset = args
+                .get("offset")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let Some(sqlite) = &self.sqlite else {
+                return ToolOutcome {
+                    status: crate::loop_engine::CallStatus::Failed,
+                    error: Some(ErrorCode::ToolFailed),
+                    body: "contacts search unavailable: SQLite is not configured".to_string(),
+                };
+            };
+            let conn = sqlite.lock().expect("sqlite lock");
+            return match crate::contacts_sync::search_contacts(
+                &conn,
+                crate::contacts_sync::CONTACTS_SOURCE_ID,
+                &query,
+                limit,
+                offset,
+            ) {
+                Ok(rows) => {
+                    let mut out = String::new();
+                    for row in &rows {
+                        out.push_str(&format!(
+                            "contact: {} | name: {} | organization: {} | phones: {} | emails: {} | has_address: {} | has_birthday: {}\n",
+                            row.contact_id,
+                            row.display_name,
+                            row.organization,
+                            row.phones.join(", "),
+                            row.emails.join(", "),
+                            row.addresses_hash.is_some(),
+                            row.birthday_hash.is_some(),
+                        ));
+                    }
+                    if out.is_empty() {
+                        out.push_str("（通讯录暂无匹配联系人。）\n");
+                    }
+                    ToolOutcome::success(email_rendered(out))
+                }
+                Err(detail) => ToolOutcome {
+                    status: crate::loop_engine::CallStatus::Failed,
+                    error: Some(ErrorCode::ToolFailed),
+                    body: detail,
+                },
             };
         }
         if tool == "email.message" {
@@ -2982,6 +3064,14 @@ impl AppState {
         self
     }
 
+    /// Test seam: replace the contacts source (tests use
+    /// the fake source; production macOS uses AppleScript,
+    /// other platforms keep the Unavailable source).
+    pub fn with_contacts_source(mut self, source: Arc<dyn ContactsSource>) -> Self {
+        self.contacts_source = source;
+        self
+    }
+
     /// Test seam: replace the calendar backend (tests use
     /// the fake backend; production macOS uses EventKit,
     /// other platforms keep the Unavailable backend).
@@ -4046,7 +4136,7 @@ fn seed_sources_from(
 /// — the only tools an entry point can invoke today.
 /// Local definition (no runtime evidence behind the
 /// choice beyond the whitelist itself); keep in sync with
-/// `loop_engine::normalize` (same 12 names, same order).
+/// `loop_engine::normalize` (same 13 names, same order).
 const MANDATE_TOOLS: &[&str] = &[
     "fs.list",
     "fs.read",
@@ -4056,6 +4146,7 @@ const MANDATE_TOOLS: &[&str] = &[
     "email.threads",
     "email.message",
     "imessage.threads",
+    "contacts.search",
     "code.search",
     "git.read",
     "worker.run",
@@ -7891,6 +7982,10 @@ pub fn app(state: AppState) -> Router {
         .route("/api/imessage/sync", post(crate::routes_imessage::imessage_sync))
         .route("/api/imessage/threads", get(crate::routes_imessage::imessage_threads_list))
         .route("/api/imessage/threads/{id}", get(crate::routes_imessage::imessage_thread_get))
+        .route("/api/contacts/sync", post(crate::routes_contacts::contacts_sync))
+        .route("/api/contacts", get(crate::routes_contacts::contacts_list))
+        .route("/api/contacts/search", get(crate::routes_contacts::contacts_search))
+        .route("/api/contacts/{id}", get(crate::routes_contacts::contacts_get))
         .route("/api/nodes/register", post(crate::routes_peers::nodes_register))
         .route("/api/nodes/list", post(crate::routes_peers::nodes_list))
         .route("/api/nodes/heartbeat", post(crate::routes_peers::nodes_heartbeat))

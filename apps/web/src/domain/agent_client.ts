@@ -81,6 +81,9 @@ function requiresApproval(tool: string): boolean | undefined {
     // (email.threads / email.message are missing here
     // too — a pre-existing gap, out of scope.)
     case "imessage.threads":
+    // MCL-2: the contacts search is a read, no
+    // approval (mirrors the gateway's Some(false)).
+    case "contacts.search":
       return false;
     case "fs.write":
     case "fs.delete":

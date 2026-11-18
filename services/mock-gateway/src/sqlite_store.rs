@@ -57,8 +57,9 @@ use crate::execution_store::ExecutionFileRecord;
 /// SCHEMA_V9).
 /// Row-level `schema_version` fields are a separate concept
 /// (the record contract version, still 1 for P0-A+ rows) and
-/// are untouched.
-pub const DB_SCHEMA_VERSION: i64 = 14;
+/// are untouched. v15 adds the MCL-2 `contacts` table
+/// (see SCHEMA_V15).
+pub const DB_SCHEMA_VERSION: i64 = 15;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -611,6 +612,42 @@ CREATE TABLE IF NOT EXISTS imessage_threads (
     UNIQUE (source_id, native_id)
 );
 ";
+/// MCL-2 v15 step: `contacts` fact table. `contact_id`
+/// is the local `contact-N` id; `native_id` is the
+/// card's AppleScript id (a `UUID:ABPerson` string,
+/// Q-MCL-10). `display_name` / `organization` /
+/// `job_title` and `phones_json` / `emails_json` are
+/// PLAINTEXT (Q-MCL-11: display, dial, and send need
+/// them); `addresses_hash` is the sha256 of the
+/// canonical JSON of the sorted address list, NULL when
+/// the card has no addresses; `birthday_hash` is the
+/// sha256 of the ISO-8601 date string, NULL when there
+/// is no birth date — NULL is the existence flag, and
+/// no address / birthday VALUE is ever stored. Typed
+/// DDL for every ms column (the E2-D batch-2 lesson:
+/// untyped backfill columns land as TEXT on old DBs).
+/// `(source_id, native_id)` is UNIQUE — the tombstone
+/// anti-resurrect key, and the no-merge key (Q-MCL-12:
+/// one person with several cards has several rows).
+const SCHEMA_V15: &str = "
+CREATE TABLE IF NOT EXISTS contacts (
+    contact_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    native_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    organization TEXT NOT NULL DEFAULT '',
+    job_title TEXT NOT NULL DEFAULT '',
+    phones_json TEXT NOT NULL DEFAULT '[]',
+    emails_json TEXT NOT NULL DEFAULT '[]',
+    addresses_hash TEXT,
+    birthday_hash TEXT,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    origin_device_id TEXT NOT NULL,
+    UNIQUE (source_id, native_id)
+);
+";
 /// create fact record. `event_id` is the EventKit
 /// identifier itself (the stable system id, so no local
 /// number is assigned); `idempotency_key` is UNIQUE —
@@ -867,6 +904,19 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V14).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '14')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // MCL-2 v15 step: contacts table only. One
+    // transaction, v5–v14 style; a fresh database runs
+    // v1–v15 in the same transaction. The table starts
+    // empty — rows arrive only from POST /api/contacts/sync.
+    if version < 15 {
+        tx.execute_batch(SCHEMA_V15).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '15')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -1947,6 +1997,15 @@ const REDACTED_PAYLOAD_FIELDS: &[&str] = &[
     "source_id",
     "native_id",
     "thread_id",
+    "contact_id",
+    "display_name_hash",
+    "organization_hash",
+    "phone_count",
+    "phone_hash",
+    "email_count",
+    "email_hash",
+    "has_address",
+    "has_birthday",
     "body_hash",
     "subject_len",
     "sender_hash",

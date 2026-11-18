@@ -355,6 +355,36 @@ impl Source for IMessageSourceEntry {
     }
 }
 
+/// The contacts source (MCL-2, the `MailSourceEntry`
+/// precedent): one row for the Contacts.app backend —
+/// the same backend serves the contacts sync. One row:
+/// the source has no account concept of its own (the
+/// card is picked per read). Disconnect is a flag
+/// flip only; reads are unaffected (6b Q-24).
+pub struct ContactsSourceEntry;
+
+impl Source for ContactsSourceEntry {
+    fn source_id(&self) -> String {
+        "contacts-source".to_string()
+    }
+
+    fn kind(&self) -> &'static str {
+        "contacts"
+    }
+
+    fn display_name(&self) -> String {
+        "Contacts".to_string()
+    }
+
+    fn config_json(&self) -> Value {
+        serde_json::json!({})
+    }
+
+    fn scope(&self) -> String {
+        "contacts".to_string()
+    }
+}
+
 /// The reminder backend as one source (Q-D1-43): Fake
 /// and EventKit are two backends of this single source,
 /// never two rows. `backend` is the switch value
@@ -476,6 +506,8 @@ pub fn seed_sources(
     let (row, _) = NotesSourceEntry.register(&mut *conn, &inputs.origin_device_id)?;
     rows.push(row);
     let (row, _) = IMessageSourceEntry.register(&mut *conn, &inputs.origin_device_id)?;
+    rows.push(row);
+    let (row, _) = ContactsSourceEntry.register(&mut *conn, &inputs.origin_device_id)?;
     rows.push(row);
     let (row, _) = ReminderDeviceSource {
         backend: inputs.device_backend,
