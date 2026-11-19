@@ -1,59 +1,60 @@
-//! Current-location read surface, MCL-3.
+//! Current-location read surface, MCL-3 (shell route, S-1).
 //!
-//! One manual sample at a time: `POST /api/location/record`
-//! asks the system location service for a single fix and
-//! stores it as a discrete `device_locations` row. There
-//! is no background collection and no trajectory (Q-MCL-18
-//! / Q-MCL-19): the source is only ever read through the
-//! manual record route and the `location.current` loop
-//! tool, and the loop tool reads the latest recorded row
-//! from SQLite — it never triggers a live fix.
+//! One manual sample at a time: `POST /api/location/record-from-shell`
+//! takes a fix the packaged app's shell process acquired
+//! itself and stores it as a discrete `device_locations`
+//! row. There is no background collection and no
+//! trajectory (Q-MCL-18 / Q-MCL-19): the source is only
+//! ever read through the manual record route and the
+//! `location.current` loop tool, and the loop tool reads
+//! the latest recorded row from SQLite — it never
+//! triggers a live fix.
 //!
-//! # Q-MCL-15 form decision (coordinator's call, from evidence)
+//! # Q-MCL-15 form decision, rewritten by the shell plan (S-1)
 //!
-//! In-process binding, `objc2-core-location` 0.3.2. The
-//! gateway runs as a Tauri sidecar inside the signed
-//! `.app` bundle — `gateway_lifecycle.rs` `start_owned`,
-//! `tauri.conf.json` `externalBin`, and `run-build.command`
-//! copies `mock-gateway` into the bundle — so the gateway
-//! process IS the packaged app (`com.bu2ai.bu2agent`) and
-//! Core Location authorizes against that identity — the
-//! same in-process form EventKit 0.4.0 already uses from
-//! this sidecar (calendar read/create window-proven in
-//! 6b-2). A Swift helper was rejected: it would be a
-//! second executable needing its own bundling step and
-//! its own TCC attribution question, and the MCL-0 S2
-//! evidence covers a standalone Swift app, never a helper
-//! subprocess of the gateway.
+//! The fix is acquired in the SHELL main process
+//! (`apps/shell/src-tauri/src/location_shell.rs`), not in
+//! the gateway sidecar: the sidecar's `CLLocationManager`
+//! is created with identifier `""` / bundlePath `""`
+//! (Console diagnosis, window rounds 1-2), so locationd
+//! refuses to attribute the request and the authorization
+//! prompt never appears. The shell process IS properly
+//! identified (subject=com.bu2ai.bu2agent in tccd), and
+//! the S-0 probe proved it can prompt and read one fix
+//! (35.0 m, auth wait 26,307 ms). The sidecar Core
+//! Location body that MCL-3 shipped was DELETED by S-1
+//! (Q-S-03); this module keeps only the fix shape, the
+//! error type, the hash functions and the 501 stub. The
+//! shell POSTs the raw fix to the gateway with the
+//! startup token (`X-Shell-Token`); a fix that arrives
+//! without the token never reaches SQLite (Q-S-02).
 //!
-//! `objc2-core-location` 0.3.2 resolves from crates.io
-//! (verified by `cargo fetch` on the VM; default features
-//! include `CLLocation`, `CLLocationManager` and
-//! `CLLocationManagerDelegate`). The macOS body below
-//! uses `CLLocationManager::requestLocation` (one-shot)
-//! with a delegate that records the first fix, and pumps
-//! this thread's runloop while waiting — the manager is
-//! created on the calling (blocking) thread, so its
+//! The macOS fix acquisition still uses
+//! `CLLocationManager::requestLocation` (one-shot) with
+//! a delegate that records the first fix, and pumps the
+//! acquiring thread's runloop while waiting — the
+//! manager is created on the worker thread, so its
 //! callbacks arrive on that thread's runloop. The
 //! `Info.plist` must carry
-//! `NSLocationWhenInUseUsageDescription` (the app
-//! currently has only the Reminders keys): without it
+//! `NSLocationWhenInUseUsageDescription`: without it
 //! the authorization prompt cannot appear and every
 //! record is `Denied`.
 //!
 //! The gateway never auto-launches anything for
 //! location: there is no app to launch. When location
-//! services are off system-wide the read is
+//! services are off system-wide the shell read is
 //! `Unavailable` (501); when the user denied (or the
 //! prompt is unanswered within the cap) it is `Denied`
-//! (403) / `Timeout` (502).
+//! (403) / `Timeout` (502) — the shell maps those to
+//! the same strings the old gateway route used, and the
+//! Tauri command surfaces them unchanged.
 //!
 //! Coordinates come from the system location service
 //! only — never from request parameters (Q-MCL-15).
 //! `country_code` is `None` unless the source provides
 //! one: Core Location alone has no country (reverse
 //! geocoding is a separate network service, not in
-//! MCL-3), so the macOS body leaves it `None` and the
+//! MCL-3), so the shell fix leaves it `None` and the
 //! column stays NULL. `locality_hash` / `grid_hash` are
 //! LOCAL DEFINITIONs below (deterministic pure functions
 //! of the coordinates; the hashes never contain
@@ -82,10 +83,12 @@ pub struct DeviceLocationView {
 /// -> 501, `Denied` -> 403, `Upstream` / `NotRunning` /
 /// `Timeout` -> 502 on the read paths). Separate type so
 /// no location error ever renders as a mail error.
-/// `NotFound` / `NotRunning` are unused by the Core
-/// Location body (a current fix has no id to miss and
-/// no app to be not-running); they are kept so the
-/// mapping stays the shared six-variant shape.
+/// S-1 deleted the gateway-side Core Location body
+/// (Q-S-03): the only production `LocationSource` left
+/// is `UnavailableLocationSource`, and the shell reports
+/// its own failures as plain strings through the Tauri
+/// command. The type stays so the trait, the stub and
+/// tests share the six-variant shape.
 #[derive(Debug, Clone)]
 pub enum LocationError {
     NotFound(&'static str),
@@ -166,253 +169,6 @@ impl LocationSource for UnavailableLocationSource {
         Err(LocationError::Unavailable(
             "location source unavailable on this platform".to_string(),
         ))
-    }
-}
-
-/// Hard cap on one Core Location call (authorization
-/// prompt + first fix share this single deadline, so
-/// the desktop 120 s sync client always wins over the
-/// gateway cap). A user slow at the prompt retries by
-/// tapping record again; a cold first fix is normally
-/// seconds (the MCL-0 S2 probe took 2.385 s with
-/// authorization already granted).
-#[cfg(target_os = "macos")]
-const LOCATION_TIMEOUT_SECS: u64 = 60;
-
-#[cfg(target_os = "macos")]
-use std::{
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
-
-#[cfg(target_os = "macos")]
-use objc2::define_class;
-#[cfg(target_os = "macos")]
-use objc2::msg_send;
-#[cfg(target_os = "macos")]
-use objc2::rc::Retained;
-#[cfg(target_os = "macos")]
-use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
-#[cfg(target_os = "macos")]
-use objc2::{AnyThread, DefinedClass};
-#[cfg(target_os = "macos")]
-use objc2_core_location::{
-    kCLLocationAccuracyBest, CLAuthorizationStatus, CLError, CLLocation, CLLocationManager,
-    CLLocationManagerDelegate,
-};
-#[cfg(target_os = "macos")]
-use objc2_foundation::{NSArray, NSDate, NSError, NSRunLoop};
-
-/// Shared state between the Core Location delegate
-/// callbacks and the waiting `current()` call. The
-/// delegate writes; the waiter polls under the same
-/// mutex while pumping the runloop.
-#[cfg(target_os = "macos")]
-#[derive(Debug, Default)]
-struct LocationState {
-    /// The first fix received: (latitude, longitude,
-    /// horizontal accuracy in meters). First fix wins —
-    /// `requestLocation` delivers one location (the
-    /// newest last); a later stale update must not
-    /// overwrite it.
-    fix: Option<(f64, f64, f64)>,
-    /// Terminal failure, if any.
-    failure: Option<LocationError>,
-    /// `LocationUnknown` retries so far (at most one).
-    retries: u32,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug)]
-struct LocationDelegateIvars {
-    state: Arc<Mutex<LocationState>>,
-}
-
-#[cfg(target_os = "macos")]
-define_class!(
-    // SAFETY:
-    // - The superclass NSObject does not have any subclassing requirements.
-    // - `LocationDelegate` does not implement `Drop`.
-    #[unsafe(super(NSObject))]
-    #[ivars = LocationDelegateIvars]
-    struct LocationDelegate;
-
-    unsafe impl NSObjectProtocol for LocationDelegate {}
-
-    unsafe impl CLLocationManagerDelegate for LocationDelegate {
-        #[allow(non_snake_case)]
-        #[unsafe(method(locationManager:didUpdateLocations:))]
-        unsafe fn locationManager_didUpdateLocations(
-            &self,
-            _manager: &CLLocationManager,
-            locations: &NSArray<CLLocation>,
-        ) {
-            // The last location in the array is the
-            // newest fix.
-            if let Some(location) = locations.lastObject() {
-                let coordinate = unsafe { location.coordinate() };
-                let accuracy = unsafe { location.horizontalAccuracy() };
-                let mut state = self.ivars().state.lock().unwrap();
-                if state.fix.is_none() {
-                    state.fix = Some((coordinate.latitude, coordinate.longitude, accuracy));
-                }
-            }
-        }
-
-        #[allow(non_snake_case)]
-        #[unsafe(method(locationManager:didFailWithError:))]
-        unsafe fn locationManager_didFailWithError(
-            &self,
-            manager: &CLLocationManager,
-            error: &NSError,
-        ) {
-            let code = error.code();
-            let mut state = self.ivars().state.lock().unwrap();
-            if state.fix.is_some() || state.failure.is_some() {
-                return;
-            }
-            if code == CLError::LocationUnknown.0 && state.retries < 1 {
-                // Transient: the fix was not ready yet.
-                // One retry, then the failure below stands.
-                state.retries += 1;
-                drop(state);
-                unsafe { manager.requestLocation() };
-                return;
-            }
-            state.failure = Some(if code == CLError::Denied.0 {
-                LocationError::Denied
-            } else {
-                // Never render the NSError text: it can
-                // contain local paths. The code is enough
-                // for the route mapping (Denied / Timeout
-                // / Upstream).
-                LocationError::Upstream("location lookup failed".to_string())
-            });
-        }
-    }
-);
-
-#[cfg(target_os = "macos")]
-impl LocationDelegate {
-    fn new(state: Arc<Mutex<LocationState>>) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(LocationDelegateIvars { state });
-        unsafe { msg_send![super(this), init] }
-    }
-}
-
-/// macOS-only real source: one Core Location fix via
-/// `objc2-core-location`, in-process under the packaged
-/// app's identity. See the module docs for the
-/// best-effort caveat: the body is validated by window
-/// validation on a real Mac (and CI's macOS job), not
-/// by this VM.
-#[cfg(target_os = "macos")]
-pub struct CoreLocationSource;
-
-#[cfg(target_os = "macos")]
-impl Default for CoreLocationSource {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl CoreLocationSource {
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// Pump this thread's runloop in short slices until
-    /// `done` is true or the deadline passes. The Core
-    /// Location delegate callbacks arrive on this
-    /// thread's runloop (the manager is created on this
-    /// thread, not the main thread), so without pumping
-    /// nothing is ever delivered.
-    fn pump_until(deadline: Instant, done: impl Fn() -> bool) {
-        let runloop = NSRunLoop::currentRunLoop();
-        while !done() {
-            if Instant::now() >= deadline {
-                break;
-            }
-            let until = NSDate::dateWithTimeIntervalSinceNow(0.1);
-            runloop.runUntilDate(&until);
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl LocationSource for CoreLocationSource {
-    fn current(&self) -> Result<DeviceLocationView, LocationError> {
-        // One overall deadline for the whole call
-        // (authorization prompt + first fix).
-        let deadline = Instant::now() + Duration::from_secs(LOCATION_TIMEOUT_SECS);
-        if !unsafe { CLLocationManager::locationServicesEnabled_class() } {
-            return Err(LocationError::Unavailable(
-                "location services are disabled".to_string(),
-            ));
-        }
-        let manager = unsafe { CLLocationManager::new() };
-        unsafe { manager.setDesiredAccuracy(kCLLocationAccuracyBest) };
-        let state = Arc::new(Mutex::new(LocationState::default()));
-        let delegate = LocationDelegate::new(Arc::clone(&state));
-        // setDelegate holds a weak reference: keep the
-        // type-erased retained object alive for the call.
-        let delegate_obj: Retained<ProtocolObject<dyn CLLocationManagerDelegate>> =
-            ProtocolObject::from_retained(delegate);
-        unsafe { manager.setDelegate(Some(&delegate_obj)) };
-        // Authorization first: NotDetermined prompts the
-        // user (system dialog, once per app); Denied /
-        // Restricted never prompts again. Wait on the
-        // status itself, NOT on the delegate callback:
-        // Core Location reports the *current* status via
-        // `locationManagerDidChangeAuthorization:` as
-        // soon as the delegate is set (still
-        // NotDetermined, 2-9 ms in), so a callback is
-        // not proof the user answered the prompt —
-        // treating it as one returns Timeout before the
-        // dialog ever appears (window round 1, W1-1).
-        match unsafe { manager.authorizationStatus() } {
-            CLAuthorizationStatus::Denied | CLAuthorizationStatus::Restricted => {
-                return Err(LocationError::Denied);
-            }
-            CLAuthorizationStatus::NotDetermined => {
-                unsafe { manager.requestWhenInUseAuthorization() };
-                Self::pump_until(deadline, || {
-                    let status = unsafe { manager.authorizationStatus() };
-                    status != CLAuthorizationStatus::NotDetermined
-                });
-                match unsafe { manager.authorizationStatus() } {
-                    CLAuthorizationStatus::Denied | CLAuthorizationStatus::Restricted => {
-                        return Err(LocationError::Denied);
-                    }
-                    CLAuthorizationStatus::NotDetermined => {
-                        return Err(LocationError::Timeout);
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-        unsafe { manager.requestLocation() };
-        Self::pump_until(deadline, || {
-            let state = state.lock().unwrap();
-            state.fix.is_some() || state.failure.is_some()
-        });
-        let state = state.lock().unwrap();
-        if let Some((latitude, longitude, accuracy_meters)) = state.fix {
-            return Ok(DeviceLocationView {
-                latitude,
-                longitude,
-                accuracy_meters,
-                // No reverse geocoder in MCL-3 (see the
-                // module docs): the column stays NULL.
-                country_code: None,
-            });
-        }
-        if let Some(failure) = &state.failure {
-            return Err(failure.clone());
-        }
-        Err(LocationError::Timeout)
     }
 }
 

@@ -106,6 +106,22 @@ impl HttpClient {
     /// rules (notably: reads may retry once on 401, writes never
     /// retry blindly -- see file_gateway_client).
     pub fn request(&self, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String)> {
+        self.request_with_headers(method, path, body, &[])
+    }
+
+    /// Raw request with extra headers (MCL-3 shell route:
+    /// `X-Shell-Token` on the record-from-shell POST).
+    /// Callers must pass header-safe names/values (no
+    /// CR/LF); the shell token is generated hex (or a
+    /// validated dev override), so it is safe by
+    /// construction.
+    pub fn request_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> Result<(u16, String)> {
         let timeout = Duration::from_millis(self.timeout_ms);
         let addr = format!("{}:{}", self.host, self.port)
             .to_socket_addrs()
@@ -124,6 +140,9 @@ impl HttpClient {
             "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
             self.host
         );
+        for (name, value) in headers {
+            req.push_str(&format!("{name}: {value}\r\n"));
+        }
         if let Some(body) = body {
             req.push_str(&format!(
                 "Content-Type: application/json\r\nContent-Length: {}\r\n",
@@ -218,6 +237,23 @@ impl HttpClient {
         body: &str,
     ) -> Result<T> {
         let (status, resp_body) = self.request("POST", path, Some(body))?;
+        if !(200..300).contains(&status) {
+            return Err(gateway_error_with_body(status, &resp_body));
+        }
+        serde_json::from_str(&resp_body)
+            .map_err(|_| transport_error("mock gateway returned invalid JSON"))
+    }
+
+    /// POST with a JSON body and extra headers, mirroring
+    /// post_json (MCL-3 shell route: the record-from-shell
+    /// POST carries `X-Shell-Token`).
+    pub fn post_json_with_headers<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<T> {
+        let (status, resp_body) = self.request_with_headers("POST", path, Some(body), headers)?;
         if !(200..300).contains(&status) {
             return Err(gateway_error_with_body(status, &resp_body));
         }

@@ -1,16 +1,24 @@
-//! Location routes, MCL-3.
+//! Location routes, MCL-3 (shell route, S-1).
 //!
 //! Three routes, the mail read-batch 1 pattern
 //! (`routes_mail.rs` is the model, `routes_imessage.rs`
 //! is the nearest copy):
 //!
-//! - `POST /api/location/record` — manual trigger, one
-//!   current sample (no Effect, no approval, no Outbox:
-//!   fact recording only, like `POST /api/email/sync`).
-//!   Reads the live source (outside the SQLite lock)
-//!   and writes the `device_locations` row + the
-//!   `location.recorded` event + the 30-day prune in one
-//!   transaction. A disconnected `location-source`
+//! - `POST /api/location/record-from-shell` — manual
+//!   trigger, one current sample (no Effect, no
+//!   approval, no Outbox: fact recording only, like
+//!   `POST /api/email/sync`). The fix arrives in the
+//!   request body — raw latitude / longitude / accuracy
+//!   — but ONLY from the packaged app's shell process,
+//!   attested by the startup token (`X-Shell-Token`,
+//!   Q-S-02): a fix without the token, or with the
+//!   wrong token, is 403 and never reaches SQLite
+//!   (the old sidecar-fetch route
+//!   `POST /api/location/record` was deleted with the
+//!   sidecar Core Location body, Q-S-03/Q-S-08).
+//!   Writes the `device_locations` row + the
+//!   `location.recorded` event + the 30-day prune in
+//!   one transaction. A disconnected `location-source`
 //!   rejects the new record with 409
 //!   `source_disconnected` (6b Q-24: reads unaffected).
 //!   The response is the recorded row, bare (like
@@ -24,12 +32,10 @@
 //!   sample by local `loc-sample-N` id, a bare row;
 //!   unknown ids are 404.
 
-use std::sync::Arc;
-
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
@@ -37,7 +43,7 @@ use serde::Deserialize;
 use crate::location_record::{
     get_device_location, list_device_locations, record_location, LOCATION_SOURCE_ID,
 };
-use crate::location_source::{clamp_limit, LocationError};
+use crate::location_source::{clamp_limit, DeviceLocationView};
 use crate::routes_common::{sqlite_error_response, sqlite_not_configured};
 use crate::server::AppState;
 use crate::sqlite_store::{self, StateBackend};
@@ -48,37 +54,16 @@ pub struct ListParams {
     pub offset: Option<usize>,
 }
 
-/// Map a source failure onto the shared read-path
-/// codes: unavailable -> 501, denied -> 403, not
-/// running / upstream / timeout -> 502 (the mail
-/// `mail_error_response` precedent, with location
-/// wording — never a mail error string).
-pub(crate) fn location_error_response(error: &LocationError, what: &str) -> Response {
-    let (status, detail) = match error {
-        LocationError::NotFound(detail) => (StatusCode::NOT_FOUND, detail.to_string()),
-        LocationError::Unavailable(detail) => (StatusCode::NOT_IMPLEMENTED, detail.clone()),
-        LocationError::Denied => (
-            StatusCode::FORBIDDEN,
-            "location access denied (check Location Services permission)".to_string(),
-        ),
-        LocationError::Upstream(detail) => (StatusCode::BAD_GATEWAY, detail.clone()),
-        LocationError::NotRunning => (
-            StatusCode::BAD_GATEWAY,
-            "location source is not running".to_string(),
-        ),
-        LocationError::Timeout => (
-            StatusCode::BAD_GATEWAY,
-            "location read timed out".to_string(),
-        ),
-    };
-    (
-        status,
-        Json(serde_json::json!({
-            "error": format!("location {what} failed: {detail}"),
-            "code": "location_source_error",
-        })),
-    )
-        .into_response()
+/// The shell-attested fix: raw latitude / longitude /
+/// accuracy only. No `country_code` — Core Location
+/// alone has none (the column stays NULL); no grid or
+/// locality hash — the gateway computes those from the
+/// fix (Q-S-10: the shell sends raw coordinates only).
+#[derive(Deserialize, Debug)]
+pub struct ShellFixDto {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub accuracy_meters: f64,
 }
 
 /// MCL-3 (Q-MCL-15 + 6b Q-24): a disconnected
@@ -98,7 +83,47 @@ fn location_source_disconnected(state: &AppState) -> bool {
     )
 }
 
-pub(crate) async fn location_record(State(state): State<AppState>) -> impl IntoResponse {
+/// MCL-3 shell route (S-1, Q-S-02): the shell
+/// acquired the fix itself and attests it with the
+/// startup token. The token check runs FIRST, before
+/// any SQLite/state touch: without the token (or with
+/// the wrong one) no fix is ever recorded, whatever
+/// else the gateway's state is.
+///
+/// Failure mapping (Q-S-02, coordinator's call from
+/// the gateway's own precedent): both failures are
+/// 403, never 401 — no 401 precedent exists anywhere
+/// in the gateway (a grep for 401/UNAUTHORIZED finds
+/// only a retry comment), while 403 is the established
+/// code for "caller not allowed"
+/// (`approval_binding_mismatch` 403, location Denied
+/// 403). Missing and wrong differ only in the error
+/// string (`shell_token_required` vs
+/// `shell_token_invalid`) so the shell can tell "no
+/// token configured" from "token mismatch" without
+/// the gateway leaking which side failed.
+pub(crate) async fn location_record_from_shell(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(fix): Json<ShellFixDto>,
+) -> impl IntoResponse {
+    let presented = headers.get("X-Shell-Token");
+    let token_ok = match (&state.location_shell_token, presented) {
+        (Some(expected), Some(got)) => got.as_bytes() == expected.as_bytes(),
+        _ => false,
+    };
+    if !token_ok {
+        let error = if presented.is_some() {
+            "shell_token_invalid"
+        } else {
+            "shell_token_required"
+        };
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response();
+    }
     if state.sqlite_is_broken() {
         return sqlite_error_response();
     }
@@ -115,25 +140,16 @@ pub(crate) async fn location_record(State(state): State<AppState>) -> impl IntoR
         )
             .into_response();
     }
-    // The fetch runs outside the SQLite lock (the Core
-    // Location call can block up to its 60 s cap while
-    // the user answers the authorization prompt); the
-    // write is one transaction (prune + row + event).
-    // Run the fetch on a blocking thread so the wait
-    // never holds a tokio worker.
-    let source = Arc::clone(&state.location_source);
-    let view = match tokio::task::spawn_blocking(move || source.current()).await {
-        Ok(Ok(view)) => view,
-        Ok(Err(error)) => return location_error_response(&error, "record"),
-        // The blocking thread panicked: the lookup
-        // itself failed, so the record maps to the
-        // shared 502 like any other source failure.
-        Err(_) => {
-            return location_error_response(
-                &LocationError::Upstream("location lookup failed".to_string()),
-                "record",
-            );
-        }
+    // The fix is already in hand (the shell did the
+    // 60 s Core Location wait); the write is one
+    // transaction (prune + row + event) via the same
+    // `record_location` the old route used. The shell
+    // sends no country: Core Location alone has none.
+    let view = DeviceLocationView {
+        latitude: fix.latitude,
+        longitude: fix.longitude,
+        accuracy_meters: fix.accuracy_meters,
+        country_code: None,
     };
     let mut conn = sqlite.lock().expect("sqlite lock");
     match record_location(
@@ -206,29 +222,5 @@ pub(crate) async fn location_sample_get(
             eprintln!("warning: location sample get failed ({detail})");
             sqlite_error_response()
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn location_error_response_maps_each_variant() {
-        // Denied -> 403; Unavailable -> 501; Timeout ->
-        // 502 (the error-mapping contract the L-tests
-        // exercise end to end through the record route).
-        let denied = location_error_response(&LocationError::Denied, "record");
-        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-        let unavailable = location_error_response(
-            &LocationError::Unavailable("no source".to_string()),
-            "record",
-        );
-        assert_eq!(unavailable.status(), StatusCode::NOT_IMPLEMENTED);
-        let timeout = location_error_response(&LocationError::Timeout, "record");
-        assert_eq!(timeout.status(), StatusCode::BAD_GATEWAY);
-        let upstream =
-            location_error_response(&LocationError::Upstream("boom".to_string()), "record");
-        assert_eq!(upstream.status(), StatusCode::BAD_GATEWAY);
     }
 }

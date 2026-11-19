@@ -1,12 +1,21 @@
 //! Location client: Rust shell -> Mock Gateway location
 //! surface (MCL-3, manual record + read).
 //!
-//! Manual trigger only: `record_location` records one
-//! sample; there is no auto-collection and no
-//! background track. On non-macOS the gateway answers
-//! 501 and the error surfaces here unchanged; the
-//! packaged Mac app reads real system location via
-//! Core Location.
+//! Manual trigger only: `record_from_shell` records one
+//! sample the shell acquired itself; there is no
+//! auto-collection and no background track. The gateway
+//! never fetches a fix any more (S-1 deleted the
+//! sidecar Core Location body): the shell does the
+//! Core Location wait and POSTs the raw fix with the
+//! startup token.
+//!
+//! Q-S-05 (S-1 decision): the 120 s client is GONE.
+//! It existed only because the gateway-side Core
+//! Location fetch could block up to 60 s (the D1-6a
+//! F-1 shape). The new route is a fast insert — one
+//! SQLite transaction, no live fetch — so the shared
+//! 10 s client is the right bound: a hung gateway
+//! still fails fast instead of hanging the command.
 //!
 //! PII shape (Q-MCL-17): SQLite stores the RAW
 //! coordinates and the UI shows exact values only
@@ -38,25 +47,24 @@ pub struct DeviceLocationRow {
     pub origin_device_id: String,
 }
 
-/// MCL-3: record runs Core Location gateway-side and
-/// can take up to 60 s, past the shared 10 s read
-/// timeout — the same F-1 failure shape as mail sync
-/// (D1-6a) and contacts sync (MCL-2). Record alone
-/// gets a 120 s bound; every other location call keeps
-/// the 10 s default so a hung gateway still fails fast
-/// instead of hanging the CLI.
-const LOCATION_RECORD_TIMEOUT_MS: u64 = 120_000;
+/// The shell-attested fix the shell POSTs to
+/// `POST /api/location/record-from-shell`: raw
+/// coordinates + accuracy only. No `country_code`
+/// (Core Location alone has none) and no hashes (the
+/// gateway computes those). Serialized snake_case to
+/// match the gateway's `ShellFixDto`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShellFixInput {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub accuracy_meters: f64,
+}
 
 /// `base_url` must look like `http://127.0.0.1:3001` and pass
 /// the egress allowlist (localhost Mock only).
 #[derive(Debug, Clone)]
 pub struct LocationClient {
     http: HttpClient,
-    /// Long-timeout client (F-1): record alone uses it —
-    /// the gateway-side Core Location fetch can take up
-    /// to 60 s. All other calls share `http` and its
-    /// 10 s default.
-    sync_http: HttpClient,
 }
 
 impl LocationClient {
@@ -65,16 +73,30 @@ impl LocationClient {
         policy.check_url(base_url)?;
         Ok(Self {
             http: HttpClient::new(base_url)?,
-            sync_http: HttpClient::with_timeout(base_url, LOCATION_RECORD_TIMEOUT_MS)?,
         })
     }
 
-    pub fn record_location(&self) -> std::result::Result<DeviceLocationRow, AgentError> {
-        // F-1: record alone uses the long-timeout client;
-        // the gateway-side Core Location fetch can take
-        // up to 60 s and the shared 10 s client times
-        // out first while the gateway still finishes.
-        Ok(self.sync_http.post_json("/api/location/record", "{}")?)
+    /// Record one shell-acquired fix. The fix is
+    /// already in hand (the shell did the 60 s wait
+    /// before this call), so this POST is a fast insert
+    /// on the default 10 s client (Q-S-05). The token
+    /// is the startup token the shell passed the
+    /// gateway at launch; without it the gateway 403s
+    /// and nothing is recorded. The token itself is
+    /// never logged — only the HTTP status reaches the
+    /// error (the `HttpClient` redaction policy).
+    pub fn record_from_shell(
+        &self,
+        fix: &ShellFixInput,
+        shell_token: &str,
+    ) -> std::result::Result<DeviceLocationRow, AgentError> {
+        let body = serde_json::to_string(fix)
+            .map_err(|_| crate::http_client::transport_error("cannot encode location fix"))?;
+        Ok(self.http.post_json_with_headers(
+            "/api/location/record-from-shell",
+            &body,
+            &[("X-Shell-Token", shell_token)],
+        )?)
     }
 
     /// List recorded samples, newest first

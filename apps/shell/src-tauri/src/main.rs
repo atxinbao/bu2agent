@@ -15,6 +15,7 @@ mod session_commands;
 mod gateway_endpoint;
 mod gateway_home;
 mod gateway_lifecycle;
+mod location_shell;
 mod settings_commands;
 mod settings_store;
 mod tool_commands;

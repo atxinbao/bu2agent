@@ -3,11 +3,16 @@
 //! delete, redact no coordinate plaintext in events.
 //! L0 is the registration unit test (the loop-tool
 //! points, without a server); L5 is the disconnect
-//! check, L6 the source-error mapping, L7 the
+//! check, L6 the shell-token mapping, L7 the
 //! loop-dispatch e2e test (the MCL-1/MCL-2 extras).
 //!
-//! Tests use a mutable fake source only; never Core
-//! Location. Cross-platform: temp dirs, ports, SQLite
+//! S-1 (shell route): there is no fake location source
+//! any more — the gateway never reads a live source, so
+//! the tests POST the fix the shell would send, with
+//! the startup token (`X-Shell-Token`). The fix
+//! coordinates are fictional (Shanghai, .invalid-free
+//! — they are only ever asserted by their hashes in
+//! events). Cross-platform: temp dirs, ports, SQLite
 //! only. No kill command, no POSIX signals, no
 //! Unix-only path spellings. JSON bodies are built with
 //! `json!` (the test-hygiene skill); time budgets are
@@ -30,15 +35,28 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mock_gateway::location_record::LOCATION_RETENTION_MS;
-use mock_gateway::location_source::{
-    grid_hash_for, locality_hash_for, DeviceLocationView, LocationError, LocationSource,
-};
+use mock_gateway::location_source::{grid_hash_for, locality_hash_for};
 use mock_gateway::loop_engine::*;
 use mock_gateway::server::{app, AppState};
 use mock_gateway::sqlite_store;
 use mock_gateway::tool_requires_approval;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+
+/// The fixed shell token the harness configures the
+/// gateway with (the production token is random per
+/// launch; tests need a stable one to present).
+const TEST_SHELL_TOKEN: &str = "test-shell-token-mcl3";
+
+/// The fix the shell would POST for the first record
+/// (the S-0 probe's shape: raw coordinates + accuracy).
+fn first_fix() -> Value {
+    json!({
+        "latitude": 31.2304,
+        "longitude": 121.4737,
+        "accuracy_meters": 35.0,
+    })
+}
 
 static NEXT: AtomicUsize = AtomicUsize::new(1);
 
@@ -114,53 +132,8 @@ fn done() -> ModelReply {
     ModelReply::Final("finished".into())
 }
 
-/// Mutable fake location source: the test controls the
-/// fix (move the device between records for L2) and can
-/// make the next read fail (L6). Coordinates are
-/// fictional (Shanghai, .invalid-free — they are only
-/// ever asserted by their hashes in events).
-struct MutableFakeLocationSource {
-    view: Mutex<DeviceLocationView>,
-    fail: Mutex<Option<LocationError>>,
-}
-
-impl MutableFakeLocationSource {
-    fn seeded() -> Arc<Self> {
-        Arc::new(Self {
-            view: Mutex::new(DeviceLocationView {
-                latitude: 31.2304,
-                longitude: 121.4737,
-                accuracy_meters: 35.0,
-                country_code: None,
-            }),
-            fail: Mutex::new(None),
-        })
-    }
-
-    fn set_view(&self, view: DeviceLocationView) {
-        *self.view.lock().unwrap() = view;
-    }
-
-    fn set_fail(&self, fail: Option<LocationError>) {
-        *self.fail.lock().unwrap() = fail;
-    }
-}
-
-impl LocationSource for MutableFakeLocationSource {
-    fn current(&self) -> Result<DeviceLocationView, LocationError> {
-        if let Some(fail) = self.fail.lock().unwrap().clone() {
-            return Err(fail);
-        }
-        Ok(self.view.lock().unwrap().clone())
-    }
-}
-
-fn build_state(
-    dir: &Path,
-    model: Arc<ScriptModel>,
-    source: Arc<MutableFakeLocationSource>,
-) -> AppState {
-    let state = AppState::with_files_root_and_approvals(
+fn build_state(dir: &Path, model: Arc<ScriptModel>, token: Option<&str>) -> AppState {
+    let mut state = AppState::with_files_root_and_approvals(
         dir.join("files"),
         Some(dir.join("approvals.jsonl")),
     )
@@ -188,8 +161,13 @@ fn build_state(
     .with_project_state_path(dir.join("projects.jsonl"))
     .with_location_state_path(dir.join("locations.jsonl"))
     .with_worktree_state_path(dir.join("worktrees.jsonl"))
-    .with_location_source(source)
     .with_sqlite_path(dir.join("gateway.sqlite3"));
+    // The shell token is the S-1 seam: tests that need
+    // the route pass Some; the no-token harness passes
+    // None and the route must reject everything.
+    if let Some(token) = token {
+        state = state.with_location_shell_token(token.to_string());
+    }
     state.sqlite_import_and_switch().expect("switch");
     state
 }
@@ -200,16 +178,28 @@ struct Harness {
     client: reqwest::Client,
     server: Option<tokio::task::JoinHandle<()>>,
     model: Arc<ScriptModel>,
-    source: Arc<MutableFakeLocationSource>,
+    /// The token this harness configured the gateway
+    /// with (`None` = no token configured); restart
+    /// rebuilds with the same token.
+    token: Option<String>,
 }
 
 impl Harness {
     async fn serve(replies: Vec<ModelReply>) -> Self {
+        Self::serve_with_token(replies, Some(TEST_SHELL_TOKEN)).await
+    }
+
+    /// The no-token harness: the route must reject
+    /// every record (the safe default, Q-S-02).
+    async fn serve_without_token() -> Self {
+        Self::serve_with_token(vec![], None).await
+    }
+
+    async fn serve_with_token(replies: Vec<ModelReply>, token: Option<&str>) -> Self {
         let dir = temp_dir("harness");
         std::fs::create_dir_all(dir.join("files")).unwrap();
         let model = Arc::new(ScriptModel::new(replies));
-        let source = MutableFakeLocationSource::seeded();
-        let state = build_state(&dir, model.clone(), source.clone());
+        let state = build_state(&dir, model.clone(), token);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
@@ -222,12 +212,12 @@ impl Harness {
                 .unwrap(),
             server: Some(server),
             model,
-            source,
+            token: token.map(str::to_string),
         }
     }
 
     /// Restart the gateway on the same directory (same
-    /// SQLite file, same JSONL files, same fake source):
+    /// SQLite file, same JSONL files, same token):
     /// the production restart path, not a fresh database.
     async fn restart(&mut self) {
         if let Some(old) = self.server.take() {
@@ -236,7 +226,7 @@ impl Harness {
         }
         let model = Arc::new(ScriptModel::new(vec![]));
         self.model = model.clone();
-        let state = build_state(&self.dir, model, self.source.clone());
+        let state = build_state(&self.dir, model, self.token.as_deref());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         self.url = format!("http://{}", listener.local_addr().unwrap());
         self.server = Some(tokio::spawn(async move {
@@ -264,6 +254,21 @@ impl Harness {
         (status, body)
     }
 
+    async fn post_with_token(&self, path: &str, value: Value, token: Option<&str>) -> (u16, Value) {
+        let mut request = self.client.post(format!("{}{}", self.url, path)).json(&value);
+        if let Some(token) = token {
+            request = request.header("X-Shell-Token", token);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    async fn post_token(&self, path: &str, value: Value) -> (u16, Value) {
+        self.post_with_token(path, value, Some(TEST_SHELL_TOKEN)).await
+    }
+
     async fn get(&self, path: &str) -> (u16, Value) {
         let response = self
             .client
@@ -288,8 +293,25 @@ impl Harness {
         body
     }
 
+    /// Record one fix the way the shell would: POST the
+    /// raw fix + the startup token to the new route.
+    async fn record_fix(&self, latitude: f64, longitude: f64, accuracy_meters: f64) -> Value {
+        let (status, body) = self
+            .post_token(
+                "/api/location/record-from-shell",
+                json!({
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "accuracy_meters": accuracy_meters,
+                }),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        body
+    }
+
     async fn record(&self) -> Value {
-        self.ok("/api/location/record", json!({})).await
+        self.record_fix(31.2304, 121.4737, 35.0).await
     }
 
     async fn start(&self) -> String {
@@ -449,17 +471,14 @@ async fn l2_list_newest_first() {
     h.record().await;
 
     // The device moves: the second record is a
-    // different fix.
-    h.source.set_view(DeviceLocationView {
-        latitude: 31.24,
-        longitude: 121.48,
-        accuracy_meters: 12.5,
-        country_code: Some("CN".to_string()),
-    });
-    let second = h.record().await;
+    // different fix (posted, not faked: the gateway
+    // never reads a live source any more).
+    let second = h.record_fix(31.24, 121.48, 12.5).await;
     assert_eq!(second["sample_id"], "loc-sample-2");
     assert_eq!(second["latitude"], 31.24);
-    assert_eq!(second["country_code"], "CN");
+    // The shell sends no country (Core Location alone
+    // has none): the column stays NULL on every record.
+    assert_eq!(second["country_code"], Value::Null);
 
     // Newest first (the second record heads the list),
     // even if both records landed in the same
@@ -598,8 +617,12 @@ async fn l5_disconnect_rejects_new_records_reads_unaffected() {
     assert_eq!(disconnected["status"], "disconnected");
 
     // A new record is rejected with 409
-    // `source_disconnected` (6b Q-24).
-    let (status, body) = h.post("/api/location/record", json!({})).await;
+    // `source_disconnected` (6b Q-24) — with the valid
+    // token, so the rejection is the disconnect gate,
+    // not the token gate.
+    let (status, body) = h
+        .post_token("/api/location/record-from-shell", first_fix())
+        .await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(body["error"], "source_disconnected");
 
@@ -623,42 +646,64 @@ async fn l5_disconnect_rejects_new_records_reads_unaffected() {
 // ---------------------------------------------------------------- L6
 
 #[tokio::test]
-async fn l6_source_error_mapping() {
+async fn l6_shell_token_mapping() {
     let h = Harness::serve(vec![]).await;
 
-    // Denied -> 403 (the user refused location access).
-    h.source
-        .set_fail(Some(LocationError::Denied));
-    let (status, _) = h.post("/api/location/record", json!({})).await;
-    assert_eq!(status, 403);
+    // No token -> 403 `shell_token_required`.
+    let (status, body) = h
+        .post("/api/location/record-from-shell", first_fix())
+        .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"], "shell_token_required");
 
-    // Unavailable -> 501 (no location source on this
-    // platform / services off).
-    h.source
-        .set_fail(Some(LocationError::Unavailable("no source".to_string())));
-    let (status, _) = h.post("/api/location/record", json!({})).await;
-    assert_eq!(status, 501);
+    // Wrong token -> 403 `shell_token_invalid`.
+    let (status, body) = h
+        .post_with_token(
+            "/api/location/record-from-shell",
+            first_fix(),
+            Some("wrong-token"),
+        )
+        .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"], "shell_token_invalid");
 
-    // Timeout -> 502 (no fix within the cap).
-    h.source.set_fail(Some(LocationError::Timeout));
-    let (status, _) = h.post("/api/location/record", json!({})).await;
-    assert_eq!(status, 502);
-
-    // Upstream -> 502 as well.
-    h.source
-        .set_fail(Some(LocationError::Upstream("boom".to_string())));
-    let (status, _) = h.post("/api/location/record", json!({})).await;
-    assert_eq!(status, 502);
-
-    // No row and no event from any failed record.
+    // No row and no event from either rejected record.
     let rows = h.ok_get("/api/location/samples").await;
     assert_eq!(rows.as_array().unwrap().len(), 0);
     assert!(location_event_payloads(&h).is_empty());
 
-    // Clearing the failure records normally again.
-    h.source.set_fail(None);
+    // The right token records normally — and the same
+    // `record_location` transaction as before (row +
+    // event + prune) is what ran.
     let row = h.record().await;
     assert_eq!(row["sample_id"], "loc-sample-1");
+    assert_eq!(row["latitude"], 31.2304);
+    assert_eq!(location_event_payloads(&h).len(), 1);
+
+    // The old route is gone: 404, not a record.
+    let (status, _) = h
+        .post("/api/location/record", first_fix())
+        .await;
+    assert_eq!(status, 404);
+
+    // No token configured at all: the route rejects
+    // everything (the safe default, Q-S-02) — even a
+    // presented token has nothing to match against.
+    let h2 = Harness::serve_without_token().await;
+    let (status, body) = h2
+        .post_with_token(
+            "/api/location/record-from-shell",
+            first_fix(),
+            Some(TEST_SHELL_TOKEN),
+        )
+        .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"], "shell_token_invalid");
+    let (status, body) = h2
+        .post("/api/location/record-from-shell", first_fix())
+        .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"], "shell_token_required");
 }
 
 // ---------------------------------------------------------------- L7

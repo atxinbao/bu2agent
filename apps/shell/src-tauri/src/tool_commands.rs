@@ -60,7 +60,7 @@ use agent_desktop::email_client::{
 };
 use agent_desktop::imessage_client::{IMessageClient, IMessageSyncResult, IMessageThreadRow};
 use agent_desktop::contacts_client::{ContactRow, ContactsClient, ContactsSyncResult};
-use agent_desktop::location_client::{DeviceLocationRow, LocationClient};
+use agent_desktop::location_client::{DeviceLocationRow, LocationClient, ShellFixInput};
 use agent_desktop::calendar_client::{
     CalendarClient, CalendarEvent, CreateCalendarEventInput, CreatedCalendarEventRow,
 };
@@ -1777,19 +1777,50 @@ pub fn contacts_search(
 // --- Location surface (MCL-3, manual record + read) ---
 //
 // Three commands mirror the three gateway routes
-// (record / list / get). Manual trigger only: record
-// takes one Core Location sample; there is no
-// auto-collection and no background track. Raw
-// coordinates are stored in SQLite (Q-MCL-17); the
+// (record-from-shell / list / get). Manual trigger
+// only: record acquires one fix in THIS (shell) process
+// and POSTs it to the gateway with the startup token;
+// there is no auto-collection and no background track.
+// Raw coordinates are stored in SQLite (Q-MCL-17); the
 // UI shows exact values only locally in the packaged
-// app.
+// app. The shell never logs the fix or the token.
 fn location_client() -> Result<LocationClient, String> {
     LocationClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub fn location_record() -> Result<DeviceLocationRow, String> {
-    location_client()?.record_location().map_err(agent_err_string)
+    // S-1 (Q-S-01 form (i)): the fix is acquired here,
+    // in the shell main process — the gateway sidecar
+    // cannot present the authorization prompt (its
+    // CLLocationManager has no bundle identity). The
+    // acquisition blocks up to 60 s while the user
+    // answers the prompt (Q-S-05: the timeout belongs
+    // to the shell); the POST after it is a fast insert
+    // on the desktop client's default 10 s client.
+    // The token comes from the shell's own env, set by
+    // `start_owned` from the same generation the
+    // gateway received — never regenerated here (see
+    // `gateway_home::shell_token`). Absent (an attached
+    // gateway this shell did not start) or invalid, the
+    // command fails here, before any HTTP call, so the
+    // error names the real cause instead of a 403.
+    let fix = crate::location_shell::acquire_fix()?;
+    let token = std::env::var(crate::gateway_home::LOCATION_SHELL_TOKEN_ENV)
+        .ok()
+        .filter(|token| crate::gateway_home::shell_token_is_valid(token))
+        .ok_or_else(|| {
+            "location shell token is not set (the gateway was not started by this shell)"
+                .to_string()
+        })?;
+    let fix = ShellFixInput {
+        latitude: fix.latitude,
+        longitude: fix.longitude,
+        accuracy_meters: fix.accuracy_meters,
+    };
+    location_client()?
+        .record_from_shell(&fix, &token)
+        .map_err(agent_err_string)
 }
 
 #[tauri::command(rename_all = "snake_case")]

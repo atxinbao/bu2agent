@@ -110,7 +110,11 @@ pub fn gateway_paths(working_dir: &Path) -> GatewayPaths {
 /// set are left alone (a spawned child inherits the shell's env), so
 /// this only fills gaps with the fixed daily-app paths. The shell never
 /// invents a model key: the gateway resolves DeepSeek from its own
-/// env/Keychain lookup at startup.
+/// env/Keychain lookup at startup. The one exception is the
+/// location shell token (`LOCATION_SHELL_TOKEN_ENV`): it is
+/// generated fresh on every gateway start (rotation on
+/// restart, Q-S-02) unless the developer preset a valid
+/// one, which the gap-fill rule then keeps.
 pub fn gateway_env(paths: &GatewayPaths, addr: &str) -> Vec<(String, String)> {
     let mut env = Vec::new();
     let mut push = |key: &str, value: &str| {
@@ -145,11 +149,87 @@ pub fn gateway_env(paths: &GatewayPaths, addr: &str) -> Vec<(String, String)> {
     push("MOCK_EFFECTS_PATH", &paths.effects_path.to_string_lossy());
     push("MOCK_EVIDENCE_PATH", &paths.evidence_path.to_string_lossy());
     push("MOCK_SQLITE_PATH", &paths.sqlite_path.to_string_lossy());
+    // MCL-3 shell route (S-1, Q-S-02): the startup token
+    // the sidecar must see as `X-Shell-Token` on
+    // `POST /api/location/record-from-shell`. Generated
+    // fresh on every gateway start (see `shell_token`);
+    // a developer preset wins via the gap-fill rule.
+    // `start_owned` sets every returned pair into the
+    // shell's own env too, so the location command can
+    // read the same value back — that is the only way
+    // the command learns the token (it must never call
+    // `shell_token()` itself: that would generate a
+    // DIFFERENT token and every record would 403).
+    push(LOCATION_SHELL_TOKEN_ENV, &shell_token());
     // The daily app uses the real EventKit backend on macOS; a developer
     // override (already set) still wins via the gap-fill rule above.
     #[cfg(target_os = "macos")]
     push("MOCK_DEVICE_BACKEND", "eventkit");
     env
+}
+
+/// The env var carrying the location shell token
+/// (Q-S-02). The shell passes it to the sidecar at
+/// startup via `gateway_env`; the gateway reads it
+/// into memory, never persists it, never logs it.
+pub const LOCATION_SHELL_TOKEN_ENV: &str = "MOCK_LOCATION_SHELL_TOKEN";
+
+/// A token is safe to carry in an HTTP header (and to
+/// compare byte-wise gateway-side): 8–128 chars of
+/// `[A-Za-z0-9_-]` only, so no CR/LF can ever smuggle
+/// a header line through the desktop client's raw TCP
+/// request. Used both when adopting a developer preset
+/// (`shell_token`) and when the location command reads
+/// the token back from the env (a preset that fails
+/// this check is rejected there, never sent).
+pub fn shell_token_is_valid(token: &str) -> bool {
+    (8..=128).contains(&token.len())
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The token for the NEXT gateway start: a developer
+/// preset wins when it passes `shell_token_is_valid`,
+/// otherwise a fresh 128-bit hex token is generated.
+/// Called ONLY by `gateway_env` (once per gateway
+/// start) — never by the location command (see the
+/// `gateway_env` comment: the command reads the env
+/// var `start_owned` set from this same generation).
+pub fn shell_token() -> String {
+    if let Ok(preset) = std::env::var(LOCATION_SHELL_TOKEN_ENV) {
+        if shell_token_is_valid(&preset) {
+            return preset;
+        }
+    }
+    generate_shell_token()
+}
+
+/// Fresh 128-bit hex token, std-only (no new deps, no
+/// FFI). Entropy: `RandomState` keys are OS-seeded per
+/// thread, so the hash inputs are unpredictable — but
+/// the SAME thread reuses the same keys, so the
+/// per-process generation counter is mixed in as well:
+/// without it every gateway restart in one shell
+/// lifetime would generate the identical token and
+/// the Q-S-02 "rotated on restart" rule would be
+/// hollow. Two domain strings give two independent
+/// 64-bit halves; the pair carries the keys' 128 bits.
+fn generate_shell_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+    let mut part = |domain: &str| {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write(domain.as_bytes());
+        hasher.write_u64(generation);
+        hasher.finish()
+    };
+    let a = part("bu2agent-location-shell-token/a");
+    let b = part("bu2agent-location-shell-token/b");
+    format!("{a:016x}{b:016x}")
 }
 
 /// Gateway ownership record. Only a gateway the shell started (or

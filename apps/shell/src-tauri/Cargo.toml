@@ -20,6 +20,25 @@ tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-single-instance = "2"
 
+# MCL-3 shell route (S-1): Core Location binding so
+# the shell main process can request one fix itself.
+# macOS only; the module (src/location_shell.rs) is
+# cfg-gated the same way. The gateway's own objc2 trio
+# was deleted by S-1 (Q-S-03) — the sidecar cannot
+# present the authorization prompt, so the fix is
+# acquired here instead.
+# Versions mirror the gateway's former set
+# (services/mock-gateway/Cargo.toml had them):
+# objc2-core-location 0.3.2, objc2 0.6, objc2-foundation 0.3. The
+# shell crate is its own workspace and this cannot be compiled on
+# the Linux VM at all (objc2 hard-errors on non-Apple targets):
+# CI's shell job (macOS, cargo test) is the only compile check
+# before the Mac window build.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-core-location = "0.3.2"
+objc2-foundation = "0.3"
+
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
 

@@ -112,7 +112,6 @@ use crate::stream_store::{
 use crate::mail_source::{MailError, MailSource, UnavailableMailSource};
 use crate::contacts_source::{ContactsSource, UnavailableContactsSource};
 use crate::imessage_source::{IMessageError, IMessageSource, UnavailableIMessageSource};
-use crate::location_source::{LocationSource, UnavailableLocationSource};
 use crate::notes_source::NotesSource;
 use crate::calendar_backend::{default_calendar_backend, CalendarBackend};
 use crate::voice_store::{load_voice_state, merged_custom_voices, CustomVoice};
@@ -385,13 +384,17 @@ pub struct AppState {
     /// substitute a fake; the sync route reads through
     /// it (the loop tool reads SQLite, not the source).
     pub(crate) contacts_source: Arc<dyn ContactsSource>,
-    /// MCL-3: the location source (Core Location
-    /// in-process binding on macOS, the 501 stub
-    /// elsewhere). Reads go through this trait so tests
-    /// can substitute a fake; the record route reads
-    /// through it (the loop tool reads SQLite, not the
-    /// source — Q-MCL-18: no live fix from the loop).
-    pub(crate) location_source: Arc<dyn LocationSource>,
+    /// MCL-3 shell route (S-1, Q-S-02): the startup
+    /// token the shell hands the sidecar at launch
+    /// (`MOCK_LOCATION_SHELL_TOKEN` env). The shell
+    /// must present it as `X-Shell-Token` on
+    /// `POST /api/location/record-from-shell`; without
+    /// it no fix is ever recorded. Memory only: never
+    /// persisted, never logged, rotated on every
+    /// gateway start. `None` (tests, or a gateway
+    /// started without the token) means the route
+    /// always rejects.
+    pub(crate) location_shell_token: Option<String>,
     /// D1-6b-2: the calendar backend (EventKit on macOS,
     /// the 501 stub elsewhere). Reads delegate to the
     /// D1-6a free functions; writes go through this
@@ -617,19 +620,19 @@ impl AppState {
                 crate::contacts_source::AppleScriptContactsSource::new(),
             ));
         }
-        // MCL-3: on macOS the production location source
-        // asks Core Location in-process (the packaged-app
-        // identity, Q-MCL-15); every other platform keeps
-        // the Unavailable source (501, never fake data).
-        // Tests override via with_location_source.
-        #[cfg(target_os = "macos")]
-        {
-            state = state.with_location_source(Arc::new(
-                crate::location_source::CoreLocationSource::new(),
-            ));
-        }
         if let Ok(pin) = std::env::var("MOCK_DEVICE_REMINDER_ID") {
             state = state.with_device_reminder_pin(pin);
+        }
+        // MCL-3 shell route (S-1, Q-S-02): the startup
+        // token, read the same way as the reminder pin
+        // above. Absent in tests (the test seam sets
+        // it); absent in production only if the shell
+        // never passed one — then the record-from-shell
+        // route rejects every call (safe default).
+        if let Ok(token) = std::env::var("MOCK_LOCATION_SHELL_TOKEN") {
+            if !token.is_empty() {
+                state = state.with_location_shell_token(token);
+            }
         }
         // EventKit backend selection: only the production Default
         // reads this env var, never the test constructors (which
@@ -802,7 +805,7 @@ impl AppState {
             mail_source: Arc::new(UnavailableMailSource),
             imessage_source: Arc::new(UnavailableIMessageSource),
             contacts_source: Arc::new(UnavailableContactsSource),
-            location_source: Arc::new(UnavailableLocationSource),
+            location_shell_token: None,
             calendar_backend: default_calendar_backend(),
             notes_source: crate::notes_source::default_notes_source(),
             git_path: crate::worker::resolve_git_path(),
@@ -3142,12 +3145,12 @@ impl AppState {
         self
     }
 
-    /// Test seam: replace the location source (tests use
-    /// the fake source; production macOS uses Core
-    /// Location in-process, other platforms keep the
-    /// Unavailable source).
-    pub fn with_location_source(mut self, source: Arc<dyn LocationSource>) -> Self {
-        self.location_source = source;
+    /// Test seam: set the shell token the
+    /// record-from-shell route accepts (tests use a
+    /// fixed token; production reads the env var in
+    /// `from_deepseek_config`).
+    pub fn with_location_shell_token(mut self, token: String) -> Self {
+        self.location_shell_token = Some(token);
         self
     }
 
@@ -8066,12 +8069,18 @@ pub fn app(state: AppState) -> Router {
         .route("/api/contacts", get(crate::routes_contacts::contacts_list))
         .route("/api/contacts/search", get(crate::routes_contacts::contacts_search))
         .route("/api/contacts/{id}", get(crate::routes_contacts::contacts_get))
-        // MCL-3: current-location record + samples
-        // (SQLite v16). Record is the manual trigger
-        // (fact recording only — no Effect, no approval,
-        // no Outbox, like POST /api/email/sync); list /
-        // get read the recorded rows, newest first.
-        .route("/api/location/record", post(crate::routes_location::location_record))
+        // MCL-3 shell route (S-1): the shell acquires
+        // the fix itself and POSTs it with the startup
+        // token (fact recording only — no Effect, no
+        // approval, no Outbox, like POST /api/email/sync);
+        // list / get read the recorded rows, newest
+        // first. The old sidecar-fetch route
+        // (`POST /api/location/record`) was deleted with
+        // the sidecar Core Location body (Q-S-03/Q-S-08).
+        .route(
+            "/api/location/record-from-shell",
+            post(crate::routes_location::location_record_from_shell),
+        )
         .route("/api/location/samples", get(crate::routes_location::location_samples_list))
         .route("/api/location/samples/{id}", get(crate::routes_location::location_sample_get))
         .route("/api/nodes/register", post(crate::routes_peers::nodes_register))

@@ -955,7 +955,8 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     // MCL-3 v16 step: device_locations table only. One
     // transaction, v5–v15 style; a fresh database runs
     // v1–v16 in the same transaction. The table starts
-    // empty — rows arrive only from POST /api/location/record.
+    // empty — rows arrive only from POST
+    // /api/location/record-from-shell (S-1).
     if version < 16 {
         tx.execute_batch(SCHEMA_V16).map_err(err)?;
         tx.execute(

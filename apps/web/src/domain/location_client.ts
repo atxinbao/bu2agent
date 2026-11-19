@@ -1,13 +1,15 @@
 // Location client: browser/dev -> Mock Gateway location
-// surface (MCL-3, manual record + read).
+// surface (MCL-3, read only since S-1).
 //
 // Same shape as the other domain clients: the gateway
 // returns snake_case; the domain shape is camelCase, so
-// the mapping lives here, not in the view. Manual
-// trigger only: record takes one Core Location sample;
-// there is no auto-collection and no background track.
-// The packaged Mac app reads real system location;
-// other platforms answer 501.
+// the mapping lives here, not in the view. Read only:
+// `recordLocation` throws (see below) — recording
+// moved to the packaged app's shell process in S-1
+// (Q-S-01/Q-S-08) and the browser never holds the
+// startup token. The packaged Mac app records through
+// the invoke client; other platforms answer 501 from
+// the shell command.
 //
 // PII shape (Q-MCL-17): SQLite stores the RAW
 // coordinates and the UI shows exact values only
@@ -97,11 +99,20 @@ export class LocationClient implements LocationGateway {
   }
 
   async recordLocation(): Promise<DeviceLocationSample> {
-    const sample = await this.requestJson<ServerDeviceLocationSample>(
-      "POST",
-      "/api/location/record",
+    // S-1 (Q-S-01/Q-S-08): the browser/dev client can no
+    // longer record. The old route (`POST /api/location/record`,
+    // gateway-side Core Location fetch) was deleted with
+    // the sidecar body, and the new route
+    // (`POST /api/location/record-from-shell`) accepts a
+    // fix ONLY with the shell startup token — which must
+    // never enter the frontend. Recording works only in
+    // the packaged app, through the invoke client
+    // (`InvokeLocationClient.recordLocation`, same
+    // signature, same returned row); the view is
+    // unchanged and keeps calling this interface.
+    throw new Error(
+      "location recording is only available in the packaged app (use the desktop build)",
     );
-    return toDeviceLocationSample(sample);
   }
 
   async samples(limit: number | null, offset: number | null): Promise<DeviceLocationSample[]> {
