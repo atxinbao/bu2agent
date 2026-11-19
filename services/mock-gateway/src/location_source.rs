@@ -218,10 +218,6 @@ struct LocationState {
     fix: Option<(f64, f64, f64)>,
     /// Terminal failure, if any.
     failure: Option<LocationError>,
-    /// Authorization became decided while waiting for
-    /// the prompt answer (either callback sets this;
-    /// the waiter also re-reads the status).
-    auth_decided: bool,
     /// `LocationUnknown` retries so far (at most one).
     retries: u32,
 }
@@ -292,22 +288,6 @@ define_class!(
                 // / Upstream).
                 LocationError::Upstream("location lookup failed".to_string())
             });
-        }
-
-        #[allow(non_snake_case)]
-        #[unsafe(method(locationManagerDidChangeAuthorization:))]
-        unsafe fn locationManagerDidChangeAuthorization(&self, _manager: &CLLocationManager) {
-            self.ivars().state.lock().unwrap().auth_decided = true;
-        }
-
-        #[allow(non_snake_case)]
-        #[unsafe(method(locationManager:didChangeAuthorizationStatus:))]
-        unsafe fn locationManager_didChangeAuthorizationStatus(
-            &self,
-            _manager: &CLLocationManager,
-            _status: CLAuthorizationStatus,
-        ) {
-            self.ivars().state.lock().unwrap().auth_decided = true;
         }
     }
 );
@@ -382,7 +362,15 @@ impl LocationSource for CoreLocationSource {
         unsafe { manager.setDelegate(Some(&delegate_obj)) };
         // Authorization first: NotDetermined prompts the
         // user (system dialog, once per app); Denied /
-        // Restricted never prompts again.
+        // Restricted never prompts again. Wait on the
+        // status itself, NOT on the delegate callback:
+        // Core Location reports the *current* status via
+        // `locationManagerDidChangeAuthorization:` as
+        // soon as the delegate is set (still
+        // NotDetermined, 2-9 ms in), so a callback is
+        // not proof the user answered the prompt —
+        // treating it as one returns Timeout before the
+        // dialog ever appears (window round 1, W1-1).
         match unsafe { manager.authorizationStatus() } {
             CLAuthorizationStatus::Denied | CLAuthorizationStatus::Restricted => {
                 return Err(LocationError::Denied);
@@ -390,9 +378,8 @@ impl LocationSource for CoreLocationSource {
             CLAuthorizationStatus::NotDetermined => {
                 unsafe { manager.requestWhenInUseAuthorization() };
                 Self::pump_until(deadline, || {
-                    state.lock().unwrap().auth_decided
-                        || unsafe { manager.authorizationStatus() }
-                            != CLAuthorizationStatus::NotDetermined
+                    let status = unsafe { manager.authorizationStatus() };
+                    status != CLAuthorizationStatus::NotDetermined
                 });
                 match unsafe { manager.authorizationStatus() } {
                     CLAuthorizationStatus::Denied | CLAuthorizationStatus::Restricted => {

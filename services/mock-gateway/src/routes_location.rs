@@ -24,6 +24,8 @@
 //!   sample by local `loc-sample-N` id, a bare row;
 //!   unknown ids are 404.
 
+use std::sync::Arc;
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -117,9 +119,21 @@ pub(crate) async fn location_record(State(state): State<AppState>) -> impl IntoR
     // Location call can block up to its 60 s cap while
     // the user answers the authorization prompt); the
     // write is one transaction (prune + row + event).
-    let view = match state.location_source.current() {
-        Ok(view) => view,
-        Err(error) => return location_error_response(&error, "record"),
+    // Run the fetch on a blocking thread so the wait
+    // never holds a tokio worker.
+    let source = Arc::clone(&state.location_source);
+    let view = match tokio::task::spawn_blocking(move || source.current()).await {
+        Ok(Ok(view)) => view,
+        Ok(Err(error)) => return location_error_response(&error, "record"),
+        // The blocking thread panicked: the lookup
+        // itself failed, so the record maps to the
+        // shared 502 like any other source failure.
+        Err(_) => {
+            return location_error_response(
+                &LocationError::Upstream("location lookup failed".to_string()),
+                "record",
+            );
+        }
     };
     let mut conn = sqlite.lock().expect("sqlite lock");
     match record_location(
