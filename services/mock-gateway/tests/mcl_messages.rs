@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mock_gateway::imessage_source::{
-    participant_hash_for, IMessageError, IMessageSource, IMessageThreadView,
+    participant_hash_for, IMessageError, IMessageSource, IMessageThreadView, SentIMessage,
 };
 use mock_gateway::loop_engine::*;
 use mock_gateway::server::{app, AppState};
@@ -123,6 +123,13 @@ impl IMessageSource for MutableFakeIMessageSource {
     fn threads(&self, limit: usize, offset: usize) -> Result<Vec<IMessageThreadView>, IMessageError> {
         let views = self.threads.lock().unwrap().clone();
         Ok(views.into_iter().skip(offset).take(limit).collect())
+    }
+
+    // MCL-1 tests never send: the trait's send is a
+    // no-op success here (the MCL-4 tests use their own
+    // fake with failure modes).
+    fn send(&self, _native_id: &str, _body: &str) -> Result<SentIMessage, IMessageError> {
+        Ok(SentIMessage { native_id: None })
     }
 }
 

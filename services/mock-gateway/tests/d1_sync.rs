@@ -338,8 +338,8 @@ fn seed_60() -> Vec<MessageView> {
 async fn y1_first_sync_imports_inbox_first_50() {
     let h = Harness::serve(seed_60()).await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    // MCL-3 bumps the schema to v16 (device_locations table).
-    assert_eq!(DB_SCHEMA_VERSION, 16);
+    // MCL-4 bumps the schema to v17 (sent_imessages table).
+    assert_eq!(DB_SCHEMA_VERSION, 17);
 
     let result = h.sync_ok().await;
     assert_eq!(result["synced_count"], 50);
@@ -451,8 +451,8 @@ async fn y3_rebuild_reassigns_the_same_local_ids() {
     assert_eq!(before.len(), 50);
 
     h.restart_fresh_db().await;
-    // MCL-3 bumps the schema to v16 (device_locations table).
-    assert_eq!(h.schema_version(), 16);
+    // MCL-4 bumps the schema to v17 (sent_imessages table).
+    assert_eq!(h.schema_version(), 17);
     assert_eq!(h.mail_rows().len(), 0);
     let result = h.sync_ok().await;
     assert_eq!(result["synced_count"], 50);

@@ -70,6 +70,7 @@ pub mod mail_sync;
 pub mod mail_send;
 pub mod imessage_source;
 pub mod imessage_sync;
+pub mod imessage_send;
 pub mod routes_imessage;
 pub mod contacts_source;
 pub mod contacts_sync;
@@ -143,7 +144,7 @@ pub fn start_stream(stream_id: &str, turn_id: &str, text: &str) -> Vec<Subscript
 pub fn tool_requires_approval(name: &str) -> Option<bool> {
     match name {
         "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" | "email.threads" | "email.message" | "imessage.threads" | "contacts.search" | "location.current" | "code.search" | "git.read" | "worker.wait" => Some(false),
-        "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "fs.export" | "notes.create" | "notes.append" | "notes.delete" | "mail.send" | "mail.delete" | "calendar.create" | "reminders.set_completed" | "worker.run" => Some(true),
+        "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "fs.export" | "notes.create" | "notes.append" | "notes.delete" | "mail.send" | "mail.delete" | "calendar.create" | "imessage.send" | "reminders.set_completed" | "worker.run" => Some(true),
         _ => None,
     }
 }

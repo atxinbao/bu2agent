@@ -8065,6 +8065,12 @@ pub fn app(state: AppState) -> Router {
         .route("/api/imessage/sync", post(crate::routes_imessage::imessage_sync))
         .route("/api/imessage/threads", get(crate::routes_imessage::imessage_threads_list))
         .route("/api/imessage/threads/{id}", get(crate::routes_imessage::imessage_thread_get))
+        // MCL-4: iMessage send (SQLite v17). Digest-bound
+        // write, the 6b-1 send order; list / get read the
+        // sent rows.
+        .route("/api/imessage/send", post(crate::routes_imessage::imessage_send))
+        .route("/api/imessage/sent", get(crate::routes_imessage::imessage_sent_list))
+        .route("/api/imessage/sent/{id}", get(crate::routes_imessage::imessage_sent_get))
         .route("/api/contacts/sync", post(crate::routes_contacts::contacts_sync))
         .route("/api/contacts", get(crate::routes_contacts::contacts_list))
         .route("/api/contacts/search", get(crate::routes_contacts::contacts_search))

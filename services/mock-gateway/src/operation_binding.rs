@@ -303,6 +303,30 @@ pub fn mail_send_digest(to_sorted: &[String], subject: &str, body_hash: &str) ->
     operation_digest("mail.send", None, &params)
 }
 
+/// Digest for a real iMessage send (MCL-4, plan §6).
+/// The digest binding follows the 6b-1 Q-D1-6b-22
+/// precedent (no MCL §12 question numbers it — the
+/// plan's shared-changes section names this helper).
+/// LOCAL DEFINITION:
+/// the digest commits to the local thread id and the
+/// body hash — raw text lives only in request memory,
+/// never in the digest inputs. Both the
+/// approval-request path and the send route call this
+/// same function over the same inputs, so the two
+/// digests can never drift apart. `body_hash` is the
+/// caller's sha256 of the body (the body itself is never
+/// hashed twice or stored). The thread's native id is
+/// NOT in the digest: the local `thread-N` is the
+/// stable identity the route resolves, and the native
+/// id follows from it.
+pub fn imessage_send_digest(thread_id: &str, body_hash: &str) -> String {
+    let params = BTreeMap::from([
+        ("body_hash".to_string(), body_hash.to_string()),
+        ("thread_id".to_string(), thread_id.to_string()),
+    ]);
+    operation_digest("imessage.send", None, &params)
+}
+
 /// Digest for a real mail delete (D1-6b-3,
 /// Q-D1-6b-22). LOCAL DEFINITION: the digest commits
 /// to the resolved native id — the message's real

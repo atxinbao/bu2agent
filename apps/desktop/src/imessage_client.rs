@@ -1,17 +1,21 @@
 //! iMessage client: Rust shell -> Mock Gateway iMessage
-//! threads surface (MCL-1, threads-only).
+//! threads + send surface (MCL-1 threads-only read,
+//! MCL-4 send).
 //!
-//! Read-only: sync, threads list/get. No approval loop
-//! (reads). On non-macOS the gateway answers 501 and the
+//! Reads are sync, threads list/get (no approval loop).
+//! The send goes through the digest-bound approval flow
+//! (approval_request -> decide -> send, the 6b-1 mail
+//! shape). On non-macOS the gateway answers 501 and the
 //! error surfaces here unchanged; the packaged Mac app
-//! reads real Messages.app data via AppleScript.
+//! sends real Messages.app messages via AppleScript.
 //!
 //! No message content anywhere in this file: MCL-1 is
 //! threads-only (message history is not readable — the
 //! MCL-0 probe proved the AppleScript dictionary has no
 //! message element). `last_message_ms` / `unread_count`
 //! are always `None` under AppleScript sync (never
-//! fabricated).
+//! fabricated). The send input carries the body to the
+//! gateway only; the stored fact row carries its hash.
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +50,38 @@ pub struct IMessageThreadRow {
     pub origin_device_id: String,
 }
 
+/// MCL-4: one accepted send (the gateway
+/// `SentIMessageRow` shape). The body is never in this
+/// struct — only its hash. "Sent" means Messages.app
+/// accepted the message, never that the other side
+/// received it (Q-MCL-21).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentIMessageRow {
+    pub sent_id: String,
+    pub source_id: String,
+    pub thread_id: String,
+    pub native_id: Option<String>,
+    pub idempotency_key: String,
+    pub body_hash: String,
+    pub sent_ms: i64,
+    pub effect_id: String,
+    pub policy_version: String,
+    pub created_ms: i64,
+    pub origin_device_id: String,
+}
+
+/// MCL-4: a send request. The idempotency key is
+/// client-supplied and required (Q-MCL-23, the 6b-1
+/// shape); the approval id is the decided digest-bound
+/// approval for this exact message in this exact thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendIMessageInput {
+    pub thread_id: String,
+    pub body: String,
+    pub idempotency_key: String,
+    pub tool_call_id: Option<String>,
+}
+
 /// MCL-1: one iMessage sync pass (manual trigger only).
 /// Counts + the imessage-source cursor; the gateway
 /// records one row + one `imessage.synced` event per new
@@ -72,10 +108,12 @@ const IMESSAGE_SYNC_TIMEOUT_MS: u64 = 120_000;
 #[derive(Debug, Clone)]
 pub struct IMessageClient {
     http: HttpClient,
-    /// Long-timeout client (F-1): sync alone uses it —
-    /// the gateway-side AppleScript enumeration can take
-    /// up to 30 s. All other calls share `http` and its
-    /// 10 s default.
+    /// Long-timeout client (F-1): sync and send share
+    /// it — the gateway-side AppleScript enumeration can
+    /// take up to 30 s, and the send call the same. All
+    /// other calls share `http` and its 10 s default so a
+    /// hung gateway still fails fast instead of hanging
+    /// the CLI.
     sync_http: HttpClient,
 }
 
@@ -118,6 +156,32 @@ impl IMessageClient {
             path.push_str(&query.join("&"));
         }
         Ok(self.http.get_json(&path)?)
+    }
+
+    /// MCL-4: send one plain-text message to one
+    /// already-synced thread, through the digest-bound
+    /// approval flow (approval_request → decide → send).
+    /// Uses the long-timeout client (the mail `send_mail`
+    /// precedent: the gateway-side send can take up to
+    /// 30 s, and the 10 s default would time out before
+    /// the gateway finishes). The gateway's extra
+    /// `replayed` flag is ignored on decode; the row is
+    /// the fact record.
+    pub fn send_imessage(
+        &self,
+        input: &SendIMessageInput,
+    ) -> std::result::Result<SentIMessageRow, AgentError> {
+        let body = serde_json::to_string(input)
+            .map_err(|_| crate::http_client::transport_error("cannot encode imessage send"))?;
+        Ok(self.sync_http.post_json("/api/imessage/send", &body)?)
+    }
+
+    pub fn list_sent(&self) -> std::result::Result<Vec<SentIMessageRow>, AgentError> {
+        Ok(self.http.get_json("/api/imessage/sent")?)
+    }
+
+    pub fn sent_get(&self, sent_id: &str) -> std::result::Result<SentIMessageRow, AgentError> {
+        Ok(self.http.get_json(&format!("/api/imessage/sent/{sent_id}"))?)
     }
 
     /// One synced thread by local `thread-N` id; a

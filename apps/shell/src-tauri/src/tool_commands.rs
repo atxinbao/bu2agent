@@ -58,7 +58,7 @@ use agent_desktop::email_client::{
     EmailClient, MailDeleteResponse, MailMessageRow, MailSyncResult, MailboxInfo, MailboxSetup,
     MessageView, SendMailInput, SentMessageRow, ThreadView,
 };
-use agent_desktop::imessage_client::{IMessageClient, IMessageSyncResult, IMessageThreadRow};
+use agent_desktop::imessage_client::{IMessageClient, IMessageSyncResult, IMessageThreadRow, SendIMessageInput, SentIMessageRow};
 use agent_desktop::contacts_client::{ContactRow, ContactsClient, ContactsSyncResult};
 use agent_desktop::location_client::{DeviceLocationRow, LocationClient, ShellFixInput};
 use agent_desktop::calendar_client::{
@@ -1705,10 +1705,11 @@ pub fn mail_synced_get(message_id: String) -> Result<MailMessageRow, String> {
     email_client()?.synced_get(&message_id).map_err(agent_err_string)
 }
 
-// --- iMessage surface (MCL-1, threads-only) ---
+// --- iMessage surface (MCL-1 threads-only + MCL-4 send) ---
 //
-// Three commands mirror the three gateway routes
-// (sync / list / get). Reads only; no message detail
+// Six commands mirror the six gateway routes
+// (sync / list / get / send / sent-list / sent-get).
+// Reads only, plus the MCL-4 send; no message detail
 // exists — the list method is `threads_list` in the
 // desktop client and `threads` in the TS clients (the
 // plan's "threads" token), not a fourth command: the
@@ -1735,6 +1736,39 @@ pub fn imessage_list(
 #[tauri::command(rename_all = "snake_case")]
 pub fn imessage_get(thread_id: String) -> Result<IMessageThreadRow, String> {
     imessage_client()?.thread_get(&thread_id).map_err(agent_err_string)
+}
+
+// MCL-4: real iMessage send + sent readers. The send
+// carries the decided digest-bound approval id and the
+// client-supplied idempotency key; the gateway binds,
+// consumes, and records the Effect + fact row. "Sent"
+// means Messages.app accepted the message, never that
+// the other side received it (Q-MCL-21).
+#[tauri::command(rename_all = "snake_case")]
+pub fn imessage_send(
+    thread_id: String,
+    body: String,
+    idempotency_key: String,
+    tool_call_id: Option<String>,
+) -> Result<SentIMessageRow, String> {
+    imessage_client()?
+        .send_imessage(&SendIMessageInput {
+            thread_id,
+            body,
+            idempotency_key,
+            tool_call_id,
+        })
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn imessage_sent_list() -> Result<Vec<SentIMessageRow>, String> {
+    imessage_client()?.list_sent().map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn imessage_sent_get(sent_id: String) -> Result<SentIMessageRow, String> {
+    imessage_client()?.sent_get(&sent_id).map_err(agent_err_string)
 }
 
 // --- Contacts surface (MCL-2, read-only) ---

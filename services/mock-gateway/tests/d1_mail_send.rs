@@ -352,8 +352,8 @@ const BODY: &str = "Body of SD1.";
 async fn sd1_send_end_to_end() {
     let h = Harness::serve().await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    // MCL-3 bumps the schema to v16 (device_locations table).
-    assert_eq!(DB_SCHEMA_VERSION, 16);
+    // MCL-4 bumps the schema to v17 (sent_imessages table).
+    assert_eq!(DB_SCHEMA_VERSION, 17);
 
     let approval = h.approved_mail_send(&TO, SUBJECT, BODY).await;
     // The send presents the recipients in the other

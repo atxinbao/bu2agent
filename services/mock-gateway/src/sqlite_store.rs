@@ -59,8 +59,9 @@ use crate::execution_store::ExecutionFileRecord;
 /// (the record contract version, still 1 for P0-A+ rows) and
 /// are untouched. v15 adds the MCL-2 `contacts` table
 /// (see SCHEMA_V15); v16 adds the MCL-3
-/// `device_locations` table (see SCHEMA_V16).
-pub const DB_SCHEMA_VERSION: i64 = 16;
+/// `device_locations` table (see SCHEMA_V16); v17 adds
+/// the MCL-4 `sent_imessages` table (see SCHEMA_V17).
+pub const DB_SCHEMA_VERSION: i64 = 17;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -678,6 +679,38 @@ CREATE TABLE IF NOT EXISTS device_locations (
     origin_device_id TEXT NOT NULL
 );
 ";
+/// MCL-4 v17 step: `sent_imessages` fact table.
+/// `sent_id` is the local `sent-imsg-N` id
+/// (max-suffix + 1 in the record transaction — the
+/// `sent-N` precedent in `mail_send.rs`). `thread_id`
+/// is the local `thread-N` the message was sent to;
+/// `native_id` is the sent message's Messages id when
+/// the script can read it back, NULL otherwise (the
+/// send script has no read-back: reading the sent
+/// message would need message history, which the MCL-0
+/// probe falsified — so NULL is the normal case, never
+/// fabricated). `body_hash` is the sha256 of the body;
+/// the body itself is NEVER stored (red line 7).
+/// `idempotency_key` is UNIQUE — the replay backstop
+/// (same key + same content replays the original row,
+/// same key + different content is a 409). Typed DDL
+/// for every ms column (the E2-D batch-2 lesson:
+/// untyped backfill columns land as TEXT on old DBs).
+const SCHEMA_V17: &str = "
+CREATE TABLE IF NOT EXISTS sent_imessages (
+    sent_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    native_id TEXT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    body_hash TEXT NOT NULL,
+    sent_ms INTEGER NOT NULL,
+    effect_id TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL
+);
+";
 /// create fact record. `event_id` is the EventKit
 /// identifier itself (the stable system id, so no local
 /// number is assigned); `idempotency_key` is UNIQUE —
@@ -961,6 +994,19 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V16).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '16')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // MCL-4 v17 step: sent_imessages table only. One
+    // transaction, v5–v16 style; a fresh database runs
+    // v1–v17 in the same transaction. The table starts
+    // empty — rows arrive only from POST /api/imessage/send.
+    if version < 17 {
+        tx.execute_batch(SCHEMA_V17).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '17')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )

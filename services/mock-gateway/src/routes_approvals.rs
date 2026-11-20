@@ -139,6 +139,13 @@ pub(crate) struct ApprovalRequestDto {
     /// hash — the approval binds the exact message, not
     /// the bare ability to delete mail.
     native_id: Option<String>,
+    /// MCL-4 (plan §6): the iMessage send
+    /// presentation — the local `thread-N` id. The
+    /// server recomputes `imessage_send_digest` from the
+    /// thread id and `body`, never from a client hash —
+    /// the approval binds the exact message in the exact
+    /// thread, not the bare ability to send iMessages.
+    thread_id: Option<String>,
     /// D1-6b-4 (Q-D1-6b-22): the note create / append /
     /// delete presentation. The server recomputes the
     /// note digests from these fields, never from a
@@ -297,6 +304,42 @@ pub(crate) async fn approval_request(
                     &recipients,
                     subject,
                     &body_hash,
+                ))
+            }
+        }
+        "imessage.send" => {
+            // MCL-4 (plan §6): when the thread id +
+            // body are presented, the digest is computed
+            // here from them — same inputs (thread id +
+            // server-side body hash) as the send route,
+            // so the two digests match. When they are
+            // entirely absent the request stays tool-only
+            // (the mail.send precedent): a tool-only
+            // record can never authorize the real send —
+            // the send route rejects a missing digest
+            // with 403 `approval_binding_mismatch`. A
+            // partial presentation is a client error. No
+            // planned Effect is created for imessage.send
+            // here (the `worker.run` precedent): the send
+            // route plans its own Effect on its write
+            // Execution (Q-D1-6b-23) and binds this
+            // approval to it at consume time.
+            if req.thread_id.is_none() && req.body.is_none() {
+                None
+            } else {
+                let (Some(thread_id), Some(body)) =
+                    (req.thread_id.as_deref(), req.body.as_deref())
+                else {
+                    return bad_request("imessage.send approval requires thread_id and body");
+                };
+                if thread_id.is_empty() || body.is_empty() {
+                    return bad_request(
+                        "imessage.send approval requires non-empty thread_id and body",
+                    );
+                }
+                let body_hash = crate::operation_binding::sha256_hex(body.as_bytes());
+                Some(crate::operation_binding::imessage_send_digest(
+                    thread_id, &body_hash,
                 ))
             }
         }

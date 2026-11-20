@@ -725,7 +725,7 @@ export function App() {
         (clients === null ? (
           <p className="empty">Choosing transport…</p>
         ) : (
-          <MessagesView imessage={clients.imessage} />
+          <MessagesView imessage={clients.imessage} agent={clients.agent} />
         ))}
       {tab === "contacts" &&
         (clients === null ? (

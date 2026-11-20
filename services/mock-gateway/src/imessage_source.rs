@@ -47,6 +47,21 @@
 //! - `UnavailableIMessageSource`: every call fails with
 //!   `IMessageError::Unavailable` (501, never fake data).
 //!
+//! MCL-4 adds `send` to the trait: one plain-text
+//! message to one already-synced thread, addressed by
+//! the thread's AppleScript chat id. The `send` verb is
+//! the MCL-0 probe-verified form (`send "…" to first
+//! chat` exited 0 with the reply bubble visible); the
+//! `chat id` addressing targets the requested thread
+//! instead of whichever chat happens to be first —
+//! window validation on a real Mac is the proof of that
+//! addressing, same best-effort caveat as the dump
+//! script. "Sent" means Messages.app accepted the send,
+//! never that the other side received it (Q-MCL-21);
+//! the script has no read-back of the sent message's id
+//! (that would need message history — falsified), so
+//! `SentIMessage.native_id` stays `None` in MCL-4.
+//!
 //! The gateway checks the Messages.app process state
 //! FIRST (pgrep) and never auto-launches it: B2-0 proved
 //! osascript auto-launches an app it is told to control.
@@ -101,6 +116,27 @@ pub trait IMessageSource: Send + Sync {
     /// script enumerates all chats); the sync passes
     /// `usize::MAX` to take them all.
     fn threads(&self, limit: usize, offset: usize) -> Result<Vec<IMessageThreadView>, IMessageError>;
+
+    /// MCL-4: send one plain-text message to the chat
+    /// with this AppleScript id (`native_id` of a synced
+    /// `imessage_threads` row). "Sent" means
+    /// Messages.app accepted the send, never that the
+    /// other side received it (Q-MCL-21). The body is
+    /// passed to the script only (never logged); the
+    /// returned id is `None` whenever the script cannot
+    /// read it back — the normal case in MCL-4, never
+    /// fabricated.
+    fn send(&self, native_id: &str, body: &str) -> Result<SentIMessage, IMessageError>;
+}
+
+/// MCL-4: the outcome of one accepted send. `native_id`
+/// is the sent message's Messages id when the script
+/// can read it back — `None` in MCL-4 (the send script
+/// has no read-back; reading the sent message would need
+/// message history, falsified by the MCL-0 probe).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentIMessage {
+    pub native_id: Option<String>,
 }
 
 /// The participant hash for one thread: sha256 of the
@@ -178,6 +214,12 @@ impl IMessageSource for UnavailableIMessageSource {
             "imessage source unavailable on this platform".to_string(),
         ))
     }
+
+    fn send(&self, _native_id: &str, _body: &str) -> Result<SentIMessage, IMessageError> {
+        Err(IMessageError::Unavailable(
+            "imessage source unavailable on this platform".to_string(),
+        ))
+    }
 }
 
 /// AppleScript for the threads dump. Plain string
@@ -208,6 +250,64 @@ fn threads_dump_script() -> String {
   end tell
 end timeout"#
         .to_string()
+}
+
+/// Escape one value for an AppleScript double-quoted
+/// string literal (the `mail_source.rs`
+/// `applescript_escape` precedent, copied verbatim):
+/// backslash and quote are escaped, and newlines /
+/// carriage returns / tabs become their escape
+/// sequences (AppleScript interprets `\n`, `\r`, `\t`
+/// inside literals). Any other control character
+/// becomes a space — it must never reach the script
+/// verbatim, where it could break the literal or the
+/// `osascript -e` argument.
+#[cfg(any(target_os = "macos", test))]
+fn applescript_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// AppleScript for sending one plain-text message to
+/// one chat (MCL-4, best-effort — the `send` verb is
+/// probe-verified, the `chat id` addressing is NOT:
+/// window validation on a real Mac is the proof, same
+/// as the batch-1 read scripts and the 6b-1 send
+/// script). Plain string construction (no macOS calls)
+/// so the guard test runs on every platform. The chat
+/// is addressed by its AppleScript id — never `first
+/// chat`, which would send to whichever chat happens to
+/// be first regardless of the requested thread. No
+/// read-back: the script returns nothing, so
+/// `native_id` stays `None` (reading the sent message
+/// would need message history — falsified by the MCL-0
+/// probe). Multi-line only: a single-line
+/// if-then-else is illegal AppleScript (the MCL-2
+/// lesson) — this script has no conditional at all. The
+/// body travels inside the `osascript -e` argument
+/// only, never into a log or a file.
+#[cfg(any(target_os = "macos", test))]
+fn send_script(native_id: &str, body: &str) -> String {
+    format!(
+        r#"with timeout of 30 seconds
+  tell application "Messages"
+    send "{body}" to chat id "{native_id}"
+  end tell
+end timeout"#,
+        body = applescript_escape(body),
+        native_id = applescript_escape(native_id),
+    )
 }
 
 /// Hard cap on one `osascript` invocation (the
@@ -342,6 +442,20 @@ impl IMessageSource for AppleScriptIMessageSource {
         let views = parse_threads_dump(&dump);
         Ok(views.into_iter().skip(offset).take(limit).collect())
     }
+
+    fn send(&self, native_id: &str, body: &str) -> Result<SentIMessage, IMessageError> {
+        // MCL-4: the send form is best-effort (see
+        // `send_script`); window validation on a real Mac
+        // is the proof. `run_script` already gates on
+        // Messages.app running (Q-MCL-21 / 6b Q-07: never
+        // launch Messages.app for a send) and maps the
+        // 30 s kill to `Timeout`. The script returns
+        // nothing, so native_id stays None — never
+        // fabricated.
+        let script = send_script(native_id, body);
+        let _ = Self::run_script(&script)?;
+        Ok(SentIMessage { native_id: None })
+    }
 }
 
 #[cfg(test)]
@@ -374,6 +488,47 @@ mod tests {
         assert!(
             !script.contains("content of"),
             "must never read message content"
+        );
+    }
+
+    #[test]
+    fn send_script_targets_one_chat_and_never_reads_messages() {
+        // MCL-4 is send-only: the script must address
+        // the requested chat by id and must NEVER ask
+        // for message history (the dictionary has no
+        // message element; a real-session read errors
+        // -1700). It must not use `first chat` — that
+        // would send to whichever chat happens to be
+        // first, regardless of the requested thread.
+        // This guard runs on every platform because the
+        // builder is plain string construction.
+        let script = send_script("any;-;+15550101001", "hello");
+        assert!(
+            script.contains("send \"hello\" to chat id \"any;-;+15550101001\""),
+            "must send to the requested chat id: {script}"
+        );
+        assert!(
+            !script.contains("first chat"),
+            "must never send to first chat: {script}"
+        );
+        assert!(
+            !script.contains("messages of"),
+            "must never read message history"
+        );
+        assert!(
+            !script.contains("content of"),
+            "must never read message content"
+        );
+        // Multi-line only: a single-line if-then-else
+        // is illegal AppleScript (the MCL-2 lesson) —
+        // this script has no conditional at all.
+        assert!(!script.contains("if "), "send script has no conditional");
+        // The body is escaped into the literal, never
+        // interpolated raw: a quote cannot break out.
+        let tricky = send_script("chat-1", "say \"hi\"\nbye");
+        assert!(
+            tricky.contains("say \\\"hi\\\"\\nbye"),
+            "body must be escaped: {tricky}"
         );
     }
 
