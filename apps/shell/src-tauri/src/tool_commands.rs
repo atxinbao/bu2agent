@@ -59,7 +59,10 @@ use agent_desktop::email_client::{
     MessageView, SendMailInput, SentMessageRow, ThreadView,
 };
 use agent_desktop::imessage_client::{IMessageClient, IMessageSyncResult, IMessageThreadRow, SendIMessageInput, SentIMessageRow};
-use agent_desktop::contacts_client::{ContactRow, ContactsClient, ContactsSyncResult};
+use agent_desktop::contacts_client::{
+    ContactRow, ContactsClient, ContactsSyncResult, CreateContactInput, DeleteContactInput,
+    UpdateContactInput,
+};
 use agent_desktop::location_client::{DeviceLocationRow, LocationClient, ShellFixInput};
 use agent_desktop::calendar_client::{
     CalendarClient, CalendarEvent, CreateCalendarEventInput, CreatedCalendarEventRow,
@@ -1771,12 +1774,17 @@ pub fn imessage_sent_get(sent_id: String) -> Result<SentIMessageRow, String> {
     imessage_client()?.sent_get(&sent_id).map_err(agent_err_string)
 }
 
-// --- Contacts surface (MCL-2, read-only) ---
+// --- Contacts surface (MCL-2 read, MCL-5 write) ---
 //
-// Four commands mirror the four gateway routes
-// (sync / list / get / search). Reads only; address /
-// birthday values are never stored, so they cannot be
-// searched or returned.
+// Seven commands mirror the seven gateway routes
+// (sync / list / get / search + create / update /
+// delete). Reads only need no approval; the three
+// writes each carry the decided digest-bound approval
+// id and a client-supplied idempotency key, and the
+// gateway binds, consumes, and records the Effect +
+// fact row. A delete tombstones the row, never
+// hard-deletes. Address / birthday values are never
+// stored, so they cannot be searched or returned.
 fn contacts_client() -> Result<ContactsClient, String> {
     ContactsClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
 }
@@ -1806,6 +1814,79 @@ pub fn contacts_search(
     offset: Option<usize>,
 ) -> Result<Vec<ContactRow>, String> {
     contacts_client()?.contacts_search(&query, limit, offset).map_err(agent_err_string)
+}
+
+// MCL-5: contacts writes. Each carries the decided
+// digest-bound approval id and the client-supplied
+// idempotency key; the gateway binds, consumes, and
+// records the Effect + fact row. "已创建 / 已更新"
+// means Contacts.app accepted the write, never more.
+// A delete tombstones the row (deleted: true, still
+// listed) — it never hard-deletes.
+#[tauri::command(rename_all = "snake_case")]
+pub fn contacts_create(
+    display_name: String,
+    organization: String,
+    job_title: String,
+    phones: Vec<String>,
+    emails: Vec<String>,
+    idempotency_key: String,
+    tool_call_id: Option<String>,
+) -> Result<ContactRow, String> {
+    contacts_client()?
+        .create_contact(&CreateContactInput {
+            display_name,
+            organization,
+            job_title,
+            phones,
+            emails,
+            idempotency_key,
+            tool_call_id,
+        })
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn contacts_update(
+    contact_id: String,
+    display_name: String,
+    organization: String,
+    job_title: String,
+    phones: Vec<String>,
+    emails: Vec<String>,
+    base_content_hash: String,
+    idempotency_key: String,
+    tool_call_id: Option<String>,
+) -> Result<ContactRow, String> {
+    contacts_client()?
+        .update_contact(
+            &contact_id,
+            &UpdateContactInput {
+                display_name,
+                organization,
+                job_title,
+                phones,
+                emails,
+                base_content_hash,
+                idempotency_key,
+                tool_call_id,
+            },
+        )
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn contacts_delete(
+    contact_id: String,
+    idempotency_key: String,
+    tool_call_id: Option<String>,
+) -> Result<ContactRow, String> {
+    contacts_client()?
+        .delete_contact(
+            &contact_id,
+            &DeleteContactInput { idempotency_key, tool_call_id },
+        )
+        .map_err(agent_err_string)
 }
 
 // --- Location surface (MCL-3, manual record + read) ---

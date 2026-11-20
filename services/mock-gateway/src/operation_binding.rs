@@ -432,6 +432,125 @@ pub fn note_delete_digest(note_id: &str) -> String {
     operation_digest("notes.delete", None, &params)
 }
 
+/// Normalize one contacts text list (MCL-5): trim
+/// each value, drop empties, sort, dedupe. The same
+/// normalization runs before the digest, before the
+/// AppleScript execution, and before storing, so a
+/// digest computed from presented fields, from stored
+/// fields, or from a live re-read can never drift apart
+/// over whitespace or ordering. The phone / email
+/// `string_list_hash` precedent is order-independent
+/// already; this extends the rule to trimming.
+pub fn normalize_contact_strings(values: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = values
+        .iter()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The content hash for one contact's writable fields
+/// (MCL-5, plan §6). LOCAL DEFINITION: sha256 of the
+/// canonical JSON of the normalized
+/// display_name / organization / job_title / phones /
+/// emails — the same five fields the write routes and
+/// the live re-read compare. Addresses and birthday are
+/// NOT in the hash: address / birthday writes are
+/// deferred, so their values never change through this
+/// batch and must not trip the conflict check. The
+/// normalization trims text (a live card whose last
+/// name is empty derives its display name with a
+/// trailing space — the hash must not see it) and
+/// sorts / dedupes the lists. The hash is computed on
+/// the fly from the stored row's fields, never stored
+/// in its own column: the row is the record, the hash
+/// is the comparison key.
+pub fn contact_content_hash(
+    display_name: &str,
+    organization: &str,
+    job_title: &str,
+    phones: &[String],
+    emails: &[String],
+) -> String {
+    let doc = serde_json::json!({
+        "display_name": display_name.trim(),
+        "organization": organization.trim(),
+        "job_title": job_title.trim(),
+        "phones": normalize_contact_strings(phones),
+        "emails": normalize_contact_strings(emails),
+    });
+    sha256_hex(serde_json::to_string(&doc).unwrap_or_default().as_bytes())
+}
+
+/// Digest for a real contact create (MCL-5, plan §6).
+/// LOCAL DEFINITION: the digest commits to the content
+/// hash of the presented fields — the same hash the
+/// route compares against a stored row for the
+/// idempotency replay. Both the approval-request path
+/// and the create route call this same function over
+/// the same normalized inputs, so the two digests can
+/// never drift apart.
+pub fn contact_create_digest(
+    display_name: &str,
+    organization: &str,
+    job_title: &str,
+    phones: &[String],
+    emails: &[String],
+) -> String {
+    let params = BTreeMap::from([(
+        "content_hash".to_string(),
+        contact_content_hash(display_name, organization, job_title, phones, emails),
+    )]);
+    operation_digest("contacts.create", None, &params)
+}
+
+/// Digest for a real contact update (MCL-5, plan §6).
+/// LOCAL DEFINITION: the digest commits to the local
+/// `contact-N` id and the content hash of the presented
+/// fields — never to `base_content_hash`, so a retry
+/// with a fresh base and the same unconsumed approval
+/// still matches (the base is a concurrency guard, not
+/// part of the approved content). Both the
+/// approval-request path and the update route call this
+/// same function over the same normalized inputs, so the
+/// two digests can never drift apart.
+pub fn contact_update_digest(
+    contact_id: &str,
+    display_name: &str,
+    organization: &str,
+    job_title: &str,
+    phones: &[String],
+    emails: &[String],
+) -> String {
+    let params = BTreeMap::from([
+        ("contact_id".to_string(), contact_id.to_string()),
+        (
+            "content_hash".to_string(),
+            contact_content_hash(display_name, organization, job_title, phones, emails),
+        ),
+    ]);
+    operation_digest("contacts.update", None, &params)
+}
+
+/// Digest for a real contact delete (MCL-5, plan §6).
+/// LOCAL DEFINITION: the digest commits to the local
+/// `contact-N` id — the contact's stable identity (the
+/// native id is only an alias, so it never enters the
+/// digest; the notes.delete precedent, whose route is
+/// likewise addressed by its local id — the mail.delete
+/// precedent commits to the native id only because mail
+/// routes accept a native id in the path). Both the
+/// approval-request path and the delete route call this
+/// same function over the same id, so the two digests
+/// can never drift apart.
+pub fn contact_delete_digest(contact_id: &str) -> String {
+    let params = BTreeMap::from([("contact_id".to_string(), contact_id.to_string())]);
+    operation_digest("contacts.delete", None, &params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +602,92 @@ mod tests {
         assert_ne!(write_digest("a.txt", b"hello", true).expect("digest"), base);
         assert_ne!(delete_digest("a.txt").expect("digest"), base);
         assert_eq!(delete_digest("a/./b.txt").expect("digest"), delete_digest("a/b.txt").expect("digest"));
+    }
+
+    #[test]
+    fn contact_digests_are_stable_but_sensitive_to_every_parameter() {
+        let phones = vec!["+15550101001".to_string()];
+        let emails = vec!["ada@mock.invalid".to_string()];
+        let create = contact_create_digest("Ada", "Org", "Title", &phones, &emails);
+        assert_eq!(
+            contact_create_digest("Ada", "Org", "Title", &phones, &emails),
+            create
+        );
+        assert_ne!(
+            contact_create_digest("ADA", "Org", "Title", &phones, &emails),
+            create
+        );
+        assert_ne!(
+            contact_create_digest("Ada", "Org", "Title", &["+15550101002".to_string()], &emails),
+            create
+        );
+        // Normalization: whitespace and ordering do not
+        // move the digest — a live card whose last name
+        // is empty derives its display name with a
+        // trailing space, and phone order is not content.
+        assert_eq!(
+            contact_create_digest("Ada ", "Org", "Title", &phones, &emails),
+            create,
+            "trailing space must not move the digest"
+        );
+        let reordered = vec!["+15550101002".to_string(), "+15550101001".to_string()];
+        let with_dup = vec![
+            "+15550101001".to_string(),
+            "+15550101002".to_string(),
+            "+15550101001".to_string(),
+        ];
+        assert_eq!(
+            contact_create_digest("Ada", "Org", "Title", &reordered, &emails),
+            contact_create_digest(
+                "Ada",
+                "Org",
+                "Title",
+                &["+15550101002".to_string(), "+15550101001".to_string()],
+                &emails
+            ),
+            "order must not move the digest"
+        );
+        assert_eq!(
+            contact_create_digest("Ada", "Org", "Title", &with_dup, &emails),
+            contact_create_digest(
+                "Ada",
+                "Org",
+                "Title",
+                &["+15550101001".to_string(), "+15550101002".to_string()],
+                &emails
+            ),
+            "duplicates must not move the digest"
+        );
+        let update = contact_update_digest("contact-1", "Ada", "Org", "Title", &phones, &emails);
+        assert_eq!(
+            contact_update_digest("contact-1", "Ada", "Org", "Title", &phones, &emails),
+            update
+        );
+        assert_ne!(
+            contact_update_digest("contact-2", "Ada", "Org", "Title", &phones, &emails),
+            update
+        );
+        assert_ne!(
+            contact_update_digest("contact-1", "Ada", "Org", "Title", &[], &emails),
+            update
+        );
+        assert_ne!(update, create, "update and create bind different tools");
+        let delete = contact_delete_digest("contact-1");
+        assert_eq!(contact_delete_digest("contact-1"), delete);
+        assert_ne!(contact_delete_digest("contact-2"), delete);
+        assert_ne!(delete, update);
+        // The content hash itself is stable across the
+        // same normalization.
+        let two_phones = vec!["+15550101001".to_string(), "+15550101002".to_string()];
+        let two_reordered = vec!["+15550101002".to_string(), "+15550101001".to_string()];
+        assert_eq!(
+            contact_content_hash("Ada", "Org", "Title", &two_phones, &emails),
+            contact_content_hash("Ada ", " Org ", "Title", &two_reordered, &emails),
+        );
+        assert_ne!(
+            contact_content_hash("Ada", "Org", "Title", &phones, &emails),
+            contact_content_hash("Ada", "Org", "Other", &phones, &emails),
+        );
     }
 
     #[test]

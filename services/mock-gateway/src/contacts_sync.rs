@@ -34,13 +34,24 @@
 //!   (`phones_json` / `emails_json` columns). Address /
 //!   birthday values are never stored at all — only
 //!   `addresses_hash` / `birthday_hash` (NULL = none).
+//!
+//! MCL-5 adds the write record functions
+//! (`record_contact_created` / `record_contact_updated`
+//! / `record_contact_deleted`): one transaction per
+//! write — the row (with its write audit trail:
+//! `idempotency_key` / `effect_id` / `policy_version`)
+//! and the `contact.created` / `contact.updated` /
+//! `contact.deleted` event. The sync stays
+//! insert-if-absent and never touches those columns.
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    contacts_source::{addresses_hash_for, birthday_hash_for, string_list_hash, ContactView},
-    operation_binding::sha256_hex,
+    contacts_source::{
+        addresses_hash_for, birthday_hash_for, string_list_hash, ContactContent, ContactView,
+    },
+    operation_binding::{contact_content_hash, sha256_hex},
     sqlite_store::{append_event, update_source_cursor_tx, DB_SCHEMA_VERSION},
 };
 
@@ -55,6 +66,17 @@ pub const CONTACTS_SOURCE_ID: &str = "contacts-source";
 /// `deleted` column is visible in list responses
 /// (6b-3 Q-14: tombstones visible) so the UI can show a
 /// deleted card as deleted, never as a live contact.
+///
+/// MCL-5 adds the write audit trail + the conflict
+/// base: `idempotency_key` / `effect_id` /
+/// `policy_version` are the last write's key, Effect,
+/// and Policy version (NULL on rows that only ever
+/// synced — the backfill columns land NULL on old
+/// rows); `content_hash` is computed on the fly from
+/// the stored fields (never stored in its own column),
+/// so the UI can present it as the update's
+/// `base_content_hash` and the route can compare it
+/// against a live re-read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactRow {
     pub contact_id: String,
@@ -71,6 +93,10 @@ pub struct ContactRow {
     pub updated_ms: i64,
     pub deleted: bool,
     pub origin_device_id: String,
+    pub idempotency_key: Option<String>,
+    pub effect_id: Option<String>,
+    pub policy_version: Option<String>,
+    pub content_hash: String,
 }
 
 /// One sync's outcome: rows inserted, rows skipped
@@ -118,21 +144,51 @@ fn synced_payload(row: &ContactRow) -> String {
 fn row_from_sqlite(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContactRow> {
     let phones_json: String = row.get("phones_json")?;
     let emails_json: String = row.get("emails_json")?;
+    let phones: Vec<String> = serde_json::from_str(&phones_json).unwrap_or_default();
+    let emails: Vec<String> = serde_json::from_str(&emails_json).unwrap_or_default();
+    let display_name: String = row.get("display_name")?;
+    let organization: String = row.get("organization")?;
+    let job_title: String = row.get("job_title")?;
+    // The conflict base is computed on the fly, never
+    // stored: the hash normalizes (trims / sorts /
+    // dedupes), so a stored row, a presented write, and
+    // a live re-read hash the same content the same way.
+    let content_hash = contact_content_hash(
+        &display_name,
+        &organization,
+        &job_title,
+        &phones,
+        &emails,
+    );
     Ok(ContactRow {
         contact_id: row.get("contact_id")?,
         source_id: row.get("source_id")?,
         native_id: row.get("native_id")?,
-        display_name: row.get("display_name")?,
-        organization: row.get("organization")?,
-        job_title: row.get("job_title")?,
-        phones: serde_json::from_str(&phones_json).unwrap_or_default(),
-        emails: serde_json::from_str(&emails_json).unwrap_or_default(),
+        display_name,
+        organization,
+        job_title,
+        phones,
+        emails,
         addresses_hash: row.get("addresses_hash")?,
         birthday_hash: row.get("birthday_hash")?,
         created_ms: row.get("created_ms")?,
         updated_ms: row.get("updated_ms")?,
         deleted: row.get::<_, i64>("deleted")? != 0,
         origin_device_id: row.get("origin_device_id")?,
+        // The backfill columns are NULL on rows that
+        // only ever synced (and on pre-MCL-5 rows); a
+        // missing column (a DB that predates the
+        // backfill step) reads as NULL too — the column
+        // is optional by name, so an older fixture
+        // without it still reads.
+        idempotency_key: row
+            .get::<_, Option<String>>("idempotency_key")
+            .unwrap_or(None),
+        effect_id: row.get::<_, Option<String>>("effect_id").unwrap_or(None),
+        policy_version: row
+            .get::<_, Option<String>>("policy_version")
+            .unwrap_or(None),
+        content_hash,
     })
 }
 
@@ -186,6 +242,21 @@ fn insert_contact_if_absent(
         updated_ms: now_ms,
         deleted: false,
         origin_device_id: origin_device_id.to_string(),
+        // A synced row has no write behind it: the
+        // write audit trail stays NULL until an MCL-5
+        // write records one. The content hash is
+        // computed from the synced fields, like every
+        // row read.
+        idempotency_key: None,
+        effect_id: None,
+        policy_version: None,
+        content_hash: contact_content_hash(
+            &view.display_name,
+            &view.organization,
+            &view.job_title,
+            &view.phones,
+            &view.emails,
+        ),
     };
     tx.execute(
         "INSERT INTO contacts (contact_id, source_id, native_id, display_name, organization, \
@@ -282,6 +353,280 @@ pub fn get_source_cursor(conn: &Connection, source_id: &str) -> Result<String, S
     .map(|value| value.unwrap_or_default())
 }
 
+/// The full contacts column list (MCL-5: the three
+/// backfill columns ride along so `row_from_sqlite`
+/// sees the write audit trail).
+const CONTACT_COLS: &str = "contact_id, source_id, native_id, display_name, organization, \
+    job_title, phones_json, emails_json, addresses_hash, birthday_hash, created_ms, \
+    updated_ms, deleted, origin_device_id, idempotency_key, effect_id, policy_version";
+
+/// One contact by its last write's idempotency key
+/// (MCL-5 replay lookup). `None` when no write used
+/// this key — synced rows carry NULL, so they never
+/// match.
+pub fn find_contact_by_idempotency_key(
+    conn: &Connection,
+    idempotency_key: &str,
+) -> Result<Option<ContactRow>, String> {
+    conn.query_row(
+        &format!("SELECT {CONTACT_COLS} FROM contacts WHERE idempotency_key = ?1"),
+        params![idempotency_key],
+        row_from_sqlite,
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// One contact by its live native id (MCL-5 create
+/// collision guard). `None` when the card is unknown.
+pub fn find_contact_by_native_id(
+    conn: &Connection,
+    source_id: &str,
+    native_id: &str,
+) -> Result<Option<ContactRow>, String> {
+    conn.query_row(
+        &format!(
+            "SELECT {CONTACT_COLS} FROM contacts WHERE source_id = ?1 AND native_id = ?2"
+        ),
+        params![source_id, native_id],
+        row_from_sqlite,
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// The redacted event payload for one written contact
+/// (MCL-5): the synced payload's 13 fields, plus the
+/// content hash of the written fields and the write
+/// Execution id. No display name, no phone or email
+/// value, no job title, no address or birthday value —
+/// the same allowlist rule as `synced_payload`.
+fn write_payload(row: &ContactRow, execution_id: &str) -> String {
+    let payload = serde_json::json!({
+        "contact_id": row.contact_id,
+        "source_id": row.source_id,
+        "native_id": row.native_id,
+        "display_name_hash": sha256_hex(row.display_name.as_bytes()),
+        "organization_hash": sha256_hex(row.organization.as_bytes()),
+        "phone_count": row.phones.len(),
+        "phone_hash": string_list_hash(&row.phones),
+        "email_count": row.emails.len(),
+        "email_hash": string_list_hash(&row.emails),
+        "has_address": row.addresses_hash.is_some(),
+        "has_birthday": row.birthday_hash.is_some(),
+        "created_ms": row.created_ms,
+        "updated_ms": row.updated_ms,
+        "content_hash": row.content_hash,
+        "execution_id": execution_id,
+    });
+    serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Record one created contact (MCL-5) in a single
+/// transaction: the row + its `contact.created` event.
+/// Returns the row and whether it was inserted: when a
+/// row already exists for the native id (a concurrent
+/// create, or a lost response retried with a new key),
+/// the existing row is the replay — no second row, no
+/// second event, never a duplicate (the MCL-4 send
+/// UNIQUE-race shape). A created card has no addresses
+/// / birthday (the create script never sets them), so
+/// both hashes stay NULL.
+#[allow(clippy::too_many_arguments)]
+pub fn record_contact_created(
+    conn: &mut Connection,
+    native_id: &str,
+    content: &ContactContent,
+    idempotency_key: &str,
+    effect_id: &str,
+    execution_id: &str,
+    policy_version: &str,
+    origin_device_id: &str,
+) -> Result<(ContactRow, bool), String> {
+    let now_ms = crate::sqlite_store::now_ms() as i64;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    if let Some(existing) = find_contact_by_native_id(&tx, CONTACTS_SOURCE_ID, native_id)? {
+        tx.commit().map_err(|e| e.to_string())?;
+        return Ok((existing, false));
+    }
+    let next: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM contacts WHERE source_id = ?1",
+            params![CONTACTS_SOURCE_ID],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let contact_id = format!("contact-{}", next + 1);
+    let phones_json = serde_json::to_string(&content.phones).unwrap_or_else(|_| "[]".to_string());
+    let emails_json = serde_json::to_string(&content.emails).unwrap_or_else(|_| "[]".to_string());
+    let row = ContactRow {
+        contact_id,
+        source_id: CONTACTS_SOURCE_ID.to_string(),
+        native_id: native_id.to_string(),
+        display_name: content.display_name.clone(),
+        organization: content.organization.clone(),
+        job_title: content.job_title.clone(),
+        phones: content.phones.clone(),
+        emails: content.emails.clone(),
+        addresses_hash: None,
+        birthday_hash: None,
+        created_ms: now_ms,
+        updated_ms: now_ms,
+        deleted: false,
+        origin_device_id: origin_device_id.to_string(),
+        idempotency_key: Some(idempotency_key.to_string()),
+        effect_id: Some(effect_id.to_string()),
+        policy_version: Some(policy_version.to_string()),
+        content_hash: contact_content_hash(
+            &content.display_name,
+            &content.organization,
+            &content.job_title,
+            &content.phones,
+            &content.emails,
+        ),
+    };
+    tx.execute(
+        "INSERT INTO contacts (contact_id, source_id, native_id, display_name, organization, \
+         job_title, phones_json, emails_json, addresses_hash, birthday_hash, created_ms, \
+         updated_ms, deleted, origin_device_id, idempotency_key, effect_id, policy_version) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?9, 0, ?10, ?11, ?12, ?13)",
+        params![
+            row.contact_id,
+            row.source_id,
+            row.native_id,
+            row.display_name,
+            row.organization,
+            row.job_title,
+            phones_json,
+            emails_json,
+            now_ms,
+            row.origin_device_id,
+            idempotency_key,
+            effect_id,
+            policy_version,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    append_event(
+        &tx,
+        "contacts",
+        &row.contact_id,
+        "contact.created",
+        &write_payload(&row, execution_id),
+        origin_device_id,
+        now_ms,
+        DB_SCHEMA_VERSION,
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok((row, true))
+}
+
+/// Record one updated contact (MCL-5) in a single
+/// transaction: the full-replace field write + its
+/// `contact.updated` event. The caller already ran the
+/// live conflict re-read and the AppleScript replace;
+/// this records the stored truth. Addresses / birthday
+/// hashes are untouched (address / birthday writes are
+/// deferred). The write audit trail advances to this
+/// write's key / Effect / Policy version.
+#[allow(clippy::too_many_arguments)]
+pub fn record_contact_updated(
+    conn: &mut Connection,
+    row: &ContactRow,
+    content: &ContactContent,
+    idempotency_key: &str,
+    effect_id: &str,
+    execution_id: &str,
+    policy_version: &str,
+    origin_device_id: &str,
+) -> Result<ContactRow, String> {
+    let now_ms = crate::sqlite_store::now_ms() as i64;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let phones_json = serde_json::to_string(&content.phones).unwrap_or_else(|_| "[]".to_string());
+    let emails_json = serde_json::to_string(&content.emails).unwrap_or_else(|_| "[]".to_string());
+    tx.execute(
+        "UPDATE contacts SET display_name = ?1, organization = ?2, job_title = ?3, \
+         phones_json = ?4, emails_json = ?5, updated_ms = ?6, idempotency_key = ?7, \
+         effect_id = ?8, policy_version = ?9 WHERE contact_id = ?10",
+        params![
+            content.display_name,
+            content.organization,
+            content.job_title,
+            phones_json,
+            emails_json,
+            now_ms,
+            idempotency_key,
+            effect_id,
+            policy_version,
+            row.contact_id,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    let updated = get_contact(&tx, &row.contact_id)?.ok_or_else(|| {
+        format!("contact {} vanished during its own update", row.contact_id)
+    })?;
+    append_event(
+        &tx,
+        "contacts",
+        &updated.contact_id,
+        "contact.updated",
+        &write_payload(&updated, execution_id),
+        origin_device_id,
+        now_ms,
+        DB_SCHEMA_VERSION,
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(updated)
+}
+
+/// Record one deleted contact (MCL-5) in a single
+/// transaction: the tombstone (`deleted = 1`,
+/// `updated_ms` advances, text stays) + its
+/// `contact.deleted` event. An already-tombstoned row
+/// is returned unchanged — no second event (the mail
+/// `tombstone_mail_message` precedent). The write audit
+/// trail advances to this write's key / Effect / Policy
+/// version, so a later replay can name the delete's
+/// Effect.
+#[allow(clippy::too_many_arguments)]
+pub fn record_contact_deleted(
+    conn: &mut Connection,
+    row: &ContactRow,
+    idempotency_key: &str,
+    effect_id: &str,
+    execution_id: &str,
+    policy_version: &str,
+    origin_device_id: &str,
+) -> Result<ContactRow, String> {
+    let now_ms = crate::sqlite_store::now_ms() as i64;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    if row.deleted {
+        tx.commit().map_err(|e| e.to_string())?;
+        return Ok(row.clone());
+    }
+    tx.execute(
+        "UPDATE contacts SET deleted = 1, updated_ms = ?1, idempotency_key = ?2, \
+         effect_id = ?3, policy_version = ?4 WHERE contact_id = ?5",
+        params![now_ms, idempotency_key, effect_id, policy_version, row.contact_id],
+    )
+    .map_err(|e| e.to_string())?;
+    let tombstoned = get_contact(&tx, &row.contact_id)?.ok_or_else(|| {
+        format!("contact {} vanished during its own delete", row.contact_id)
+    })?;
+    append_event(
+        &tx,
+        "contacts",
+        &tombstoned.contact_id,
+        "contact.deleted",
+        &write_payload(&tombstoned, execution_id),
+        origin_device_id,
+        now_ms,
+        DB_SCHEMA_VERSION,
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(tombstoned)
+}
+
 /// List contacts for one source, tombstones visible
 /// (6b-3 Q-14), insertion order. `limit` is clamped
 /// to 50/200 by the caller.
@@ -295,7 +640,7 @@ pub fn list_contacts(
         .prepare(
             "SELECT contact_id, source_id, native_id, display_name, organization, job_title, \
              phones_json, emails_json, addresses_hash, birthday_hash, created_ms, updated_ms, \
-             deleted, origin_device_id FROM contacts WHERE source_id = ?1 \
+             deleted, origin_device_id, idempotency_key, effect_id, policy_version FROM contacts WHERE source_id = ?1 \
              ORDER BY rowid ASC LIMIT ?2 OFFSET ?3",
         )
         .map_err(|e| e.to_string())?;
@@ -315,7 +660,7 @@ pub fn get_contact(conn: &Connection, contact_id: &str) -> Result<Option<Contact
     conn.query_row(
         "SELECT contact_id, source_id, native_id, display_name, organization, job_title, \
          phones_json, emails_json, addresses_hash, birthday_hash, created_ms, updated_ms, \
-         deleted, origin_device_id FROM contacts WHERE contact_id = ?1",
+         deleted, origin_device_id, idempotency_key, effect_id, policy_version FROM contacts WHERE contact_id = ?1",
         params![contact_id],
         row_from_sqlite,
     )
@@ -348,7 +693,7 @@ pub fn search_contacts(
         .prepare(
             "SELECT contact_id, source_id, native_id, display_name, organization, job_title, \
              phones_json, emails_json, addresses_hash, birthday_hash, created_ms, updated_ms, \
-             deleted, origin_device_id FROM contacts WHERE source_id = ?1 ORDER BY rowid ASC",
+             deleted, origin_device_id, idempotency_key, effect_id, policy_version FROM contacts WHERE source_id = ?1 ORDER BY rowid ASC",
         )
         .map_err(|e| e.to_string())?;
     let all = stmt
@@ -400,6 +745,16 @@ mod tests {
             updated_ms: 1_000,
             deleted: false,
             origin_device_id: "dev-1".to_string(),
+            idempotency_key: None,
+            effect_id: None,
+            policy_version: None,
+            content_hash: contact_content_hash(
+                "Ada Lovelace",
+                "Analytical Engines",
+                "Mathematician",
+                &["+15550101001".to_string()],
+                &["ada@mock.invalid".to_string()],
+            ),
         };
         let payload = synced_payload(&row);
         assert!(payload.contains("\"contact_id\":\"contact-1\""));
@@ -438,6 +793,10 @@ mod tests {
             updated_ms: 1_000,
             deleted: false,
             origin_device_id: "dev-1".to_string(),
+            idempotency_key: None,
+            effect_id: None,
+            policy_version: None,
+            content_hash: contact_content_hash("Bob", "", "", &[], &[]),
         };
         let payload = synced_payload(&row);
         assert!(payload.contains("\"has_address\":false"));

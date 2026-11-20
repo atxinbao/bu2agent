@@ -96,6 +96,16 @@ function requiresApproval(tool: string): boolean | undefined {
     case "notes.create":
     case "notes.append":
     case "notes.delete":
+    // MCL-5: the contacts write tools are
+    // approval-gated like mail.send (digest-bound
+    // writes, Q-MCL-22; mirrors the gateway's
+    // Some(true)). NOTE: `imessage.send` is still
+    // missing from this switch (found 2026-11-20 while
+    // diagnosing the paused MCL-4 window round); that
+    // gap belongs to the MCL-4 revisit, not this batch.
+    case "contacts.create":
+    case "contacts.update":
+    case "contacts.delete":
     case "reminders.set_completed":
     case "worker.run":
       return true;
@@ -247,6 +257,57 @@ export class AgentClient implements AgentGateway {
         throw new Error("notes.delete approval requires note_id");
       }
       body.note_id = args.note_id;
+    } else if (tool === "contacts.create") {
+      // MCL-5: a contacts create approval binds the
+      // exact content (Q-MCL-22). `phones` / `emails`
+      // arrive as JSON array strings (the mail.send `to`
+      // shape); the server recomputes the digest from
+      // the decoded lists, never from a client hash.
+      if (
+        args?.display_name === undefined ||
+        args?.phones === undefined ||
+        args?.emails === undefined
+      ) {
+        throw new Error("contacts.create approval requires display_name, phones and emails");
+      }
+      body.display_name = args.display_name;
+      body.organization = args.organization ?? "";
+      body.job_title = args.job_title ?? "";
+      body.phones = JSON.parse(args.phones) as string[];
+      body.emails = JSON.parse(args.emails) as string[];
+    } else if (tool === "contacts.update") {
+      // MCL-5: a contacts update approval binds the
+      // contact id and the exact new content (Q-MCL-22).
+      // The base hash is NOT part of the digest (a retry
+      // with a fresh base and the same content still
+      // matches); the server recomputes the digest from
+      // these fields, never from a client hash.
+      if (
+        args?.contact_id === undefined ||
+        args?.display_name === undefined ||
+        args?.phones === undefined ||
+        args?.emails === undefined
+      ) {
+        throw new Error(
+          "contacts.update approval requires contact_id, display_name, phones and emails",
+        );
+      }
+      body.contact_id = args.contact_id;
+      body.display_name = args.display_name;
+      body.organization = args.organization ?? "";
+      body.job_title = args.job_title ?? "";
+      body.phones = JSON.parse(args.phones) as string[];
+      body.emails = JSON.parse(args.emails) as string[];
+    } else if (tool === "contacts.delete") {
+      // MCL-5: a contacts delete approval binds the
+      // contact id (Q-MCL-22, the notes.delete shape —
+      // the local id, not the native id). The server
+      // recomputes the digest from it, never from a
+      // client hash.
+      if (args?.contact_id === undefined) {
+        throw new Error("contacts.delete approval requires contact_id");
+      }
+      body.contact_id = args.contact_id;
     }
     const response = await this.post<ApprovalRequestResponse>("/approval/request", body);
     if (response.requires_approval !== requires) {

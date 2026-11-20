@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mock_gateway::contacts_source::{
-    addresses_hash_for, birthday_hash_for, ContactAddress, ContactView, ContactsError,
-    ContactsSource,
+    addresses_hash_for, birthday_hash_for, ContactAddress, ContactContent, ContactView,
+    ContactsError, ContactsSource,
 };
 use mock_gateway::loop_engine::*;
 use mock_gateway::server::{app, AppState};
@@ -111,12 +111,16 @@ fn done() -> ModelReply {
 /// file — only their hashes reach the event log.
 struct MutableFakeContactsSource {
     contacts: Mutex<Vec<ContactView>>,
+    next_id: AtomicUsize,
 }
 
 impl MutableFakeContactsSource {
     fn seeded() -> Arc<Self> {
         Arc::new(Self {
             contacts: Mutex::new(vec![contact_view_a(), contact_view_b()]),
+            // Seeded cards are person-a / person-b; new
+            // cards take fake-person-N from 3 up.
+            next_id: AtomicUsize::new(3),
         })
     }
 
@@ -129,6 +133,66 @@ impl ContactsSource for MutableFakeContactsSource {
     fn contacts(&self, limit: usize, offset: usize) -> Result<Vec<ContactView>, ContactsError> {
         let views = self.contacts.lock().unwrap().clone();
         Ok(views.into_iter().skip(offset).take(limit).collect())
+    }
+
+    fn contact_content(
+        &self,
+        native_id: &str,
+    ) -> Result<Option<ContactContent>, ContactsError> {
+        let views = self.contacts.lock().unwrap();
+        Ok(views.iter().find(|v| v.native_id == native_id).map(|v| {
+            ContactContent {
+                display_name: v.display_name.clone(),
+                organization: v.organization.clone(),
+                job_title: v.job_title.clone(),
+                phones: v.phones.clone(),
+                emails: v.emails.clone(),
+            }
+        }))
+    }
+
+    fn create_contact(&self, content: &ContactContent) -> Result<String, ContactsError> {
+        let native_id = format!("fake-person-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+        self.contacts.lock().unwrap().push(ContactView {
+            native_id: native_id.clone(),
+            display_name: content.display_name.clone(),
+            organization: content.organization.clone(),
+            job_title: content.job_title.clone(),
+            phones: content.phones.clone(),
+            emails: content.emails.clone(),
+            addresses: vec![],
+            birthday: None,
+        });
+        Ok(native_id)
+    }
+
+    fn update_contact(
+        &self,
+        native_id: &str,
+        content: &ContactContent,
+    ) -> Result<(), ContactsError> {
+        let mut views = self.contacts.lock().unwrap();
+        let Some(view) = views.iter_mut().find(|v| v.native_id == native_id) else {
+            return Err(ContactsError::NotFound("unknown contact"));
+        };
+        // Full replace of the writable fields only:
+        // addresses / birthday are untouched (address /
+        // birthday writes are deferred).
+        view.display_name = content.display_name.clone();
+        view.organization = content.organization.clone();
+        view.job_title = content.job_title.clone();
+        view.phones = content.phones.clone();
+        view.emails = content.emails.clone();
+        Ok(())
+    }
+
+    fn delete_contact(&self, native_id: &str) -> Result<(), ContactsError> {
+        let mut views = self.contacts.lock().unwrap();
+        let Some(pos) = views.iter().position(|v| v.native_id == native_id) else {
+            return Err(ContactsError::NotFound("unknown contact"));
+        };
+        views.remove(pos);
+        Ok(())
     }
 }
 

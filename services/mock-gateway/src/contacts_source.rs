@@ -94,6 +94,45 @@ pub struct ContactView {
     pub birthday: Option<String>,
 }
 
+/// One contact's WRITABLE content (MCL-5): the five
+/// fields the write routes carry — display name,
+/// organization, job title, phones, emails. Addresses
+/// and birthday are NOT here: address / birthday writes
+/// are deferred, so no write ever touches them. Use
+/// `ContactContent::normalized` to build one: text is
+/// trimmed, phone / email lists are trimmed, empties
+/// dropped, sorted, deduped (the
+/// `operation_binding::normalize_contact_strings`
+/// rule) — the digest, the AppleScript execution, and
+/// the stored row all see the same normalized form, so
+/// the three can never drift apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactContent {
+    pub display_name: String,
+    pub organization: String,
+    pub job_title: String,
+    pub phones: Vec<String>,
+    pub emails: Vec<String>,
+}
+
+impl ContactContent {
+    pub fn normalized(
+        display_name: &str,
+        organization: &str,
+        job_title: &str,
+        phones: &[String],
+        emails: &[String],
+    ) -> Self {
+        Self {
+            display_name: display_name.trim().to_string(),
+            organization: organization.trim().to_string(),
+            job_title: job_title.trim().to_string(),
+            phones: crate::operation_binding::normalize_contact_strings(phones),
+            emails: crate::operation_binding::normalize_contact_strings(emails),
+        }
+    }
+}
+
 /// Source failures. Same six variants as `MailError`
 /// (the same mapping: `NotFound` -> 404, `Unavailable`
 /// -> 501, `Denied` -> 403, `Upstream` / `NotRunning` /
@@ -118,6 +157,32 @@ pub trait ContactsSource: Send + Sync {
     /// script enumerates all people); the sync passes
     /// `usize::MAX` to take them all.
     fn contacts(&self, limit: usize, offset: usize) -> Result<Vec<ContactView>, ContactsError>;
+    /// Read one card's writable content (MCL-5): the
+    /// five fields the update conflict check compares
+    /// against the approved base. `Ok(None)` when no
+    /// card has this native id. Addresses / birthday are
+    /// never read here — they are not writable fields.
+    fn contact_content(
+        &self,
+        native_id: &str,
+    ) -> Result<Option<ContactContent>, ContactsError>;
+    /// Create one card from writable content (MCL-5);
+    /// returns the new card's native id (the
+    /// `UUID:ABPerson` string the script returns). The
+    /// content must already be normalized (see
+    /// `ContactContent::normalized`).
+    fn create_contact(&self, content: &ContactContent) -> Result<String, ContactsError>;
+    /// Full replace of one card's writable content
+    /// (MCL-5): text fields are set (empty clears),
+    /// all phones / emails are deleted and the new set
+    /// is added. The content must already be normalized.
+    fn update_contact(
+        &self,
+        native_id: &str,
+        content: &ContactContent,
+    ) -> Result<(), ContactsError>;
+    /// Delete one card (MCL-5).
+    fn delete_contact(&self, native_id: &str) -> Result<(), ContactsError>;
 }
 
 /// sha256 of the canonical JSON of the sorted string
@@ -257,6 +322,37 @@ impl ContactsSource for UnavailableContactsSource {
             "contacts source unavailable on this platform".to_string(),
         ))
     }
+
+    fn contact_content(
+        &self,
+        _native_id: &str,
+    ) -> Result<Option<ContactContent>, ContactsError> {
+        Err(ContactsError::Unavailable(
+            "contacts source unavailable on this platform".to_string(),
+        ))
+    }
+
+    fn create_contact(&self, _content: &ContactContent) -> Result<String, ContactsError> {
+        Err(ContactsError::Unavailable(
+            "contacts source unavailable on this platform".to_string(),
+        ))
+    }
+
+    fn update_contact(
+        &self,
+        _native_id: &str,
+        _content: &ContactContent,
+    ) -> Result<(), ContactsError> {
+        Err(ContactsError::Unavailable(
+            "contacts source unavailable on this platform".to_string(),
+        ))
+    }
+
+    fn delete_contact(&self, _native_id: &str) -> Result<(), ContactsError> {
+        Err(ContactsError::Unavailable(
+            "contacts source unavailable on this platform".to_string(),
+        ))
+    }
 }
 
 /// AppleScript for the contacts dump. Plain string
@@ -365,6 +461,254 @@ fn contacts_dump_script() -> String {
   end tell
 end timeout"#
         .to_string()
+}
+
+/// The lookup-miss sentinel for the single-card
+/// scripts (the mail `delete_script` precedent):
+/// AppleScript `try` returns this when `first person
+/// whose id is ...` finds no card, so the caller can
+/// map it to `NotFound` instead of guessing. The `try`
+/// wraps ONLY the lookup — a failure during the
+/// mutation itself propagates as a script error
+/// (non-zero exit → `Upstream`), never as a miss.
+#[cfg(any(target_os = "macos", test))]
+const CONTACT_NOT_FOUND_SENTINEL: &str = "«BU2AGENT_CONTACT_NOT_FOUND»";
+
+/// Escape one value for interpolation into an
+/// AppleScript double-quoted string (the mail_source.rs
+/// `applescript_escape` form, copied: backslash and
+/// quote are escaped, control characters become their
+/// escapes or a space — a value can never break out of
+/// its quotes or inject script).
+#[cfg(any(target_os = "macos", test))]
+fn applescript_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn applescript_string_list(values: &[String]) -> String {
+    let items: Vec<String> = values
+        .iter()
+        .map(|v| format!("\"{}\"", applescript_escape(v)))
+        .collect();
+    format!("{{{}}}", items.join(", "))
+}
+
+/// AppleScript for creating one card (MCL-5).
+/// Best-effort — the exact create form is UNVERIFIED:
+/// the MCL-0 probe verified only that an AppleScript
+/// create works (0.414 s, returns the new
+/// `UUID:ABPerson` id); its evidence files record the
+/// outcome, not the script text, so this form follows
+/// the Contacts dictionary (`make new person`,
+/// `make new phone/email ... with properties
+/// {label, value}`) and window validation on a real Mac
+/// is the proof, same as the 6b-1 send script. Plain
+/// string construction (no macOS calls) so the guard
+/// test runs on every platform. The content must
+/// already be normalized. `save` is required after the
+/// mutation (Contacts AppleScript changes are not
+/// persisted without it). First name carries the whole
+/// display name; a new person has no last name to
+/// clear. New phones get label "mobile", new emails
+/// label "home" (conventional defaults — the fact
+/// model stores values only, Q-MCL-11). Returns the new
+/// card's id as one line.
+#[cfg(any(target_os = "macos", test))]
+fn contact_create_script(content: &ContactContent) -> String {
+    format!(
+        r#"with timeout of 120 seconds
+  tell application "Contacts"
+    set newPerson to make new person with properties {{first name:"{name}"}}
+    set organization of newPerson to "{org}"
+    set job title of newPerson to "{title}"
+    repeat with ph in {phones}
+      make new phone at end of phones of newPerson with properties {{label:"mobile", value:ph}}
+    end repeat
+    repeat with em in {emails}
+      make new email at end of emails of newPerson with properties {{label:"home", value:em}}
+    end repeat
+    save
+    return (id of newPerson as string)
+  end tell
+end timeout"#,
+        name = applescript_escape(&content.display_name),
+        org = applescript_escape(&content.organization),
+        title = applescript_escape(&content.job_title),
+        phones = applescript_string_list(&content.phones),
+        emails = applescript_string_list(&content.emails),
+    )
+}
+
+/// AppleScript for a full replace of one card's
+/// writable content (MCL-5). Best-effort — the MCL-0
+/// probe verified only that an AppleScript rename +
+/// phone / email add works (0.254 s); the exact form
+/// here (delete-all then add the new set, last name
+/// cleared so a stale first/last split cannot survive
+/// a display-name change) follows the Contacts
+/// dictionary and window validation on a real Mac is
+/// the proof. The lookup is the only `try`: a miss
+/// returns the sentinel, a mutation failure propagates
+/// as a script error. Returns "updated".
+#[cfg(any(target_os = "macos", test))]
+fn contact_update_script(native_id: &str, content: &ContactContent) -> String {
+    format!(
+        r#"with timeout of 120 seconds
+  tell application "Contacts"
+    try
+      set p to first person whose id is "{native_id}"
+    on error
+      return "{sentinel}"
+    end try
+    set first name of p to "{name}"
+    set last name of p to ""
+    set organization of p to "{org}"
+    set job title of p to "{title}"
+    delete every phone of p
+    repeat with ph in {phones}
+      make new phone at end of phones of p with properties {{label:"mobile", value:ph}}
+    end repeat
+    delete every email of p
+    repeat with em in {emails}
+      make new email at end of emails of p with properties {{label:"home", value:em}}
+    end repeat
+    save
+    return "updated"
+  end tell
+end timeout"#,
+        native_id = applescript_escape(native_id),
+        sentinel = CONTACT_NOT_FOUND_SENTINEL,
+        name = applescript_escape(&content.display_name),
+        org = applescript_escape(&content.organization),
+        title = applescript_escape(&content.job_title),
+        phones = applescript_string_list(&content.phones),
+        emails = applescript_string_list(&content.emails),
+    )
+}
+
+/// AppleScript for deleting one card (MCL-5).
+/// Best-effort — the MCL-0 probe verified only that an
+/// AppleScript delete works (0.187 s, card gone on
+/// re-query); the exact form here (`delete p` + `save`)
+/// follows the Contacts dictionary and window
+/// validation on a real Mac is the proof. The lookup is
+/// the only `try`: a miss returns the sentinel, a
+/// delete failure propagates as a script error.
+/// Returns "deleted".
+#[cfg(any(target_os = "macos", test))]
+fn contact_delete_script(native_id: &str) -> String {
+    format!(
+        r#"with timeout of 120 seconds
+  tell application "Contacts"
+    try
+      set p to first person whose id is "{native_id}"
+    on error
+      return "{sentinel}"
+    end try
+    delete p
+    save
+    return "deleted"
+  end tell
+end timeout"#,
+        native_id = applescript_escape(native_id),
+        sentinel = CONTACT_NOT_FOUND_SENTINEL,
+    )
+}
+
+/// AppleScript for reading one card's writable content
+/// (MCL-5): the five fields the update conflict check
+/// compares. Same field extraction as the dump script,
+/// one card only — no addresses / birthday (they are
+/// not writable fields, and the hash must not see
+/// them). A miss returns the sentinel; the caller maps
+/// it to `Ok(None)`.
+#[cfg(any(target_os = "macos", test))]
+fn contact_content_script(native_id: &str) -> String {
+    format!(
+        r#"with timeout of 120 seconds
+  tell application "Contacts"
+    try
+      set p to first person whose id is "{native_id}"
+    on error
+      return "{sentinel}"
+    end try
+    set pname to (name of p as string)
+    set orgVal to organization of p
+    if orgVal is missing value then
+      set orgVal to ""
+    else
+      set orgVal to (orgVal as string)
+    end if
+    set titleVal to job title of p
+    if titleVal is missing value then
+      set titleVal to ""
+    else
+      set titleVal to (titleVal as string)
+    end if
+    set phoneVals to ""
+    repeat with ph in phones of p
+      set phoneVals to phoneVals & (value of ph as string) & ","
+    end repeat
+    set emailVals to ""
+    repeat with em in emails of p
+      set emailVals to emailVals & (value of em as string) & ","
+    end repeat
+    return pname & (character id 31) & orgVal & (character id 31) & titleVal & (character id 31) & phoneVals & (character id 31) & emailVals
+  end tell
+end timeout"#,
+        native_id = applescript_escape(native_id),
+        sentinel = CONTACT_NOT_FOUND_SENTINEL,
+    )
+}
+
+/// Parse one single-card content line: five fields
+/// separated by ASCII 31, in the order display name,
+/// organization, job title, phones (comma-joined),
+/// emails (comma-joined). `None` when the line does
+/// not have exactly five fields (the dump parser's
+/// malformed-line rule). The sentinel is NOT parsed
+/// here — the caller checks for it first.
+pub fn parse_contact_content_line(text: &str) -> Option<ContactContent> {
+    let line = text.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let fields: Vec<&str> = line.split('\u{1f}').collect();
+    if fields.len() != 5 {
+        return None;
+    }
+    let phones: Vec<String> = fields[3]
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let emails: Vec<String> = fields[4]
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    Some(ContactContent {
+        display_name: fields[0].to_string(),
+        organization: fields[1].to_string(),
+        job_title: fields[2].to_string(),
+        phones,
+        emails,
+    })
 }
 
 /// Hard cap on one `osascript` invocation (the
@@ -510,6 +854,66 @@ impl ContactsSource for AppleScriptContactsSource {
         let views = parse_contacts_dump(&dump);
         Ok(views.into_iter().skip(offset).take(limit).collect())
     }
+
+    fn contact_content(
+        &self,
+        native_id: &str,
+    ) -> Result<Option<ContactContent>, ContactsError> {
+        let out = Self::run_script(&contact_content_script(native_id))?;
+        let trimmed = out.trim();
+        if trimmed == CONTACT_NOT_FOUND_SENTINEL {
+            return Ok(None);
+        }
+        match parse_contact_content_line(trimmed) {
+            Some(content) => Ok(Some(content)),
+            None => Err(ContactsError::Upstream(
+                "Contacts card read returned an unexpected shape".to_string(),
+            )),
+        }
+    }
+
+    fn create_contact(&self, content: &ContactContent) -> Result<String, ContactsError> {
+        let out = Self::run_script(&contact_create_script(content))?;
+        let native_id = out.trim().to_string();
+        if native_id.is_empty() {
+            return Err(ContactsError::Upstream(
+                "Contacts create returned no card id".to_string(),
+            ));
+        }
+        Ok(native_id)
+    }
+
+    fn update_contact(
+        &self,
+        native_id: &str,
+        content: &ContactContent,
+    ) -> Result<(), ContactsError> {
+        let out = Self::run_script(&contact_update_script(native_id, content))?;
+        let trimmed = out.trim();
+        if trimmed == CONTACT_NOT_FOUND_SENTINEL {
+            return Err(ContactsError::NotFound("unknown contact"));
+        }
+        if trimmed != "updated" {
+            return Err(ContactsError::Upstream(
+                "Contacts update returned an unexpected result".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn delete_contact(&self, native_id: &str) -> Result<(), ContactsError> {
+        let out = Self::run_script(&contact_delete_script(native_id))?;
+        let trimmed = out.trim();
+        if trimmed == CONTACT_NOT_FOUND_SENTINEL {
+            return Err(ContactsError::NotFound("unknown contact"));
+        }
+        if trimmed != "deleted" {
+            return Err(ContactsError::Upstream(
+                "Contacts delete returned an unexpected result".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -596,6 +1000,164 @@ mod tests {
             script_secs >= 120,
             "script timeout ({script_secs}s) must cover the gateway cap (120s)"
         );
+    }
+
+    #[test]
+    fn write_scripts_are_write_only_and_save() {
+        // MCL-5: the write scripts may only do their
+        // one write (+ the single-card read for the
+        // conflict check). No notes, no vCard export,
+        // no images, no urls, no social profiles — and
+        // nothing that reads messages (the imessage
+        // guard-test precedent). Every mutation ends in
+        // `save`: Contacts AppleScript changes are not
+        // persisted without it.
+        let content = ContactContent::normalized(
+            "Ada Lovelace",
+            "Analytical Engines",
+            "Mathematician",
+            &["+15550101001".to_string()],
+            &["ada@mock.invalid".to_string()],
+        );
+        let create = contact_create_script(&content);
+        assert!(create.contains("make new person"), "must create a person");
+        assert!(create.contains("first name:"), "must set the first name");
+        assert!(create.contains("make new phone"), "must add phones");
+        assert!(create.contains("make new email"), "must add emails");
+        assert!(create.contains("\n    save\n"), "must save");
+        assert!(
+            create.contains("return (id of newPerson as string)"),
+            "must return the new id"
+        );
+        let update = contact_update_script("person-a", &content);
+        assert!(
+            update.contains("first person whose id is"),
+            "must address one card by id"
+        );
+        assert!(
+            update.contains(CONTACT_NOT_FOUND_SENTINEL),
+            "a lookup miss must return the sentinel"
+        );
+        assert!(update.contains("delete every phone"), "must clear phones");
+        assert!(update.contains("delete every email"), "must clear emails");
+        assert!(update.contains("set last name of p to \"\""), "must clear a stale split");
+        assert!(update.contains("\n    save\n"), "must save");
+        assert!(update.contains("return \"updated\""), "must confirm the update");
+        let delete = contact_delete_script("person-a");
+        assert!(delete.contains("delete p"), "must delete the card");
+        assert!(
+            delete.contains(CONTACT_NOT_FOUND_SENTINEL),
+            "a lookup miss must return the sentinel"
+        );
+        assert!(delete.contains("\n    save\n"), "must save");
+        assert!(delete.contains("return \"deleted\""), "must confirm the delete");
+        let read = contact_content_script("person-a");
+        assert!(read.contains("name of p"), "must read the name");
+        assert!(read.contains("organization of p"), "must read the organization");
+        assert!(read.contains("job title of p"), "must read the job title");
+        assert!(read.contains("phones of p"), "must read phones");
+        assert!(read.contains("emails of p"), "must read emails");
+        assert!(
+            read.contains(CONTACT_NOT_FOUND_SENTINEL),
+            "a lookup miss must return the sentinel"
+        );
+        assert!(!read.contains("save"), "the read must not write");
+        for (name, script) in [
+            ("create", &create),
+            ("update", &update),
+            ("delete", &delete),
+            ("content", &read),
+        ] {
+            for forbidden in [
+                "note of",
+                "vcard",
+                "image of",
+                "urls of",
+                "social profile",
+                "messages of",
+                "content of",
+            ] {
+                assert!(
+                    !script.to_lowercase().contains(forbidden),
+                    "{name} script must never ask for {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn write_scripts_have_no_single_line_if_else() {
+        // The MCL-2 -2741 lesson: every `else` must sit
+        // on its own line. The create / update / delete
+        // scripts have no `if` at all; the content script
+        // has the dump's two missing-value guards.
+        let content = ContactContent::normalized("Ada", "", "", &[], &[]);
+        for script in [
+            contact_create_script(&content),
+            contact_update_script("person-a", &content),
+            contact_delete_script("person-a"),
+            contact_content_script("person-a"),
+        ] {
+            for (i, line) in script.lines().enumerate() {
+                assert!(
+                    !(line.contains("then") && line.contains("else")),
+                    "line {} is a single-line if-then-else: {line}",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn write_scripts_timeout_covers_gateway_cap() {
+        // Same 120 s rule as the dump: the script's own
+        // `with timeout` must cover the gateway cap, or
+        // a slow card fails inside AppleScript (-1712)
+        // instead of surfacing the gateway's `Timeout`.
+        let content = ContactContent::normalized("Ada", "", "", &[], &[]);
+        for script in [
+            contact_create_script(&content),
+            contact_update_script("person-a", &content),
+            contact_delete_script("person-a"),
+            contact_content_script("person-a"),
+        ] {
+            assert!(
+                script.contains("with timeout of 120 seconds"),
+                "script must set a 120 s timeout: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn applescript_escape_neutralizes_control_characters() {
+        assert_eq!(applescript_escape("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(applescript_escape("a\nb\rc\td"), "a\\nb\\rc\\td");
+        assert_eq!(applescript_escape("a\u{1}b"), "a b");
+        // A value carrying a quote can never break out
+        // of its double quotes in the built script.
+        let content = ContactContent::normalized("Ada \"L\" Lovelace", "", "", &[], &[]);
+        let script = contact_create_script(&content);
+        assert!(script.contains("first name:\"Ada \\\"L\\\" Lovelace\""));
+    }
+
+    #[test]
+    fn content_line_parsing_reads_five_fields() {
+        let line = "Ada Lovelace\u{1f}Analytical Engines\u{1f}Mathematician\u{1f}+15550101001,+15550101002,\u{1f}ada@mock.invalid,\n";
+        let content = parse_contact_content_line(line).expect("five fields must parse");
+        assert_eq!(content.display_name, "Ada Lovelace");
+        assert_eq!(content.organization, "Analytical Engines");
+        assert_eq!(content.job_title, "Mathematician");
+        assert_eq!(content.phones, vec!["+15550101001", "+15550101002"]);
+        assert_eq!(content.emails, vec!["ada@mock.invalid"]);
+        // Minimal card: empty text, no phones / emails.
+        let minimal = parse_contact_content_line("Bob\u{1f}\u{1f}\u{1f}\u{1f}").expect("must parse");
+        assert_eq!(minimal.display_name, "Bob");
+        assert!(minimal.phones.is_empty());
+        assert!(minimal.emails.is_empty());
+        // Wrong field count or an empty line is not a card.
+        assert!(parse_contact_content_line("Ada\u{1f}Org").is_none());
+        assert!(parse_contact_content_line("").is_none());
+        assert!(parse_contact_content_line("   ").is_none());
     }
 
     #[test]

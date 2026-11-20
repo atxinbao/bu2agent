@@ -86,6 +86,24 @@ fn invalid(detail: &str) -> UnifiedError {
     }
 }
 
+/// Decode one invoke-transport string arg as a JSON
+/// array of strings (the mail.send `to` shape): the
+/// invoke transport only carries string args, so list
+/// values arrive as JSON array strings. A missing arg
+/// or a non-array value is an invalid-input error, not
+/// a silent empty list.
+fn decode_string_list(
+    args: &HashMap<String, String>,
+    tool: &str,
+    field: &str,
+) -> std::result::Result<Vec<String>, UnifiedError> {
+    let raw = args
+        .get(field)
+        .ok_or_else(|| invalid(&format!("{tool} approval requires {field}")))?;
+    serde_json::from_str(raw)
+        .map_err(|_| invalid(&format!("{tool} approval {field} must be a JSON array of strings")))
+}
+
 #[derive(Debug, Serialize)]
 struct ApprovalRequestDto {
     tool: String,
@@ -139,6 +157,23 @@ struct ApprovalRequestDto {
     note_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     base_body_hash: Option<String>,
+    /// MCL-5: the contacts write presentation. The
+    /// server recomputes the contact digests from these
+    /// fields; a client hash is never trusted. `phones`
+    /// / `emails` arrive as JSON array strings on the
+    /// invoke transport (the mail.send `to` shape).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contact_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phones: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    emails: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,7 +249,7 @@ impl AgentClient {
             return Err(invalid("unknown tool").into());
         };
         self.post_approval(
-            &ApprovalRequestDto { tool: tool.to_string(), path: None, content_base64: None, append: None, to: None, subject: None, body: None, calendar_id: None, title: None, start_ms: None, end_ms: None, all_day: None, location: None, notes: None, native_id: None, folder: None, name: None, note_id: None, base_body_hash: None },
+            &ApprovalRequestDto { tool: tool.to_string(), path: None, content_base64: None, append: None, to: None, subject: None, body: None, calendar_id: None, title: None, start_ms: None, end_ms: None, all_day: None, location: None, notes: None, native_id: None, folder: None, name: None, note_id: None, base_body_hash: None, contact_id: None, display_name: None, organization: None, job_title: None, phones: None, emails: None },
             requires,
         )
     }
@@ -258,6 +293,12 @@ impl AgentClient {
                     name: None,
                     note_id: None,
                     base_body_hash: None,
+                    contact_id: None,
+                    display_name: None,
+                    organization: None,
+                    job_title: None,
+                    phones: None,
+                    emails: None,
                 }
             }
             "fs.delete" => {
@@ -283,6 +324,12 @@ impl AgentClient {
                     name: None,
                     note_id: None,
                     base_body_hash: None,
+                    contact_id: None,
+                    display_name: None,
+                    organization: None,
+                    job_title: None,
+                    phones: None,
+                    emails: None,
                 }
             }
             // D1-6b-1: a mail send approval binds the exact
@@ -326,6 +373,12 @@ impl AgentClient {
                     name: None,
                     note_id: None,
                     base_body_hash: None,
+                    contact_id: None,
+                    display_name: None,
+                    organization: None,
+                    job_title: None,
+                    phones: None,
+                    emails: None,
                 }
             }
             // D1-6b-2: a calendar create approval binds the
@@ -383,6 +436,12 @@ impl AgentClient {
                     name: None,
                     note_id: None,
                     base_body_hash: None,
+                    contact_id: None,
+                    display_name: None,
+                    organization: None,
+                    job_title: None,
+                    phones: None,
+                    emails: None,
                 }
             }
             // D1-6b-3: a mail delete approval binds the
@@ -415,6 +474,12 @@ impl AgentClient {
                     name: None,
                     note_id: None,
                     base_body_hash: None,
+                    contact_id: None,
+                    display_name: None,
+                    organization: None,
+                    job_title: None,
+                    phones: None,
+                    emails: None,
                 }
             }
             // D1-6b-4: a note create approval binds the
@@ -454,6 +519,12 @@ impl AgentClient {
                     name: Some(name.clone()),
                     note_id: None,
                     base_body_hash: None,
+                    contact_id: None,
+                    display_name: None,
+                    organization: None,
+                    job_title: None,
+                    phones: None,
+                    emails: None,
                 }
             }
             // D1-6b-4: a note append approval binds the
@@ -495,6 +566,12 @@ impl AgentClient {
                     name: None,
                     note_id: Some(note_id.clone()),
                     base_body_hash: Some(base_body_hash.clone()),
+                    contact_id: None,
+                    display_name: None,
+                    organization: None,
+                    job_title: None,
+                    phones: None,
+                    emails: None,
                 }
             }
             // D1-6b-4: a note delete approval binds the
@@ -526,6 +603,141 @@ impl AgentClient {
                     name: None,
                     note_id: Some(note_id.clone()),
                     base_body_hash: None,
+                    contact_id: None,
+                    display_name: None,
+                    organization: None,
+                    job_title: None,
+                    phones: None,
+                    emails: None,
+                }
+            }
+            // MCL-5: a contacts create approval binds the
+            // exact content (Q-MCL-22). `phones` /
+            // `emails` arrive as JSON array strings (the
+            // mail.send `to` shape); the server
+            // recomputes the digest from the decoded
+            // values, never from a client hash.
+            "contacts.create" => {
+                let args = args.ok_or_else(|| {
+                    invalid("contacts.create approval requires display_name, phones and emails")
+                })?;
+                let display_name = args
+                    .get("display_name")
+                    .ok_or_else(|| invalid("contacts.create approval requires display_name"))?;
+                let phones = decode_string_list(args, "contacts.create", "phones")?;
+                let emails = decode_string_list(args, "contacts.create", "emails")?;
+                ApprovalRequestDto {
+                    tool: tool.to_string(),
+                    path: None,
+                    content_base64: None,
+                    append: None,
+                    to: None,
+                    subject: None,
+                    body: None,
+                    calendar_id: None,
+                    title: None,
+                    start_ms: None,
+                    end_ms: None,
+                    all_day: None,
+                    location: None,
+                    notes: None,
+                    native_id: None,
+                    folder: None,
+                    name: None,
+                    note_id: None,
+                    base_body_hash: None,
+                    contact_id: None,
+                    display_name: Some(display_name.clone()),
+                    organization: Some(args.get("organization").cloned().unwrap_or_default()),
+                    job_title: Some(args.get("job_title").cloned().unwrap_or_default()),
+                    phones: Some(phones),
+                    emails: Some(emails),
+                }
+            }
+            // MCL-5: a contacts update approval binds the
+            // contact id and the exact new content
+            // (Q-MCL-22). The base hash is NOT part of
+            // the digest (a retry with a fresh base and
+            // the same content still matches); the
+            // server recomputes the digest from these
+            // fields, never from a client hash.
+            "contacts.update" => {
+                let args = args.ok_or_else(|| {
+                    invalid("contacts.update approval requires contact_id, display_name, phones and emails")
+                })?;
+                let contact_id = args
+                    .get("contact_id")
+                    .ok_or_else(|| invalid("contacts.update approval requires contact_id"))?;
+                let display_name = args
+                    .get("display_name")
+                    .ok_or_else(|| invalid("contacts.update approval requires display_name"))?;
+                let phones = decode_string_list(args, "contacts.update", "phones")?;
+                let emails = decode_string_list(args, "contacts.update", "emails")?;
+                ApprovalRequestDto {
+                    tool: tool.to_string(),
+                    path: None,
+                    content_base64: None,
+                    append: None,
+                    to: None,
+                    subject: None,
+                    body: None,
+                    calendar_id: None,
+                    title: None,
+                    start_ms: None,
+                    end_ms: None,
+                    all_day: None,
+                    location: None,
+                    notes: None,
+                    native_id: None,
+                    folder: None,
+                    name: None,
+                    note_id: None,
+                    base_body_hash: None,
+                    contact_id: Some(contact_id.clone()),
+                    display_name: Some(display_name.clone()),
+                    organization: Some(args.get("organization").cloned().unwrap_or_default()),
+                    job_title: Some(args.get("job_title").cloned().unwrap_or_default()),
+                    phones: Some(phones),
+                    emails: Some(emails),
+                }
+            }
+            // MCL-5: a contacts delete approval binds the
+            // contact id (Q-MCL-22, the notes.delete
+            // shape — the local id, not the native id).
+            // The server recomputes the digest from it,
+            // never from a client hash.
+            "contacts.delete" => {
+                let args = args
+                    .ok_or_else(|| invalid("contacts.delete approval requires contact_id"))?;
+                let contact_id = args
+                    .get("contact_id")
+                    .ok_or_else(|| invalid("contacts.delete approval requires contact_id"))?;
+                ApprovalRequestDto {
+                    tool: tool.to_string(),
+                    path: None,
+                    content_base64: None,
+                    append: None,
+                    to: None,
+                    subject: None,
+                    body: None,
+                    calendar_id: None,
+                    title: None,
+                    start_ms: None,
+                    end_ms: None,
+                    all_day: None,
+                    location: None,
+                    notes: None,
+                    native_id: None,
+                    folder: None,
+                    name: None,
+                    note_id: None,
+                    base_body_hash: None,
+                    contact_id: Some(contact_id.clone()),
+                    display_name: None,
+                    organization: None,
+                    job_title: None,
+                    phones: None,
+                    emails: None,
                 }
             }
             _ => {

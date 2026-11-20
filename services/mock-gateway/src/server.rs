@@ -8075,6 +8075,20 @@ pub fn app(state: AppState) -> Router {
         .route("/api/contacts", get(crate::routes_contacts::contacts_list))
         .route("/api/contacts/search", get(crate::routes_contacts::contacts_search))
         .route("/api/contacts/{id}", get(crate::routes_contacts::contacts_get))
+        // MCL-5: contacts write (create / update /
+        // delete). Digest-bound writes, the 6b-1 send
+        // order; the delete is a tombstone write (POST,
+        // not HTTP DELETE — the memories-delete
+        // precedent).
+        .route("/api/contacts/create", post(crate::routes_contacts::contacts_create))
+        .route(
+            "/api/contacts/{id}/update",
+            post(crate::routes_contacts::contacts_update),
+        )
+        .route(
+            "/api/contacts/{id}/delete",
+            post(crate::routes_contacts::contacts_delete),
+        )
         // MCL-3 shell route (S-1): the shell acquires
         // the fix itself and POSTs it with the startup
         // token (fact recording only — no Effect, no

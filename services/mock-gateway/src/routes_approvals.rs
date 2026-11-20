@@ -162,6 +162,23 @@ pub(crate) struct ApprovalRequestDto {
     name: Option<String>,
     note_id: Option<String>,
     base_body_hash: Option<String>,
+    /// MCL-5 (plan §6): the contacts create / update /
+    /// delete presentation. The server recomputes the
+    /// contact digests from these fields, never from a
+    /// client hash — the approval binds the exact card
+    /// write, not the bare ability to write contacts.
+    /// `display_name` (+ `organization` / `job_title` /
+    /// `phones` / `emails`) binds a create; the same
+    /// fields with `contact_id` bind an update;
+    /// `contact_id` alone binds a delete. `phones` /
+    /// `emails` arrive as JSON arrays (the mail.send
+    /// `to` precedent).
+    contact_id: Option<String>,
+    display_name: Option<String>,
+    organization: Option<String>,
+    job_title: Option<String>,
+    phones: Option<Vec<String>>,
+    emails: Option<Vec<String>>,
     /// P3-C (§7): a client-presented Worker command spec.
     /// Never trusted: the handler recomputes the spec from
     /// the raw presentation below and rejects a mismatch.
@@ -535,6 +552,136 @@ pub(crate) async fn approval_request(
                     return bad_request("notes.delete approval requires non-empty note_id");
                 }
                 Some(crate::operation_binding::note_delete_digest(note_id))
+            }
+        }
+        "contacts.create" => {
+            // MCL-5 (plan §6): when the display name is
+            // presented, the digest is computed here from
+            // the normalized fields — the same inputs the
+            // create route recomputes, so the two digests
+            // match. When all five fields are absent the
+            // request stays tool-only (the mail.send
+            // precedent): a tool-only record can never
+            // authorize the real create — the create route
+            // rejects a missing digest with 403
+            // `approval_binding_mismatch`. A present-but-
+            // empty display name is a client error (a
+            // card with an empty name is not a card);
+            // phones / emails / organization / job title
+            // are optional (a card with just a name is
+            // valid). No planned Effect is created here
+            // (the `worker.run` precedent): the create
+            // route plans its own Effect on its write
+            // Execution (Q-D1-6b-23) and binds this
+            // approval to it at consume time.
+            if req.display_name.is_none()
+                && req.organization.is_none()
+                && req.job_title.is_none()
+                && req.phones.is_none()
+                && req.emails.is_none()
+            {
+                None
+            } else {
+                let Some(display_name) = req.display_name.as_deref() else {
+                    return bad_request(
+                        "contacts.create approval requires display_name",
+                    );
+                };
+                if display_name.trim().is_empty() {
+                    return bad_request(
+                        "contacts.create approval requires non-empty display_name",
+                    );
+                }
+                let content = crate::contacts_source::ContactContent::normalized(
+                    display_name,
+                    req.organization.as_deref().unwrap_or(""),
+                    req.job_title.as_deref().unwrap_or(""),
+                    req.phones.as_deref().unwrap_or(&[]),
+                    req.emails.as_deref().unwrap_or(&[]),
+                );
+                Some(crate::operation_binding::contact_create_digest(
+                    &content.display_name,
+                    &content.organization,
+                    &content.job_title,
+                    &content.phones,
+                    &content.emails,
+                ))
+            }
+        }
+        "contacts.update" => {
+            // MCL-5 (plan §6): when the contact id +
+            // display name are presented, the digest is
+            // computed here from the normalized fields —
+            // the same inputs the update route recomputes,
+            // so the two digests match. The base content
+            // hash is NOT in the digest: it is a
+            // concurrency guard, not part of the approved
+            // content, so a retry with a fresh base and
+            // the same unconsumed approval still matches.
+            // When all six fields are absent the request
+            // stays tool-only (the mail.send precedent);
+            // a partial presentation is a client error.
+            // No planned Effect is created here (the
+            // `worker.run` precedent).
+            if req.contact_id.is_none()
+                && req.display_name.is_none()
+                && req.organization.is_none()
+                && req.job_title.is_none()
+                && req.phones.is_none()
+                && req.emails.is_none()
+            {
+                None
+            } else {
+                let (Some(contact_id), Some(display_name)) =
+                    (req.contact_id.as_deref(), req.display_name.as_deref())
+                else {
+                    return bad_request(
+                        "contacts.update approval requires contact_id and display_name",
+                    );
+                };
+                if contact_id.is_empty() || display_name.trim().is_empty() {
+                    return bad_request(
+                        "contacts.update approval requires non-empty contact_id and display_name",
+                    );
+                }
+                let content = crate::contacts_source::ContactContent::normalized(
+                    display_name,
+                    req.organization.as_deref().unwrap_or(""),
+                    req.job_title.as_deref().unwrap_or(""),
+                    req.phones.as_deref().unwrap_or(&[]),
+                    req.emails.as_deref().unwrap_or(&[]),
+                );
+                Some(crate::operation_binding::contact_update_digest(
+                    contact_id,
+                    &content.display_name,
+                    &content.organization,
+                    &content.job_title,
+                    &content.phones,
+                    &content.emails,
+                ))
+            }
+        }
+        "contacts.delete" => {
+            // MCL-5 (plan §6): when the contact id is
+            // presented, the digest is computed here from
+            // it — the same id the delete route resolves
+            // its path id to, so the two digests match.
+            // When it is absent the request stays
+            // tool-only (the mail.send precedent): a
+            // tool-only record can never authorize the
+            // real delete. An empty id is a client error.
+            // No planned Effect is created here (the
+            // `worker.run` precedent).
+            if req.contact_id.is_none() {
+                None
+            } else {
+                let Some(contact_id) = req.contact_id.as_deref() else {
+                    return bad_request("contacts.delete approval requires contact_id");
+                };
+                if contact_id.is_empty() {
+                    return bad_request("contacts.delete approval requires non-empty contact_id");
+                }
+                Some(crate::operation_binding::contact_delete_digest(contact_id))
             }
         }
         "worker.run" => {

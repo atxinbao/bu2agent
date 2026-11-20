@@ -144,7 +144,7 @@ pub fn start_stream(stream_id: &str, turn_id: &str, text: &str) -> Vec<Subscript
 pub fn tool_requires_approval(name: &str) -> Option<bool> {
     match name {
         "fs.list" | "fs.read" | "echo" | "notes.list" | "mail.list" | "email.threads" | "email.message" | "imessage.threads" | "contacts.search" | "location.current" | "code.search" | "git.read" | "worker.wait" => Some(false),
-        "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "fs.export" | "notes.create" | "notes.append" | "notes.delete" | "mail.send" | "mail.delete" | "calendar.create" | "imessage.send" | "reminders.set_completed" | "worker.run" => Some(true),
+        "fs.write" | "fs.delete" | "fs.rename" | "fs.mkdir" | "fs.export" | "notes.create" | "notes.append" | "notes.delete" | "mail.send" | "mail.delete" | "calendar.create" | "imessage.send" | "contacts.create" | "contacts.update" | "contacts.delete" | "reminders.set_completed" | "worker.run" => Some(true),
         _ => None,
     }
 }
@@ -279,6 +279,13 @@ mod tests {
         assert_eq!(tool_requires_approval("imessage.threads"), Some(false));
         // MCL-2: the contacts search is a read, no approval.
         assert_eq!(tool_requires_approval("contacts.search"), Some(false));
+        // MCL-5: the contacts writes are approval-gated
+        // like mail.send / imessage.send (digest-bound
+        // writes, Q-MCL-22/23). No loop registration:
+        // write tools never enter the loop (Q-MCL-24/25).
+        assert_eq!(tool_requires_approval("contacts.create"), Some(true));
+        assert_eq!(tool_requires_approval("contacts.update"), Some(true));
+        assert_eq!(tool_requires_approval("contacts.delete"), Some(true));
         // MCL-3: the current-location read is a read, no
         // approval (it reads the latest recorded row, never
         // a live fix — Q-MCL-18).

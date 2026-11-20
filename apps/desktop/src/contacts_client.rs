@@ -1,11 +1,15 @@
 //! Contacts client: Rust shell -> Mock Gateway contacts
-//! surface (MCL-2, read-only).
+//! surface (MCL-2 read, MCL-5 write).
 //!
-//! Read-only: sync, contacts list/get/search. No
-//! approval loop (reads). On non-macOS the gateway
-//! answers 501 and the error surfaces here unchanged;
-//! the packaged Mac app reads real Contacts.app data
-//! via AppleScript.
+//! Reads: sync, contacts list/get/search. No approval
+//! loop (reads). Writes (MCL-5): create / update /
+//! delete — each is a digest-bound approved write
+//! (approval id in `tool_call_id`, client-supplied
+//! idempotency key), executed against Contacts.app
+//! gateway-side via AppleScript. On non-macOS the
+//! gateway answers 501 and the error surfaces here
+//! unchanged; the packaged Mac app writes real
+//! Contacts.app data via AppleScript.
 //!
 //! PII shape (Q-MCL-11): display_name / organization /
 //! job_title and phones / emails are PLAINTEXT here
@@ -29,7 +33,15 @@ use crate::Result;
 /// `deleted: true`. `phones` / `emails` are JSON
 /// arrays on the wire; `addresses_hash` /
 /// `birthday_hash` are sha256 hexes or NULL (NULL is
-/// the existence flag).
+/// the existence flag). `idempotency_key` /
+/// `effect_id` / `policy_version` are NULL on synced
+/// rows (a sync writes no Effect) and set on rows
+/// written by MCL-5; `content_hash` is the sha256 of
+/// the normalized writable content and is computed on
+/// every row, synced or written. The write responses
+/// also carry a `replayed` flag — serde drops it here
+/// (the imessage `SentIMessageRow` precedent); the row
+/// itself is the same either way.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactRow {
     pub contact_id: String,
@@ -42,10 +54,56 @@ pub struct ContactRow {
     pub emails: Vec<String>,
     pub addresses_hash: Option<String>,
     pub birthday_hash: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub effect_id: Option<String>,
+    pub policy_version: Option<String>,
+    pub content_hash: String,
     pub created_ms: i64,
     pub updated_ms: i64,
     pub deleted: bool,
     pub origin_device_id: String,
+}
+
+/// MCL-5: a create request. The idempotency key is
+/// client-supplied and required (Q-MCL-23, the 6b-1
+/// shape); the approval id is the decided digest-bound
+/// approval for this exact content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateContactInput {
+    pub display_name: String,
+    pub organization: String,
+    pub job_title: String,
+    pub phones: Vec<String>,
+    pub emails: Vec<String>,
+    pub idempotency_key: String,
+    pub tool_call_id: Option<String>,
+}
+
+/// MCL-5: an update request — full replace of the
+/// writable fields. `base_content_hash` is the hash of
+/// the card the caller last read; if the live card
+/// moved since, the gateway answers 409
+/// `contact_changed` with the fresh hash and writes
+/// nothing (the 6b-4 U6 shape).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateContactInput {
+    pub display_name: String,
+    pub organization: String,
+    pub job_title: String,
+    pub phones: Vec<String>,
+    pub emails: Vec<String>,
+    pub base_content_hash: String,
+    pub idempotency_key: String,
+    pub tool_call_id: Option<String>,
+}
+
+/// MCL-5: a delete request. The gateway tombstones the
+/// row (`deleted: true`, still listed) — it never
+/// hard-deletes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteContactInput {
+    pub idempotency_key: String,
+    pub tool_call_id: Option<String>,
 }
 
 /// MCL-2: one contacts sync pass (manual trigger only).
@@ -63,10 +121,13 @@ pub struct ContactsSyncResult {
 /// MCL-2: sync runs AppleScript against Contacts.app
 /// gateway-side and can take up to the 30 s osascript
 /// cap, past the shared 10 s read timeout — the same
-/// F-1 failure shape as mail sync (D1-6a). Sync alone
-/// gets a 120 s bound; every other contacts call keeps
-/// the 10 s default so a hung gateway still fails fast
-/// instead of hanging the CLI.
+/// F-1 failure shape as mail sync (D1-6a). MCL-5: the
+/// three writes run AppleScript too (a single-card
+/// write takes ~0.25 s on the probe, but the gateway
+/// cap is 120 s), so they share the long-timeout
+/// client. Sync + writes alone use it; every other
+/// contacts call keeps the 10 s default so a hung
+/// gateway still fails fast instead of hanging the CLI.
 const CONTACTS_SYNC_TIMEOUT_MS: u64 = 120_000;
 
 /// `base_url` must look like `http://127.0.0.1:3001` and pass
@@ -74,10 +135,11 @@ const CONTACTS_SYNC_TIMEOUT_MS: u64 = 120_000;
 #[derive(Debug, Clone)]
 pub struct ContactsClient {
     http: HttpClient,
-    /// Long-timeout client (F-1): sync alone uses it —
-    /// the gateway-side AppleScript enumeration can take
-    /// up to 30 s. All other calls share `http` and its
-    /// 10 s default.
+    /// Long-timeout client (F-1): sync and the three
+    /// MCL-5 writes use it — the gateway-side
+    /// AppleScript enumeration / write can take up to
+    /// 30 s / 120 s. All other calls share `http` and
+    /// its 10 s default.
     sync_http: HttpClient,
 }
 
@@ -154,6 +216,59 @@ impl ContactsClient {
             path.push_str(&extra.join("&"));
         }
         Ok(self.http.get_json(&path)?)
+    }
+
+    /// MCL-5: create a contact in Contacts.app
+    /// (gateway-side AppleScript). Uses the 120 s
+    /// client (the mail-send precedent): the gateway
+    /// cap is 120 s. The approval id is the decided
+    /// digest-bound `contacts.create` approval for this
+    /// exact content; the idempotency key is
+    /// client-supplied and required. A replay of the
+    /// same key + same content returns the original row
+    /// (the gateway marks it `replayed: true`; serde
+    /// drops the flag here).
+    pub fn create_contact(
+        &self,
+        input: &CreateContactInput,
+    ) -> std::result::Result<ContactRow, AgentError> {
+        let body = serde_json::to_string(input)
+            .map_err(|_| crate::http_client::transport_error("cannot encode contact create"))?;
+        Ok(self.sync_http.post_json("/api/contacts/create", &body)?)
+    }
+
+    /// MCL-5: update a contact (full replace of the
+    /// writable fields). `base_content_hash` is the
+    /// hash the caller last read; a 409
+    /// `contact_changed` (with `current_hash`) means
+    /// the live card moved — re-read and retry, the
+    /// approval is not burned.
+    pub fn update_contact(
+        &self,
+        contact_id: &str,
+        input: &UpdateContactInput,
+    ) -> std::result::Result<ContactRow, AgentError> {
+        let body = serde_json::to_string(input)
+            .map_err(|_| crate::http_client::transport_error("cannot encode contact update"))?;
+        Ok(self
+            .sync_http
+            .post_json(&format!("/api/contacts/{contact_id}/update"), &body)?)
+    }
+
+    /// MCL-5: delete a contact. The gateway tombstones
+    /// the row (`deleted: true`, still listed) — it
+    /// never hard-deletes, and a re-delete replays the
+    /// tombstone.
+    pub fn delete_contact(
+        &self,
+        contact_id: &str,
+        input: &DeleteContactInput,
+    ) -> std::result::Result<ContactRow, AgentError> {
+        let body = serde_json::to_string(input)
+            .map_err(|_| crate::http_client::transport_error("cannot encode contact delete"))?;
+        Ok(self
+            .sync_http
+            .post_json(&format!("/api/contacts/{contact_id}/delete"), &body)?)
     }
 }
 

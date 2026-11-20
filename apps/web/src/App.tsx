@@ -731,7 +731,7 @@ export function App() {
         (clients === null ? (
           <p className="empty">Choosing transport…</p>
         ) : (
-          <ContactsView contacts={clients.contacts} />
+          <ContactsView contacts={clients.contacts} agent={clients.agent} />
         ))}
       {tab === "location" &&
         (clients === null ? (

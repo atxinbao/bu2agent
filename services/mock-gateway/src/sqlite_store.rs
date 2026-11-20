@@ -1083,6 +1083,26 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     // deleted = false / updated_ms = 0.
     backfill_column_typed(&tx, "mail_messages", "deleted", "INTEGER")?;
     backfill_column_typed(&tx, "mail_messages", "updated_ms", "INTEGER")?;
+    // MCL-5 additive columns: databases migrated before
+    // MCL-5 have no contacts.idempotency_key /
+    // effect_id / policy_version — the write audit trail
+    // for the create / update / delete routes. Nullable
+    // TEXT backfill (these are strings, so TEXT storage
+    // is correct by construction — the E2-D TEXT lesson
+    // is about INTEGER columns), idempotent, schema
+    // version stays 17 (column backfill, not a v18
+    // migration — the E2-D progress_json precedent).
+    // Old rows read NULL (synced rows never had a
+    // write); the row reader treats NULL as absent.
+    // The UNIQUE index is the replay backstop: one
+    // idempotency key names one write (SQLite UNIQUE
+    // treats NULLs as distinct, so synced rows are
+    // unaffected — the worker_runs.approval_id
+    // precedent).
+    backfill_column(&tx, "contacts", "idempotency_key")?;
+    backfill_column(&tx, "contacts", "effect_id")?;
+    backfill_column(&tx, "contacts", "policy_version")?;
+    ensure_unique_index(&tx, "contacts", "idx_contacts_idempotency", "idempotency_key")?;
     tx.commit().map_err(err)?;
     Ok(())
 }
@@ -2195,6 +2215,15 @@ const REDACTED_PAYLOAD_FIELDS: &[&str] = &[
     // `recorded_ms` — the record time, a timestamp only,
     // like `date_ms`.
     "recorded_ms",
+    // MCL-5 `contact.created` / `contact.updated` /
+    // `contact.deleted` field (added with its reason,
+    // per this helper's own rule):
+    // `content_hash` — sha256 of the canonical JSON of
+    // the written display name / organization / job
+    // title / phones / emails, like `body_hash` for sent
+    // mail: the written version is auditable without
+    // naming anyone.
+    "content_hash",
 ];
 
 pub(crate) fn redact_event_payload(kind: &str, payload_json: &str) -> String {
