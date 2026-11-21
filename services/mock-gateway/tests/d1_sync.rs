@@ -338,8 +338,8 @@ fn seed_60() -> Vec<MessageView> {
 async fn y1_first_sync_imports_inbox_first_50() {
     let h = Harness::serve(seed_60()).await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    // F-1 将模式升级到 v18，新增联系人历史幂等索引。
-    assert_eq!(DB_SCHEMA_VERSION, 18);
+    // F-1 将模式升级到 v18，新增联系人历史幂等索引；C-2 升到 v19，新增定时发送正文表。
+    assert_eq!(DB_SCHEMA_VERSION, 19);
 
     let result = h.sync_ok().await;
     assert_eq!(result["synced_count"], 50);
@@ -451,7 +451,7 @@ async fn y3_rebuild_reassigns_the_same_local_ids() {
     assert_eq!(before.len(), 50);
 
     h.restart_fresh_db().await;
-    // F-1 将模式升级到 v18，新增联系人历史幂等索引。
+    // F-1 将模式升级到 v18，新增联系人历史幂等索引；C-2 升到 v19，新增定时发送正文表。
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
     assert_eq!(h.mail_rows().len(), 0);
     let result = h.sync_ok().await;

@@ -61,8 +61,12 @@ use crate::execution_store::ExecutionFileRecord;
 /// (see SCHEMA_V15); v16 adds the MCL-3
 /// `device_locations` table (see SCHEMA_V16); v17 adds
 /// the MCL-4 `sent_imessages` table (see SCHEMA_V17).
+/// v18 adds the MCL-5 `contact_idempotency` table (see
+/// SCHEMA_V18); v19 adds the D1-3 C-2
+/// `scheduled_imessage_sends` table (see SCHEMA_V19).
 // v18 新增 contacts 历史写入幂等索引。
-pub const DB_SCHEMA_VERSION: i64 = 18;
+// v19 新增 D1-3 C-2 定时发送正文表（Q-C2-01）。
+pub const DB_SCHEMA_VERSION: i64 = 19;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -693,6 +697,34 @@ CREATE TABLE IF NOT EXISTS contact_idempotency (
 );
 ";
 
+/// D1-3 C-2 v19 step: `scheduled_imessage_sends`, the
+/// scheduled-send body store (Q-C2-01). One row per
+/// scheduled `imessage_send` Outbox row, keyed by
+/// `outbox_id`: `thread_id` + `body` (plaintext — the
+/// delivery execute needs the real text; the body lives
+/// NOWHERE else durable after the approval request) +
+/// `body_hash` + `idempotency_key` + `approval_id`.
+/// The body is NEVER copied into any event payload, any
+/// Evidence, or the Outbox row itself (red line 7): the
+/// `outbox.*` events serialize the Outbox row, whose
+/// `payload_summary_json` carries ids + hashes only.
+/// A row is deleted when its Outbox row is delivered
+/// (`sent`); it is RETAINED on failure so a manual
+/// requeue can redeliver (delete-on-sent /
+/// retain-on-failed; stale bodies of never-requeued
+/// failed rows have no cleanup yet — recorded residual).
+const SCHEMA_V19: &str = "
+CREATE TABLE IF NOT EXISTS scheduled_imessage_sends (
+    outbox_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    body_hash TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    approval_id TEXT NOT NULL,
+    created_ms INTEGER NOT NULL
+);
+";
+
 /// MCL-4 v17 step: `sent_imessages` fact table.
 /// `sent_id` is the local `sent-imsg-N` id
 /// (max-suffix + 1 in the record transaction — the
@@ -1031,6 +1063,19 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V18).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '18')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // D1-3 C-2 v19 step: scheduled_imessage_sends table
+    // only. One transaction, v5–v18 style; the table
+    // starts empty — rows arrive only from a scheduled
+    // POST /api/imessage/send (deliver_at_ms present).
+    if version < 19 {
+        tx.execute_batch(SCHEMA_V19).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '19')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -4337,7 +4382,34 @@ pub fn enqueue_outbox_tx(
     execution_id: &str,
     payload_summary_json: &str,
 ) -> Result<OutboxRow, String> {
-    let dedup_key = format!("{execution_id}:local_notification");
+    let (row, _) = enqueue_outbox_kind_tx(
+        tx,
+        execution_id,
+        payload_summary_json,
+        "local_notification",
+        &format!("{execution_id}:local_notification"),
+        None,
+    )?;
+    Ok(row)
+}
+
+/// Enqueue one Outbox row of any kind, one transaction.
+/// The dedup key is the caller's (UNIQUE in the table):
+/// a row with the same key already present is returned
+/// unchanged with `created = false` — no second row, no
+/// second event. The local-notification wrapper above
+/// keeps the D1-3 producer's
+/// `{execution_id}:local_notification` key; C-2 passes
+/// the send's `idempotency_key` so a second schedule
+/// with the same key replays the first row.
+pub fn enqueue_outbox_kind_tx(
+    tx: &rusqlite::Transaction<'_>,
+    execution_id: &str,
+    payload_summary_json: &str,
+    destination_kind: &str,
+    dedup_key: &str,
+    deliver_at_ms: Option<i64>,
+) -> Result<(OutboxRow, bool), String> {
     if let Some(existing) = tx
         .query_row(
             "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE dedup_key = ?1",
@@ -4347,32 +4419,32 @@ pub fn enqueue_outbox_tx(
         .optional()
         .map_err(err)?
     {
-        return Ok(existing);
+        return Ok((existing, false));
     }
     let now = now_ms() as i64;
     let seq = next_seq_for(tx, "outbox", "outbox_id")?;
     let outbox_id = format!("outbox-{seq}");
     tx.execute(
         "INSERT INTO outbox (seq, outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms)
-         VALUES (?1, ?2, ?3, ?4, 'local_notification', 'pending', 0, ?5, ?6, ?6, NULL)",
-        params![seq, outbox_id, execution_id, payload_summary_json, dedup_key, now],
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?7, ?8)",
+        params![seq, outbox_id, execution_id, payload_summary_json, destination_kind, dedup_key, now, deliver_at_ms],
     )
     .map_err(err)?;
     let row = OutboxRow {
         outbox_id: outbox_id.clone(),
         execution_id: execution_id.to_string(),
         payload_summary_json: payload_summary_json.to_string(),
-        destination_kind: "local_notification".to_string(),
+        destination_kind: destination_kind.to_string(),
         status: "pending".to_string(),
         attempts: 0,
-        dedup_key,
+        dedup_key: dedup_key.to_string(),
         created_ms: now,
         updated_at_ms: now,
-        deliver_at_ms: None,
+        deliver_at_ms,
     };
     let payload = serde_json::to_string(&row).map_err(|e| e.to_string())?;
     append_event(tx, "outbox", &outbox_id, "outbox.enqueued", &payload, "unknown", now, 1)?;
-    Ok(row)
+    Ok((row, true))
 }
 
 pub fn enqueue_outbox(
@@ -4551,6 +4623,150 @@ pub fn schedule_outbox(
     append_event(&tx, "outbox", outbox_id, "outbox.rescheduled", &payload, "unknown", now, 1)?;
     tx.commit().map_err(err)?;
     Ok(Some(row))
+}
+
+/// D1-3 C-2 (Q-C2-01): one scheduled-send body row.
+/// No serde derives on purpose — the body must never be
+/// serialized into an event payload, an HTTP response,
+/// or an export; it is read only by the delivery execute
+/// (which hands it straight to the send implementation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledIMessageSendRow {
+    pub outbox_id: String,
+    pub thread_id: String,
+    pub body: String,
+    pub body_hash: String,
+    pub idempotency_key: String,
+    pub approval_id: String,
+    pub created_ms: i64,
+}
+
+fn scheduled_send_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledIMessageSendRow> {
+    Ok(ScheduledIMessageSendRow {
+        outbox_id: row.get(0)?,
+        thread_id: row.get(1)?,
+        body: row.get(2)?,
+        body_hash: row.get(3)?,
+        idempotency_key: row.get(4)?,
+        approval_id: row.get(5)?,
+        created_ms: row.get(6)?,
+    })
+}
+
+const SCHEDULED_SEND_COLS: &str =
+    "outbox_id, thread_id, body, body_hash, idempotency_key, approval_id, created_ms";
+
+fn insert_scheduled_imessage_send_tx(
+    tx: &rusqlite::Transaction<'_>,
+    outbox_id: &str,
+    thread_id: &str,
+    body: &str,
+    body_hash: &str,
+    idempotency_key: &str,
+    approval_id: &str,
+) -> Result<(), String> {
+    let now = now_ms() as i64;
+    tx.execute(
+        &format!(
+            "INSERT INTO scheduled_imessage_sends ({SCHEDULED_SEND_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+        ),
+        params![outbox_id, thread_id, body, body_hash, idempotency_key, approval_id, now],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// One scheduled-send body row by Outbox id, if any.
+pub fn get_scheduled_imessage_send(
+    conn: &Connection,
+    outbox_id: &str,
+) -> Result<Option<ScheduledIMessageSendRow>, String> {
+    conn.query_row(
+        &format!("SELECT {SCHEDULED_SEND_COLS} FROM scheduled_imessage_sends WHERE outbox_id = ?1"),
+        params![outbox_id],
+        scheduled_send_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// Delete one scheduled-send body row (idempotent: a
+/// missing row is a no-op). Called when its Outbox row
+/// reaches `sent` — never on failure (a failed row keeps
+/// its body for a manual requeue).
+pub fn delete_scheduled_imessage_send(
+    conn: &mut Connection,
+    outbox_id: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM scheduled_imessage_sends WHERE outbox_id = ?1",
+        params![outbox_id],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// One Outbox row by dedup key, if any. The schedule
+/// path checks this BEFORE consuming the approval: a
+/// second schedule with the same key replays the first
+/// row (same content) or 409s (different content)
+/// without burning the new approval.
+pub fn get_outbox_by_dedup_key(
+    conn: &Connection,
+    dedup_key: &str,
+) -> Result<Option<OutboxRow>, String> {
+    conn.query_row(
+        "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE dedup_key = ?1",
+        params![dedup_key],
+        outbox_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// D1-3 C-2: enqueue one `imessage_send` Outbox row plus
+/// its body row in ONE transaction. The dedup key is the
+/// send's `idempotency_key`: a row with the same key
+/// already present is returned with `created = false`
+/// (the caller compares `body_hash` for the
+/// conflict/replay decision) — no second row, no second
+/// body row, no second event. The Outbox row's
+/// `payload_summary_json` carries ids + hashes only,
+/// never the body.
+#[allow(clippy::too_many_arguments)]
+pub fn enqueue_scheduled_imessage_send(
+    conn: &mut Connection,
+    execution_id: &str,
+    payload_summary_json: &str,
+    deliver_at_ms: i64,
+    thread_id: &str,
+    body: &str,
+    body_hash: &str,
+    idempotency_key: &str,
+    approval_id: &str,
+) -> Result<(OutboxRow, bool), String> {
+    let tx = conn.transaction().map_err(err)?;
+    let (row, created) = enqueue_outbox_kind_tx(
+        &tx,
+        execution_id,
+        payload_summary_json,
+        "imessage_send",
+        idempotency_key,
+        Some(deliver_at_ms),
+    )?;
+    if created {
+        insert_scheduled_imessage_send_tx(
+            &tx,
+            &row.outbox_id,
+            thread_id,
+            body,
+            body_hash,
+            idempotency_key,
+            approval_id,
+        )?;
+    }
+    tx.commit().map_err(err)?;
+    Ok((row, created))
 }
 
 // --- D1-3: event_cursors + the Outbox consumer ---

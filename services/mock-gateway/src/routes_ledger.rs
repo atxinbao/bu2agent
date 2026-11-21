@@ -997,10 +997,15 @@ pub(crate) async fn outbox_get(
 }
 
 /// D1-3 (plan §4): manual top-up delivery of one Outbox
-/// row through the log sink. A row that is already `sent`
-/// (or `failed`) is returned unchanged — delivery is
-/// idempotent, a repeat call never re-delivers. Unknown id
-/// is 404, same shape as `outbox_get`.
+/// row. A row that is already `sent` (or `failed`) is
+/// returned unchanged — delivery is idempotent, a repeat
+/// call never re-delivers. Unknown id is 404, same shape
+/// as `outbox_get`. D1-3 C-2: the delivery dispatches by
+/// kind (Q-C-04: manual deliver is an immediate
+/// override) — an `imessage_send` row executes the send
+/// NOW through the same internal execute as the row
+/// scan; a `local_notification` row goes through the log
+/// sink, unchanged.
 pub(crate) async fn outbox_deliver(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -1011,6 +1016,36 @@ pub(crate) async fn outbox_deliver(
     let Some(sqlite) = &state.sqlite else {
         return sqlite_not_configured();
     };
+    let row = {
+        let conn = sqlite.lock().expect("sqlite lock");
+        match sqlite_store::get_outbox(&conn, &id) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "unknown outbox item" })),
+                )
+                    .into_response();
+            }
+            Err(_) => return sqlite_error_response(),
+        }
+    };
+    if row.destination_kind == "imessage_send" && row.status == "pending" {
+        // The lock must be released before the execute:
+        // the send takes up to 30 s and takes the lock
+        // itself for its database steps.
+        crate::routes_imessage::deliver_scheduled_imessage_send(&state, &row).await;
+        let conn = sqlite.lock().expect("sqlite lock");
+        return match sqlite_store::get_outbox(&conn, &id) {
+            Ok(Some(row)) => Json(row).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "unknown outbox item" })),
+            )
+                .into_response(),
+            Err(_) => sqlite_error_response(),
+        };
+    }
     let mut conn = sqlite.lock().expect("sqlite lock");
     match sqlite_store::deliver_outbox_via_log_sink(&mut conn, &id) {
         Ok(Some(row)) => Json(row).into_response(),

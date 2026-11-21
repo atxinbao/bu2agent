@@ -2536,8 +2536,7 @@ impl AppState {
     /// D1-3 C-1: the timed-Outbox row scan, run from the
     /// assignment sweeper's 10 s tick — no second
     /// scheduler. Delivers due timed rows
-    /// (`deliver_at_ms <= now`) through the same log sink
-    /// as the event channel; the pending-only guard in
+    /// (`deliver_at_ms <= now`); the pending-only guard in
     /// `set_outbox_status` is the anti-double-delivery
     /// guard, so a row the event channel just delivered
     /// (or a manual deliver just sent) is a no-op here.
@@ -2545,7 +2544,15 @@ impl AppState {
     /// returns 0 — the next tick retries, and no row is
     /// marked failed. A single row's failure never aborts
     /// the pass. Returns the number of rows delivered.
-    pub fn deliver_due_outbox(&self) -> usize {
+    /// D1-3 C-2: the scan dispatches by
+    /// `destination_kind` (the Q-C-11 dispatch table, as
+    /// a match branch): `local_notification` → the log
+    /// sink (unchanged); `imessage_send` → the internal
+    /// scheduled-send execute (async — the AppleScript
+    /// call can take up to 30 s, so this function is
+    /// async and the sweeper awaits it); an unknown kind
+    /// is warned + skipped, never fatal.
+    pub async fn deliver_due_outbox(&self) -> usize {
         if self.sqlite_mode() != StateBackend::Sqlite || self.sqlite_is_broken() {
             return 0;
         }
@@ -2564,13 +2571,29 @@ impl AppState {
         };
         let mut delivered = 0;
         for row in &due {
-            let mut conn = sqlite.lock().expect("sqlite lock");
-            match sqlite_store::deliver_outbox_via_log_sink(&mut conn, &row.outbox_id) {
-                Ok(Some(sent)) if sent.status == "sent" => delivered += 1,
-                Ok(_) => {}
-                Err(detail) => {
+            match row.destination_kind.as_str() {
+                "local_notification" => {
+                    let mut conn = sqlite.lock().expect("sqlite lock");
+                    match sqlite_store::deliver_outbox_via_log_sink(&mut conn, &row.outbox_id) {
+                        Ok(Some(sent)) if sent.status == "sent" => delivered += 1,
+                        Ok(_) => {}
+                        Err(detail) => {
+                            eprintln!(
+                                "warning: D1-3 C-1 due outbox deliver failed for {}: {detail}",
+                                row.outbox_id
+                            );
+                        }
+                    }
+                }
+                "imessage_send" => {
+                    if crate::routes_imessage::deliver_scheduled_imessage_send(self, row).await
+                    {
+                        delivered += 1;
+                    }
+                }
+                other => {
                     eprintln!(
-                        "warning: D1-3 C-1 due outbox deliver failed for {}: {detail}",
+                        "warning: D1-3 C-2 due outbox row {} has unknown destination_kind {other}, skipped",
                         row.outbox_id
                     );
                 }
@@ -8327,7 +8350,9 @@ pub fn spawn_assignment_sweeper(state: AppState) -> tokio::task::JoinHandle<()> 
             // D1-3 C-1: due timed Outbox rows ride the
             // same tick, after the event channel and
             // before due worker runs — no second scheduler.
-            state.deliver_due_outbox();
+            // D1-3 C-2: the due pass is async (a scheduled
+            // send can take up to 30 s in AppleScript).
+            state.deliver_due_outbox().await;
             // E2-D batch 2: due deferred runs start from
             // the same tick — no second scheduler.
             state.start_due_worker_runs().await;

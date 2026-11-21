@@ -478,7 +478,7 @@ fn content_hash_of(row: &Value) -> String {
 async fn w1_create_end_to_end() {
     let h = Harness::serve().await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    assert_eq!(h.schema_version(), 18, "F-1 adds the v18 idempotency index");
+    assert_eq!(h.schema_version(), 19, "C-2 adds the v19 scheduled_imessage_sends table (F-1 added v18)");
     let synced = h.sync().await;
     assert_eq!(synced["synced_count"], 2);
 
@@ -1691,7 +1691,7 @@ async fn f1_v18_migration_is_typed_repeatable_and_does_not_backfill() {
     conn.execute_batch("DROP TABLE contact_idempotency; UPDATE db_meta SET value='17' WHERE key='db_schema_version';").unwrap();
     sqlite_store::apply_migrations(&mut conn).unwrap();
     sqlite_store::apply_migrations(&mut conn).unwrap();
-    assert_eq!(sqlite_store::schema_version(&conn).unwrap(), 18);
+    assert_eq!(sqlite_store::schema_version(&conn).unwrap(), 19);
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM contact_idempotency", [], |r| r.get(0))
         .unwrap();
