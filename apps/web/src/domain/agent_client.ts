@@ -91,6 +91,7 @@ function requiresApproval(tool: string): boolean | undefined {
     case "fs.write":
     case "fs.delete":
     case "mail.send":
+    case "imessage.send":
     case "mail.delete":
     case "calendar.create":
     case "notes.create":
@@ -99,10 +100,7 @@ function requiresApproval(tool: string): boolean | undefined {
     // MCL-5: the contacts write tools are
     // approval-gated like mail.send (digest-bound
     // writes, Q-MCL-22; mirrors the gateway's
-    // Some(true)). NOTE: `imessage.send` is still
-    // missing from this switch (found 2026-11-20 while
-    // diagnosing the paused MCL-4 window round); that
-    // gap belongs to the MCL-4 revisit, not this batch.
+    // Some(true)).
     case "contacts.create":
     case "contacts.update":
     case "contacts.delete":
@@ -188,6 +186,20 @@ export class AgentClient implements AgentGateway {
       }
       body.to = JSON.parse(args.to) as string[];
       body.subject = args.subject;
+      body.body = args.body;
+    } else if (tool === "imessage.send") {
+      // MCL-4 revisit: an iMessage send approval binds
+      // the thread id + body (Q-MCL-22). The server
+      // recomputes the digest from them, never from a
+      // client hash. Both fields must be present and
+      // non-empty (the gateway's two 400s).
+      if (args?.thread_id === undefined || args?.body === undefined) {
+        throw new Error("imessage.send approval requires thread_id and body");
+      }
+      if (args.thread_id === "" || args.body === "") {
+        throw new Error("imessage.send approval requires non-empty thread_id and body");
+      }
+      body.thread_id = args.thread_id;
       body.body = args.body;
     } else if (tool === "calendar.create") {
       // D1-6b-2: a calendar create approval binds the

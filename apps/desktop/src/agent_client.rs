@@ -122,6 +122,11 @@ struct ApprovalRequestDto {
     subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<String>,
+    /// MCL-4: the iMessage send presentation. The server
+    /// recomputes `imessage_send_digest` from the thread
+    /// id + body; a client hash is never trusted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_id: Option<String>,
     /// D1-6b-2: the calendar create presentation. The
     /// server recomputes `calendar_create_digest` from
     /// these fields; a client hash is never trusted.
@@ -249,7 +254,7 @@ impl AgentClient {
             return Err(invalid("unknown tool").into());
         };
         self.post_approval(
-            &ApprovalRequestDto { tool: tool.to_string(), path: None, content_base64: None, append: None, to: None, subject: None, body: None, calendar_id: None, title: None, start_ms: None, end_ms: None, all_day: None, location: None, notes: None, native_id: None, folder: None, name: None, note_id: None, base_body_hash: None, contact_id: None, display_name: None, organization: None, job_title: None, phones: None, emails: None },
+            &ApprovalRequestDto { tool: tool.to_string(), path: None, content_base64: None, append: None, to: None, subject: None, body: None, thread_id: None, calendar_id: None, title: None, start_ms: None, end_ms: None, all_day: None, location: None, notes: None, native_id: None, folder: None, name: None, note_id: None, base_body_hash: None, contact_id: None, display_name: None, organization: None, job_title: None, phones: None, emails: None },
             requires,
         )
     }
@@ -281,6 +286,7 @@ impl AgentClient {
                     to: None,
                     subject: None,
                     body: None,
+                    thread_id: None,
                     calendar_id: None,
                     title: None,
                     start_ms: None,
@@ -312,6 +318,7 @@ impl AgentClient {
                     to: None,
                     subject: None,
                     body: None,
+                    thread_id: None,
                     calendar_id: None,
                     title: None,
                     start_ms: None,
@@ -361,6 +368,59 @@ impl AgentClient {
                     to: Some(to),
                     subject: Some(subject.clone()),
                     body: Some(body.clone()),
+                    thread_id: None,
+                    calendar_id: None,
+                    title: None,
+                    start_ms: None,
+                    end_ms: None,
+                    all_day: None,
+                    location: None,
+                    notes: None,
+                    native_id: None,
+                    folder: None,
+                    name: None,
+                    note_id: None,
+                    base_body_hash: None,
+                    contact_id: None,
+                    display_name: None,
+                    organization: None,
+                    job_title: None,
+                    phones: None,
+                    emails: None,
+                }
+            }
+            // MCL-4 revisit: an iMessage send approval binds
+            // the thread id + body (Q-MCL-22). The server
+            // recomputes `imessage_send_digest` from them,
+            // never from a client hash. Both fields must be
+            // present and non-empty (the gateway's two 400s);
+            // a missing field is a client error here, not a
+            // tool-only request — a tool-only record could
+            // never authorize the real send.
+            "imessage.send" => {
+                let args = args
+                    .ok_or_else(|| invalid("imessage.send approval requires thread_id and body"))?;
+                let (Some(thread_id), Some(body)) = (args.get("thread_id"), args.get("body"))
+                else {
+                    return Err(
+                        invalid("imessage.send approval requires thread_id and body").into(),
+                    );
+                };
+                if thread_id.is_empty() || body.is_empty() {
+                    return Err(invalid(
+                        "imessage.send approval requires non-empty thread_id and body",
+                    )
+                    .into());
+                }
+                ApprovalRequestDto {
+                    tool: tool.to_string(),
+                    path: None,
+                    content_base64: None,
+                    append: None,
+                    to: None,
+                    subject: None,
+                    body: Some(body.clone()),
+                    thread_id: Some(thread_id.clone()),
                     calendar_id: None,
                     title: None,
                     start_ms: None,
@@ -424,6 +484,7 @@ impl AgentClient {
                     to: None,
                     subject: None,
                     body: None,
+                    thread_id: None,
                     calendar_id: Some(calendar_id.clone()),
                     title: Some(title.clone()),
                     start_ms: Some(start_ms),
@@ -462,6 +523,7 @@ impl AgentClient {
                     to: None,
                     subject: None,
                     body: None,
+                    thread_id: None,
                     calendar_id: None,
                     title: None,
                     start_ms: None,
@@ -507,6 +569,7 @@ impl AgentClient {
                     to: None,
                     subject: None,
                     body: Some(body.clone()),
+                    thread_id: None,
                     calendar_id: None,
                     title: None,
                     start_ms: None,
@@ -554,6 +617,7 @@ impl AgentClient {
                     to: None,
                     subject: None,
                     body: Some(body.clone()),
+                    thread_id: None,
                     calendar_id: None,
                     title: None,
                     start_ms: None,
@@ -591,6 +655,7 @@ impl AgentClient {
                     to: None,
                     subject: None,
                     body: None,
+                    thread_id: None,
                     calendar_id: None,
                     title: None,
                     start_ms: None,
@@ -634,6 +699,7 @@ impl AgentClient {
                     to: None,
                     subject: None,
                     body: None,
+                    thread_id: None,
                     calendar_id: None,
                     title: None,
                     start_ms: None,
@@ -681,6 +747,7 @@ impl AgentClient {
                     to: None,
                     subject: None,
                     body: None,
+                    thread_id: None,
                     calendar_id: None,
                     title: None,
                     start_ms: None,
@@ -720,6 +787,7 @@ impl AgentClient {
                     to: None,
                     subject: None,
                     body: None,
+                    thread_id: None,
                     calendar_id: None,
                     title: None,
                     start_ms: None,
@@ -844,6 +912,210 @@ impl AgentClient {
                     other => other,
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// What the capture server observed.
+    struct CapturedRequest {
+        count: usize,
+        body: Option<String>,
+    }
+
+    /// A loopback server that records the requests it
+    /// receives. With `response` it answers the first
+    /// request with a canned 200 JSON body; without it,
+    /// it only counts connections for `wait_ms` and then
+    /// reports — the "no gateway request" proof for
+    /// client-side rejections.
+    fn spawn_capture_server(
+        response: Option<String>,
+        wait_ms: u64,
+    ) -> (u16, mpsc::Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind capture server");
+        let port = listener.local_addr().expect("capture port").port();
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking capture server");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
+            let mut count = 0usize;
+            let mut body: Option<String> = None;
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        count += 1;
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        loop {
+                            match stream.read(&mut chunk) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&chunk[..n]);
+                                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let text = String::from_utf8_lossy(&buf);
+                        let content_len = text.lines().find_map(|line| {
+                            line.strip_prefix("Content-Length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        });
+                        if let Some(len) = content_len {
+                            let head_end =
+                                text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
+                            let mut body_bytes = buf[head_end..].to_vec();
+                            while body_bytes.len() < len {
+                                match stream.read(&mut chunk) {
+                                    Ok(0) => break,
+                                    Ok(n) => body_bytes.extend_from_slice(&chunk[..n]),
+                                    Err(_) => break,
+                                }
+                            }
+                            body = Some(String::from_utf8_lossy(&body_bytes).into_owned());
+                        }
+                        if let Some(response) = &response {
+                            let wire = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                response.len(),
+                                response
+                            );
+                            let _ = stream.write_all(wire.as_bytes());
+                        }
+                        break;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(CapturedRequest { count, body });
+        });
+        (port, rx)
+    }
+
+    fn client_on(port: u16) -> AgentClient {
+        AgentClient::new(&format!("http://127.0.0.1:{port}")).expect("test client")
+    }
+
+    fn args(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn invalid_input(err: AgentError) -> UnifiedError {
+        match err {
+            AgentError::Unified(e) => {
+                assert_eq!(e.code, ErrorCode::InvalidInput);
+                e
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registry_contains_imessage_send() {
+        let registry = ToolRegistry::phase4();
+        let spec = registry
+            .get("imessage.send")
+            .expect("imessage.send registered");
+        assert!(spec.requires_approval);
+        assert_eq!(spec.capability, "imessage");
+        // The sibling read stays approval-free.
+        let threads = registry
+            .get("imessage.threads")
+            .expect("imessage.threads registered");
+        assert!(!threads.requires_approval);
+    }
+
+    #[test]
+    fn imessage_send_approval_rejects_missing_or_empty_fields_without_a_request() {
+        // One capture server for all five client-side
+        // rejections: none of them may reach the gateway.
+        let (port, rx) = spawn_capture_server(None, 500);
+        let client = client_on(port);
+        let cases: Vec<Option<HashMap<String, String>>> = vec![
+            None,
+            Some(args(&[("body", "hello")])),
+            Some(args(&[("thread_id", "thread-1")])),
+            Some(args(&[("thread_id", ""), ("body", "hello")])),
+            Some(args(&[("thread_id", "thread-1"), ("body", "")])),
+        ];
+        for (i, case) in cases.into_iter().enumerate() {
+            let err = client
+                .request_approval_for("imessage.send", case.as_ref())
+                .unwrap_err();
+            let detail = invalid_input(err);
+            assert!(
+                detail
+                    .redacted_detail
+                    .contains("imessage.send approval requires"),
+                "case {i}: {}",
+                detail.redacted_detail
+            );
+        }
+        let captured = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("capture report");
+        assert_eq!(
+            captured.count, 0,
+            "client-side rejections must not hit the gateway"
+        );
+        assert_eq!(captured.body, None);
+    }
+
+    #[test]
+    fn imessage_send_approval_posts_thread_id_and_body() {
+        let canned = r#"{"tool_call_id":"approval-1","requires_approval":true,"status":"pending"}"#
+            .to_string();
+        let (port, rx) = spawn_capture_server(Some(canned), 5_000);
+        let client = client_on(port);
+        let request = client
+            .request_approval_for(
+                "imessage.send",
+                Some(&args(&[("thread_id", "thread-1"), ("body", "r1-test")])),
+            )
+            .expect("valid approval request");
+        assert_eq!(request.tool_call_id.as_deref(), Some("approval-1"));
+        assert!(request.requires_approval);
+        assert_eq!(request.status, "pending");
+        let captured = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("capture report");
+        assert_eq!(captured.count, 1);
+        let body = captured.body.expect("captured request body");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("request body is JSON");
+        assert_eq!(value["tool"], "imessage.send");
+        assert_eq!(value["thread_id"], "thread-1");
+        assert_eq!(value["body"], "r1-test");
+    }
+
+    #[test]
+    fn unknown_tools_still_rejected_before_any_request() {
+        let client = AgentClient::new("http://127.0.0.1:3001").expect("test client");
+        for tool in ["does.not.exist", "imessage.message"] {
+            let err = client.request_approval_for(tool, None).unwrap_err();
+            let detail = invalid_input(err);
+            assert_eq!(detail.redacted_detail, "unknown tool");
+            let err = client.request_approval(tool).unwrap_err();
+            let detail = invalid_input(err);
+            assert_eq!(detail.redacted_detail, "unknown tool");
         }
     }
 }

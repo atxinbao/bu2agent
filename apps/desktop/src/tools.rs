@@ -79,11 +79,14 @@ impl ToolRegistry {
         // writes, Q-MCL-22). This registry is the
         // tool-list surface, not the loop whitelist —
         // MCL adds no loop write tools (Q-MCL-24/25).
-        // NOTE: MCL-4's `imessage.send` is still
-        // missing from this registry (found 2026-11-20
-        // while diagnosing the paused MCL-4 window
-        // round); that gap belongs to the MCL-4 revisit,
-        // not to this batch — do not "fix" it here.
+        // MCL-4 revisit: the iMessage send tool is
+        // approval-gated like mail.send (digest-bound
+        // write, Q-MCL-22); the approval binds the
+        // thread id + body, and the gateway recomputes
+        // the digest (Q-D1-6b-22). This registry is the
+        // tool-list surface, not the loop whitelist —
+        // MCL adds no loop write tools (Q-MCL-24/25).
+        registry.tools.push(ToolSpec { name: "imessage.send".to_string(), requires_approval: true, capability: "imessage".to_string() });
         registry.tools.push(ToolSpec { name: "contacts.create".to_string(), requires_approval: true, capability: "contacts".to_string() });
         registry.tools.push(ToolSpec { name: "contacts.update".to_string(), requires_approval: true, capability: "contacts".to_string() });
         registry.tools.push(ToolSpec { name: "contacts.delete".to_string(), requires_approval: true, capability: "contacts".to_string() });
