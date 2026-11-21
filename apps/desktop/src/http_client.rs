@@ -43,20 +43,59 @@ pub fn gateway_error(status: u16) -> UnifiedError {
 }
 
 /// Detail for a gateway error response. The body is never
-/// copied wholesale; only the structured `rule` field of a
-/// network-rule denial is appended, so the window can name
-/// the blocking rule (Task 13 window validation: the 403
-/// itself passed, but the rule name never reached the UI).
+/// copied wholesale; only structured machine fields are
+/// appended: the `rule` field of a network-rule denial
+/// (Task 13 window validation: the 403 itself passed, but
+/// the rule name never reached the UI), and — as one group —
+/// a whitelisted `error` machine code with its
+/// `current_hash` (MCL-5 W2: the contacts update conflict
+/// 409 must reach the UI so it can retry with the fresh
+/// base). The code is surfaced only when it is a lowercase
+/// snake machine code (`^[a-z][a-z0-9_]*$`) AND the hash is
+/// a 64-hex sha256; the pair is only meaningful together —
+/// a bare code has no retry base, and surfacing one alone
+/// would change the redaction expectations the existing
+/// tests pin (`{"error":"x","rule":42}` stays redacted).
 fn gateway_error_detail(status: u16, body: &str) -> String {
     let base = format!("mock gateway returned HTTP {status}");
-    let rule = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let rule = parsed
+        .as_ref()
         .and_then(|value| value.get("rule")?.as_str().map(str::to_string))
         .filter(|rule| !rule.is_empty());
-    match rule {
-        Some(rule) => format!("{base} (network rule: {rule})"),
-        None => base,
+    let conflict = parsed.as_ref().and_then(|value| {
+        let error = value.get("error")?.as_str()?;
+        let hash = value.get("current_hash")?.as_str()?;
+        if is_machine_code(error) && is_sha256_hex(hash) {
+            Some(format!("{error}; current_hash={hash}"))
+        } else {
+            None
+        }
+    });
+    let mut detail = base;
+    if let Some(rule) = rule {
+        detail.push_str(&format!(" (network rule: {rule})"));
     }
+    if let Some(conflict) = conflict {
+        detail.push_str(&format!(" ({conflict})"));
+    }
+    detail
+}
+
+fn is_machine_code(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn gateway_error_with_body(status: u16, body: &str) -> UnifiedError {
@@ -315,5 +354,38 @@ mod tests {
         // Malformed body degrades to the plain status form.
         let detail = gateway_error_detail(403, "not json");
         assert_eq!(detail, "mock gateway returned HTTP 403");
+    }
+
+    #[test]
+    fn conflict_detail_surfaces_machine_code_and_hash() {
+        // MCL-5 W2: the contacts update conflict 409 must
+        // reach the UI as a machine code + fresh base hash.
+        let hash = "0123456789abcdef".repeat(4);
+        assert_eq!(hash.len(), 64);
+        let detail = gateway_error_detail(
+            409,
+            &format!(r#"{{"error":"contact_changed","current_hash":"{hash}"}}"#),
+        );
+        assert_eq!(
+            detail,
+            format!("mock gateway returned HTTP 409 (contact_changed; current_hash={hash})")
+        );
+        // Illegal error text stays redacted even with a valid hash.
+        let detail = gateway_error_detail(
+            409,
+            &format!(r#"{{"error":"user secret text here","current_hash":"{hash}"}}"#),
+        );
+        assert_eq!(detail, "mock gateway returned HTTP 409");
+        assert!(!detail.contains("secret"));
+        // A non-hex hash stays redacted even with a valid code.
+        let detail = gateway_error_detail(
+            409,
+            r#"{"error":"contact_changed","current_hash":"not-a-sha256-hex"}"#,
+        );
+        assert_eq!(detail, "mock gateway returned HTTP 409");
+        assert!(!detail.contains("contact_changed"));
+        // A bare machine code without a hash is not surfaced.
+        let detail = gateway_error_detail(409, r#"{"error":"contact_changed"}"#);
+        assert_eq!(detail, "mock gateway returned HTTP 409");
     }
 }

@@ -345,13 +345,23 @@ export default function ContactsView({ contacts, agent }: ContactsViewProps) {
       // burned, so the same approval retries with the
       // fresh base.
       if (pendingWrite.kind === "update" && text.includes("contact_changed")) {
-        try {
-          const fresh = await contacts.contact(pendingWrite.contactId ?? "");
-          setPendingWrite({ ...pendingWrite, baseContentHash: fresh.contentHash });
-          setEditBaseHash(fresh.contentHash);
+        // The fresh base lives in the 409 itself: the
+        // gateway returns `current_hash` (the live card's
+        // hash) and the transport surfaces it — either as
+        // `current_hash=<64hex>` (invoke path) or as
+        // `"current_hash":"<64hex>"` (browser path, whose
+        // client carries the error body). Do NOT re-read
+        // via GET: GET only reads the DB row, whose hash
+        // is the stale base, so a GET-based retry would
+        // 409 again (MCL-5 W2).
+        const match = /"current_hash"\s*:\s*"([0-9a-f]{64})"|current_hash=([0-9a-f]{64})/.exec(text);
+        const hash = match?.[1] ?? match?.[2] ?? null;
+        if (hash !== null) {
+          setPendingWrite({ ...pendingWrite, baseContentHash: hash });
+          setEditBaseHash(hash);
           setError("联系人已被外部修改，已读取最新版本，可点「批准并写入」重试。审批未消耗。");
-        } catch (rereadError) {
-          setError(`${text}（重读失败：${errText(rereadError)}）`);
+        } else {
+          setError("联系人已被外部修改，已读取最新版本，可点「批准并写入」重试。审批未消耗。（未读到新基线，可再点一次「批准并写入」重试）");
         }
       } else {
         setError(text);
