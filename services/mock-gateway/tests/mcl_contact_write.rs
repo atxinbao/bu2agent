@@ -478,7 +478,7 @@ fn content_hash_of(row: &Value) -> String {
 async fn w1_create_end_to_end() {
     let h = Harness::serve().await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    assert_eq!(h.schema_version(), 17, "MCL-5 adds no version bump");
+    assert_eq!(h.schema_version(), 18, "F-1 adds the v18 idempotency index");
     let synced = h.sync().await;
     assert_eq!(synced["synced_count"], 2);
 
@@ -1528,4 +1528,241 @@ async fn w10_restart_persists_and_replays() {
     assert_eq!(replay["replayed"], true);
     assert_eq!(h.contacts_effects().len(), 1);
     assert_eq!(h.contact_rows().len(), 3);
+}
+
+// F-1：通过真实 HTTP 审批链创建测试事实，后续重放不再提供审批。
+async fn f1_create(h: &Harness, key: &str) -> Value {
+    let mut body = create_body("F1 Person", key, None);
+    let approval = h.approved("contacts.create", body.clone()).await;
+    body["tool_call_id"] = json!(approval);
+    h.ok("/api/contacts/create", body).await
+}
+
+async fn f1_update(h: &Harness, row: &Value, key: &str, name: &str) -> Value {
+    let id = row["contact_id"].as_str().unwrap();
+    let mut body = create_body(name, key, None);
+    body["contact_id"] = json!(id);
+    body["base_content_hash"] = row["content_hash"].clone();
+    let approval = h.approved("contacts.update", body.clone()).await;
+    body["tool_call_id"] = json!(approval);
+    h.ok(&format!("/api/contacts/{id}/update"), body).await
+}
+
+async fn f1_delete(h: &Harness, id: &str, key: &str) -> Value {
+    let approval = h
+        .approved("contacts.delete", json!({"contact_id": id}))
+        .await;
+    h.ok(
+        &format!("/api/contacts/{id}/delete"),
+        json!({"idempotency_key": key, "tool_call_id": approval}),
+    )
+    .await
+}
+
+fn f1_counts(h: &Harness) -> (usize, usize, usize, usize, usize) {
+    (
+        h.contact_rows().len(),
+        h.contacts_effects().len(),
+        h.contacts_events("contact.created").len(),
+        h.contacts_events("contact.updated").len(),
+        h.contacts_events("contact.deleted").len(),
+    )
+}
+
+#[tokio::test]
+async fn w11_create_delete_restart_replay() {
+    let mut h = Harness::serve().await;
+    let row = f1_create(&h, "w11-create").await;
+    let id = row["contact_id"].as_str().unwrap();
+    let tombstone = f1_delete(&h, id, "w11-delete").await;
+    let before = f1_counts(&h);
+    h.restart().await;
+    let replay = h
+        .ok(
+            "/api/contacts/create",
+            create_body("F1 Person", "w11-create", None),
+        )
+        .await;
+    assert_eq!(replay["contact_id"], row["contact_id"]);
+    assert_eq!(replay["deleted"], true);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["effect_id"], tombstone["effect_id"]);
+    assert_eq!(f1_counts(&h), before);
+    let (status, conflict) = h
+        .post(
+            "/api/contacts/create",
+            create_body("Changed", "w11-create", None),
+        )
+        .await;
+    assert_eq!(status, 409);
+    assert_eq!(conflict["error"], "idempotency_key_conflict");
+    assert_eq!(f1_counts(&h), before);
+    let delete_replay = h
+        .ok(
+            &format!("/api/contacts/{id}/delete"),
+            json!({"idempotency_key":"w11-delete"}),
+        )
+        .await;
+    assert_eq!(delete_replay["replayed"], true);
+    assert_eq!(f1_counts(&h), before);
+}
+
+#[tokio::test]
+async fn w12_multiple_updates_replay_current_row() {
+    let mut h = Harness::serve().await;
+    let row = f1_create(&h, "w12-create").await;
+    let u1 = f1_update(&h, &row, "w12-u1", "First").await;
+    let u2 = f1_update(&h, &u1, "w12-u2", "Second").await;
+    let id = row["contact_id"].as_str().unwrap();
+    let before = f1_counts(&h);
+    assert_eq!(before, (1, 3, 1, 2, 0));
+    h.restart().await;
+    for (key, name, base) in [("w12-u1", "First", &row), ("w12-u2", "Second", &u1)] {
+        let mut body = create_body(name, key, None);
+        body["base_content_hash"] = base["content_hash"].clone();
+        let replay = h
+            .ok(&format!("/api/contacts/{id}/update"), body.clone())
+            .await;
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["content_hash"], u2["content_hash"]);
+        assert_eq!(replay["display_name"], "Second");
+        body["display_name"] = json!("Wrong");
+        let (status, conflict) = h.post(&format!("/api/contacts/{id}/update"), body).await;
+        assert_eq!(status, 409);
+        assert_eq!(conflict["error"], "idempotency_key_conflict");
+        assert_eq!(f1_counts(&h), before);
+    }
+    // 创建键在多次更新之后仍有效，返回当前内容。
+    let replay = h
+        .ok(
+            "/api/contacts/create",
+            create_body("F1 Person", "w12-create", None),
+        )
+        .await;
+    assert_eq!(replay["display_name"], "Second");
+    assert_eq!(f1_counts(&h), before);
+}
+
+#[tokio::test]
+async fn w13_update_replay_after_delete_and_cross_contact_conflict() {
+    let mut h = Harness::serve().await;
+    let row = f1_create(&h, "w13-create").await;
+    let id = row["contact_id"].as_str().unwrap();
+    f1_update(&h, &row, "w13-update", "Updated").await;
+    f1_delete(&h, id, "w13-delete").await;
+    let other = f1_create(&h, "w13-other").await;
+    let before = f1_counts(&h);
+    h.restart().await;
+    let mut body = create_body("Updated", "w13-update", None);
+    body["base_content_hash"] = row["content_hash"].clone();
+    let replay = h
+        .ok(&format!("/api/contacts/{id}/update"), body.clone())
+        .await;
+    assert_eq!(replay["deleted"], true);
+    assert_eq!(replay["replayed"], true);
+    let other_id = other["contact_id"].as_str().unwrap();
+    let (status, conflict) = h
+        .post(&format!("/api/contacts/{other_id}/update"), body.clone())
+        .await;
+    assert_eq!(status, 409);
+    assert_eq!(conflict["error"], "idempotency_key_conflict");
+    // 同键跨操作也冲突；新的墓碑更新仍是404。
+    let (status, conflict) = h
+        .post(
+            &format!("/api/contacts/{id}/delete"),
+            json!({"idempotency_key":"w13-update"}),
+        )
+        .await;
+    assert_eq!(status, 409);
+    assert_eq!(conflict["error"], "idempotency_key_conflict");
+    body["idempotency_key"] = json!("w13-new");
+    let (status, _) = h.post(&format!("/api/contacts/{id}/update"), body).await;
+    assert_eq!(status, 404);
+    assert_eq!(f1_counts(&h), before);
+}
+
+#[tokio::test]
+async fn f1_v18_migration_is_typed_repeatable_and_does_not_backfill() {
+    let h = Harness::serve().await;
+    let row = f1_create(&h, "legacy-key").await;
+    let before = f1_counts(&h);
+    let mut conn = h.db();
+    // 仅在隔离测试库模拟v17；生产旧库不回填残存最新键。
+    conn.execute_batch("DROP TABLE contact_idempotency; UPDATE db_meta SET value='17' WHERE key='db_schema_version';").unwrap();
+    sqlite_store::apply_migrations(&mut conn).unwrap();
+    sqlite_store::apply_migrations(&mut conn).unwrap();
+    assert_eq!(sqlite_store::schema_version(&conn).unwrap(), 18);
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM contact_idempotency", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    let ty: String = conn
+        .query_row(
+            "SELECT type FROM pragma_table_info('contact_idempotency') WHERE name='created_ms'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(ty, "INTEGER");
+    assert_eq!(
+        h.ok_get(&format!(
+            "/api/contacts/{}",
+            row["contact_id"].as_str().unwrap()
+        ))
+        .await["idempotency_key"],
+        "legacy-key"
+    );
+    assert_eq!(f1_counts(&h), before);
+}
+
+#[tokio::test]
+async fn f1_index_failure_rolls_back_contact_and_event() {
+    use mock_gateway::contacts_sync::{
+        record_contact_created, record_contact_deleted, record_contact_updated,
+    };
+    let h = Harness::serve().await;
+    let row = f1_create(&h, "rollback-seed").await;
+    let mut conn = h.db();
+    let stored =
+        mock_gateway::contacts_sync::get_contact(&conn, row["contact_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+    let before = f1_counts(&h);
+    let content = ContactContent::normalized("Changed", "", "", &[], &[]);
+    conn.execute_batch("CREATE TRIGGER reject_contact_key BEFORE INSERT ON contact_idempotency BEGIN SELECT RAISE(ABORT, 'test injected failure'); END;").unwrap();
+    assert!(record_contact_created(
+        &mut conn,
+        "new-native",
+        &content,
+        "fail-create",
+        "e",
+        "x",
+        "p",
+        "test"
+    )
+    .is_err());
+    assert!(record_contact_updated(
+        &mut conn,
+        &stored,
+        &content,
+        "fail-update",
+        "e",
+        "x",
+        "p",
+        "test"
+    )
+    .is_err());
+    assert!(
+        record_contact_deleted(&mut conn, &stored, "fail-delete", "e", "x", "p", "test").is_err()
+    );
+    assert_eq!(f1_counts(&h), before);
+    let after = mock_gateway::contacts_sync::get_contact(&conn, &stored.contact_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.content_hash, stored.content_hash);
+    assert!(!after.deleted);
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM contact_idempotency", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
 }

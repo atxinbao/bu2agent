@@ -599,8 +599,8 @@ impl Harness {
 async fn nt1_sync_end_to_end() {
     let mut h = Harness::serve().await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    // MCL-4 bumps the schema to v17 (sent_imessages table).
-    assert_eq!(DB_SCHEMA_VERSION, 17);
+    // F-1 将模式升级到 v18，新增联系人历史幂等索引。
+    assert_eq!(DB_SCHEMA_VERSION, 18);
 
     let (status, synced) = h.sync("bu2agent-test").await;
     assert_eq!(status, 200, "sync: {synced}");
@@ -680,7 +680,7 @@ async fn nt1_sync_end_to_end() {
 
     // Restart: rows + schema survive, fold holds.
     h.restart().await;
-    assert_eq!(h.schema_version(), 17);
+    assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
     assert_eq!(h.note_rows().len(), 2);
     assert_eq!(h.note_rows()[0].note_id, "note-1");
     assert!(sqlite_store::fold_matches_tables(&h.db()).expect("fold"));

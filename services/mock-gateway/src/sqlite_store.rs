@@ -61,7 +61,8 @@ use crate::execution_store::ExecutionFileRecord;
 /// (see SCHEMA_V15); v16 adds the MCL-3
 /// `device_locations` table (see SCHEMA_V16); v17 adds
 /// the MCL-4 `sent_imessages` table (see SCHEMA_V17).
-pub const DB_SCHEMA_VERSION: i64 = 17;
+// v18 新增 contacts 历史写入幂等索引。
+pub const DB_SCHEMA_VERSION: i64 = 18;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -679,6 +680,19 @@ CREATE TABLE IF NOT EXISTS device_locations (
     origin_device_id TEXT NOT NULL
 );
 ";
+// 每次 contacts 写入独占一个幂等键；只追加，不从旧列回填。
+const SCHEMA_V18: &str = "
+CREATE TABLE IF NOT EXISTS contact_idempotency (
+    idempotency_key TEXT PRIMARY KEY,
+    contact_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    effect_id TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL
+);
+";
+
 /// MCL-4 v17 step: `sent_imessages` fact table.
 /// `sent_id` is the local `sent-imsg-N` id
 /// (max-suffix + 1 in the record transaction — the
@@ -1007,6 +1021,16 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V17).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '17')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // v18 与事实行迁移共用事务，旧库从空幂等索引开始。
+    if version < 18 {
+        tx.execute_batch(SCHEMA_V18).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '18')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )

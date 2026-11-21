@@ -444,23 +444,16 @@ pub(crate) async fn contacts_create(
     // different content → 409.
     {
         let conn = sqlite.lock().expect("sqlite lock");
-        match find_contact_by_idempotency_key(&conn, &idempotency_key) {
-            Ok(Some(existing)) => {
-                let existing_digest = contact_create_digest(
-                    &existing.display_name,
-                    &existing.organization,
-                    &existing.job_title,
-                    &existing.phones,
-                    &existing.emails,
-                );
-                if existing_digest == digest {
-                    return contact_row_response(&existing, true);
-                }
+        match find_contact_by_idempotency_key(&conn, &idempotency_key, "create", &digest, None) {
+            Err(detail) if detail == "idempotency_key_conflict" => {
                 return (
                     StatusCode::CONFLICT,
-                    Json(serde_json::json!({ "error": "idempotency_key_conflict" })),
+                    Json(serde_json::json!({"error": "idempotency_key_conflict"})),
                 )
-                    .into_response();
+                    .into_response()
+            }
+            Ok(Some(existing)) => {
+                return contact_row_response(&existing, true);
             }
             Ok(None) => {}
             Err(detail) => {
@@ -561,10 +554,23 @@ pub(crate) async fn contacts_create(
                 // Terminal with an unconsumed approval
                 // should not happen (consume precedes
                 // terminal), but a succeeded replay is
-                // still the original row, never a second
+                // 返回当前联系人行，不执行第二次
                 // card.
                 let conn = sqlite.lock().expect("sqlite lock");
-                match find_contact_by_idempotency_key(&conn, &idempotency_key) {
+                match find_contact_by_idempotency_key(
+                    &conn,
+                    &idempotency_key,
+                    "create",
+                    &digest,
+                    None,
+                ) {
+                    Err(detail) if detail == "idempotency_key_conflict" => {
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({"error": "idempotency_key_conflict"})),
+                        )
+                            .into_response()
+                    }
                     Ok(Some(existing)) => return contact_row_response(&existing, true),
                     _ => {
                         return (
@@ -598,7 +604,20 @@ pub(crate) async fn contacts_create(
                 LedgerEntryDecision::Entered(entry) => (entry.execution_id, entry.effect),
                 LedgerEntryDecision::Replay(other) => {
                     let conn = sqlite.lock().expect("sqlite lock");
-                    match find_contact_by_idempotency_key(&conn, &idempotency_key) {
+                    match find_contact_by_idempotency_key(
+                        &conn,
+                        &idempotency_key,
+                        "create",
+                        &digest,
+                        None,
+                    ) {
+                        Err(detail) if detail == "idempotency_key_conflict" => {
+                            return (
+                                StatusCode::CONFLICT,
+                                Json(serde_json::json!({"error": "idempotency_key_conflict"})),
+                            )
+                                .into_response()
+                        }
                         Ok(Some(existing)) => return contact_row_response(&existing, true),
                         _ => {
                             return (
@@ -668,8 +687,7 @@ pub(crate) async fn contacts_create(
             ) {
                 Ok((row, inserted)) => {
                     drop(conn);
-                    match ledger_entry_finish(&state, &effect.effect_id, LedgerOutcome::Succeeded)
-                    {
+                    match ledger_entry_finish(&state, &effect.effect_id, LedgerOutcome::Succeeded) {
                         Ok(_) => contact_row_response(&row, !inserted),
                         Err(_) => {
                             eprintln!(
@@ -728,15 +746,11 @@ pub(crate) async fn contacts_update(
     let Some(idempotency_key) = req.idempotency_key.filter(|k| !k.trim().is_empty()) else {
         return bad_request("idempotency_key is required");
     };
-    // 2. Resolve the row: unknown id — or a tombstoned
-    // one — is 404, never an update target (the MCL-4
-    // send precedent: a deleted thread is not a
-    // sendable target). This is input validation, so it
-    // runs before the disconnect gate.
+    // 先解析联系人；墓碑在历史键重放后再拒绝新更新。
     let row = {
         let conn = sqlite.lock().expect("sqlite lock");
         match get_contact(&conn, &contact_id) {
-            Ok(Some(row)) if !row.deleted => row,
+            Ok(Some(row)) => row,
             Ok(_) => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -775,29 +789,27 @@ pub(crate) async fn contacts_update(
     }
     // 4. Idempotency replay BEFORE planning a new Effect:
     // same key + same content on the same contact → 200
-    // original row, no second write, no second Effect;
+    // 返回当前行（含墓碑），不再写入、不创建第二个 Effect。
     // same key on another contact, or with different
     // content → 409.
     {
         let conn = sqlite.lock().expect("sqlite lock");
-        match find_contact_by_idempotency_key(&conn, &idempotency_key) {
-            Ok(Some(existing)) => {
-                let existing_digest = contact_update_digest(
-                    &existing.contact_id,
-                    &existing.display_name,
-                    &existing.organization,
-                    &existing.job_title,
-                    &existing.phones,
-                    &existing.emails,
-                );
-                if existing.contact_id == contact_id && existing_digest == digest {
-                    return contact_row_response(&existing, true);
-                }
+        match find_contact_by_idempotency_key(
+            &conn,
+            &idempotency_key,
+            "update",
+            &digest,
+            Some(&contact_id),
+        ) {
+            Err(detail) if detail == "idempotency_key_conflict" => {
                 return (
                     StatusCode::CONFLICT,
-                    Json(serde_json::json!({ "error": "idempotency_key_conflict" })),
+                    Json(serde_json::json!({"error": "idempotency_key_conflict"})),
                 )
-                    .into_response();
+                    .into_response()
+            }
+            Ok(Some(existing)) => {
+                return contact_row_response(&existing, true);
             }
             Ok(None) => {}
             Err(detail) => {
@@ -805,6 +817,14 @@ pub(crate) async fn contacts_update(
                 return sqlite_error_response();
             }
         }
+    }
+    // 仅已完成写入的历史键可返回墓碑；未命中幂等记录的新更新仍拒绝。
+    if row.deleted {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown contact"})),
+        )
+            .into_response();
     }
     // 5. Approval peek (read-only, nothing burned).
     let Some(approval_id) = req.tool_call_id.clone() else {
@@ -941,10 +961,23 @@ pub(crate) async fn contacts_update(
                 // Terminal with an unconsumed approval
                 // should not happen (consume precedes
                 // terminal), but a succeeded replay is
-                // still the original row, never a second
+                // 返回当前联系人行，不执行第二次
                 // write.
                 let conn = sqlite.lock().expect("sqlite lock");
-                match find_contact_by_idempotency_key(&conn, &idempotency_key) {
+                match find_contact_by_idempotency_key(
+                    &conn,
+                    &idempotency_key,
+                    "update",
+                    &digest,
+                    Some(&contact_id),
+                ) {
+                    Err(detail) if detail == "idempotency_key_conflict" => {
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({"error": "idempotency_key_conflict"})),
+                        )
+                            .into_response()
+                    }
                     Ok(Some(existing)) => return contact_row_response(&existing, true),
                     _ => {
                         return (
@@ -978,7 +1011,20 @@ pub(crate) async fn contacts_update(
                 LedgerEntryDecision::Entered(entry) => (entry.execution_id, entry.effect),
                 LedgerEntryDecision::Replay(other) => {
                     let conn = sqlite.lock().expect("sqlite lock");
-                    match find_contact_by_idempotency_key(&conn, &idempotency_key) {
+                    match find_contact_by_idempotency_key(
+                        &conn,
+                        &idempotency_key,
+                        "update",
+                        &digest,
+                        Some(&contact_id),
+                    ) {
+                        Err(detail) if detail == "idempotency_key_conflict" => {
+                            return (
+                                StatusCode::CONFLICT,
+                                Json(serde_json::json!({"error": "idempotency_key_conflict"})),
+                            )
+                                .into_response()
+                        }
                         Ok(Some(existing)) => return contact_row_response(&existing, true),
                         _ => {
                             return (
@@ -1021,10 +1067,9 @@ pub(crate) async fn contacts_update(
     let source = Arc::clone(&state.contacts_source);
     let update_native = row.native_id.clone();
     let update_content = content.clone();
-    let update_result = tokio::task::spawn_blocking(move || {
-        source.update_contact(&update_native, &update_content)
-    })
-    .await;
+    let update_result =
+        tokio::task::spawn_blocking(move || source.update_contact(&update_native, &update_content))
+            .await;
     let outcome = match update_result {
         Ok(result) => result,
         Err(_) => Err(ContactsError::Timeout),
@@ -1049,8 +1094,7 @@ pub(crate) async fn contacts_update(
             ) {
                 Ok(updated) => {
                     drop(conn);
-                    match ledger_entry_finish(&state, &effect.effect_id, LedgerOutcome::Succeeded)
-                    {
+                    match ledger_entry_finish(&state, &effect.effect_id, LedgerOutcome::Succeeded) {
                         Ok(_) => contact_row_response(&updated, false),
                         Err(_) => {
                             eprintln!(
@@ -1137,16 +1181,22 @@ pub(crate) async fn contacts_delete(
     // another contact → 409.
     {
         let conn = sqlite.lock().expect("sqlite lock");
-        match find_contact_by_idempotency_key(&conn, &idempotency_key) {
-            Ok(Some(existing)) => {
-                if existing.contact_id == contact_id {
-                    return contact_row_response(&existing, true);
-                }
+        match find_contact_by_idempotency_key(
+            &conn,
+            &idempotency_key,
+            "delete",
+            &digest,
+            Some(&contact_id),
+        ) {
+            Err(detail) if detail == "idempotency_key_conflict" => {
                 return (
                     StatusCode::CONFLICT,
-                    Json(serde_json::json!({ "error": "idempotency_key_conflict" })),
+                    Json(serde_json::json!({"error": "idempotency_key_conflict"})),
                 )
-                    .into_response();
+                    .into_response()
+            }
+            Ok(Some(existing)) => {
+                return contact_row_response(&existing, true);
             }
             Ok(None) => {}
             Err(detail) => {
@@ -1246,10 +1296,23 @@ pub(crate) async fn contacts_delete(
                 // Terminal with an unconsumed approval
                 // should not happen (consume precedes
                 // terminal), but a succeeded replay is
-                // still the original row, never a second
+                // 返回当前联系人行，不执行第二次
                 // delete.
                 let conn = sqlite.lock().expect("sqlite lock");
-                match find_contact_by_idempotency_key(&conn, &idempotency_key) {
+                match find_contact_by_idempotency_key(
+                    &conn,
+                    &idempotency_key,
+                    "delete",
+                    &digest,
+                    Some(&contact_id),
+                ) {
+                    Err(detail) if detail == "idempotency_key_conflict" => {
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({"error": "idempotency_key_conflict"})),
+                        )
+                            .into_response()
+                    }
                     Ok(Some(existing)) => return contact_row_response(&existing, true),
                     _ => {
                         return (
@@ -1283,7 +1346,20 @@ pub(crate) async fn contacts_delete(
                 LedgerEntryDecision::Entered(entry) => (entry.execution_id, entry.effect),
                 LedgerEntryDecision::Replay(other) => {
                     let conn = sqlite.lock().expect("sqlite lock");
-                    match find_contact_by_idempotency_key(&conn, &idempotency_key) {
+                    match find_contact_by_idempotency_key(
+                        &conn,
+                        &idempotency_key,
+                        "delete",
+                        &digest,
+                        Some(&contact_id),
+                    ) {
+                        Err(detail) if detail == "idempotency_key_conflict" => {
+                            return (
+                                StatusCode::CONFLICT,
+                                Json(serde_json::json!({"error": "idempotency_key_conflict"})),
+                            )
+                                .into_response()
+                        }
                         Ok(Some(existing)) => return contact_row_response(&existing, true),
                         _ => {
                             return (
@@ -1350,8 +1426,7 @@ pub(crate) async fn contacts_delete(
             ) {
                 Ok(tombstoned) => {
                     drop(conn);
-                    match ledger_entry_finish(&state, &effect.effect_id, LedgerOutcome::Succeeded)
-                    {
+                    match ledger_entry_finish(&state, &effect.effect_id, LedgerOutcome::Succeeded) {
                         Ok(_) => contact_row_response(&tombstoned, false),
                         Err(_) => {
                             eprintln!(

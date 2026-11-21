@@ -51,7 +51,10 @@ use crate::{
     contacts_source::{
         addresses_hash_for, birthday_hash_for, string_list_hash, ContactContent, ContactView,
     },
-    operation_binding::{contact_content_hash, sha256_hex},
+    operation_binding::{
+        contact_content_hash, contact_create_digest, contact_delete_digest, contact_update_digest,
+        sha256_hex,
+    },
     sqlite_store::{append_event, update_source_cursor_tx, DB_SCHEMA_VERSION},
 };
 
@@ -153,13 +156,8 @@ fn row_from_sqlite(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContactRow> {
     // stored: the hash normalizes (trims / sorts /
     // dedupes), so a stored row, a presented write, and
     // a live re-read hash the same content the same way.
-    let content_hash = contact_content_hash(
-        &display_name,
-        &organization,
-        &job_title,
-        &phones,
-        &emails,
-    );
+    let content_hash =
+        contact_content_hash(&display_name, &organization, &job_title, &phones, &emails);
     Ok(ContactRow {
         contact_id: row.get("contact_id")?,
         source_id: row.get("source_id")?,
@@ -360,21 +358,51 @@ const CONTACT_COLS: &str = "contact_id, source_id, native_id, display_name, orga
     job_title, phones_json, emails_json, addresses_hash, birthday_hash, created_ms, \
     updated_ms, deleted, origin_device_id, idempotency_key, effect_id, policy_version";
 
-/// One contact by its last write's idempotency key
-/// (MCL-5 replay lookup). `None` when no write used
-/// this key — synced rows carry NULL, so they never
-/// match.
+/// 按不可覆盖的写入索引验证摘要，再返回联系人当前行（含墓碑）。
+/// 同键跨操作、跨联系人或不同内容均冲突，不能用当前行重算历史摘要。
 pub fn find_contact_by_idempotency_key(
     conn: &Connection,
     idempotency_key: &str,
+    operation: &str,
+    content_digest: &str,
+    contact_id: Option<&str>,
 ) -> Result<Option<ContactRow>, String> {
-    conn.query_row(
-        &format!("SELECT {CONTACT_COLS} FROM contacts WHERE idempotency_key = ?1"),
+    let entry = conn.query_row(
+        "SELECT contact_id, operation, content_digest FROM contact_idempotency WHERE idempotency_key = ?1",
         params![idempotency_key],
-        row_from_sqlite,
-    )
-    .optional()
-    .map_err(|e| e.to_string())
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+    ).optional().map_err(|e| e.to_string())?;
+    let Some((stored_id, stored_operation, stored_digest)) = entry else {
+        return Ok(None);
+    };
+    if stored_operation != operation
+        || stored_digest != content_digest
+        || contact_id.is_some_and(|id| id != stored_id)
+    {
+        return Err("idempotency_key_conflict".to_string());
+    }
+    get_contact(conn, &stored_id)?
+        .map(Some)
+        .ok_or_else(|| "contact idempotency references missing row".to_string())
+}
+
+/// 索引与联系人、事件在同一事务中写入；冲突必须回滚，不能覆盖原记录。
+#[allow(clippy::too_many_arguments)]
+fn insert_contact_idempotency(
+    tx: &Transaction<'_>,
+    key: &str,
+    contact_id: &str,
+    operation: &str,
+    digest: &str,
+    effect_id: &str,
+    created_ms: i64,
+    origin_device_id: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO contact_idempotency (idempotency_key, contact_id, operation, content_digest, effect_id, created_ms, origin_device_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![key, contact_id, operation, digest, effect_id, created_ms, origin_device_id],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// One contact by its live native id (MCL-5 create
@@ -385,9 +413,7 @@ pub fn find_contact_by_native_id(
     native_id: &str,
 ) -> Result<Option<ContactRow>, String> {
     conn.query_row(
-        &format!(
-            "SELECT {CONTACT_COLS} FROM contacts WHERE source_id = ?1 AND native_id = ?2"
-        ),
+        &format!("SELECT {CONTACT_COLS} FROM contacts WHERE source_id = ?1 AND native_id = ?2"),
         params![source_id, native_id],
         row_from_sqlite,
     )
@@ -445,7 +471,30 @@ pub fn record_contact_created(
 ) -> Result<(ContactRow, bool), String> {
     let now_ms = crate::sqlite_store::now_ms() as i64;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let digest = contact_create_digest(
+        &content.display_name,
+        &content.organization,
+        &content.job_title,
+        &content.phones,
+        &content.emails,
+    );
+    if let Some(existing) =
+        find_contact_by_idempotency_key(&tx, idempotency_key, "create", &digest, None)?
+    {
+        tx.commit().map_err(|e| e.to_string())?;
+        return Ok((existing, false));
+    }
     if let Some(existing) = find_contact_by_native_id(&tx, CONTACTS_SOURCE_ID, native_id)? {
+        insert_contact_idempotency(
+            &tx,
+            idempotency_key,
+            &existing.contact_id,
+            "create",
+            &digest,
+            effect_id,
+            now_ms,
+            origin_device_id,
+        )?;
         tx.commit().map_err(|e| e.to_string())?;
         return Ok((existing, false));
     }
@@ -507,6 +556,16 @@ pub fn record_contact_created(
         ],
     )
     .map_err(|e| e.to_string())?;
+    insert_contact_idempotency(
+        &tx,
+        idempotency_key,
+        &row.contact_id,
+        "create",
+        &digest,
+        effect_id,
+        now_ms,
+        origin_device_id,
+    )?;
     append_event(
         &tx,
         "contacts",
@@ -542,6 +601,24 @@ pub fn record_contact_updated(
 ) -> Result<ContactRow, String> {
     let now_ms = crate::sqlite_store::now_ms() as i64;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let digest = contact_update_digest(
+        &row.contact_id,
+        &content.display_name,
+        &content.organization,
+        &content.job_title,
+        &content.phones,
+        &content.emails,
+    );
+    if let Some(existing) = find_contact_by_idempotency_key(
+        &tx,
+        idempotency_key,
+        "update",
+        &digest,
+        Some(&row.contact_id),
+    )? {
+        tx.commit().map_err(|e| e.to_string())?;
+        return Ok(existing);
+    }
     let phones_json = serde_json::to_string(&content.phones).unwrap_or_else(|_| "[]".to_string());
     let emails_json = serde_json::to_string(&content.emails).unwrap_or_else(|_| "[]".to_string());
     tx.execute(
@@ -562,9 +639,18 @@ pub fn record_contact_updated(
         ],
     )
     .map_err(|e| e.to_string())?;
-    let updated = get_contact(&tx, &row.contact_id)?.ok_or_else(|| {
-        format!("contact {} vanished during its own update", row.contact_id)
-    })?;
+    let updated = get_contact(&tx, &row.contact_id)?
+        .ok_or_else(|| format!("contact {} vanished during its own update", row.contact_id))?;
+    insert_contact_idempotency(
+        &tx,
+        idempotency_key,
+        &updated.contact_id,
+        "update",
+        &digest,
+        effect_id,
+        now_ms,
+        origin_device_id,
+    )?;
     append_event(
         &tx,
         "contacts",
@@ -600,6 +686,17 @@ pub fn record_contact_deleted(
 ) -> Result<ContactRow, String> {
     let now_ms = crate::sqlite_store::now_ms() as i64;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let digest = contact_delete_digest(&row.contact_id);
+    if let Some(existing) = find_contact_by_idempotency_key(
+        &tx,
+        idempotency_key,
+        "delete",
+        &digest,
+        Some(&row.contact_id),
+    )? {
+        tx.commit().map_err(|e| e.to_string())?;
+        return Ok(existing);
+    }
     if row.deleted {
         tx.commit().map_err(|e| e.to_string())?;
         return Ok(row.clone());
@@ -607,12 +704,27 @@ pub fn record_contact_deleted(
     tx.execute(
         "UPDATE contacts SET deleted = 1, updated_ms = ?1, idempotency_key = ?2, \
          effect_id = ?3, policy_version = ?4 WHERE contact_id = ?5",
-        params![now_ms, idempotency_key, effect_id, policy_version, row.contact_id],
+        params![
+            now_ms,
+            idempotency_key,
+            effect_id,
+            policy_version,
+            row.contact_id
+        ],
     )
     .map_err(|e| e.to_string())?;
-    let tombstoned = get_contact(&tx, &row.contact_id)?.ok_or_else(|| {
-        format!("contact {} vanished during its own delete", row.contact_id)
-    })?;
+    let tombstoned = get_contact(&tx, &row.contact_id)?
+        .ok_or_else(|| format!("contact {} vanished during its own delete", row.contact_id))?;
+    insert_contact_idempotency(
+        &tx,
+        idempotency_key,
+        &tombstoned.contact_id,
+        "delete",
+        &digest,
+        effect_id,
+        now_ms,
+        origin_device_id,
+    )?;
     append_event(
         &tx,
         "contacts",

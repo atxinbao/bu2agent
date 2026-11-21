@@ -352,8 +352,8 @@ const BODY: &str = "Body of SD1.";
 async fn sd1_send_end_to_end() {
     let h = Harness::serve().await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    // MCL-4 bumps the schema to v17 (sent_imessages table).
-    assert_eq!(DB_SCHEMA_VERSION, 17);
+    // F-1 将模式升级到 v18，新增联系人历史幂等索引。
+    assert_eq!(DB_SCHEMA_VERSION, 18);
 
     let approval = h.approved_mail_send(&TO, SUBJECT, BODY).await;
     // The send presents the recipients in the other

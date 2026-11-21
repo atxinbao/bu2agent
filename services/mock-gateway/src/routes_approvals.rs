@@ -873,7 +873,7 @@ pub(crate) async fn approval_decide(
     }
     let already_decided = record.consumed
         || (record.status != ApprovalStatus::Pending
-            && !(record.status == ApprovalStatus::Edited && !bound));
+            && (record.status != ApprovalStatus::Edited || bound));
     let edited_via_decide = bound && status == ApprovalStatus::Edited;
     if already_decided || edited_via_decide {
         return (StatusCode::CONFLICT, Json(serde_json::json!({"error":"loop_approval_already_decided_or_invalid"}))).into_response();
