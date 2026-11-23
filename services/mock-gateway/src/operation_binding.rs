@@ -327,6 +327,35 @@ pub fn imessage_send_digest(thread_id: &str, body_hash: &str) -> String {
     operation_digest("imessage.send", None, &params)
 }
 
+/// Digest for a plan draft (ORC-1, plan §3, Q-ORC-10).
+/// LOCAL DEFINITION: the canonical form is the JSON
+/// tuple `("plan.draft", {task_id, steps, replan_if})`
+/// where `steps` / `replan_if` are the sha256 hexes of
+/// the canonical JSON (`canonical_json`: object keys
+/// sorted recursively) of the validated step /
+/// condition arrays. The route computes it server-side
+/// from the validated arrays — a client-supplied digest
+/// is never accepted, and the DTO has no digest field.
+/// A later batch binds a plan approval to this digest;
+/// ORC-1 itself has no approval flow. Callers pass
+/// canonical JSON (from `canonical_json`), never raw
+/// client text, so two drafts of the same blueprint
+/// always hash the same.
+pub fn plan_digest(task_id: &str, steps_canonical_json: &str, replan_if_canonical_json: &str) -> String {
+    let params = BTreeMap::from([
+        (
+            "replan_if".to_string(),
+            sha256_hex(replan_if_canonical_json.as_bytes()),
+        ),
+        (
+            "steps".to_string(),
+            sha256_hex(steps_canonical_json.as_bytes()),
+        ),
+        ("task_id".to_string(), task_id.to_string()),
+    ]);
+    operation_digest("plan.draft", None, &params)
+}
+
 /// Digest for a real mail delete (D1-6b-3,
 /// Q-D1-6b-22). LOCAL DEFINITION: the digest commits
 /// to the resolved native id — the message's real

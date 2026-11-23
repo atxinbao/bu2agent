@@ -43,6 +43,11 @@ pub struct TaskRecord {
     pub project_id: Option<String>,
     #[serde(default)]
     pub workspace_id: Option<String>,
+    /// ORC-1 (Q-ORC-03): the task's current plan id
+    /// (`plan-N`). A pointer only — the `plans` table
+    /// is the fact source. Old records carry None.
+    #[serde(default)]
+    pub plan_id: Option<String>,
 }
 
 /// A gateway-run task's draft, fetched separately: the record

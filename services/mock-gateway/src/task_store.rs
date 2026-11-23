@@ -63,6 +63,14 @@ pub struct TaskFileRecord {
     pub project_id: Option<String>,
     #[serde(default)]
     pub workspace_id: Option<String>,
+    /// ORC-1 (Q-ORC-03): the task's current plan id
+    /// (`plan-N`), set when a plan is drafted for the
+    /// task. A pointer only — the `plans` table is the
+    /// fact source, and the current plan is its highest
+    /// `version` row. Old JSONL lines load as None
+    /// (no plan yet).
+    #[serde(default)]
+    pub plan_id: Option<String>,
 }
 
 pub fn load_tasks(path: &Path) -> Vec<TaskFileRecord> {
@@ -197,6 +205,7 @@ mod tests {
                 goal_id: None,
                 project_id: None,
                 workspace_id: None,
+                plan_id: None,
             },
         );
         append_task(
@@ -214,6 +223,7 @@ mod tests {
                 goal_id: None,
                 project_id: None,
                 workspace_id: None,
+                plan_id: None,
             },
         );
         let records = load_tasks(&path);
@@ -239,6 +249,7 @@ mod tests {
                 goal_id: None,
                 project_id: None,
                 workspace_id: None,
+                plan_id: None,
             },
             TaskFileRecord {
                 task_id: "other".to_string(),
@@ -253,6 +264,7 @@ mod tests {
                 goal_id: None,
                 project_id: None,
                 workspace_id: None,
+                plan_id: None,
             },
         ];
         assert_eq!(next_task_number(&records), 4);

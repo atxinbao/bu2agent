@@ -455,8 +455,8 @@ impl Harness {
 async fn md1_delete_end_to_end() {
     let h = Harness::serve().await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    // F-1 将模式升级到 v18，新增联系人历史幂等索引；C-2 升到 v19，新增定时发送正文表。
-    assert_eq!(DB_SCHEMA_VERSION, 19);
+    // F-1 将模式升级到 v18，新增联系人历史幂等索引；C-2 升到 v19，新增定时发送正文表；ORC-1 升到 v20，新增蓝图表。
+    assert_eq!(DB_SCHEMA_VERSION, 20);
 
     let (status, synced) = h.sync().await;
     assert_eq!(status, 200, "sync: {synced}");

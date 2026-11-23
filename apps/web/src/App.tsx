@@ -84,6 +84,11 @@ import {
 } from "./domain/task_client";
 import { InvokeTaskClient } from "./domain/invoke_task_client";
 import {
+  PlanClient,
+  type PlanGateway,
+} from "./domain/plan_client";
+import { InvokePlanClient } from "./domain/invoke_plan_client";
+import {
   DeviceClient,
   type DeviceGateway,
 } from "./domain/device_client";
@@ -192,6 +197,7 @@ interface Clients {
   agent: AgentGateway;
   connectors: ConnectorGateway;
   tasks: TaskGateway;
+  plans: PlanGateway;
   devices: DeviceGateway;
   loops: LoopGateway;
   sessions: SessionGateway;
@@ -308,6 +314,7 @@ export function App() {
           agent: new InvokeAgentClient(),
           connectors: new InvokeConnectorClient(),
           tasks: new InvokeTaskClient(),
+          plans: new InvokePlanClient(),
           devices: new InvokeDeviceClient(),
           loops: new InvokeLoopClient(),
           sessions: new InvokeSessionClient(),
@@ -349,6 +356,7 @@ export function App() {
           agent: new AgentClient(MOCK_BASE_URL),
           connectors: new ConnectorClient(MOCK_BASE_URL),
           tasks: new TaskClient(MOCK_BASE_URL),
+          plans: new PlanClient(MOCK_BASE_URL),
           devices: new DeviceClient(MOCK_BASE_URL),
           loops: new LoopClient(MOCK_BASE_URL),
           sessions: new SessionClient(MOCK_BASE_URL),
@@ -772,6 +780,7 @@ export function App() {
             files={clients.files}
             agent={clients.agent}
             tasks={clients.tasks}
+            plans={clients.plans}
             executions={clients.executions}
             effects={clients.effects}
             evidence={clients.evidence}

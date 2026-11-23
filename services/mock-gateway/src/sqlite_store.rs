@@ -63,10 +63,12 @@ use crate::execution_store::ExecutionFileRecord;
 /// the MCL-4 `sent_imessages` table (see SCHEMA_V17).
 /// v18 adds the MCL-5 `contact_idempotency` table (see
 /// SCHEMA_V18); v19 adds the D1-3 C-2
-/// `scheduled_imessage_sends` table (see SCHEMA_V19).
+/// `scheduled_imessage_sends` table (see SCHEMA_V19);
+/// v20 adds the ORC-1 `plans` table (see SCHEMA_V20).
 // v18 新增 contacts 历史写入幂等索引。
 // v19 新增 D1-3 C-2 定时发送正文表（Q-C2-01）。
-pub const DB_SCHEMA_VERSION: i64 = 19;
+// v20 新增 ORC-1 蓝图表（Q-ORC-03）。
+pub const DB_SCHEMA_VERSION: i64 = 20;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -725,6 +727,34 @@ CREATE TABLE IF NOT EXISTS scheduled_imessage_sends (
 );
 ";
 
+/// ORC-1 v20 step: `plans`, the Plan first-class
+/// object (Q-ORC-03). One row per plan version: the
+/// task's current plan is the highest `version` row;
+/// supersede flips the old row's `status`, never
+/// deletes it (red line 9). `steps_json` /
+/// `replan_if_json` are canonical JSON arrays (see
+/// `plan_store.rs`); the blueprint body text lives
+/// only here — events carry counts + digest only
+/// (Q-ORC-04). `execution_id` is NULL at draft time
+/// (no Execution exists yet); `planner_model` is the
+/// model string of the planning round, a fact record.
+const SCHEMA_V20: &str = "
+CREATE TABLE IF NOT EXISTS plans (
+    plan_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    execution_id TEXT,
+    version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    steps_json TEXT NOT NULL,
+    replan_if_json TEXT NOT NULL,
+    planner_model TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL
+);
+";
+
 /// MCL-4 v17 step: `sent_imessages` fact table.
 /// `sent_id` is the local `sent-imsg-N` id
 /// (max-suffix + 1 in the record transaction — the
@@ -1076,6 +1106,19 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V19).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '19')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    // ORC-1 v20 step: plans table only. One
+    // transaction, v5–v19 style; the table starts
+    // empty — rows arrive only from POST
+    // /tasks/plan/draft.
+    if version < 20 {
+        tx.execute_batch(SCHEMA_V20).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '20')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -2293,6 +2336,27 @@ const REDACTED_PAYLOAD_FIELDS: &[&str] = &[
     // mail: the written version is auditable without
     // naming anyone.
     "content_hash",
+    // ORC-1 `plan.created` / `plan.superseded` fields
+    // (each added with its reason, per this helper's
+    // own rule):
+    // `plan_id` — the plan's local id, like
+    // `message_id` for synced mail.
+    "plan_id",
+    // `task_id` — which task the plan belongs to, an
+    // id only, never the task's content.
+    "task_id",
+    // `version` — the plan version number, like
+    // `schema_version`: a number about the record,
+    // never its content.
+    "version",
+    // `step_count` — how many blueprint steps, a count
+    // only, like `recipient_count`: the blueprint is
+    // auditable for size without naming any step.
+    "step_count",
+    // `digest` — sha256 of the canonical plan JSON,
+    // like `body_hash` for sent mail: the planned
+    // version is auditable without naming any step.
+    "digest",
 ];
 
 pub(crate) fn redact_event_payload(kind: &str, payload_json: &str) -> String {

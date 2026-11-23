@@ -22,6 +22,7 @@ interface ServerTaskRecord {
   goal_id: string | null;
   project_id: string | null;
   workspace_id: string | null;
+  plan_id: string | null;
 }
 
 interface ServerTaskDraft {
@@ -51,6 +52,7 @@ function toRecord(server: ServerTaskRecord): TaskRecord {
     goalId: server.goal_id,
     projectId: server.project_id,
     workspaceId: server.workspace_id,
+    planId: server.plan_id,
   };
 }
 

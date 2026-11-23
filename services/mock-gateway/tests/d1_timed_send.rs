@@ -407,7 +407,7 @@ impl Harness {
 async fn c2_schedule_creates_pending_row_and_consumes_approval() {
     let h = Harness::serve().await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    assert_eq!(h.schema_version(), 19);
+    assert_eq!(h.schema_version(), 20);
     let thread_id = h.sync_threads().await;
     let body = "c2-schedule-body-pending";
     let approval_id = h.approved_imessage_send(&thread_id, body).await;
@@ -706,7 +706,7 @@ async fn c2_restart_backfill() {
     assert_eq!(status, 200, "schedule: {scheduled}");
     let outbox_id = scheduled["outbox_id"].as_str().unwrap().to_string();
     h.restart().await;
-    assert_eq!(h.schema_version(), 19);
+    assert_eq!(h.schema_version(), 20);
     assert_eq!(h.outbox_row(&outbox_id).status, "pending");
     assert!(h.body_row(&outbox_id).is_some(), "body survives restart");
     // No re-sync needed: the threads are already in the

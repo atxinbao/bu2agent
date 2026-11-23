@@ -76,6 +76,9 @@ use agent_desktop::voice_client::{
 };
 use agent_desktop::device_client::{DeviceActionRecord, DeviceClient, DeviceReminder};
 use agent_desktop::task_client::{TaskClient, TaskExecuteBinding, TaskRecord};
+use agent_desktop::plan_client::{
+    PlanClient, PlanDraftInput, PlanRecord, PlanReplanIfInput, PlanStepInput,
+};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
 use agent_desktop::{ErrorCode, UnifiedError, UserAction};
 
@@ -929,6 +932,8 @@ pub struct TaskOut {
     pub goal_id: Option<String>,
     pub project_id: Option<String>,
     pub workspace_id: Option<String>,
+    /// ORC-1 (Q-ORC-03): the task's current plan id.
+    pub plan_id: Option<String>,
 }
 
 impl From<TaskRecord> for TaskOut {
@@ -946,6 +951,7 @@ impl From<TaskRecord> for TaskOut {
             goal_id: value.goal_id,
             project_id: value.project_id,
             workspace_id: value.workspace_id,
+            plan_id: value.plan_id,
         }
     }
 }
@@ -1028,6 +1034,48 @@ pub fn task_resume(task_id: String) -> Result<TaskOut, String> {
 #[tauri::command(rename_all = "snake_case")]
 pub fn task_cancel(task_id: String) -> Result<TaskOut, String> {
     task_client()?.cancel(&task_id).map_err(|e| err_string(&e)).map(TaskOut::from)
+}
+
+// --- Plan surface (ORC-1) ---
+//
+// Two commands mirror the ORC-1 plan routes (draft /
+// get-by-id; the current-plan read is `plan_get` with
+// the task id). ORC-1 has no approval flow: drafting
+// a plan is a plain SQLite write, not a write through
+// the approval machinery, so these commands never
+// request or decide an approval. The digest is
+// computed gateway-side; the draft input carries no
+// digest field and no execution_id (a draft has no
+// Execution yet).
+fn plan_client() -> Result<PlanClient, String> {
+    PlanClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn plan_draft(
+    task_id: String,
+    steps: Vec<PlanStepInput>,
+    replan_if: Option<Vec<PlanReplanIfInput>>,
+    planner_model: Option<String>,
+) -> Result<PlanRecord, String> {
+    plan_client()?
+        .draft_plan(&PlanDraftInput {
+            task_id,
+            steps,
+            replan_if: replan_if.unwrap_or_default(),
+            planner_model,
+        })
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn plan_get(plan_id: String) -> Result<PlanRecord, String> {
+    plan_client()?.plan_get(&plan_id).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn plan_current(task_id: String) -> Result<PlanRecord, String> {
+    plan_client()?.current_plan(&task_id).map_err(agent_err_string)
 }
 
 // --- Devices (B-layer single-device validation) ---

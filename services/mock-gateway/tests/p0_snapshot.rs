@@ -118,6 +118,7 @@ fn task_record(
         goal_id: None,
         project_id: None,
         workspace_id: None,
+        plan_id: None,
     }
 }
 

@@ -1,4 +1,4 @@
-//! Task routes: /tasks (10 routes).
+//! Task routes: /tasks (13 routes).
 //!
 //! The handlers moved here from `server.rs` (FU-5 S-6). The rest of the
 //! route directory lives in `server.rs`. There is no `//!` directory line
@@ -22,7 +22,7 @@
 //! precedent: a helper called from staying code stays in server.rs).
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -30,7 +30,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::effect_store::NewEffect;
-use crate::routes_common::bad_request;
+use crate::operation_binding::plan_digest;
+use crate::plan_store::{PlanStep, ReplanIf};
+use crate::routes_common::{bad_request, sqlite_error_response, sqlite_not_configured};
 use crate::server::{
     check_idempotency, close_execution, close_execution_for_task,
     consume_bound_approval_for_effect, create_execution, create_mandate, ensure_root,
@@ -186,6 +188,7 @@ pub(crate) async fn tasks_create(
         goal_id: req.goal_id,
         project_id: req.project_id,
         workspace_id: req.workspace_id,
+        plan_id: None,
     };
     state.tasks.lock().expect("task lock").insert(record.task_id.clone(), record.clone());
     persist_task(&state, &record);
@@ -752,5 +755,308 @@ pub(crate) async fn tasks_cancel(
         }
         _ => (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task not cancellable" })))
             .into_response(),
+    }
+}
+
+/// ORC-1 plan DTOs (plan §3, Q-ORC-03/04/05).
+/// The DTO carries no `digest` field and no
+/// `execution_id`: the digest is recomputed
+/// server-side from the validated arrays, and a draft
+/// has no Execution yet (execution_id is NULL).
+#[derive(Debug, Deserialize)]
+pub(crate) struct PlanStepDto {
+    step_no: i64,
+    kind: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(default)]
+    change: Option<String>,
+    #[serde(default)]
+    verify_cmd: Option<String>,
+    #[serde(default)]
+    expected: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PlanReplanIfDto {
+    signal: String,
+    action: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PlanDraftDto {
+    task_id: String,
+    steps: Vec<PlanStepDto>,
+    #[serde(default)]
+    replan_if: Vec<PlanReplanIfDto>,
+    #[serde(default)]
+    planner_model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PlanListQuery {
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
+/// Validate one draft step (Q-ORC-04): `kind` must
+/// be one of the four blueprint kinds; the
+/// four-piece set — `path` / `symbol` / `change` /
+/// `verify_cmd` / `expected` — must be present and
+/// non-empty. An empty string counts as missing: a
+/// step that names nothing cannot be executed
+/// "按图索骥".
+fn non_empty_field(value: &Option<String>) -> Option<&str> {
+    value.as_deref().map(str::trim).filter(|text| !text.is_empty())
+}
+
+fn validate_plan_step(step: &PlanStepDto) -> Result<PlanStep, String> {
+    if !matches!(
+        step.kind.as_str(),
+        "file_write" | "command" | "verify" | "review"
+    ) {
+        return Err(format!("invalid plan step kind: {}", step.kind));
+    }
+    let path = non_empty_field(&step.path).ok_or("plan step missing path")?;
+    let symbol = non_empty_field(&step.symbol).ok_or("plan step missing symbol")?;
+    let change = non_empty_field(&step.change).ok_or("plan step missing change")?;
+    let verify_cmd = non_empty_field(&step.verify_cmd).ok_or("plan step missing verify_cmd")?;
+    let expected = non_empty_field(&step.expected).ok_or("plan step missing expected")?;
+    Ok(PlanStep {
+        step_no: step.step_no,
+        kind: step.kind.clone(),
+        path: path.to_string(),
+        symbol: symbol.to_string(),
+        change: change.to_string(),
+        verify_cmd: verify_cmd.to_string(),
+        expected: expected.to_string(),
+    })
+}
+
+/// ORC-1 (plan §3): draft a plan version for a task.
+/// The plan belongs to the task, so the task must
+/// exist — unknown task is 404, the `tasks_*`
+/// unknown-task wording. A second draft for the same
+/// task supersedes the current version in the same
+/// transaction (Q-ORC-12). ORC-1 has NO approval
+/// flow: this route creates the plan row + digest
+/// only; no approve route, no approval tool, no
+/// approval arm is added here.
+pub(crate) async fn tasks_plan_draft(
+    State(state): State<AppState>,
+    Json(req): Json<PlanDraftDto>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    // The tasks lock is held across the whole draft:
+    // existence, the plan write, and the pointer
+    // update serialize, so two concurrent drafts for
+    // one task cannot leave `plan_id` pointing at the
+    // superseded version.
+    let mut tasks = state.tasks.lock().expect("task lock");
+    let Some(record) = tasks.get_mut(&req.task_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
+            .into_response();
+    };
+    if req.steps.is_empty() {
+        return bad_request("plan steps must be a non-empty array");
+    }
+    // step_no must be 1-up consecutive and unique
+    // (LOCAL DEFINITION — the plan leaves the step_no
+    // rule to the implementer; a gap or a duplicate
+    // would make the Executor's order ambiguous).
+    let mut steps: Vec<PlanStep> = Vec::with_capacity(req.steps.len());
+    for (index, step) in req.steps.iter().enumerate() {
+        if step.step_no != index as i64 + 1 {
+            return bad_request("plan step_no must be consecutive starting at 1");
+        }
+        match validate_plan_step(step) {
+            Ok(valid) => steps.push(valid),
+            Err(message) => return bad_request(&message),
+        }
+    }
+    // Re-plan-if (Q-ORC-05): `signal` is free text, but
+    // an empty signal can never trigger, so it is
+    // refused; `action` has exactly one value.
+    let mut replan_if: Vec<ReplanIf> = Vec::with_capacity(req.replan_if.len());
+    for condition in &req.replan_if {
+        if condition.signal.trim().is_empty() {
+            return bad_request("plan replan_if signal must not be empty");
+        }
+        if condition.action != "stop_and_hand_back" {
+            return bad_request("plan replan_if action must be stop_and_hand_back");
+        }
+        replan_if.push(ReplanIf {
+            signal: condition.signal.clone(),
+            action: condition.action.clone(),
+        });
+    }
+    // planner_model defaults to the gateway's current
+    // model string (LOCAL DEFINITION — the plan leaves
+    // the default to the implementer): the staged
+    // model when one is staged, else the running
+    // DeepSeek config's model — the same precedence
+    // `model_view` uses in routes_misc.rs.
+    let planner_model = req.planner_model.clone().unwrap_or_else(|| {
+        state
+            .model_staged
+            .lock()
+            .expect("model staged lock")
+            .as_ref()
+            .and_then(|staged| staged.model.clone())
+            .unwrap_or_else(|| state.deepseek.config().model.clone())
+    });
+    let steps_value = serde_json::to_value(&steps).unwrap_or(serde_json::Value::Null);
+    let replan_value = serde_json::to_value(&replan_if).unwrap_or(serde_json::Value::Null);
+    let digest = plan_digest(
+        &req.task_id,
+        &crate::sqlite_store::canonical_json(&steps_value),
+        &crate::sqlite_store::canonical_json(&replan_value),
+    );
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    let row = match crate::plan_store::create_plan(
+        &mut conn,
+        &req.task_id,
+        &steps,
+        &replan_if,
+        &planner_model,
+        &digest,
+        &state.origin_device_id,
+    ) {
+        Ok(row) => row,
+        Err(detail) => {
+            eprintln!("warning: plan draft failed ({detail})");
+            return sqlite_error_response();
+        }
+    };
+    // Point the task at its new current plan (a
+    // pointer only — the `plans` table is the fact
+    // source).
+    record.plan_id = Some(row.plan_id.clone());
+    let updated = record.clone();
+    persist_task(&state, &updated);
+    drop(tasks);
+    match row.to_record() {
+        Ok(record) => Json(record).into_response(),
+        Err(detail) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": detail })),
+        )
+            .into_response(),
+    }
+}
+
+/// ORC-1 (plan §3): read plans. With `?task_id=`
+/// the task's current plan object (unknown task or
+/// no plan yet: 404, the `tasks_draft` wording);
+/// without it a bare array of all plans, newest
+/// first, default 50, max 200 (the MCL list
+/// precedent).
+pub(crate) async fn tasks_plan_list(
+    State(state): State<AppState>,
+    Query(query): Query<PlanListQuery>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0);
+    if let Some(task_id) = &query.task_id {
+        if !state.tasks.lock().expect("task lock").contains_key(task_id) {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
+                .into_response();
+        }
+        return match crate::plan_store::current_plan_for_task(&conn, task_id) {
+            Ok(Some(row)) => match row.to_record() {
+                Ok(record) => Json(record).into_response(),
+                Err(detail) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": detail })),
+                )
+                    .into_response(),
+            },
+            Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "no plan" })))
+                .into_response(),
+            Err(detail) => {
+                eprintln!("warning: plan list failed ({detail})");
+                sqlite_error_response()
+            }
+        };
+    }
+    match crate::plan_store::list_plans(&conn, None, limit, offset) {
+        Ok(rows) => {
+            let mut records = Vec::with_capacity(rows.len());
+            for row in rows {
+                match row.to_record() {
+                    Ok(record) => records.push(record),
+                    Err(detail) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({ "error": detail })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            Json(records).into_response()
+        }
+        Err(detail) => {
+            eprintln!("warning: plan list failed ({detail})");
+            sqlite_error_response()
+        }
+    }
+}
+
+/// ORC-1 (plan §3): one plan version by local
+/// `plan-N` id. Unknown id is 404.
+pub(crate) async fn tasks_plan_get(
+    State(state): State<AppState>,
+    Path(plan_id): Path<String>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let conn = sqlite.lock().expect("sqlite lock");
+    match crate::plan_store::get_plan(&conn, &plan_id) {
+        Ok(Some(row)) => match row.to_record() {
+            Ok(record) => Json(record).into_response(),
+            Err(detail) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": detail })),
+            )
+                .into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown plan" })))
+            .into_response(),
+        Err(detail) => {
+            eprintln!("warning: plan get failed ({detail})");
+            sqlite_error_response()
+        }
     }
 }

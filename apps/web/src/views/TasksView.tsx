@@ -19,6 +19,7 @@ import type {
   ExecutionsGateway,
 } from "../domain/executions_client";
 import type { MandatesGateway } from "../domain/mandates_client";
+import type { Plan, PlanGateway } from "../domain/plan_client";
 import { ExecutionDetail } from "./ExecutionDetail";
 import { MandatesSection } from "./MandatesSection";
 
@@ -60,6 +61,11 @@ interface TasksViewProps {
   // same as the other clients: until App.tsx passes it the
   // sections below say so.
   mandates?: MandatesGateway | null;
+  // ORC-1 (Q-ORC-03): plan client for the task-level
+  // "蓝图" section below. Optional, same as the other
+  // clients: until App.tsx passes it the section below
+  // says so.
+  plans?: PlanGateway | null;
   // Settings page's default working directory (root-relative,
   // "" = file root). Only the initial directory for a new
   // task and its default artifact path; an explicitly typed
@@ -90,6 +96,7 @@ export function TasksView({
   evidence: evidenceClient = null,
   assignments: assignmentsClient = null,
   mandates: mandatesClient = null,
+  plans: plansClient = null,
   defaultDir = "",
   defaultDirValid = true,
 }: TasksViewProps) {
@@ -117,6 +124,27 @@ export function TasksView({
   const [taskEffects, setTaskEffects] = useState<EffectRecord[]>([]);
   const [taskEvidence, setTaskEvidence] = useState<EvidenceRow[]>([]);
   const [execError, setExecError] = useState("");
+  // ORC-1: the selected task's current plan, loaded
+  // once per selected task. A 404 means the task has
+  // no plan yet ("暂无蓝图"); any other failure is a
+  // read error, not an empty plan.
+  const [currentPlan, setCurrentPlan] = useState<Plan | null>(null);
+  const [planError, setPlanError] = useState("");
+
+  async function refreshPlan(taskId: string) {
+    if (!plansClient) return;
+    setPlanError("");
+    try {
+      setCurrentPlan(await plansClient.currentPlan(taskId));
+    } catch (e) {
+      if (errText(e).includes("404")) {
+        setCurrentPlan(null);
+      } else {
+        setCurrentPlan(null);
+        setPlanError(`蓝图读取失败：${errText(e)}`);
+      }
+    }
+  }
 
   async function refreshExecutionData(taskId: string) {
     if (!executionsClient) return;
@@ -138,11 +166,15 @@ export function TasksView({
   }
 
   useEffect(() => {
-    if (current) void refreshExecutionData(current.taskId);
-    else {
+    if (current) {
+      void refreshExecutionData(current.taskId);
+      void refreshPlan(current.taskId);
+    } else {
       setTaskExecutions([]);
       setTaskEffects([]);
       setTaskEvidence([]);
+      setCurrentPlan(null);
+      setPlanError("");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current?.taskId]);
@@ -607,6 +639,53 @@ export function TasksView({
               <button onClick={() => void handleViewArtifact(current)} disabled={busy}>
                 查看产物
               </button>
+            </div>
+          )}
+          <h3>蓝图</h3>
+          {!plansClient && (
+            <p className="note">蓝图客户端尚未接入：待 App 接线传入客户端后，这里显示该任务的当前蓝图。</p>
+          )}
+          {plansClient && (
+            <div>
+              <button onClick={() => void refreshPlan(current.taskId)} disabled={busy}>
+                刷新蓝图
+              </button>
+              {planError !== "" && <p>错误：{planError}</p>}
+              {currentPlan === null && planError === "" && <p className="empty">暂无蓝图。</p>}
+              {currentPlan !== null && (
+                <div>
+                  <p>
+                    {currentPlan.planId} · 版本 {currentPlan.version} · {currentPlan.status} ·
+                    规划模型 {currentPlan.plannerModel} · 摘要 {currentPlan.digest.slice(0, 16)}…
+                  </p>
+                  <ol>
+                    {currentPlan.steps.map((step) => (
+                      <li key={step.stepNo}>
+                        <p>
+                          步骤 {step.stepNo} · {step.kind}
+                        </p>
+                        <p>路径：{step.path}</p>
+                        <p>符号：{step.symbol}</p>
+                        <p>改动：{step.change}</p>
+                        <p>验证：{step.verifyCmd}</p>
+                        <p>预期：{step.expected}</p>
+                      </li>
+                    ))}
+                  </ol>
+                  {currentPlan.replanIf.length > 0 && (
+                    <div>
+                      <h4>Re-plan if</h4>
+                      <ul>
+                        {currentPlan.replanIf.map((condition, index) => (
+                          <li key={index}>
+                            {condition.signal} → {condition.action}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
           <h3>Execution</h3>

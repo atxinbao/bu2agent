@@ -31,6 +31,10 @@ export interface TaskRecord {
   goalId: string | null;
   projectId: string | null;
   workspaceId: string | null;
+  // ORC-1 (Q-ORC-03): the task's current plan id
+  // (`plan-N`). A pointer only — the `plans` table is
+  // the fact source. Tasks without a plan carry null.
+  planId: string | null;
 }
 
 // A gateway-run task's draft, fetched separately: the record
@@ -61,6 +65,7 @@ interface ServerTaskRecord {
   goal_id: string | null;
   project_id: string | null;
   workspace_id: string | null;
+  plan_id: string | null;
 }
 
 interface ServerTaskDraft {
@@ -90,6 +95,7 @@ function toRecord(server: ServerTaskRecord): TaskRecord {
     goalId: server.goal_id,
     projectId: server.project_id,
     workspaceId: server.workspace_id,
+    planId: server.plan_id,
   };
 }
 
