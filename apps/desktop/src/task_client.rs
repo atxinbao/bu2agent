@@ -73,10 +73,29 @@ struct TaskIdRequest {
 /// ORC-2 (Q-ORC-07): the run request with the triage
 /// override — `force_execute: true` bypasses the
 /// Planner's "no file change" judgment.
+///
+/// W4-1 (Q-FW-01/02): the optional `worktree_id` is
+/// the worktree the user picked in the task detail.
+/// The gateway freezes the task's execute binding on
+/// first use (P3-C scheme A); absent means no freeze.
+/// Only `tasks_run` reads `force_execute`.
 #[derive(Debug, Serialize)]
 struct TaskRunRequest {
     task_id: String,
     force_execute: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worktree_id: Option<String>,
+}
+
+/// W4-1 (Q-FW-06): the execute request carries the
+/// same optional worktree for the `tasks_execute`
+/// worker-step branch, which freezes the binding the
+/// same way `tasks_run` does.
+#[derive(Debug, Serialize)]
+struct TaskExecuteRequest {
+    task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worktree_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,18 +150,29 @@ impl TaskClient {
     /// sidecar body; `execute` consumes the bound approval and
     /// writes; `reject` decides the approval rejected; `resume`
     /// restarts an interrupted task; `cancel` stops a running or
-    /// draft_ready task. All take only the task id.
-    pub fn run(&self, task_id: &str) -> Result<TaskRecord> {
-        self.post_task_id("/tasks/run", task_id)
+    /// draft_ready task. `run`, `run_force` and `execute` take
+    /// an optional worktree id (W4-1): when given, the
+    /// gateway freezes the task's execute binding to it;
+    /// when absent, no binding is frozen and a worker step
+    /// fails honestly at its prepare gate.
+    pub fn run(&self, task_id: &str, worktree_id: Option<&str>) -> Result<TaskRecord> {
+        let body = serde_json::to_string(&TaskRunRequest {
+            task_id: task_id.to_string(),
+            force_execute: false,
+            worktree_id: worktree_id.map(|s| s.to_string()),
+        })
+        .map_err(|_| transport_error("cannot encode task run request"))?;
+        self.http.post_json("/tasks/run", &body)
     }
 
     /// ORC-2 (Q-ORC-07): run with the triage override —
     /// the Planner's "no file change" judgment is bypassed
     /// and the Executor runs anyway.
-    pub fn run_force(&self, task_id: &str) -> Result<TaskRecord> {
+    pub fn run_force(&self, task_id: &str, worktree_id: Option<&str>) -> Result<TaskRecord> {
         let body = serde_json::to_string(&TaskRunRequest {
             task_id: task_id.to_string(),
             force_execute: true,
+            worktree_id: worktree_id.map(|s| s.to_string()),
         })
         .map_err(|_| transport_error("cannot encode task run request"))?;
         self.http.post_json("/tasks/run", &body)
@@ -152,8 +182,13 @@ impl TaskClient {
         self.http.get_json(&format!("/tasks/draft?task_id={task_id}"))
     }
 
-    pub fn execute(&self, task_id: &str) -> Result<TaskRecord> {
-        self.post_task_id("/tasks/execute", task_id)
+    pub fn execute(&self, task_id: &str, worktree_id: Option<&str>) -> Result<TaskRecord> {
+        let body = serde_json::to_string(&TaskExecuteRequest {
+            task_id: task_id.to_string(),
+            worktree_id: worktree_id.map(|s| s.to_string()),
+        })
+        .map_err(|_| transport_error("cannot encode task execute request"))?;
+        self.http.post_json("/tasks/execute", &body)
     }
 
     pub fn reject(&self, task_id: &str) -> Result<TaskRecord> {

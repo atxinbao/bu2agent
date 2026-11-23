@@ -832,3 +832,95 @@ async fn r5_single_step_failure_stops_batch() {
     assert!(h.open_inbox("failed").await.is_empty());
     assert_eq!(h.plan_count(&task_id), 1);
 }
+
+/// R6 (W4-1, Q-FW-09): a worker step with no frozen
+/// binding fails honestly at the prepare gate — the
+/// task fails, the error tells the user to pick a
+/// worktree in the task detail, exactly one
+/// `step_failed` Evidence row is recorded, and no
+/// Inbox row opens. (This is the ORC-2 window W4
+/// failure, which no test covered: r5 always passed
+/// a `worktree_id`.)
+#[tokio::test]
+async fn r6_worker_step_without_binding_fails_honestly() {
+    let (fake_url, _fake) = start_fake_deepseek(vec![planner_steps_reply(vec![
+        verify_step(1, "git status"),
+    ])])
+    .await;
+    let h = Harness::serve(&fake_url).await;
+    let task_id = h.make_task().await;
+    let (status, value) = h.post("/tasks/run", json!({"task_id": task_id})).await;
+    assert_eq!(status, StatusCode::OK, "run: {value}");
+    let record = h.wait_task_status(&task_id, "failed", 60).await;
+    let error = record["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("未绑定工作区"),
+        "the failure names the missing binding: {record}"
+    );
+    assert!(
+        error.contains("选择工作区"),
+        "the failure tells the user how to fix it: {record}"
+    );
+    assert_eq!(h.plan_count(&task_id), 1);
+    // Exactly one `step_failed` Evidence row, from the
+    // prepare gate (no worker run was ever created).
+    let evidence = h.evidence().await;
+    let failed: Vec<&Value> = evidence
+        .iter()
+        .filter(|e| e["reason"] == "step_failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "evidence: {evidence:?}");
+    assert_eq!(failed[0]["source"], "executor");
+    let observed = observed_of(failed[0]);
+    assert_eq!(observed["step_no"], 1);
+    assert_eq!(observed["step_kind"], "verify");
+    assert!(
+        observed["failure"].as_str().unwrap_or("").contains("未绑定工作区"),
+        "observed failure: {observed}"
+    );
+    assert_eq!(observed["run_id"], Value::Null);
+    // The failed Execution close opens one `failed`
+    // Inbox row for review (E2-A §2.3) — unlike r5,
+    // no worker run ever existed, so the §5.4 test-run
+    // carve-out (`close_execution_no_inbox`) does not
+    // apply. The row names the Execution, no Effect.
+    let inbox = h.open_inbox("failed").await;
+    assert_eq!(inbox.len(), 1, "inbox: {inbox:?}");
+    assert_eq!(inbox[0]["execution_id"], "execution-1");
+    assert_eq!(inbox[0]["effect_id"], Value::Null);
+}
+
+/// R7 (W4-1, Q-FW-01): the same worker step with a
+/// frozen binding runs — the read-only verify step
+/// (`git status`, no approval) executes inside the
+/// worktree and the task completes.
+#[tokio::test]
+async fn r7_worker_step_with_binding_succeeds() {
+    let (fake_url, _fake) = start_fake_deepseek(vec![planner_steps_reply(vec![
+        verify_step(1, "git status"),
+    ])])
+    .await;
+    let h = Harness::serve(&fake_url).await;
+    let repo = init_repo(&h.dir);
+    let worktree_id = h.setup_worktree(&repo).await;
+    let task_id = h.make_task().await;
+    let (status, value) = h
+        .post("/tasks/run", json!({"task_id": task_id, "worktree_id": worktree_id}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "run: {value}");
+    // The read-only verify step stops at draft_ready
+    // with no approval; `tasks_execute` runs it.
+    let record = h.wait_task_status(&task_id, "draft_ready", 30).await;
+    assert_eq!(record["executor_step_no"], 1);
+    assert_eq!(record["approval_id"], Value::Null);
+    let (status, value) = h.post("/tasks/execute", json!({"task_id": task_id})).await;
+    assert_eq!(status, StatusCode::OK, "execute: {value}");
+    let record = h.wait_task_status(&task_id, "completed", 90).await;
+    assert_eq!(record["status"], "completed");
+    assert_eq!(h.plan_count(&task_id), 1);
+    let evidence = h.evidence().await;
+    assert!(
+        evidence.iter().all(|e| e["reason"] != "step_failed"),
+        "no step failure: {evidence:?}"
+    );
+}

@@ -124,14 +124,17 @@ export interface TaskGateway {
   // draft fetches the sidecar body; execute consumes the bound
   // approval and writes; reject decides it rejected; resume
   // restarts an interrupted task; cancel stops a running or
-  // draft_ready task.
-  run(taskId: string): Promise<TaskRecord>;
+  // draft_ready task. run / runForce / execute take an
+  // optional worktree id (W4-1): when given, the gateway
+  // freezes the task's execute binding to it; absent means
+  // no freeze and a worker step fails honestly.
+  run(taskId: string, worktreeId?: string | null): Promise<TaskRecord>;
   // ORC-2 (Q-ORC-07): run with the triage override —
   // the Planner's "no file change" judgment is bypassed
   // and the Executor runs anyway.
-  runForce(taskId: string): Promise<TaskRecord>;
+  runForce(taskId: string, worktreeId?: string | null): Promise<TaskRecord>;
   draft(taskId: string): Promise<TaskDraft>;
-  execute(taskId: string): Promise<TaskRecord>;
+  execute(taskId: string, worktreeId?: string | null): Promise<TaskRecord>;
   reject(taskId: string): Promise<TaskRecord>;
   resume(taskId: string): Promise<TaskRecord>;
   cancel(taskId: string): Promise<TaskRecord>;
@@ -199,15 +202,30 @@ export class TaskClient implements TaskGateway {
     return toRecord(record);
   }
 
-  async run(taskId: string): Promise<TaskRecord> {
-    return this.postTaskId("/tasks/run", taskId);
-  }
-
-  async runForce(taskId: string): Promise<TaskRecord> {
+  async run(taskId: string, worktreeId?: string | null): Promise<TaskRecord> {
     const record = await this.request<ServerTaskRecord>("/tasks/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task_id: taskId, force_execute: true }),
+      body: JSON.stringify({
+        task_id: taskId,
+        ...(worktreeId ? { worktree_id: worktreeId } : {}),
+      }),
+    });
+    return toRecord(record);
+  }
+
+  async runForce(
+    taskId: string,
+    worktreeId?: string | null,
+  ): Promise<TaskRecord> {
+    const record = await this.request<ServerTaskRecord>("/tasks/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        task_id: taskId,
+        force_execute: true,
+        ...(worktreeId ? { worktree_id: worktreeId } : {}),
+      }),
     });
     return toRecord(record);
   }
@@ -219,8 +237,19 @@ export class TaskClient implements TaskGateway {
     return toDraft(draft);
   }
 
-  async execute(taskId: string): Promise<TaskRecord> {
-    return this.postTaskId("/tasks/execute", taskId);
+  async execute(
+    taskId: string,
+    worktreeId?: string | null,
+  ): Promise<TaskRecord> {
+    const record = await this.request<ServerTaskRecord>("/tasks/execute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        task_id: taskId,
+        ...(worktreeId ? { worktree_id: worktreeId } : {}),
+      }),
+    });
+    return toRecord(record);
   }
 
   async reject(taskId: string): Promise<TaskRecord> {

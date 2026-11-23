@@ -106,15 +106,32 @@ export class InvokeTaskClient implements TaskGateway {
     return toRecord(record);
   }
 
-  async run(taskId: string): Promise<TaskRecord> {
-    return this.postTaskId("task_run", taskId);
-  }
-
-  async runForce(taskId: string): Promise<TaskRecord> {
-    const record = await invoke<ServerTaskRecord>("task_run_force", {
+  // W4-1: the optional worktree id is forwarded to the
+  // shell command only when picked; absent means the
+  // gateway freezes no binding.
+  private async postTaskRun(
+    command: string,
+    taskId: string,
+    worktreeId?: string | null,
+    forceExecute?: boolean,
+  ): Promise<TaskRecord> {
+    const record = await invoke<ServerTaskRecord>(command, {
       task_id: taskId,
+      ...(forceExecute ? { force_execute: true } : {}),
+      ...(worktreeId ? { worktree_id: worktreeId } : {}),
     });
     return toRecord(record);
+  }
+
+  async run(taskId: string, worktreeId?: string | null): Promise<TaskRecord> {
+    return this.postTaskRun("task_run", taskId, worktreeId);
+  }
+
+  async runForce(
+    taskId: string,
+    worktreeId?: string | null,
+  ): Promise<TaskRecord> {
+    return this.postTaskRun("task_run_force", taskId, worktreeId, true);
   }
 
   async draft(taskId: string): Promise<TaskDraft> {
@@ -124,8 +141,11 @@ export class InvokeTaskClient implements TaskGateway {
     return toDraft(draft);
   }
 
-  async execute(taskId: string): Promise<TaskRecord> {
-    return this.postTaskId("task_execute", taskId);
+  async execute(
+    taskId: string,
+    worktreeId?: string | null,
+  ): Promise<TaskRecord> {
+    return this.postTaskRun("task_execute", taskId, worktreeId);
   }
 
   async reject(taskId: string): Promise<TaskRecord> {

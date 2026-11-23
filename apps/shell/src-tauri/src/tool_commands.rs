@@ -1006,20 +1006,29 @@ pub fn task_update(
 }
 
 // --- Task runner (Round 3b): one command per gateway endpoint.
-// All take only the task id; execute never self-approves, the
-// window decides approved first, then calls task_execute.
+// `run` / `run_force` / `execute` take an optional
+// worktree id (W4-1, Q-FW-13): when given, the gateway
+// freezes the task's execute binding to it; absent means
+// no freeze. Execute never self-approves, the window
+// decides approved first, then calls task_execute.
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn task_run(task_id: String) -> Result<TaskOut, String> {
-    task_client()?.run(&task_id).map_err(|e| err_string(&e)).map(TaskOut::from)
+pub fn task_run(task_id: String, worktree_id: Option<String>) -> Result<TaskOut, String> {
+    task_client()?
+        .run(&task_id, worktree_id.as_deref())
+        .map_err(|e| err_string(&e))
+        .map(TaskOut::from)
 }
 
 /// ORC-2 (Q-ORC-07): run with the triage override —
 /// the Planner's "no file change" judgment is bypassed
 /// and the Executor runs anyway.
 #[tauri::command(rename_all = "snake_case")]
-pub fn task_run_force(task_id: String) -> Result<TaskOut, String> {
-    task_client()?.run_force(&task_id).map_err(|e| err_string(&e)).map(TaskOut::from)
+pub fn task_run_force(task_id: String, worktree_id: Option<String>) -> Result<TaskOut, String> {
+    task_client()?
+        .run_force(&task_id, worktree_id.as_deref())
+        .map_err(|e| err_string(&e))
+        .map(TaskOut::from)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1034,8 +1043,11 @@ pub fn task_draft(task_id: String) -> Result<TaskDraftOut, String> {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn task_execute(task_id: String) -> Result<TaskOut, String> {
-    task_client()?.execute(&task_id).map_err(|e| err_string(&e)).map(TaskOut::from)
+pub fn task_execute(task_id: String, worktree_id: Option<String>) -> Result<TaskOut, String> {
+    task_client()?
+        .execute(&task_id, worktree_id.as_deref())
+        .map_err(|e| err_string(&e))
+        .map(TaskOut::from)
 }
 
 #[tauri::command(rename_all = "snake_case")]

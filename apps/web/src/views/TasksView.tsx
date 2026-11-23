@@ -21,6 +21,10 @@ import type {
 import type { MandatesGateway } from "../domain/mandates_client";
 import type { Plan, PlanGateway } from "../domain/plan_client";
 import type { ModelGateway, ModelState } from "../domain/model_client";
+import type {
+  EngineeringGateway,
+  Worktree,
+} from "../domain/engineering_client";
 import { ExecutionDetail } from "./ExecutionDetail";
 import { MandatesSection } from "./MandatesSection";
 
@@ -72,6 +76,13 @@ interface TasksViewProps {
   // pattern: until App.tsx passes it the section says
   // so. Read-only — slot setting lives in Settings.
   models?: ModelGateway | null;
+  // W4-1 (Q-FW-02): engineering client for the
+  // task-level worktree picker below. Optional, same
+  // pattern as the other clients: until App.tsx passes
+  // it the section says so. The pick is explicit per
+  // task — no global default, no remembered pick — and
+  // an unpicked run passes no worktree id at all.
+  engineering?: EngineeringGateway | null;
   // Settings page's default working directory (root-relative,
   // "" = file root). Only the initial directory for a new
   // task and its default artifact path; an explicitly typed
@@ -104,6 +115,7 @@ export function TasksView({
   mandates: mandatesClient = null,
   plans: plansClient = null,
   models: modelsClient = null,
+  engineering: engineeringClient = null,
   defaultDir = "",
   defaultDirValid = true,
 }: TasksViewProps) {
@@ -154,6 +166,26 @@ export function TasksView({
     }
   }
 
+  // W4-1 (Q-FW-02): the worktree picker options.
+  // Loaded once when the view mounts; only active
+  // rows are offered. The pick itself lives in
+  // selectedWorktreeId and resets per selected task.
+  const [worktrees, setWorktrees] = useState<Worktree[]>([]);
+  const [worktreeError, setWorktreeError] = useState("");
+  const [selectedWorktreeId, setSelectedWorktreeId] = useState("");
+
+  async function refreshWorktrees() {
+    if (!engineeringClient) return;
+    setWorktreeError("");
+    try {
+      const all = await engineeringClient.worktreeList();
+      setWorktrees(all.filter((w) => w.status === "active"));
+    } catch (e) {
+      setWorktrees([]);
+      setWorktreeError(`工作区读取失败：${errText(e)}`);
+    }
+  }
+
   async function refreshPlan(taskId: string) {
     if (!plansClient) return;
     setPlanError("");
@@ -199,6 +231,8 @@ export function TasksView({
       setCurrentPlan(null);
       setPlanError("");
     }
+    // W4-1: the worktree pick is explicit per task.
+    setSelectedWorktreeId("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current?.taskId]);
 
@@ -213,6 +247,7 @@ export function TasksView({
   useEffect(() => {
     void refreshTasks();
     void refreshModels();
+    void refreshWorktrees();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -306,7 +341,10 @@ export function TasksView({
     setMessage("");
     setBusy(true);
     try {
-      const updated = await tasks.run(current.taskId);
+      const updated = await tasks.run(
+        current.taskId,
+        selectedWorktreeId === "" ? undefined : selectedWorktreeId,
+      );
       setCurrent(updated);
       setMessage("网关正在运行，关窗不丢进度；到审批点后在此批准。");
       await refreshTasks();
@@ -328,7 +366,10 @@ export function TasksView({
     setMessage("");
     setBusy(true);
     try {
-      const updated = await tasks.runForce(current.taskId);
+      const updated = await tasks.runForce(
+        current.taskId,
+        selectedWorktreeId === "" ? undefined : selectedWorktreeId,
+      );
       setCurrent(updated);
       setMessage("已强制执行：网关正在按蓝图运行，关窗不丢进度；到审批点后在此批准。");
       await refreshTasks();
@@ -451,7 +492,10 @@ export function TasksView({
       // executes the bound approval. Execute never approves.
       if (current.approvalId) {
         await agent.decideApproval(current.approvalId, "approve");
-        const updated = await tasks.execute(current.taskId);
+        const updated = await tasks.execute(
+          current.taskId,
+          selectedWorktreeId === "" ? undefined : selectedWorktreeId,
+        );
         setCurrent(updated);
         setMessage(`已批准并写入 ${artifactPath}，任务完成。`);
         await refreshTasks();
@@ -630,6 +674,42 @@ export function TasksView({
           {current.status === "failed" && current.error && (
             <p>失败原因：{current.error}</p>
           )}
+          <div>
+            <h3>工作区</h3>
+            {!engineeringClient && (
+              <p className="note">工作区客户端尚未接入：待 App 接线传入客户端后，这里可以选择运行任务的工作区。</p>
+            )}
+            {engineeringClient && current.executeBinding && (
+              <p>
+                已冻结绑定 {current.executeBinding.worktreeId}，运行中不可改。
+              </p>
+            )}
+            {engineeringClient && !current.executeBinding && (
+              <div>
+                <select
+                  value={selectedWorktreeId}
+                  onChange={(e) => setSelectedWorktreeId(e.target.value)}
+                  disabled={busy}
+                >
+                  <option value="">未选择工作区</option>
+                  {worktrees.map((w) => (
+                    <option key={w.worktreeId} value={w.worktreeId}>
+                      {w.worktreeId}
+                      {w.directoryRelative ? ` · ${w.directoryRelative}` : ""}
+                      {w.branchLabel ? ` · ${w.branchLabel}` : ""}
+                    </option>
+                  ))}
+                </select>
+                <button onClick={() => void refreshWorktrees()} disabled={busy}>
+                  刷新工作区
+                </button>
+                {worktreeError !== "" && <p>错误：{worktreeError}</p>}
+                <p className="note">
+                  worker 步骤（验证/命令）要在工作区里跑；不选则不传，遇到这类步骤会按“未绑定工作区”失败。
+                </p>
+              </div>
+            )}
+          </div>
           <div>
             {!current.approvalId && (
               <button onClick={() => void handleGenerate()} disabled={busy}>

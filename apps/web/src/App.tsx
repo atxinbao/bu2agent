@@ -787,6 +787,7 @@ export function App() {
             tasks={clients.tasks}
             plans={clients.plans}
             models={clients.models}
+            engineering={clients.engineering}
             executions={clients.executions}
             effects={clients.effects}
             evidence={clients.evidence}
