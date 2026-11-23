@@ -193,6 +193,21 @@ impl DeepSeekClient {
         self.reply_with_history_with_rules(rules, &[], user_text).await
     }
 
+    /// ORC-2 (Q-ORC-08): like `reply_with_rules`, but the
+    /// request carries the given model instead of the
+    /// shared config's. The shared config is never
+    /// mutated per call — two concurrent runs calling
+    /// different role models must not race each other.
+    pub async fn reply_with_rules_and_model(
+        &self,
+        rules: Option<Vec<NetworkRule>>,
+        model: &str,
+        user_text: &str,
+    ) -> DeepseekOutcome {
+        self.reply_with_history_with_rules_and_model(rules, &[], model, user_text)
+            .await
+    }
+
     /// Session send: prior complete turns first, then the current
     /// user message. The caller owns trimming; this only sends
     /// what it is given, in order.
@@ -212,6 +227,22 @@ impl DeepSeekClient {
         history: &[(String, String)],
         user_text: &str,
     ) -> DeepseekOutcome {
+        let model = self.config.model.clone();
+        self.reply_with_history_with_rules_and_model(rules, history, &model, user_text)
+            .await
+    }
+
+    /// ORC-2: the single funnel every reply path runs
+    /// through. `model` is the model string for this one
+    /// request (the shared config's model for the plain
+    /// paths, a role model for the Planner/Executor).
+    pub async fn reply_with_history_with_rules_and_model(
+        &self,
+        rules: Option<Vec<NetworkRule>>,
+        history: &[(String, String)],
+        model: &str,
+        user_text: &str,
+    ) -> DeepseekOutcome {
         let Some(key) = &self.config.api_key else {
             return DeepseekOutcome::Disabled;
         };
@@ -227,7 +258,7 @@ impl DeepSeekClient {
             .map(|(role, content)| ChatMessage { role: role.clone(), content: content.clone() })
             .collect();
         messages.push(ChatMessage { role: "user".to_string(), content: user_text.to_string() });
-        let request = ChatRequest { model: self.config.model.clone(), messages, stream: false };
+        let request = ChatRequest { model: model.to_string(), messages, stream: false };
         let sent =
             self.http.post(self.config.completions_url()).bearer_auth(key).json(&request).send().await;
         let response = match sent {

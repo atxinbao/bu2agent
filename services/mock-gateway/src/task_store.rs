@@ -71,6 +71,16 @@ pub struct TaskFileRecord {
     /// (no plan yet).
     #[serde(default)]
     pub plan_id: Option<String>,
+    /// ORC-2: the Executor's current step (1-based) for
+    /// a task being driven through its plan. `None`
+    /// means "not in the Executor flow" (a compat task
+    /// or a task that has not started executing). Set
+    /// when a step is prepared, advanced after each
+    /// executed step; cleared never — a completed task
+    /// keeps the last step number as an audit trace.
+    /// Old JSONL lines load as None.
+    #[serde(default)]
+    pub executor_step_no: Option<i64>,
 }
 
 pub fn load_tasks(path: &Path) -> Vec<TaskFileRecord> {
@@ -206,6 +216,7 @@ mod tests {
                 project_id: None,
                 workspace_id: None,
                 plan_id: None,
+                executor_step_no: None,
             },
         );
         append_task(
@@ -224,6 +235,7 @@ mod tests {
                 project_id: None,
                 workspace_id: None,
                 plan_id: None,
+                executor_step_no: None,
             },
         );
         let records = load_tasks(&path);
@@ -250,6 +262,7 @@ mod tests {
                 project_id: None,
                 workspace_id: None,
                 plan_id: None,
+                executor_step_no: None,
             },
             TaskFileRecord {
                 task_id: "other".to_string(),
@@ -265,6 +278,7 @@ mod tests {
                 project_id: None,
                 workspace_id: None,
                 plan_id: None,
+                executor_step_no: None,
             },
         ];
         assert_eq!(next_task_number(&records), 4);

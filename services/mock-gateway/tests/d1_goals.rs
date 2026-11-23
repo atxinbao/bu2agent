@@ -4,10 +4,12 @@
 //!
 //! HTTP routes only (plus `sqlite_store` reads after the
 //! fact, never to fake a production step). Loops run on the
-//! scripted model; the task run uses a fake DeepSeek key
-//! against an unreachable base URL, so the runner fails
-//! fast in the background — the Execution row is created
-//! synchronously by the run route, before the runner spawns.
+//! scripted model; the task run uses a fake DeepSeek server
+//! (ORC-2: the Execution is created by the runner only
+//! after a successful Planner round, so the task run
+//! needs a model that answers — an unreachable base URL
+//! would fail the Planner round and create no Execution
+//! at all).
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -20,6 +22,7 @@ use mock_gateway::loop_engine::*;
 use mock_gateway::server::{app, AppState};
 use mock_gateway::sqlite_store;
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 static NEXT: AtomicUsize = AtomicUsize::new(1);
@@ -72,7 +75,96 @@ fn done() -> ModelReply {
     ModelReply::Final("finished".into())
 }
 
-fn build_state(dir: &Path, model: Arc<ScriptModel>) -> AppState {
+/// Minimal multi-shot fake DeepSeek (ORC-2): serves the
+/// queued completion contents in order, one per request.
+/// An empty queue answers 500 — a test that under-queues
+/// fails loudly instead of hanging on a model call.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+async fn start_fake_deepseek(
+    replies: Vec<String>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(VecDeque::from(replies)));
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let queue = queue.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_length = 0usize;
+                while header_end.is_none() {
+                    let Ok(n) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        let head = String::from_utf8_lossy(&buf[..pos]).into_owned();
+                        for line in head.lines().skip(1) {
+                            if let Some((name, value)) = line.split_once(':') {
+                                if name.trim().eq_ignore_ascii_case("content-length") {
+                                    content_length = value.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                }
+                let end = header_end.expect("header end") + content_length;
+                while buf.len() < end {
+                    let Ok(n) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let next = queue.lock().expect("queue lock").pop_front();
+                let (status_line, body) = match next {
+                    Some(content) => (
+                        "200 OK",
+                        serde_json::to_string(&json!({
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "created": 1,
+                            "model": "fake",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": content},
+                                "finish_reason": "stop",
+                            }],
+                        }))
+                        .unwrap(),
+                    ),
+                    None => (
+                        "500 Internal Server Error",
+                        "{\"error\": \"fake deepseek queue exhausted\"}".to_string(),
+                    ),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), handle)
+}
+
+fn build_state(dir: &Path, model: Arc<ScriptModel>, deepseek_base_url: &str) -> AppState {
     let state = AppState::with_files_root_and_approvals(
         dir.join("files"),
         Some(dir.join("approvals.jsonl")),
@@ -87,7 +179,7 @@ fn build_state(dir: &Path, model: Arc<ScriptModel>) -> AppState {
     )
     .unwrap()
     .with_deepseek(DeepSeekClient::new(DeepSeekConfig {
-        base_url: "http://127.0.0.1:1".to_string(),
+        base_url: deepseek_base_url.to_string(),
         model: "fixture".to_string(),
         api_key: Some("fake-d1-key".to_string()),
     }))
@@ -109,6 +201,11 @@ struct Harness {
     url: String,
     client: reqwest::Client,
     server: Option<tokio::task::JoinHandle<()>>,
+    deepseek_url: String,
+    // The fake DeepSeek task must outlive the harness
+    // setup; the field is never read, only held.
+    #[allow(dead_code)]
+    fake: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Harness {
@@ -117,13 +214,24 @@ impl Harness {
     }
 
     async fn serve_with_tasks_seed(replies: Vec<ModelReply>, tasks_seed: Option<&str>) -> Self {
+        Self::serve_with_deepseek(replies, tasks_seed, vec![]).await
+    }
+
+    /// Serve with queued fake DeepSeek completion contents
+    /// (Planner round first, then the Executor step call).
+    async fn serve_with_deepseek(
+        replies: Vec<ModelReply>,
+        tasks_seed: Option<&str>,
+        deepseek_replies: Vec<String>,
+    ) -> Self {
+        let (deepseek_url, fake) = start_fake_deepseek(deepseek_replies).await;
         let dir = temp_dir("harness");
         std::fs::create_dir_all(dir.join("files")).unwrap();
         if let Some(seed) = tasks_seed {
             std::fs::write(dir.join("tasks.jsonl"), seed).unwrap();
         }
         let model = Arc::new(ScriptModel::new(replies));
-        let state = build_state(&dir, model);
+        let state = build_state(&dir, model, &deepseek_url);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
@@ -137,6 +245,8 @@ impl Harness {
                 .build()
                 .unwrap(),
             server: Some(server),
+            deepseek_url,
+            fake: Some(fake),
         }
     }
 
@@ -158,7 +268,7 @@ impl Harness {
             let _ = old.await;
         }
         let model = Arc::new(ScriptModel::new(vec![]));
-        let state = build_state(&self.dir, model);
+        let state = build_state(&self.dir, model, &self.deepseek_url);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         self.url = format!("http://{}", listener.local_addr().unwrap());
         self.server = Some(
@@ -334,9 +444,32 @@ async fn g2_task_link_fields_roundtrip_and_old_rows() {
 /// carries the loop caller's session_id and goal_id; a
 /// task execution resolves goal_id from the Task record
 /// and keeps session_id None (no session caller).
+/// (ORC-2: the task's Execution is created by the runner
+/// only after a successful Planner round, so the test
+/// queues a valid plan + the step's file content on the
+/// fake DeepSeek and polls for the Execution.)
 #[tokio::test]
 async fn g3_execution_binds_session_and_goal() {
-    let h = Harness::serve(vec![done()]).await;
+    let plan = serde_json::to_string(&json!({
+        "needs_file_change": true,
+        "steps": [{
+            "step_no": 1,
+            "kind": "file_write",
+            "path": "proj/notes.txt",
+            "symbol": "notes",
+            "change": "write the notes file",
+            "verify_cmd": "git status",
+            "expected": "notes file written",
+        }],
+        "replan_if": [],
+    }))
+    .unwrap();
+    let h = Harness::serve_with_deepseek(
+        vec![done()],
+        None,
+        vec![plan, "hello notes\n".to_string()],
+    )
+    .await;
     let goal = h.ok("/goals/create", json!({"title": "G1"})).await;
     assert_eq!(goal["goal_id"], "goal-1");
     let started = h
@@ -350,6 +483,7 @@ async fn g3_execution_binds_session_and_goal() {
     assert_eq!(exec["session_id"], "session-9");
     assert_eq!(exec["goal_id"], "goal-1");
     std::fs::create_dir_all(h.dir.join("files").join("proj")).unwrap();
+    std::fs::write(h.dir.join("files").join("proj").join("notes.txt"), "seed\n").unwrap();
     let task = h
         .ok(
             "/tasks/create",
@@ -359,13 +493,23 @@ async fn g3_execution_binds_session_and_goal() {
     let task_id = task["task_id"].as_str().unwrap().to_string();
     let (status, _) = h.post("/tasks/run", json!({"task_id": task_id})).await;
     assert_eq!(status, 200);
-    let list = h.ok_get("/executions/list").await;
-    let exec = list
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["task_id"] == task_id)
-        .unwrap_or_else(|| panic!("no execution for task {task_id}: {list}"));
+    // The runner creates the Execution after the Planner
+    // round; poll (the run is async, the route is not).
+    let mut found = None;
+    for _ in 0..60 {
+        let list = h.ok_get("/executions/list").await;
+        if let Some(exec) = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["task_id"] == task_id)
+        {
+            found = Some(exec.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let exec = found.unwrap_or_else(|| panic!("no execution for task {task_id}"));
     assert_eq!(exec["goal_id"], "goal-1");
     assert_eq!(exec["session_id"], Value::Null);
 }

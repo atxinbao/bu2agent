@@ -28,6 +28,8 @@ import { InvokeConnectorClient } from "./domain/invoke_connector_client";
 import { InvokeCredentialVaultClient } from "./domain/invoke_credential_vault_client";
 import { InvokePermissionPolicyClient } from "./domain/invoke_permission_policy_client";
 import { InvokeModelClient } from "./domain/invoke_model_client";
+import { ModelClient } from "./domain/model_client";
+import type { ModelGateway } from "./domain/model_client";
 import { InvokeConfigClient } from "./domain/invoke_config_client";
 import { PeerClient, type PeerGateway } from "./domain/peer_client";
 import { InvokePeerClient } from "./domain/invoke_peer_client";
@@ -198,6 +200,7 @@ interface Clients {
   connectors: ConnectorGateway;
   tasks: TaskGateway;
   plans: PlanGateway;
+  models: ModelGateway;
   devices: DeviceGateway;
   loops: LoopGateway;
   sessions: SessionGateway;
@@ -315,6 +318,7 @@ export function App() {
           connectors: new InvokeConnectorClient(),
           tasks: new InvokeTaskClient(),
           plans: new InvokePlanClient(),
+          models: new InvokeModelClient(),
           devices: new InvokeDeviceClient(),
           loops: new InvokeLoopClient(),
           sessions: new InvokeSessionClient(),
@@ -357,6 +361,7 @@ export function App() {
           connectors: new ConnectorClient(MOCK_BASE_URL),
           tasks: new TaskClient(MOCK_BASE_URL),
           plans: new PlanClient(MOCK_BASE_URL),
+          models: new ModelClient(MOCK_BASE_URL),
           devices: new DeviceClient(MOCK_BASE_URL),
           loops: new LoopClient(MOCK_BASE_URL),
           sessions: new SessionClient(MOCK_BASE_URL),
@@ -781,6 +786,7 @@ export function App() {
             agent={clients.agent}
             tasks={clients.tasks}
             plans={clients.plans}
+            models={clients.models}
             executions={clients.executions}
             effects={clients.effects}
             evidence={clients.evidence}

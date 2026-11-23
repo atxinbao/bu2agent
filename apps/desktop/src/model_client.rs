@@ -17,6 +17,9 @@ use crate::Result;
 
 /// The model surface: running config merged with any staged
 /// selection, plus key status (never the key itself).
+/// ORC-2: the Planner/Executor role slots ride on the
+/// same surface (same staging + restart semantics as
+/// the base model; no new route).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelView {
     pub provider: String,
@@ -27,12 +30,22 @@ pub struct ModelView {
     pub staged_model: Option<String>,
     pub staged_base_url: Option<String>,
     pub restart_needed: bool,
+    #[serde(default)]
+    pub planner_model: Option<String>,
+    #[serde(default)]
+    pub executor_model: Option<String>,
+    #[serde(default)]
+    pub staged_planner_model: Option<String>,
+    #[serde(default)]
+    pub staged_executor_model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct ModelSetDto {
     model: Option<String>,
     base_url: Option<String>,
+    planner_model: Option<String>,
+    executor_model: Option<String>,
 }
 
 /// `base_url` must look like `http://127.0.0.1:3001` and pass
@@ -58,10 +71,14 @@ impl ModelClient {
         &self,
         model: Option<&str>,
         base_url: Option<&str>,
+        planner_model: Option<&str>,
+        executor_model: Option<&str>,
     ) -> std::result::Result<ModelView, AgentError> {
         let body = serde_json::to_string(&ModelSetDto {
             model: model.map(|s| s.to_string()),
             base_url: base_url.map(|s| s.to_string()),
+            planner_model: planner_model.map(|s| s.to_string()),
+            executor_model: executor_model.map(|s| s.to_string()),
         })
         .map_err(|_| transport_error("cannot encode model set request"))?;
         let view: ModelView = self.http.post_json("/model", &body)?;

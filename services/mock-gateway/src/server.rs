@@ -258,6 +258,16 @@ pub struct AppState {
     /// at startup from MOCK_ORIGIN_DEVICE_ID, default "mac-local";
     /// never mixed into ids or idempotency keys.
     pub(crate) origin_device_id: String,
+    /// ORC-2: Executor worker steps currently being driven
+    /// (task_id, step_no). A double `tasks_execute` for the
+    /// same read step must not create two worker runs — the
+    /// approval-consumption guard that protects file steps
+    /// does not exist for reads (no approval), so the
+    /// in-memory claim is the guard. Held only for the
+    /// create + wait; released on every exit path. A crash
+    /// mid-step leaves a stale claim until restart (same
+    /// class as the other in-memory crash windows).
+    pub(crate) executor_step_claims: Arc<Mutex<std::collections::HashSet<(String, i64)>>>,
     pub(crate) task_drafts: Arc<Mutex<HashMap<String, String>>>,
     pub(crate) task_drafts_dir: Option<PathBuf>,
     pub(crate) sessions: Arc<Mutex<HashMap<String, SessionRecord>>>,
@@ -715,6 +725,7 @@ impl AppState {
             recovery_scanned: Arc::new(Mutex::new(false)),
             recovery_failed: Arc::new(Mutex::new(false)),
             origin_device_id: "mac-local".to_string(),
+            executor_step_claims: Arc::new(Mutex::new(std::collections::HashSet::new())),
             task_drafts: Arc::new(Mutex::new(HashMap::new())),
             task_drafts_dir: None,
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -5190,6 +5201,34 @@ fn build_workspace_snapshot(
     row
 }
 
+/// P0-E: a fresh attempt supersedes any still-running
+/// Execution a crashed earlier attempt left behind.
+/// (Moved from routes_tasks.rs for the ORC-2 runner:
+/// the Execution is now created in the runner, at the
+/// point execution actually starts, not in the run /
+/// resume handlers.)
+pub(crate) fn supersede_old_task_executions(
+    state: &AppState,
+    task_id: &str,
+    keep_execution_id: &str,
+) {
+    let Some(records) = executions_snapshot(state) else {
+        return;
+    };
+    for record in records {
+        if record.task_id.as_deref() != Some(task_id) {
+            continue;
+        }
+        if record.execution_id == keep_execution_id {
+            continue;
+        }
+        if record.status != "running" {
+            continue;
+        }
+        close_execution(state, &record.execution_id, "cancelled");
+    }
+}
+
 pub(crate) fn create_execution(
     state: &AppState,
     task_id: Option<String>,
@@ -7195,6 +7234,33 @@ pub(crate) struct WorkerRunCreateDto {
     /// Not covered by the approval digest (plan §2.2).
     #[serde(default)]
     priority: Option<i64>,
+}
+
+impl WorkerRunCreateDto {
+    /// ORC-2 (J3): build a run request from inside the
+    /// gateway (the Executor). The fields are private
+    /// to this module; the constructor is the exact
+    /// equivalent of the JSON the POST /worker/runs
+    /// handler deserializes — immediate, default
+    /// priority, no timeout override.
+    pub(crate) fn internal(
+        worktree_id: String,
+        command: String,
+        params: Option<serde_json::Value>,
+        execution_id: Option<String>,
+        approval_id: Option<String>,
+    ) -> Self {
+        Self {
+            worktree_id,
+            command,
+            params,
+            timeout_ms: None,
+            execution_id,
+            approval_id,
+            start_at_ms: None,
+            priority: None,
+        }
+    }
 }
 
 /// P3-C run-creation failure: an HTTP status + a short

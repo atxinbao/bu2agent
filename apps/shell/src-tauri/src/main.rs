@@ -277,6 +277,7 @@ fn main() {
             tool_commands::task_get,
             tool_commands::task_update,
             tool_commands::task_run,
+            tool_commands::task_run_force,
             tool_commands::task_draft,
             tool_commands::task_execute,
             tool_commands::task_reject,

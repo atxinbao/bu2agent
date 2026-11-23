@@ -110,6 +110,13 @@ export class InvokeTaskClient implements TaskGateway {
     return this.postTaskId("task_run", taskId);
   }
 
+  async runForce(taskId: string): Promise<TaskRecord> {
+    const record = await invoke<ServerTaskRecord>("task_run_force", {
+      task_id: taskId,
+    });
+    return toRecord(record);
+  }
+
   async draft(taskId: string): Promise<TaskDraft> {
     const draft = await invoke<ServerTaskDraft>("task_draft", {
       task_id: taskId,

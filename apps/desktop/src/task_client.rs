@@ -70,6 +70,15 @@ struct TaskIdRequest {
     task_id: String,
 }
 
+/// ORC-2 (Q-ORC-07): the run request with the triage
+/// override — `force_execute: true` bypasses the
+/// Planner's "no file change" judgment.
+#[derive(Debug, Serialize)]
+struct TaskRunRequest {
+    task_id: String,
+    force_execute: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct TaskUpdateRequest {
     task_id: String,
@@ -125,6 +134,18 @@ impl TaskClient {
     /// draft_ready task. All take only the task id.
     pub fn run(&self, task_id: &str) -> Result<TaskRecord> {
         self.post_task_id("/tasks/run", task_id)
+    }
+
+    /// ORC-2 (Q-ORC-07): run with the triage override —
+    /// the Planner's "no file change" judgment is bypassed
+    /// and the Executor runs anyway.
+    pub fn run_force(&self, task_id: &str) -> Result<TaskRecord> {
+        let body = serde_json::to_string(&TaskRunRequest {
+            task_id: task_id.to_string(),
+            force_execute: true,
+        })
+        .map_err(|_| transport_error("cannot encode task run request"))?;
+        self.http.post_json("/tasks/run", &body)
     }
 
     pub fn draft(&self, task_id: &str) -> Result<TaskDraft> {

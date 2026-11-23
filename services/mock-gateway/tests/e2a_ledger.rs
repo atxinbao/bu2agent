@@ -698,6 +698,112 @@ impl Drop for Harness {
 
 const MODEL_TEXT: &str = "# 报告\n\n要点：alpha 与 beta。\n\n结论：完成。";
 
+/// ORC-2: the Planner round needs a strict-JSON
+/// blueprint, the Executor step needs the file text —
+/// one fake serving both, routed by the prompt: a
+/// Planner prompt ("你是任务的规划者") gets the plan
+/// JSON, any other model call gets the file text.
+/// `planner_json` builds the one-step plan for a task
+/// directory (step path `{directory}/report.md`, the
+/// old `default_artifact_path`).
+fn planner_json(directory: &str) -> String {
+    serde_json::to_string(&json!({
+        "needs_file_change": true,
+        "steps": [{
+            "step_no": 1,
+            "kind": "file_write",
+            "path": format!("{directory}/report.md"),
+            "symbol": "report",
+            "change": "write the report",
+            "verify_cmd": "git status",
+            "expected": "report written",
+        }],
+        "replan_if": [],
+    }))
+    .unwrap()
+}
+
+async fn start_fake_model_planned(
+    plan: String,
+    text: &str,
+    delay: Duration,
+    status: u16,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let plan_body = serde_json::to_string(
+        &json!({"choices": [{"message": {"content": plan}, "finish_reason": "stop"}]}),
+    )
+    .unwrap();
+    let text_body = serde_json::to_string(
+        &json!({"choices": [{"message": {"content": text}, "finish_reason": "stop"}]}),
+    )
+    .unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                continue;
+            };
+            let plan_body = plan_body.clone();
+            let text_body = text_body.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut content_length = 0usize;
+                let mut header_end = None;
+                while header_end.is_none() {
+                    let Ok(n) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        let head = String::from_utf8_lossy(&buf[..pos]).into_owned();
+                        for line in head.lines() {
+                            if let Some(v) = line.strip_prefix("Content-Length:") {
+                                content_length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+                let header_end = header_end.unwrap();
+                while buf.len() < header_end + content_length {
+                    let Ok(n) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                tokio::time::sleep(delay).await;
+                let reason = if status == 200 { "OK" } else { "Internal Server Error" };
+                // Route by the prompt: the Planner's prompt
+                // opens with "你是任务的规划者", the
+                // Executor's with "你是任务的执行者".
+                let body = if buf
+                    .windows("你是任务的规划者".len())
+                    .any(|w| w == "你是任务的规划者".as_bytes())
+                {
+                    plan_body
+                } else {
+                    text_body
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
 async fn start_fake_model(
     text: &str,
     delay: Duration,
@@ -942,7 +1048,7 @@ async fn e2a_a12_loop_fs_write_single_path() {
 #[tokio::test]
 async fn e2a_a1_task_terminal_closes_execution() {
     let (model_addr, _model) =
-        start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+        start_fake_model_planned(planner_json("notes"), MODEL_TEXT, Duration::ZERO, 200).await;
     let h = Harness::serve_with_model(
         Vec::new(),
         format!("http://{model_addr}"),
@@ -1024,8 +1130,24 @@ async fn e2a_a1_task_failed_and_cancelled_close_execution() {
     let (status, body) = h2.post("/tasks/cancel", json!({"task_id": task2})).await;
     assert_eq!(status, 200, "{body}");
     h2.poll_task(&task2, "cancelled", 15).await;
+    // ORC-2 (J20): the Execution is created by the
+    // runner when it observes the cancel — after the
+    // in-flight model call returns — so poll for it;
+    // the task shows `cancelled` as soon as the cancel
+    // route lands, before the runner wakes up.
+    let mut found = None;
+    for _ in 0..60 {
+        let list = h2.executions().await;
+        if let Some(exec) = list.iter().find(|e| e["task_id"] == task2) {
+            if exec["status"] == "cancelled" {
+                found = Some(exec.clone());
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     assert_eq!(
-        h2.execution_for_task(&task2).await["status"],
+        found.expect("no execution for cancelled task")[ "status"],
         "cancelled"
     );
     h2.server.abort();
@@ -1197,7 +1319,8 @@ impl Harness {
 
 #[tokio::test]
 async fn e2a_f1_execute_retry_resumes_own_planned_effect() {
-    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let (model_addr, _model) =
+        start_fake_model_planned(planner_json("notes"), MODEL_TEXT, Duration::ZERO, 200).await;
     let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
     let notes = h.files_root().join("notes");
     std::fs::create_dir_all(&notes).unwrap();
@@ -1251,7 +1374,8 @@ async fn e2a_f1_execute_retry_resumes_own_planned_effect() {
 
 #[tokio::test]
 async fn e2a_f2_rerun_from_completed() {
-    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let (model_addr, _model) =
+        start_fake_model_planned(planner_json("notes"), MODEL_TEXT, Duration::ZERO, 200).await;
     let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
     let notes = h.files_root().join("notes");
     std::fs::create_dir_all(&notes).unwrap();
@@ -1308,7 +1432,8 @@ async fn e2a_f2_rerun_from_completed() {
 
 #[tokio::test]
 async fn e2a_f3_rerun_from_failed() {
-    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let (model_addr, _model) =
+        start_fake_model_planned(planner_json("empty"), MODEL_TEXT, Duration::ZERO, 200).await;
     let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
     let empty = h.files_root().join("empty");
     std::fs::create_dir_all(&empty).unwrap();
@@ -1351,7 +1476,8 @@ async fn e2a_f3_rerun_from_failed() {
 
 #[tokio::test]
 async fn e2a_f4_resume_from_completed_regenerates() {
-    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let (model_addr, _model) =
+        start_fake_model_planned(planner_json("notes"), MODEL_TEXT, Duration::ZERO, 200).await;
     let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
     let notes = h.files_root().join("notes");
     std::fs::create_dir_all(&notes).unwrap();
@@ -1394,7 +1520,8 @@ async fn e2a_f4_resume_from_completed_regenerates() {
 
 #[tokio::test]
 async fn e2a_f5_terminal_states_cannot_rerun() {
-    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let (model_addr, _model) =
+        start_fake_model_planned(planner_json("notes"), MODEL_TEXT, Duration::ZERO, 200).await;
     let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
     let notes = h.files_root().join("notes");
     std::fs::create_dir_all(&notes).unwrap();
@@ -1455,7 +1582,8 @@ async fn f6_stranded(h: &Harness) -> (String, String, String) {
 
 #[tokio::test]
 async fn e2a_f6_resume_refuses_other_approval_planned_row() {
-    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let (model_addr, _model) =
+        start_fake_model_planned(planner_json("notes"), MODEL_TEXT, Duration::ZERO, 200).await;
     let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
     let (task, approval, effect_id) = f6_stranded(&h).await;
     // The planned row belongs to another approval now: the
@@ -1487,7 +1615,8 @@ async fn e2a_f6_resume_refuses_other_approval_planned_row() {
 
 #[tokio::test]
 async fn e2a_f6_resume_refuses_started_row() {
-    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let (model_addr, _model) =
+        start_fake_model_planned(planner_json("notes"), MODEL_TEXT, Duration::ZERO, 200).await;
     let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
     let (task, approval, effect_id) = f6_stranded(&h).await;
     // The row already started (interrupted mid-write): the
@@ -1519,7 +1648,8 @@ async fn e2a_f6_resume_refuses_started_row() {
 
 #[tokio::test]
 async fn e2a_f7_concurrent_double_execute_writes_once() {
-    let (model_addr, _model) = start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    let (model_addr, _model) =
+        start_fake_model_planned(planner_json("notes"), MODEL_TEXT, Duration::ZERO, 200).await;
     let h = Harness::serve_with_model(Vec::new(), format!("http://{model_addr}")).await;
     let notes = h.files_root().join("notes");
     std::fs::create_dir_all(&notes).unwrap();
@@ -1851,10 +1981,29 @@ async fn e2a_a11_approval_consumed_by_worker_session_id() {
 
 #[tokio::test]
 async fn e2a_a5_rerun_supersedes_old_execution() {
-    let (slow_addr, _slow) =
-        start_fake_model(MODEL_TEXT, Duration::from_secs(10), 200).await;
-    let (fast_addr, _fast) =
-        start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+    // ORC-2: the first attempt must reach
+    // `begin_execution` (Planner round done) before the
+    // restart strands it — otherwise there is no
+    // Execution to supersede (the Execution is created
+    // by the runner, not by the run handler). A 10 s
+    // model delay stretches the Planner round (0–10 s)
+    // and the step-1 prepare (10–20 s); restarting at
+    // 15 s lands inside the prepare window: the
+    // Execution exists and is running, no draft yet.
+    let (slow_addr, _slow) = start_fake_model_planned(
+        planner_json("notes"),
+        MODEL_TEXT,
+        Duration::from_secs(10),
+        200,
+    )
+    .await;
+    let (fast_addr, _fast) = start_fake_model_planned(
+        planner_json("notes"),
+        MODEL_TEXT,
+        Duration::ZERO,
+        200,
+    )
+    .await;
     let mut h = Harness::serve_with_model(
         Vec::new(),
         format!("http://{slow_addr}"),
@@ -1865,8 +2014,11 @@ async fn e2a_a5_rerun_supersedes_old_execution() {
     std::fs::write(notes.join("a.txt"), "alpha").unwrap();
     let task = h.create_task("notes").await;
     h.post("/tasks/run", json!({"task_id": task})).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
     assert_eq!(h.task(&task).await["status"], "running");
+    // The Planner round finished at ~10 s, so the
+    // Execution exists; the step-1 prepare is still in
+    // flight (slow Executor call), so there is no draft.
     let old_execution = h.execution_for_task(&task).await;
     let old_id = old_execution["execution_id"].as_str().unwrap().to_string();
     assert_eq!(old_execution["status"], "running");
@@ -1878,15 +2030,22 @@ async fn e2a_a5_rerun_supersedes_old_execution() {
 
     let (status, _) = h.post("/tasks/resume", json!({"task_id": task})).await;
     assert_eq!(status, 200);
-    // The supersede lands synchronously in the resume
-    // handler, before the new runner attempt spawns.
-    assert_eq!(h.execution(&old_id).await["status"], "cancelled");
-    let task_executions: Vec<Value> = h
-        .executions()
-        .await
-        .into_iter()
-        .filter(|e| e["task_id"] == task)
-        .collect();
+    // ORC-2: the supersede lands in the runner's
+    // `begin_execution`, after the resumed run's Planner
+    // round (fast fake) — poll for the second row.
+    let mut task_executions: Vec<Value> = vec![];
+    for _ in 0..60 {
+        task_executions = h
+            .executions()
+            .await
+            .into_iter()
+            .filter(|e| e["task_id"] == task)
+            .collect();
+        if task_executions.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     assert_eq!(task_executions.len(), 2, "{task_executions:?}");
     let new_execution = task_executions
         .iter()
@@ -1895,6 +2054,7 @@ async fn e2a_a5_rerun_supersedes_old_execution() {
     let new_id = new_execution["execution_id"].as_str().unwrap().to_string();
     assert_ne!(new_id, old_id);
     assert_eq!(new_execution["status"], "running");
+    assert_eq!(h.execution(&old_id).await["status"], "cancelled");
     // The new attempt actually runs (fast fake answers).
     h.poll_task(&task, "draft_ready", 15).await;
 }
@@ -2167,7 +2327,7 @@ async fn e2a_a10_second_upsert_no_duplicate_unknown_inbox() {
 #[tokio::test]
 async fn e2a_a14_historical_reconciliation() {
     let (model_addr, _model) =
-        start_fake_model(MODEL_TEXT, Duration::ZERO, 200).await;
+        start_fake_model_planned(planner_json("notes"), MODEL_TEXT, Duration::ZERO, 200).await;
     let dir = temp_dir("a14");
     let repo = init_repo(&dir);
     let mut h = Harness::serve_full(

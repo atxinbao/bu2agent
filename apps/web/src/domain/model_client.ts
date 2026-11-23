@@ -18,6 +18,14 @@ export interface ModelState {
   stagedModel: string | null;
   stagedBaseUrl: string | null;
   restartNeeded: boolean;
+  // ORC-2: the Planner/Executor role slots (effective
+  // values, falling back to the current model; staged
+  // values take effect after a gateway restart, same
+  // as the base model).
+  plannerModel: string | null;
+  executorModel: string | null;
+  stagedPlannerModel: string | null;
+  stagedExecutorModel: string | null;
 }
 
 interface ServerModelState {
@@ -29,6 +37,10 @@ interface ServerModelState {
   staged_model: string | null;
   staged_base_url: string | null;
   restart_needed: boolean;
+  planner_model?: string | null;
+  executor_model?: string | null;
+  staged_planner_model?: string | null;
+  staged_executor_model?: string | null;
 }
 
 function toModelState(server: ServerModelState): ModelState {
@@ -41,12 +53,18 @@ function toModelState(server: ServerModelState): ModelState {
     stagedModel: server.staged_model,
     stagedBaseUrl: server.staged_base_url,
     restartNeeded: server.restart_needed,
+    plannerModel: server.planner_model ?? null,
+    executorModel: server.executor_model ?? null,
+    stagedPlannerModel: server.staged_planner_model ?? null,
+    stagedExecutorModel: server.staged_executor_model ?? null,
   };
 }
 
 export interface ModelSetPatch {
   model?: string | null;
   baseUrl?: string | null;
+  plannerModel?: string | null;
+  executorModel?: string | null;
 }
 
 // Transport-neutral surface used by the Settings view. The HTTP
@@ -95,6 +113,8 @@ export class ModelClient implements ModelGateway {
     const state = await this.request<ServerModelState>("POST", "/model", {
       model: patch.model ?? null,
       base_url: patch.baseUrl ?? null,
+      planner_model: patch.plannerModel ?? null,
+      executor_model: patch.executorModel ?? null,
     });
     return toModelState(state);
   }

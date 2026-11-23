@@ -6,8 +6,10 @@
 //! this batch. Task records stay a JSONL domain (`task_store.rs`);
 //! only the handlers move, plus their DTOs and the helpers no staying
 //! code calls (the two Mandate hooks, `valid_task_status`,
-//! `task_number`, `execution_for_task`, `close_execution_for_task`,
-//! `supersede_old_task_executions`).
+//! `task_number`, `execution_for_task`, `close_execution_for_task`).
+//! (`supersede_old_task_executions` moved back to `server.rs` in
+//! ORC-2: the runner creates the Execution now, at the point
+//! execution actually starts, not the run/resume handlers.)
 //!
 //! Shared helpers stay in `server.rs` as `pub(crate)`: the ledger
 //! helpers (`record_effect`, `transition_effect`, `check_idempotency`,
@@ -24,21 +26,20 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::effect_store::NewEffect;
 use crate::operation_binding::plan_digest;
-use crate::plan_store::{PlanStep, ReplanIf};
+use crate::plan_store::{validate_plan_steps, validate_replan_if, PlanReplanIfDto, PlanStepDto};
 use crate::routes_common::{bad_request, sqlite_error_response, sqlite_not_configured};
 use crate::server::{
-    check_idempotency, close_execution, close_execution_for_task,
-    consume_bound_approval_for_effect, create_execution, create_mandate, ensure_root,
-    execution_for_task, executions_snapshot, idempotency_key_missing, persist_task,
-    record_effect, resolve_file, resolve_worktree_binding, start_bound_effect,
-    transition_effect, AppState, IdempotencyDecision,
+    check_idempotency, close_execution_for_task, consume_bound_approval_for_effect,
+    create_execution, create_mandate, ensure_root, execution_for_task, idempotency_key_missing,
+    persist_task, record_effect, resolve_file, resolve_worktree_binding, start_bound_effect,
+    supersede_old_task_executions, transition_effect, AppState, IdempotencyDecision,
 };
 use crate::sqlite_store::{self, StateBackend};
 use crate::task_store::{TaskExecuteBinding, TaskFileRecord};
@@ -102,6 +103,12 @@ pub(crate) struct TaskGetQuery {
     /// worktree is 409 `task_binding_frozen_mismatch`.
     #[serde(default)]
     worktree_id: Option<String>,
+    /// ORC-2 (Q-ORC-07): force the Executor even when
+    /// the Planner's triage judgment is "no file
+    /// change". Only `tasks_run` reads it; `tasks_execute`
+    /// ignores it.
+    #[serde(default)]
+    force_execute: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,28 +143,6 @@ pub(crate) fn task_number(task_id: &str) -> u64 {
 /// The new Execution is the current attempt; the
 /// `execution_for_task` latest-wins read semantics are
 /// unchanged.
-pub(crate) fn supersede_old_task_executions(
-    state: &AppState,
-    task_id: &str,
-    keep_execution_id: &str,
-) {
-    let Some(records) = executions_snapshot(state) else {
-        return;
-    };
-    for record in records {
-        if record.task_id.as_deref() != Some(task_id) {
-            continue;
-        }
-        if record.execution_id == keep_execution_id {
-            continue;
-        }
-        if record.status != "running" {
-            continue;
-        }
-        close_execution(state, &record.execution_id, "cancelled");
-    }
-}
-
 pub(crate) async fn tasks_create(
     State(state): State<AppState>,
     Json(req): Json<TaskCreateDto>,
@@ -189,6 +174,7 @@ pub(crate) async fn tasks_create(
         project_id: req.project_id,
         workspace_id: req.workspace_id,
         plan_id: None,
+        executor_step_no: None,
     };
     state.tasks.lock().expect("task lock").insert(record.task_id.clone(), record.clone());
     persist_task(&state, &record);
@@ -328,17 +314,53 @@ pub(crate) async fn tasks_run(
         return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task_status_transition_invalid" })))
             .into_response();
     }
+    let mut updated = record.clone();
+    drop(tasks);
+    // ORC-2 (J10): a run may name the worktree up front;
+    // the binding freezes here, BEFORE the running claim —
+    // a failed freeze must not strand the task in
+    // `running` with no runner. (The Execution is NOT
+    // created here any more in SQLite mode: the runner
+    // creates it only when execution actually starts, so
+    // a triage run never has one — Q-ORC-07. In JSONL
+    // mode the old flow has no runner-side Execution, so
+    // the shell is created here instead — see below.)
+    if let Some(resp) = freeze_execute_binding(&state, &mut updated, &req.worktree_id) {
+        return resp;
+    }
+    let mut tasks = state.tasks.lock().expect("task lock");
+    let Some(record) = tasks.get_mut(&req.task_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
+            .into_response();
+    };
     record.status = "running".to_string();
     record.error = None;
     let updated = record.clone();
     persist_task(&state, &updated);
     drop(tasks);
-    // P0 phase 1: the runner attempt gets its Execution shell record.
-    // E2-A §2.3: a fresh attempt supersedes any still-running
-    // Execution a crashed earlier attempt left behind.
-    let execution = create_execution(&state, Some(req.task_id.clone()), None);
-    supersede_old_task_executions(&state, &req.task_id, &execution.execution_id);
-    tokio::spawn(crate::task_runner::run_task(state.clone(), req.task_id));
+    // ORC-2 (J15 revised): in JSONL mode the run takes
+    // the old single-file draft flow, which has no
+    // Planner round and no runner-side Execution — so
+    // the Execution shell is created here, synchronously,
+    // exactly as before ORC-2 (the run's attempt gets its
+    // Execution record; a fresh attempt supersedes any
+    // still-running one a crashed earlier attempt left
+    // behind). Without it, `tasks_execute` could not
+    // compute the Effect idempotency key. In SQLite mode
+    // the runner creates it in `begin_execution`.
+    if state.sqlite.is_none()
+        || state.sqlite_mode() != StateBackend::Sqlite
+        || state.sqlite_is_broken()
+    {
+        let execution = create_execution(&state, Some(req.task_id.clone()), None);
+        supersede_old_task_executions(&state, &req.task_id, &execution.execution_id);
+    }
+    tokio::spawn(crate::task_runner::run_task(
+        state.clone(),
+        req.task_id,
+        req.force_execute,
+        None,
+    ));
     Json(updated).into_response()
 }
 
@@ -388,42 +410,164 @@ pub(crate) async fn tasks_execute(
         return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task_status_transition_invalid" })))
             .into_response();
     }
-    // E2 slice, scheme A (P3-C plan §2.3): a stated worktree
-    // must exist and be active, and the first execute that
-    // names one freezes the binding into the task record. A
-    // later execute naming a different worktree is 409
-    // `task_binding_frozen_mismatch` — the Worker runs the
-    // frozen binding, never a re-resolved one.
-    if let Some(worktree_id) = &req.worktree_id {
-        let binding = match resolve_worktree_binding(&state, worktree_id) {
-            Ok(binding) => binding,
-            Err(detail) => return bad_request(detail),
-        };
-        let frozen = TaskExecuteBinding {
-            location_id: binding.location_id.clone(),
-            worktree_id: binding.worktree_id.clone(),
-            root_digest: binding.root_digest.clone(),
-        };
-        match &record.execute_binding {
-            Some(existing) if *existing != frozen => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({ "error": "task_binding_frozen_mismatch" })),
-                )
-                    .into_response();
-            }
-            Some(_) => {}
-            None => {
-                record.execute_binding = Some(frozen);
-                state
-                    .tasks
-                    .lock()
-                    .expect("task lock")
-                    .insert(record.task_id.clone(), record.clone());
-                persist_task(&state, &record);
-            }
+    // E2 slice, scheme A (P3-C plan §2.3): the binding
+    // freeze, shared with `tasks_run` (J10) — see
+    // `freeze_execute_binding` below.
+    if let Some(resp) = freeze_execute_binding(&state, &mut record, &req.worktree_id) {
+        return resp;
+    }
+    // ORC-2: an Executor step is applied by the runner,
+    // not by the file-write core below. A compat task
+    // (no `executor_step_no`) takes the old path.
+    if record.executor_step_no.is_some() {
+        return execute_executor_step(state, record, req).await;
+    }
+    apply_file_write_step(state, record, req).await
+}
+
+/// ORC-2 (J10): freeze the execute binding, shared by
+/// `tasks_run` (a run may name the worktree up front)
+/// and `tasks_execute` (E2 slice, scheme A). A stated
+/// worktree must exist and be active, and the first
+/// call that names one freezes the binding into the
+/// task record. A later call naming a different
+/// worktree is 409 `task_binding_frozen_mismatch` —
+/// the Worker runs the frozen binding, never a
+/// re-resolved one. Returns a response on failure,
+/// None on success (or when no worktree is named).
+fn freeze_execute_binding(
+    state: &AppState,
+    record: &mut TaskFileRecord,
+    worktree_id: &Option<String>,
+) -> Option<Response> {
+    let Some(worktree_id) = worktree_id else {
+        return None;
+    };
+    let binding = match resolve_worktree_binding(state, worktree_id) {
+        Ok(binding) => binding,
+        Err(detail) => return Some(bad_request(detail)),
+    };
+    let frozen = TaskExecuteBinding {
+        location_id: binding.location_id.clone(),
+        worktree_id: binding.worktree_id.clone(),
+        root_digest: binding.root_digest.clone(),
+    };
+    match &record.execute_binding {
+        Some(existing) if *existing != frozen => Some((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "task_binding_frozen_mismatch" })),
+        )
+            .into_response()),
+        Some(_) => None,
+        None => {
+            record.execute_binding = Some(frozen);
+            state
+                .tasks
+                .lock()
+                .expect("task lock")
+                .insert(record.task_id.clone(), record.clone());
+            persist_task(state, record);
+            None
         }
     }
+}
+
+/// ORC-2 (J11): apply one Executor step. A worker
+/// step (`command` / `verify` / `review`, no
+/// artifact_path) is spawned in the runner's
+/// draft_ready arm — accepted, not completed; the
+/// runner waits for the worker run and advances or
+/// fails the batch. A file step takes the extracted
+/// file-write core, whose tail advances instead of
+/// completing.
+async fn execute_executor_step(
+    state: AppState,
+    record: TaskFileRecord,
+    req: TaskGetQuery,
+) -> Response {
+    if record.artifact_path.is_none() {
+        // Worker step: the step's approval (when one
+        // exists) must already be Approved — a pending
+        // approval is a 409, not a failed task; the user
+        // may still approve it.
+        if !crate::task_runner::step_approval_ready(&state, record.approval_id.as_deref()) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "approval_not_approved" })),
+            )
+                .into_response();
+        }
+        let task_id = record.task_id.clone();
+        tokio::spawn(crate::task_runner::run_task(state, task_id, false, None));
+        return Json(record).into_response();
+    }
+    apply_file_write_step(state, record, req).await
+}
+
+/// ORC-2: advance the Executor batch after a file
+/// step's write succeeded (its Effect already drove
+/// to `succeeded`, and the write-time Evidence hook
+/// saw the task `completed`). The last step leaves
+/// the task completed and closes the Execution; any
+/// other step walks the legal `completed → running`
+/// edge, points at the next step, and spawns the
+/// runner to prepare it. A missing plan fails the
+/// task — the runner never guesses which step comes
+/// next. (Also serves the idempotency Replay arm,
+/// where the task is still `draft_ready` — both
+/// branches set the status explicitly, so the entry
+/// state does not matter.)
+async fn advance_executor_after_file_step(state: AppState, record: TaskFileRecord) -> Response {
+    let task_id = record.task_id.clone();
+    let step_no = record.executor_step_no.unwrap_or(0);
+    let Some(plan) = crate::task_runner::load_current_plan(&state, &task_id) else {
+        crate::task_runner::fail(&state, &task_id, "蓝图缺失，无法继续执行");
+        return Json(record).into_response();
+    };
+    let total = plan.steps().map(|s| s.len()).unwrap_or(0) as i64;
+    if step_no >= total {
+        let updated = {
+            let mut tasks = state.tasks.lock().expect("task lock");
+            let Some(current) = tasks.get_mut(&task_id) else {
+                return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
+                    .into_response();
+            };
+            current.status = "completed".to_string();
+            current.error = None;
+            current.executor_step_no = None;
+            current.clone()
+        };
+        persist_task(&state, &updated);
+        close_execution_for_task(&state, &task_id, "completed");
+        return Json(updated).into_response();
+    }
+    let next = step_no + 1;
+    let updated = {
+        let mut tasks = state.tasks.lock().expect("task lock");
+        let Some(current) = tasks.get_mut(&task_id) else {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "unknown task" })))
+                .into_response();
+        };
+        current.status = "running".to_string();
+        current.executor_step_no = Some(next);
+        current.clone()
+    };
+    persist_task(&state, &updated);
+    tokio::spawn(crate::task_runner::run_task(state, task_id, false, Some(next)));
+    Json(updated).into_response()
+}
+
+/// ORC-2 (J2): the file-write core, extracted from
+/// `tasks_execute` so the Executor's file steps reuse
+/// it verbatim. The compat tail (a task with no
+/// `executor_step_no`) completes the task exactly as
+/// before; the Executor tail advances the batch
+/// instead (see the terminal block below).
+async fn apply_file_write_step(
+    state: AppState,
+    record: TaskFileRecord,
+    req: TaskGetQuery,
+) -> Response {
     let Some(approval_id) = record.approval_id.clone() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -494,6 +638,14 @@ pub(crate) async fn tasks_execute(
         None,
     ) {
         IdempotencyDecision::Replay(_) => {
+            // ORC-2: the step's write already happened
+            // (a retry after a crash between the write
+            // and the advance) — advance the batch
+            // instead of returning the stale draft_ready
+            // record. A compat task replays as before.
+            if record.executor_step_no.is_some() {
+                return advance_executor_after_file_step(state, record).await;
+            }
             return Json(record).into_response();
         }
         IdempotencyDecision::Blocked(other) => {
@@ -582,6 +734,15 @@ pub(crate) async fn tasks_execute(
     // P0-R: the tasks guard must be released before the Effect
     // transition below: its write-time Evidence hook re-locks
     // the tasks map to read the completed record.
+    // ORC-2: an Executor file step completes the task
+    // HERE, exactly like a compat task — the write-time
+    // Evidence hook (`write_time_observation`) only
+    // verifies a `tasks.execute` Effect when the task
+    // is `completed`, so a step that went back to
+    // `running` first would lose its hash_match row.
+    // The advance below immediately walks the legal
+    // `completed → running` edge (no await between the
+    // two writes) when more steps remain.
     let updated = {
         let mut tasks = state.tasks.lock().expect("task lock");
         let Some(current) = tasks.get_mut(&req.task_id) else {
@@ -592,14 +753,17 @@ pub(crate) async fn tasks_execute(
         current.clone()
     };
     persist_task(&state, &updated);
-    // E2-A §2.3: the terminal Task closes its Execution.
-    close_execution_for_task(&state, &req.task_id, "completed");
     // P0-C: a successful task write drives the planned
     // Effect to `succeeded`. The digest is the artifact
     // write digest the approval gate consumed; the
     // operation is the task execution, not the underlying
     // file write.
     let _ = transition_effect(&state, &task_effect.effect_id, "succeeded", None, None);
+    if record.executor_step_no.is_some() {
+        return advance_executor_after_file_step(state, record).await;
+    }
+    // E2-A §2.3: the terminal Task closes its Execution.
+    close_execution_for_task(&state, &req.task_id, "completed");
     Json(updated).into_response()
 }
 
@@ -670,13 +834,22 @@ pub(crate) async fn tasks_resume(
     // callers poll until the status leaves interrupted. A
     // fabricated running record would lie about the runner's
     // state, and blocking here would stall on a model call.
-    // P0 phase 1: a resume spawns a fresh runner attempt, so it
-    // gets a fresh Execution shell record.
-    // E2-A §2.3: a fresh attempt supersedes any still-running
-    // Execution a crashed earlier attempt left behind.
-    let execution = create_execution(&state, Some(req.task_id.clone()), None);
-    supersede_old_task_executions(&state, &req.task_id, &execution.execution_id);
-    tokio::spawn(crate::task_runner::run_task(state.clone(), req.task_id));
+    // ORC-2: in SQLite mode no Execution is created here any
+    // more — the runner creates it only when execution
+    // actually starts (a triage run never has one, Q-ORC-07);
+    // a fresh attempt supersedes any still-running Execution
+    // a crashed earlier attempt left behind, in the runner's
+    // `begin_execution`. In JSONL mode the old flow has no
+    // runner-side Execution, so the shell is created here,
+    // synchronously, exactly as before ORC-2 (J15 revised).
+    if state.sqlite.is_none()
+        || state.sqlite_mode() != StateBackend::Sqlite
+        || state.sqlite_is_broken()
+    {
+        let execution = create_execution(&state, Some(req.task_id.clone()), None);
+        supersede_old_task_executions(&state, &req.task_id, &execution.execution_id);
+    }
+    tokio::spawn(crate::task_runner::run_task(state.clone(), req.task_id, false, None));
     Json(record).into_response()
 }
 
@@ -763,28 +936,10 @@ pub(crate) async fn tasks_cancel(
 /// `execution_id`: the digest is recomputed
 /// server-side from the validated arrays, and a draft
 /// has no Execution yet (execution_id is NULL).
-#[derive(Debug, Deserialize)]
-pub(crate) struct PlanStepDto {
-    step_no: i64,
-    kind: String,
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    symbol: Option<String>,
-    #[serde(default)]
-    change: Option<String>,
-    #[serde(default)]
-    verify_cmd: Option<String>,
-    #[serde(default)]
-    expected: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct PlanReplanIfDto {
-    signal: String,
-    action: String,
-}
-
+/// The step / replan_if DTOs and their validators live
+/// in `plan_store` (shared with the ORC-2 Planner
+/// round); only the route-level `PlanDraftDto` stays
+/// here.
 #[derive(Debug, Deserialize)]
 pub(crate) struct PlanDraftDto {
     task_id: String,
@@ -803,40 +958,6 @@ pub(crate) struct PlanListQuery {
     limit: Option<usize>,
     #[serde(default)]
     offset: Option<usize>,
-}
-
-/// Validate one draft step (Q-ORC-04): `kind` must
-/// be one of the four blueprint kinds; the
-/// four-piece set — `path` / `symbol` / `change` /
-/// `verify_cmd` / `expected` — must be present and
-/// non-empty. An empty string counts as missing: a
-/// step that names nothing cannot be executed
-/// "按图索骥".
-fn non_empty_field(value: &Option<String>) -> Option<&str> {
-    value.as_deref().map(str::trim).filter(|text| !text.is_empty())
-}
-
-fn validate_plan_step(step: &PlanStepDto) -> Result<PlanStep, String> {
-    if !matches!(
-        step.kind.as_str(),
-        "file_write" | "command" | "verify" | "review"
-    ) {
-        return Err(format!("invalid plan step kind: {}", step.kind));
-    }
-    let path = non_empty_field(&step.path).ok_or("plan step missing path")?;
-    let symbol = non_empty_field(&step.symbol).ok_or("plan step missing symbol")?;
-    let change = non_empty_field(&step.change).ok_or("plan step missing change")?;
-    let verify_cmd = non_empty_field(&step.verify_cmd).ok_or("plan step missing verify_cmd")?;
-    let expected = non_empty_field(&step.expected).ok_or("plan step missing expected")?;
-    Ok(PlanStep {
-        step_no: step.step_no,
-        kind: step.kind.clone(),
-        path: path.to_string(),
-        symbol: symbol.to_string(),
-        change: change.to_string(),
-        verify_cmd: verify_cmd.to_string(),
-        expected: expected.to_string(),
-    })
 }
 
 /// ORC-1 (plan §3): draft a plan version for a task.
@@ -874,36 +995,19 @@ pub(crate) async fn tasks_plan_draft(
     if req.steps.is_empty() {
         return bad_request("plan steps must be a non-empty array");
     }
-    // step_no must be 1-up consecutive and unique
-    // (LOCAL DEFINITION — the plan leaves the step_no
-    // rule to the implementer; a gap or a duplicate
-    // would make the Executor's order ambiguous).
-    let mut steps: Vec<PlanStep> = Vec::with_capacity(req.steps.len());
-    for (index, step) in req.steps.iter().enumerate() {
-        if step.step_no != index as i64 + 1 {
-            return bad_request("plan step_no must be consecutive starting at 1");
-        }
-        match validate_plan_step(step) {
-            Ok(valid) => steps.push(valid),
-            Err(message) => return bad_request(&message),
-        }
-    }
-    // Re-plan-if (Q-ORC-05): `signal` is free text, but
-    // an empty signal can never trigger, so it is
-    // refused; `action` has exactly one value.
-    let mut replan_if: Vec<ReplanIf> = Vec::with_capacity(req.replan_if.len());
-    for condition in &req.replan_if {
-        if condition.signal.trim().is_empty() {
-            return bad_request("plan replan_if signal must not be empty");
-        }
-        if condition.action != "stop_and_hand_back" {
-            return bad_request("plan replan_if action must be stop_and_hand_back");
-        }
-        replan_if.push(ReplanIf {
-            signal: condition.signal.clone(),
-            action: condition.action.clone(),
-        });
-    }
+    // One validator for the route and the ORC-2 Planner
+    // round (`plan_store::validate_plan_steps`): step_no
+    // 1-up consecutive, kind allowlisted, the four-piece
+    // set present and non-empty.
+    let steps = match validate_plan_steps(&req.steps) {
+        Ok(steps) => steps,
+        Err(message) => return bad_request(&message),
+    };
+    // Re-plan-if (Q-ORC-05): same shared validator.
+    let replan_if = match validate_replan_if(&req.replan_if) {
+        Ok(conditions) => conditions,
+        Err(message) => return bad_request(&message),
+    };
     // planner_model defaults to the gateway's current
     // model string (LOCAL DEFINITION — the plan leaves
     // the default to the implementer): the staged

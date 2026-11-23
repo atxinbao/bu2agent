@@ -43,6 +43,14 @@ pub(crate) struct ModelView {
     staged_model: Option<String>,
     staged_base_url: Option<String>,
     restart_needed: bool,
+    /// ORC-2 (Q-ORC-08): the effective Planner/Executor
+    /// models, resolved live per
+    /// `resolve_role_models` (staged slot -> staged
+    /// model -> running model).
+    planner_model: String,
+    executor_model: String,
+    staged_planner_model: Option<String>,
+    staged_executor_model: Option<String>,
 }
 
 /// Is there a staged value a restart would still apply?
@@ -79,6 +87,8 @@ fn model_view(state: &AppState) -> ModelView {
         Some(key) => (true, Some(redact(key))),
         None => (false, None),
     };
+    let (planner_model, executor_model) =
+        crate::model_store::resolve_role_models(&staged, &running.model);
     ModelView {
         provider: "deepseek",
         model,
@@ -88,6 +98,10 @@ fn model_view(state: &AppState) -> ModelView {
         staged_model: staged.model,
         staged_base_url: staged.base_url,
         restart_needed,
+        planner_model,
+        executor_model,
+        staged_planner_model: staged.planner_model,
+        staged_executor_model: staged.executor_model,
     }
 }
 
@@ -99,6 +113,11 @@ pub(crate) async fn model_get(State(state): State<AppState>) -> Json<ModelView> 
 pub(crate) struct ModelSetDto {
     model: Option<String>,
     base_url: Option<String>,
+    /// ORC-2 (Q-ORC-08): the role slots. Same rules as
+    /// `model`: an empty string is 400, absent means
+    /// "leave the staged value alone".
+    planner_model: Option<String>,
+    executor_model: Option<String>,
 }
 
 pub(crate) async fn model_set(
@@ -129,9 +148,35 @@ pub(crate) async fn model_set(
         }
         None => None,
     };
+    // ORC-2 (Q-ORC-08): the role slots follow the same
+    // empty-string rule as `model`. A staged slot takes
+    // effect on the next Planner/Executor call (the
+    // per-call override carries it; no restart needed).
+    let planner_model = match req.planner_model {
+        Some(raw) => {
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "planner_model must not be empty" })))
+                    .into_response();
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+    let executor_model = match req.executor_model {
+        Some(raw) => {
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "executor_model must not be empty" })))
+                    .into_response();
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
     // All-absent body is a no-op success: it changes nothing
     // and reports the current view, mirroring idempotent reads.
-    if model.is_none() && base_url.is_none() {
+    if model.is_none() && base_url.is_none() && planner_model.is_none() && executor_model.is_none() {
         return Json(model_view(&state)).into_response();
     }
     let mut staged = state.model_staged.lock().expect("model staged lock").clone().unwrap_or_default();
@@ -140,6 +185,12 @@ pub(crate) async fn model_set(
     }
     if let Some(u) = base_url {
         staged.base_url = Some(u);
+    }
+    if let Some(m) = planner_model {
+        staged.planner_model = Some(m);
+    }
+    if let Some(m) = executor_model {
+        staged.executor_model = Some(m);
     }
     staged.updated_ms = now_ms();
     *state.model_staged.lock().expect("model staged lock") = Some(staged.clone());
@@ -165,6 +216,8 @@ mod model_merge_tests {
         StagedModel {
             model: Some("deepseek-chat".to_string()),
             base_url: Some("https://staged.example.com".to_string()),
+            planner_model: None,
+            executor_model: None,
             updated_ms: 1,
         }
     }
@@ -201,6 +254,8 @@ mod model_merge_tests {
         let partial = StagedModel {
             model: Some("deepseek-chat".to_string()),
             base_url: None,
+            planner_model: None,
+            executor_model: None,
             updated_ms: 1,
         };
         let merged = merge_staged_config(running(), &Some(partial), None, None);

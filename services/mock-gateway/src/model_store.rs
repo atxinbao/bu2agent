@@ -22,11 +22,42 @@ use serde::{Deserialize, Serialize};
 
 /// A staged model selection. `None` per field means "not set;
 /// fall back to the running config at read time".
+/// ORC-2 (Q-ORC-08): the Planner/Executor role slots.
+/// Both are optional and fall back through the chain
+/// staged slot -> staged model -> running model
+/// (`resolve_role_models`); the effective default of
+/// either slot is the current model — never an automatic
+/// switch to a cheaper model.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StagedModel {
     pub model: Option<String>,
     pub base_url: Option<String>,
+    pub planner_model: Option<String>,
+    pub executor_model: Option<String>,
     pub updated_ms: u64,
+}
+
+/// Resolve the Planner/Executor models for a call
+/// (ORC-2, Q-ORC-08). The chain is read live from the
+/// staged record at call time: a staged slot wins, else
+/// the staged base model, else the running model. The
+/// slots need no restart to take effect — the per-call
+/// model override carries the model string per request,
+/// so no client is rebuilt (the base `model` keeps its
+/// Task 12 D3 restart semantics because the shared
+/// client IS built at startup).
+pub fn resolve_role_models(staged: &StagedModel, running_model: &str) -> (String, String) {
+    let planner = staged
+        .planner_model
+        .clone()
+        .or_else(|| staged.model.clone())
+        .unwrap_or_else(|| running_model.to_string());
+    let executor = staged
+        .executor_model
+        .clone()
+        .or_else(|| staged.model.clone())
+        .unwrap_or_else(|| running_model.to_string());
+    (planner, executor)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,11 +111,42 @@ mod tests {
         let record = StagedModel {
             model: Some("deepseek-flash".to_string()),
             base_url: None,
+            planner_model: Some("deepseek-planner".to_string()),
+            executor_model: None,
             updated_ms: 7,
         };
         let line = serde_json::to_string(&ModelStateLine::Model(record)).unwrap();
         assert!(line.contains("\"kind\":\"model\""));
         let parsed: ModelStateLine = serde_json::from_str(&line).unwrap();
         assert!(matches!(parsed, ModelStateLine::Model(_)));
+    }
+
+    #[test]
+    fn role_models_fall_back_through_staged_model_to_running() {
+        // No slots staged: both roles fall back to the
+        // staged base model, else the running model.
+        let staged = StagedModel {
+            model: Some("staged-base".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_role_models(&staged, "running"),
+            ("staged-base".to_string(), "staged-base".to_string())
+        );
+        let empty = StagedModel::default();
+        assert_eq!(
+            resolve_role_models(&empty, "running"),
+            ("running".to_string(), "running".to_string())
+        );
+        // A staged slot wins over the staged base model.
+        let slotted = StagedModel {
+            model: Some("staged-base".to_string()),
+            planner_model: Some("planner-x".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_role_models(&slotted, "running"),
+            ("planner-x".to_string(), "staged-base".to_string())
+        );
     }
 }

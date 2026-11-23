@@ -128,6 +128,111 @@ pub struct PlanRecord {
     pub origin_device_id: String,
 }
 
+/// ORC-1 plan DTOs (plan §3, Q-ORC-03/04/05).
+/// The DTO carries no `digest` field and no
+/// `execution_id`: the digest is recomputed
+/// server-side from the validated arrays, and a draft
+/// has no Execution yet (execution_id is NULL).
+/// The DTOs live here (not in the route module) so the
+/// ORC-2 Planner round validates model-produced
+/// blueprints with the exact same rules as the draft
+/// route — one validator, two callers.
+#[derive(Debug, Deserialize)]
+pub struct PlanStepDto {
+    pub step_no: i64,
+    pub kind: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub change: Option<String>,
+    #[serde(default)]
+    pub verify_cmd: Option<String>,
+    #[serde(default)]
+    pub expected: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlanReplanIfDto {
+    pub signal: String,
+    pub action: String,
+}
+
+/// Validate one draft step (Q-ORC-04): `kind` must
+/// be one of the four blueprint kinds; the
+/// four-piece set — `path` / `symbol` / `change` /
+/// `verify_cmd` / `expected` — must be present and
+/// non-empty. An empty string counts as missing: a
+/// step that names nothing cannot be executed
+/// "按图索骥".
+fn non_empty_field(value: &Option<String>) -> Option<&str> {
+    value.as_deref().map(str::trim).filter(|text| !text.is_empty())
+}
+
+pub fn validate_plan_step(step: &PlanStepDto) -> Result<PlanStep, String> {
+    if !matches!(
+        step.kind.as_str(),
+        "file_write" | "command" | "verify" | "review"
+    ) {
+        return Err(format!("invalid plan step kind: {}", step.kind));
+    }
+    let path = non_empty_field(&step.path).ok_or("plan step missing path")?;
+    let symbol = non_empty_field(&step.symbol).ok_or("plan step missing symbol")?;
+    let change = non_empty_field(&step.change).ok_or("plan step missing change")?;
+    let verify_cmd = non_empty_field(&step.verify_cmd).ok_or("plan step missing verify_cmd")?;
+    let expected = non_empty_field(&step.expected).ok_or("plan step missing expected")?;
+    Ok(PlanStep {
+        step_no: step.step_no,
+        kind: step.kind.clone(),
+        path: path.to_string(),
+        symbol: symbol.to_string(),
+        change: change.to_string(),
+        verify_cmd: verify_cmd.to_string(),
+        expected: expected.to_string(),
+    })
+}
+
+/// Validate a whole step list: non-empty, `step_no`
+/// 1-up consecutive and unique (LOCAL DEFINITION —
+/// the plan leaves the step_no rule to the
+/// implementer; a gap or a duplicate would make the
+/// Executor's order ambiguous).
+pub fn validate_plan_steps(steps: &[PlanStepDto]) -> Result<Vec<PlanStep>, String> {
+    if steps.is_empty() {
+        return Err("plan steps must be a non-empty array".to_string());
+    }
+    let mut out: Vec<PlanStep> = Vec::with_capacity(steps.len());
+    for (index, step) in steps.iter().enumerate() {
+        if step.step_no != index as i64 + 1 {
+            return Err("plan step_no must be consecutive starting at 1".to_string());
+        }
+        out.push(validate_plan_step(step)?);
+    }
+    Ok(out)
+}
+
+/// Validate the Re-plan-if list (Q-ORC-05):
+/// `signal` is free text, but an empty signal can
+/// never trigger, so it is refused; `action` has
+/// exactly one value.
+pub fn validate_replan_if(conditions: &[PlanReplanIfDto]) -> Result<Vec<ReplanIf>, String> {
+    let mut out: Vec<ReplanIf> = Vec::with_capacity(conditions.len());
+    for condition in conditions {
+        if condition.signal.trim().is_empty() {
+            return Err("plan replan_if signal must not be empty".to_string());
+        }
+        if condition.action != "stop_and_hand_back" {
+            return Err("plan replan_if action must be stop_and_hand_back".to_string());
+        }
+        out.push(ReplanIf {
+            signal: condition.signal.clone(),
+            action: condition.action.clone(),
+        });
+    }
+    Ok(out)
+}
+
 fn plan_from_row(row: &rusqlite::Row) -> rusqlite::Result<PlanRow> {
     Ok(PlanRow {
         plan_id: row.get(0)?,

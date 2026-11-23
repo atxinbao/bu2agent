@@ -156,7 +156,23 @@ impl Harness {
         let files_root = dir.join("files");
         std::fs::create_dir_all(&files_root).unwrap();
         let fake = Arc::new(FakeReminderBackend::new());
-        let (addr, _server) = start_fake_model("task artifact body").await;
+        // ORC-2: the Planner round needs a strict-JSON
+        // blueprint, the Executor step needs the file text.
+        let plan = serde_json::to_string(&json!({
+            "needs_file_change": true,
+            "steps": [{
+                "step_no": 1,
+                "kind": "file_write",
+                "path": "notes/report.md",
+                "symbol": "report",
+                "change": "write the report",
+                "verify_cmd": "git status",
+                "expected": "report written",
+            }],
+            "replan_if": [],
+        }))
+        .unwrap();
+        let (addr, _server) = start_fake_model_planned(&plan, "task artifact body").await;
         Self::serve_sqlite(dir, files_root, fake, Some(format!("http://{addr}"))).await
     }
 
@@ -361,13 +377,21 @@ fn observed(row: &Value) -> Value {
 
 // ---------------------------------------------------------------- fake model server
 
-/// Minimal canned DeepSeek chat-completion responder for the
-/// task flow (same shape as effect_smoke's): reads one request,
-/// answers the fixed body, closes. Never the real API.
-async fn start_fake_model(text: &str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+/// ORC-2: minimal canned DeepSeek chat-completion
+/// responder, routed by the prompt — a Planner prompt
+/// ("你是任务的规划者") gets the plan JSON, any other
+/// model call gets the file text. Never the real API.
+async fn start_fake_model_planned(
+    plan: &str,
+    text: &str,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let body = serde_json::to_string(
+    let plan_body = serde_json::to_string(
+        &json!({"choices": [{"message": {"content": plan}, "finish_reason": "stop"}]}),
+    )
+    .unwrap();
+    let text_body = serde_json::to_string(
         &json!({"choices": [{"message": {"content": text}, "finish_reason": "stop"}]}),
     )
     .unwrap();
@@ -376,7 +400,8 @@ async fn start_fake_model(text: &str) -> (std::net::SocketAddr, tokio::task::Joi
             let Ok((mut socket, _)) = listener.accept().await else {
                 continue;
             };
-            let body = body.clone();
+            let plan_body = plan_body.clone();
+            let text_body = text_body.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
@@ -410,6 +435,11 @@ async fn start_fake_model(text: &str) -> (std::net::SocketAddr, tokio::task::Joi
                     }
                     buf.extend_from_slice(&chunk[..n]);
                 }
+                let body = if find_subslice(&buf, "你是任务的规划者".as_bytes()).is_some() {
+                    plan_body
+                } else {
+                    text_body
+                };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),

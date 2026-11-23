@@ -119,6 +119,7 @@ fn task_record(
         project_id: None,
         workspace_id: None,
         plan_id: None,
+        executor_step_no: None,
     }
 }
 

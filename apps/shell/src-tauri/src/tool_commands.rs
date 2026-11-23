@@ -623,8 +623,17 @@ pub fn model_get() -> Result<ModelView, String> {
 pub fn model_set(
     model: Option<String>,
     base_url: Option<String>,
+    planner_model: Option<String>,
+    executor_model: Option<String>,
 ) -> Result<ModelView, String> {
-    model_client()?.set_model(model.as_deref(), base_url.as_deref()).map_err(agent_err_string)
+    model_client()?
+        .set_model(
+            model.as_deref(),
+            base_url.as_deref(),
+            planner_model.as_deref(),
+            executor_model.as_deref(),
+        )
+        .map_err(agent_err_string)
 }
 
 // --- Config surface (Task 14, GET only) ---
@@ -1003,6 +1012,14 @@ pub fn task_update(
 #[tauri::command(rename_all = "snake_case")]
 pub fn task_run(task_id: String) -> Result<TaskOut, String> {
     task_client()?.run(&task_id).map_err(|e| err_string(&e)).map(TaskOut::from)
+}
+
+/// ORC-2 (Q-ORC-07): run with the triage override —
+/// the Planner's "no file change" judgment is bypassed
+/// and the Executor runs anyway.
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_run_force(task_id: String) -> Result<TaskOut, String> {
+    task_client()?.run_force(&task_id).map_err(|e| err_string(&e)).map(TaskOut::from)
 }
 
 #[tauri::command(rename_all = "snake_case")]

@@ -20,6 +20,7 @@ import type {
 } from "../domain/executions_client";
 import type { MandatesGateway } from "../domain/mandates_client";
 import type { Plan, PlanGateway } from "../domain/plan_client";
+import type { ModelGateway, ModelState } from "../domain/model_client";
 import { ExecutionDetail } from "./ExecutionDetail";
 import { MandatesSection } from "./MandatesSection";
 
@@ -66,6 +67,11 @@ interface TasksViewProps {
   // clients: until App.tsx passes it the section below
   // says so.
   plans?: PlanGateway | null;
+  // ORC-2: model client for the read-only role-slot
+  // display ("模型" section below). Optional, same
+  // pattern: until App.tsx passes it the section says
+  // so. Read-only — slot setting lives in Settings.
+  models?: ModelGateway | null;
   // Settings page's default working directory (root-relative,
   // "" = file root). Only the initial directory for a new
   // task and its default artifact path; an explicitly typed
@@ -97,6 +103,7 @@ export function TasksView({
   assignments: assignmentsClient = null,
   mandates: mandatesClient = null,
   plans: plansClient = null,
+  models: modelsClient = null,
   defaultDir = "",
   defaultDirValid = true,
 }: TasksViewProps) {
@@ -130,6 +137,22 @@ export function TasksView({
   // read error, not an empty plan.
   const [currentPlan, setCurrentPlan] = useState<Plan | null>(null);
   const [planError, setPlanError] = useState("");
+  // ORC-2: the effective Planner/Executor models
+  // (read-only display). Loaded once when the view
+  // mounts; the slots are global, not per-task.
+  const [modelState, setModelState] = useState<ModelState | null>(null);
+  const [modelError, setModelError] = useState("");
+
+  async function refreshModels() {
+    if (!modelsClient) return;
+    setModelError("");
+    try {
+      setModelState(await modelsClient.getModel());
+    } catch (e) {
+      setModelState(null);
+      setModelError(`模型读取失败：${errText(e)}`);
+    }
+  }
 
   async function refreshPlan(taskId: string) {
     if (!plansClient) return;
@@ -189,6 +212,7 @@ export function TasksView({
 
   useEffect(() => {
     void refreshTasks();
+    void refreshModels();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -288,6 +312,28 @@ export function TasksView({
       await refreshTasks();
     } catch (e) {
       setError(`运行失败：${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // ORC-2 (Q-ORC-07): force-run a task whose Planner
+  // round already answered "no file change" (the task
+  // completed with a direct answer and no artifact).
+  // The button only renders for such tasks, so this
+  // never overrides a judgment the user has not seen.
+  async function handleRunForce() {
+    if (!current) return;
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      const updated = await tasks.runForce(current.taskId);
+      setCurrent(updated);
+      setMessage("已强制执行：网关正在按蓝图运行，关窗不丢进度；到审批点后在此批准。");
+      await refreshTasks();
+    } catch (e) {
+      setError(`强制执行失败：${errText(e)}`);
     } finally {
       setBusy(false);
     }
@@ -595,6 +641,11 @@ export function TasksView({
                 自动运行到审批点
               </button>
             )}
+            {current.status === "completed" && !current.artifactPath && (
+              <button onClick={() => void handleRunForce()} disabled={busy}>
+                仍要执行
+              </button>
+            )}
             {current.status === "interrupted" && (
               <button onClick={() => void handleResume()} disabled={busy}>
                 恢复运行
@@ -639,6 +690,33 @@ export function TasksView({
               <button onClick={() => void handleViewArtifact(current)} disabled={busy}>
                 查看产物
               </button>
+            </div>
+          )}
+          <h3>模型</h3>
+          {!modelsClient && (
+            <p className="note">模型客户端尚未接入：待 App 接线传入客户端后，这里显示当前的规划/执行模型。</p>
+          )}
+          {modelsClient && (
+            <div>
+              <button onClick={() => void refreshModels()} disabled={busy}>
+                刷新模型
+              </button>
+              {modelError !== "" && <p>错误：{modelError}</p>}
+              {modelState !== null && (
+                <p>
+                  规划模型 {modelState.plannerModel} · 执行模型 {modelState.executorModel}
+                  {modelState.restartNeeded ? "（有暂存改动，重启网关后生效）" : ""}
+                </p>
+              )}
+              {modelState !== null &&
+                (modelState.stagedPlannerModel !== null ||
+                  modelState.stagedExecutorModel !== null) && (
+                  <p className="note">
+                    暂存：规划 {modelState.stagedPlannerModel ?? "—"} · 执行{" "}
+                    {modelState.stagedExecutorModel ?? "—"}
+                  </p>
+                )}
+              <p className="note">只读：槽位在设置页修改，重启网关后生效。</p>
             </div>
           )}
           <h3>蓝图</h3>

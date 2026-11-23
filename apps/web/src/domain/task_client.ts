@@ -126,6 +126,10 @@ export interface TaskGateway {
   // restarts an interrupted task; cancel stops a running or
   // draft_ready task.
   run(taskId: string): Promise<TaskRecord>;
+  // ORC-2 (Q-ORC-07): run with the triage override —
+  // the Planner's "no file change" judgment is bypassed
+  // and the Executor runs anyway.
+  runForce(taskId: string): Promise<TaskRecord>;
   draft(taskId: string): Promise<TaskDraft>;
   execute(taskId: string): Promise<TaskRecord>;
   reject(taskId: string): Promise<TaskRecord>;
@@ -197,6 +201,15 @@ export class TaskClient implements TaskGateway {
 
   async run(taskId: string): Promise<TaskRecord> {
     return this.postTaskId("/tasks/run", taskId);
+  }
+
+  async runForce(taskId: string): Promise<TaskRecord> {
+    const record = await this.request<ServerTaskRecord>("/tasks/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: taskId, force_execute: true }),
+    });
+    return toRecord(record);
   }
 
   async draft(taskId: string): Promise<TaskDraft> {

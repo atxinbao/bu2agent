@@ -17,6 +17,10 @@ interface ServerModelState {
   staged_model: string | null;
   staged_base_url: string | null;
   restart_needed: boolean;
+  planner_model?: string | null;
+  executor_model?: string | null;
+  staged_planner_model?: string | null;
+  staged_executor_model?: string | null;
 }
 
 function toModelState(server: ServerModelState): ModelState {
@@ -29,6 +33,10 @@ function toModelState(server: ServerModelState): ModelState {
     stagedModel: server.staged_model,
     stagedBaseUrl: server.staged_base_url,
     restartNeeded: server.restart_needed,
+    plannerModel: server.planner_model ?? null,
+    executorModel: server.executor_model ?? null,
+    stagedPlannerModel: server.staged_planner_model ?? null,
+    stagedExecutorModel: server.staged_executor_model ?? null,
   };
 }
 
@@ -41,6 +49,8 @@ export class InvokeModelClient implements ModelGateway {
     const state = await invoke<ServerModelState>("model_set", {
       model: patch.model ?? null,
       base_url: patch.baseUrl ?? null,
+      planner_model: patch.plannerModel ?? null,
+      executor_model: patch.executorModel ?? null,
     });
     return toModelState(state);
   }
