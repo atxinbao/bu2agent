@@ -59,11 +59,18 @@ pub struct PendingReminder {
     pub target_completed: bool,
     pub args_sha256: String,
 }
+/// ORC-4 R4-F1 (R4-J9): a LoopSnapshot without a kind is a main loop.
+/// Mirrors the gateway's `default_loop_kind` — the plain `#[serde(default)]`
+/// decoded to `""`, which broke the shell round-trip test.
+fn default_loop_kind() -> String {
+    "main".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopSnapshot {
     pub loop_id: String,
     /// ORC-4 (Q-R4-03/Q-R4-12): "research" or "main".
-    #[serde(default)]
+    #[serde(default = "default_loop_kind")]
     pub kind: String,
     pub prompt_digest: ContentDigest,
     pub model: String,
@@ -166,5 +173,36 @@ impl LoopClient {
         }
         self.http
             .get_json(&format!("/agent/loop/research/{loop_id}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ORC-4 R4-F1 (R4-J9): a LoopSnapshot JSON without a kind decodes
+    // as a main loop — the plain `#[serde(default)]` decoded to `""`,
+    // which broke `shell_tests::loop_workflow_invoke_roundtrip` (CI #163).
+    const WITHOUT_KIND_JSON: &str = r#"{
+        "loop_id": "loop-8",
+        "prompt_digest": {"sha256": "prompt-hash", "bytes": 6},
+        "model": "fixture", "status": "created", "error": null,
+        "max_calls": 3, "proposal_count": 0, "model_attempts": 0,
+        "budget_ms": 45000, "used_ms": 0, "created_at_ms": 1, "updated_at_ms": 1,
+        "queue_position": 0, "calls": [], "unknown_writes": [], "unknown_reads": [],
+        "late_model_arrivals_ms": [], "final_digest": null,
+        "in_flight": false, "remaining_ms": 45000, "final_text": null,
+        "pending_write": null, "pending_reminder": null, "approval_status": null
+    }"#;
+
+    #[test]
+    fn loop_snapshot_without_kind_defaults_to_main() {
+        let snapshot: LoopSnapshot =
+            serde_json::from_str(WITHOUT_KIND_JSON).expect("snapshot without kind");
+        assert_eq!(snapshot.kind, "main");
+        let round_tripped: LoopSnapshot =
+            serde_json::from_value(serde_json::to_value(&snapshot).expect("serialize"))
+                .expect("re-deserialize");
+        assert_eq!(round_tripped.kind, "main");
     }
 }

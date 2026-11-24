@@ -14,7 +14,7 @@ fn loop_workflow_invoke_roundtrip() {
     use serde_json::{json, Value};
     let binding = json!({"loop_id":"loop-8","call_id":1,"tool":"fs.write","args_sha256":"hash"});
     let mut view = json!({
-        "loop_id":"loop-8","prompt_digest":{"sha256":"prompt-hash","bytes":6},"model":"fixture",
+        "loop_id":"loop-8","kind":"main","prompt_digest":{"sha256":"prompt-hash","bytes":6},"model":"fixture",
         "status":"created","error":null,"max_calls":3,"proposal_count":0,"model_attempts":0,
         "budget_ms":45000,"used_ms":0,"created_at_ms":1,"updated_at_ms":1,"queue_position":0,
         "calls":[],"unknown_writes":[],"unknown_reads":[],"late_model_arrivals_ms":[],"final_digest":null,
