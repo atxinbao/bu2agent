@@ -5421,19 +5421,32 @@ pub(crate) fn record_write_time_evidence(state: &AppState, record: &EffectFileRe
 /// Evidence audit export (evidence.jsonl) when an export path
 /// is configured — same best-effort contract as the insert
 /// itself; an export failure only warns.
-pub(crate) fn record_evidence_best_effort(state: &AppState, draft: &crate::evidence::OwnedEvidence) {
+/// ORC-4 (R4-J6): returns the new row's id on
+/// success, so a caller that must name the row in a
+/// follow-up prompt (the research report) can. None
+/// keeps the old best-effort contract: a failure
+/// warns, never fails the step it records. Existing
+/// callers ignore the value.
+pub(crate) fn record_evidence_best_effort(
+    state: &AppState,
+    draft: &crate::evidence::OwnedEvidence,
+) -> Option<String> {
     let Some(sqlite) = &state.sqlite else {
-        return;
+        return None;
     };
     let Ok(mut conn) = sqlite.lock() else {
         eprintln!("warning: evidence insert skipped (sqlite lock)");
-        return;
+        return None;
     };
-    if let Err(detail) = crate::sqlite_store::insert_evidence(&mut conn, &draft.as_draft()) {
-        eprintln!("warning: evidence insert failed: {detail}");
-        return;
-    }
+    let row = match crate::sqlite_store::insert_evidence(&mut conn, &draft.as_draft()) {
+        Ok(row) => row,
+        Err(detail) => {
+            eprintln!("warning: evidence insert failed: {detail}");
+            return None;
+        }
+    };
     export_evidence_best_effort(state, &conn);
+    Some(row.evidence_id)
 }
 
 /// E2-C §4.5: regenerate the Evidence audit export
@@ -8305,6 +8318,8 @@ pub fn app(state: AppState) -> Router {
         .route("/agent/loop/resume", post(crate::routes_loop::loop_resume))
         .route("/agent/loop/cancel", post(crate::routes_loop::loop_cancel))
         .route("/agent/loop/list", get(crate::routes_loop::loops_list))
+        .route("/agent/loop/research/start", post(crate::routes_loop::research_start))
+        .route("/agent/loop/research/{id}", get(crate::routes_loop::research_get))
         .route("/connectors/notes/list", get(crate::routes_connectors::notes_list))
         .route("/connectors/notes/create", post(crate::routes_connectors::notes_create))
         .route("/connectors/mail/list", get(crate::routes_connectors::mail_list))

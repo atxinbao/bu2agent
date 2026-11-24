@@ -10,5 +10,9 @@ export class InvokeLoopClient implements LoopGateway {
     return invoke<LoopSnapshot>("loop_resume", { loop_id: loopId, approval_id: approvalId ?? null, binding: binding ?? null });
   }
   cancel(loopId: string) { return invoke<LoopSnapshot>("loop_cancel", { loop_id: loopId }); }
+  researchStart(taskId: string, worktreeId?: string, maxCalls?: number, budgetMs?: number) {
+    return invoke<LoopSnapshot>("research_start", { task_id: taskId, worktree_id: worktreeId ?? null, max_calls: maxCalls ?? null, budget_ms: budgetMs ?? null });
+  }
+  researchGet(loopId: string) { return invoke<LoopSnapshot>("research_get", { loop_id: loopId }); }
   list() { return invoke<LoopSnapshot[]>("loop_list"); }
 }

@@ -76,6 +76,11 @@ pub struct ContentDigest {
     pub bytes: usize,
 }
 
+/// ORC-4 (Q-R4-03): old JSONL rows carry no kind.
+fn default_loop_kind() -> String {
+    "main".to_string()
+}
+
 pub fn digest(text: &str) -> ContentDigest {
     ContentDigest {
         sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
@@ -139,6 +144,11 @@ pub struct CallRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopRecord {
     pub loop_id: String,
+    /// ORC-4 (Q-R4-03): "research" for a Planner
+    /// research loop, "main" for a user loop. Old
+    /// JSONL rows carry no kind and load as "main".
+    #[serde(default = "default_loop_kind")]
+    pub kind: String,
     pub prompt_digest: ContentDigest,
     pub model: String,
     pub status: LoopStatus,
@@ -317,6 +327,22 @@ pub trait LoopModel: Send + Sync {
     ) -> BackendFuture<Result<ModelReply, ModelError>> {
         self.complete(messages, timeout)
     }
+
+    /// ORC-4: a research loop is a Planner sub-loop.
+    /// It uses the research SYSTEM + tool subset (see
+    /// `DeepSeekLoopModel::complete_with_rules_research`)
+    /// and its model comes from the planner_model slot;
+    /// the engine default is only the fallback (R4-J4).
+    /// The default delegates to `complete_with_rules`,
+    /// so scripted/fake models are unaffected.
+    fn complete_with_rules_research(
+        &self,
+        rules: Option<Vec<crate::policy_store::NetworkRule>>,
+        messages: Vec<Message>,
+        timeout: Duration,
+    ) -> BackendFuture<Result<ModelReply, ModelError>> {
+        self.complete_with_rules(rules, messages, timeout)
+    }
 }
 
 pub trait LoopTools: Send + Sync {
@@ -375,6 +401,11 @@ struct LiveLoop {
     results: Vec<Option<ToolMessage>>,
     final_text: Option<String>,
     active: Option<(Instant, Duration)>,
+    /// ORC-4 (Q-R4-06): per-loop model override
+    /// (planner_model slot for research loops); None
+    /// means the engine default. Memory-only, never
+    /// serialized into LoopRecord or JSONL.
+    model_override: Option<Arc<dyn LoopModel>>,
 }
 
 impl LiveLoop {
@@ -1068,6 +1099,7 @@ impl LoopEngine {
                     results: vec![],
                     final_text: None,
                     active: None,
+                    model_override: None,
                 };
                 live.update_unknown();
                 crate::loop_store::append(p, &live.record)?;
@@ -1098,9 +1130,23 @@ impl LoopEngine {
     }
 
     pub fn start(&self, request: StartLoop) -> Result<LoopView, LoopError> {
-        let model = self
-            .model
+        self.start_with_kind(request, "main", None)
+    }
+
+    /// ORC-4: start a loop of the given kind, with an
+    /// optional per-loop model override (research uses
+    /// the planner_model slot; None keeps the engine
+    /// default — R4-J4). Limits and the 503/400 codes
+    /// are exactly `start`'s (Q-R4-10).
+    pub fn start_with_kind(
+        &self,
+        request: StartLoop,
+        kind: &str,
+        model_override: Option<Arc<dyn LoopModel>>,
+    ) -> Result<LoopView, LoopError> {
+        let model = model_override
             .as_ref()
+            .or(self.model.as_ref())
             .ok_or(LoopError(503, "loop_model_not_configured"))?;
         let max_calls = request.max_calls.unwrap_or(5);
         let budget_ms = request.budget_ms.unwrap_or(120_000);
@@ -1118,6 +1164,7 @@ impl LoopEngine {
         state.next_id += 1;
         let record = LoopRecord {
             loop_id: id.clone(),
+            kind: kind.to_string(),
             prompt_digest: digest(&request.prompt),
             model: model.name().into(),
             status: LoopStatus::Created,
@@ -1143,6 +1190,7 @@ impl LoopEngine {
             results: vec![],
             final_text: None,
             active: None,
+            model_override,
         };
         self.save(&mut live)?;
         let view = live.view();
@@ -1521,7 +1569,30 @@ impl LoopEngine {
     ) -> Result<LoopView, LoopError> {
         let mut job = match &work {
             Work::Model { messages, .. } => {
-                let model = self.model.clone().expect("configured model");
+                // ORC-4 (Q-R4-06): a research loop runs on
+                // its per-loop model override (planner slot)
+                // with the research SYSTEM + tool subset;
+                // a main loop keeps the engine default.
+                // The override falls back to the engine
+                // model when unset (R4-J4); a loop with
+                // neither cannot have started (start
+                // returns 503), so the expect holds.
+                let (model, research) = {
+                    let state = self.state.lock().unwrap();
+                    match state.loops.get(&id) {
+                        Some(live) => (
+                            live.model_override
+                                .clone()
+                                .or_else(|| self.model.clone())
+                                .expect("configured model"),
+                            live.record.kind == "research",
+                        ),
+                        None => (
+                            self.model.clone().expect("configured model"),
+                            false,
+                        ),
+                    }
+                };
                 let messages = messages.clone();
                 // E2-B §3.4 (snapshot gate): the model call for
                 // this loop's Execution is denied by the rules
@@ -1534,7 +1605,14 @@ impl LoopEngine {
                         crate::server::frozen_network_rules_for_execution(&app, &execution_id)
                     });
                 tokio::spawn(async move {
-                    WorkResult::Model(model.complete_with_rules(frozen_rules, messages, limit).await)
+                    let reply = if research {
+                        model
+                            .complete_with_rules_research(frozen_rules, messages, limit)
+                            .await
+                    } else {
+                        model.complete_with_rules(frozen_rules, messages, limit).await
+                    };
+                    WorkResult::Model(reply)
                 })
             }
             Work::Tool {
@@ -1648,6 +1726,30 @@ impl LoopEngine {
                                     Some(ErrorCode::CapExceeded)
                                 } else {
                                     normal.as_ref().err().cloned()
+                                };
+                                // ORC-4 (Q-R4-02): the research
+                                // read-only hard gate. It sits
+                                // here — after normalize(), before
+                                // the call lands in `calls` — and
+                                // does NOT touch normalize()'s own
+                                // 14-item whitelist. A research
+                                // proposal outside code.search /
+                                // fs.read / git.read is recorded
+                                // Failed + InvalidTool, never
+                                // dispatched, never parked for
+                                // approval (resume delivers a
+                                // Failed call without dispatching).
+                                // The real tool name stays on the
+                                // record so S1 can name it.
+                                let error = if live.record.kind == "research"
+                                    && error.is_none()
+                                    && !matches!(
+                                        proposal.tool.as_str(),
+                                        "code.search" | "fs.read" | "git.read"
+                                    ) {
+                                    Some(ErrorCode::InvalidTool)
+                                } else {
+                                    error
                                 };
                                 let args = normal.ok();
                                 let call_id = live.record.calls.len() + 1;

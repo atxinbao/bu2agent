@@ -11,7 +11,7 @@ export interface LoopCall {
   late: { arrived_at_ms: number; result: ResultSummary } | null;
 }
 export interface LoopSnapshot {
-  loop_id: string; prompt_digest: ContentDigest; model: string; status: LoopStatus;
+  loop_id: string; kind: string; prompt_digest: ContentDigest; model: string; status: LoopStatus;
   error: string | null; max_calls: number; proposal_count: number; model_attempts: number;
   budget_ms: number; used_ms: number; remaining_ms: number; created_at_ms: number; updated_at_ms: number;
   queue_position: number; calls: LoopCall[]; unknown_writes: number[]; unknown_reads: number[];
@@ -33,6 +33,8 @@ export interface LoopGateway {
   resume(loopId: string, approvalId?: string, binding?: ApprovalBinding): Promise<LoopSnapshot>;
   cancel(loopId: string): Promise<LoopSnapshot>;
   list(): Promise<LoopSnapshot[]>;
+  researchStart(taskId: string, worktreeId?: string, maxCalls?: number, budgetMs?: number): Promise<LoopSnapshot>;
+  researchGet(loopId: string): Promise<LoopSnapshot>;
 }
 export function isTerminal(status: LoopStatus): boolean {
   return !["created", "running", "awaiting_approval"].includes(status);
@@ -58,6 +60,10 @@ export class LoopClient implements LoopGateway {
     return this.request("/agent/loop/resume", { loop_id: loopId, approval_id: approvalId ?? null, binding: binding ?? null });
   }
   cancel(loopId: string) { return this.request("/agent/loop/cancel", { loop_id: loopId }); }
+  researchStart(taskId: string, worktreeId?: string, maxCalls?: number, budgetMs?: number) {
+    return this.request("/agent/loop/research/start", { task_id: taskId, worktree_id: worktreeId ?? null, max_calls: maxCalls ?? null, budget_ms: budgetMs ?? null });
+  }
+  researchGet(loopId: string) { return this.request(`/agent/loop/research/${encodeURIComponent(loopId)}`); }
   async list(): Promise<LoopSnapshot[]> {
     const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}/agent/loop/list`, {
       signal: AbortSignal.timeout(70_000),

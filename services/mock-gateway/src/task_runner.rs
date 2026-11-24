@@ -30,6 +30,7 @@ use agent_desktop::approval::ApprovalStatus;
 use serde::Deserialize;
 
 use crate::deepseek::DeepseekOutcome;
+use crate::loop_engine::{LoopError, LoopStatus};
 use crate::evidence::OwnedEvidence;
 use crate::model_store::resolve_role_models;
 use crate::operation_binding;
@@ -77,7 +78,7 @@ pub(crate) const PLANNER_PROMPT_PREFIX: &str =
 /// appended to the file context. `answer` is required
 /// exactly when `needs_file_change` is false; `steps`
 /// must be non-empty exactly when it is true.
-pub(crate) const PLANNER_JSON_CONTRACT: &str = "\n\n请判断这个任务是否需要修改文件。只返回一个严格 JSON 对象，不要 markdown 围栏、不要解释文字：\n{\"needs_file_change\": true|false, \"answer\": \"无需改文件时直接回答任务问题的文字；需要改文件时可省略\", \"steps\": [{\"step_no\": 1, \"kind\": \"file_write|command|verify|review\", \"path\": \"相对路径\", \"symbol\": \"函数或符号名\", \"change\": \"改动描述\", \"verify_cmd\": \"验证命令\", \"expected\": \"预期输出\"}], \"replan_if\": [{\"signal\": \"触发信号描述\", \"action\": \"stop_and_hand_back\"}]}\n规则：\n- needs_file_change 为 false 时，steps 用空数组，answer 必须给出直接回答。\n- 需要改文件时，steps 至少 1 步，step_no 从 1 连续编号；每步四件套 path/symbol/change/verify_cmd/expected 都必填。\n- verify_cmd 只允许以下形式：cargo test -p <包名>、git status、git diff、git diff -- <路径>；不许写其他命令。\n- replan_if 可为空；有信号时 action 只能是 stop_and_hand_back。\n";
+pub(crate) const PLANNER_JSON_CONTRACT: &str = "\n\n请判断这个任务是否需要修改文件。只返回一个严格 JSON 对象，不要 markdown 围栏、不要解释文字：\n{\"needs_file_change\": true|false, \"answer\": \"无需改文件时直接回答任务问题的文字；需要改文件时可省略\", \"steps\": [{\"step_no\": 1, \"kind\": \"file_write|command|verify|review\", \"path\": \"相对路径\", \"symbol\": \"函数或符号名\", \"change\": \"改动描述\", \"verify_cmd\": \"验证命令\", \"expected\": \"预期输出\"}], \"research\": {\"question\": \"需要先调研的问题；不需要调研时省略\"}, \"replan_if\": [{\"signal\": \"触发信号描述\", \"action\": \"stop_and_hand_back\"}]}\n规则：\n- needs_file_change 为 false 时，steps 用空数组，answer 必须给出直接回答。\n- 需要先调研代码或现状才能定蓝图时，只返回 research（needs_file_change 填 false，steps 用空数组，不产蓝图）；不需要调研时直接产蓝图，research 省略。\n- 需要改文件时，steps 至少 1 步，step_no 从 1 连续编号；每步四件套 path/symbol/change/verify_cmd/expected 都必填。\n- verify_cmd 只允许以下形式：cargo test -p <包名>、git status、git diff、git diff -- <路径>；不许写其他命令。\n- replan_if 可为空；有信号时 action 只能是 stop_and_hand_back。\n";
 
 /// ORC-2: when the user forces execution, the Planner
 /// is told to produce steps even if it judges no file
@@ -123,6 +124,19 @@ pub(crate) struct PlannerOutput {
     pub(crate) steps: Vec<PlanStepDto>,
     #[serde(default)]
     pub(crate) replan_if: Vec<PlanReplanIfDto>,
+    /// ORC-4 (Q-R4-01): a first-round Planner reply
+    /// that asks for research instead of a blueprint.
+    /// The runner runs the research loop, injects the
+    /// report summary into a second Planner prompt,
+    /// and only then expects a blueprint.
+    #[serde(default)]
+    pub(crate) research: Option<ResearchRequest>,
+}
+
+/// ORC-4 (Q-R4-01): the Planner's research ask.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ResearchRequest {
+    pub(crate) question: String,
 }
 
 /// ORC-2: resolve the Planner/Executor models for this
@@ -175,7 +189,7 @@ pub(crate) fn record_orc_evidence(
     verdict: &str,
     reason: &str,
     observed: serde_json::Value,
-) {
+) -> Option<String> {
     let draft = OwnedEvidence {
         effect_id: effect_id.to_string(),
         execution_id: execution_id.map(str::to_string),
@@ -187,7 +201,10 @@ pub(crate) fn record_orc_evidence(
         origin_device_id: state.origin_device_id.clone(),
         schema_version: 1,
     };
-    record_evidence_best_effort(state, &draft);
+    // ORC-4 (R4-J6): the new row's id, so the
+    // research report can be named in the second
+    // Planner prompt. Existing callers ignore it.
+    record_evidence_best_effort(state, &draft)
 }
 
 /// ORC-3 (Q-R3-01): the Re-plan-if judge's reply,
@@ -1189,6 +1206,209 @@ async fn generate_body(state: AppState, record: TaskFileRecord) {
 /// Cancel is observed at the lock point after the
 /// model call: a cancelled run discards the plan but
 /// still gets an Execution (cancelled, J20).
+/// ORC-4 (Q-R4-05): the research summary is the
+/// report's final text truncated to 4000 chars
+/// (char-boundary safe).
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    text.chars().take(max_chars).collect()
+}
+
+/// ORC-4: the outcome of one Planner research round.
+enum ResearchOutcome {
+    /// Report ready: summary + Evidence row id.
+    Reported { summary: String, evidence_id: Option<String> },
+    /// No report (start failed, loop failed, timed
+    /// out): the Planner continues without one.
+    Failed,
+    /// The task was cancelled mid-research.
+    Aborted,
+}
+
+/// ORC-4: one Planner model call; a model-side
+/// failure fails the plan round exactly like the
+/// first-round call does. None means the round
+/// already failed and the caller returns.
+async fn planner_round_reply(
+    state: &AppState,
+    task_id: &str,
+    frozen_rules: Option<Vec<crate::policy_store::NetworkRule>>,
+    planner_model: &str,
+    prompt: &str,
+) -> Option<String> {
+    match state
+        .deepseek
+        .reply_with_rules_and_model(frozen_rules, planner_model, prompt)
+        .await
+    {
+        DeepseekOutcome::Disabled => {
+            fail_or_cancel_plan_round(state, task_id, "模型未配置");
+            None
+        }
+        DeepseekOutcome::Denied(pattern) => {
+            fail_or_cancel_plan_round(
+                state,
+                task_id,
+                &format!("网络规则拒绝模型调用：{pattern}"),
+            );
+            None
+        }
+        DeepseekOutcome::Failed(_) => {
+            fail_or_cancel_plan_round(state, task_id, "模型调用失败");
+            None
+        }
+        DeepseekOutcome::Replied(text) => Some(text),
+    }
+}
+
+/// ORC-4 (Q-R4-01/Q-R4-09, R4-J3): run one research
+/// loop for the Planner's question and write its
+/// report (or failure) to Evidence. The internal
+/// call goes through the same `start_research` the
+/// HTTP route uses (R4-J2), so it gets the same
+/// phase check. Best-effort: any failure leaves one
+/// `research_failed` row and the Planner continues
+/// without a report; the run never fails for
+/// research alone. Polls get() every 500 ms until
+/// terminal; the deadline is the loop's own budget
+/// plus 30 s grace for the last step to land.
+async fn run_planner_research(
+    state: &AppState,
+    task_id: &str,
+    file_context: &str,
+    question: &str,
+    worktree_id: Option<String>,
+) -> ResearchOutcome {
+    let prompt = crate::routes_loop::research_prompt(file_context, worktree_id.as_deref(), Some(question));
+    let loop_id = match crate::routes_loop::start_research(
+        state, task_id, prompt, worktree_id, None, None,
+    ) {
+        Ok(view) => view.record.loop_id,
+        Err(LoopError(_, code)) => {
+            // R4-J8: no loop was started, so the row
+            // carries task_id + the failure code only.
+            record_orc_evidence(
+                state,
+                &format!("research:{task_id}"),
+                None,
+                "planner",
+                "verified",
+                "research_failed",
+                serde_json::json!({
+                    "task_id": task_id,
+                    "error": code,
+                }),
+            );
+            return ResearchOutcome::Failed;
+        }
+    };
+    let budget_ms = state
+        .loops
+        .get(&loop_id)
+        .map(|v| v.record.budget_ms)
+        .unwrap_or(120_000);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(budget_ms + 30_000);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            record_orc_evidence(
+                state,
+                &format!("research:{task_id}"),
+                None,
+                "planner",
+                "verified",
+                "research_failed",
+                serde_json::json!({
+                    "loop_id": loop_id,
+                    "task_id": task_id,
+                    "error": "research_timeout",
+                }),
+            );
+            return ResearchOutcome::Failed;
+        }
+        // Cancel checkpoint: a cancelled run stops
+        // waiting; the caller handles the close.
+        {
+            let tasks = state.tasks.lock().expect("task lock");
+            if tasks.get(task_id).map(|r| r.status.as_str()) != Some("running") {
+                return ResearchOutcome::Aborted;
+            }
+        }
+        match state.loops.get(&loop_id) {
+            Ok(view) if view.record.status.terminal() => {
+                if view.record.status == LoopStatus::Completed {
+                    if let Some(text) = view.final_text.filter(|t| !t.trim().is_empty()) {
+                        let summary = truncate_chars(&text, 4000);
+                        let evidence_id = record_orc_evidence(
+                            state,
+                            &format!("research:{task_id}"),
+                            None,
+                            "planner",
+                            "verified",
+                            "research_report",
+                            serde_json::json!({
+                                "loop_id": loop_id,
+                                "task_id": task_id,
+                                "report_len": text.len(),
+                                "report_sha256": operation_binding::sha256_hex(text.as_bytes()),
+                                "summary_len": summary.len(),
+                                // Q-R4-04 (user-approved
+                                // exception): the report text
+                                // itself, breaking the
+                                // hash/count/id-only convention
+                                // for observed_json.
+                                "report_text": text,
+                            }),
+                        );
+                        return ResearchOutcome::Reported { summary, evidence_id };
+                    }
+                }
+                let error = view
+                    .record
+                    .error
+                    .as_ref()
+                    .and_then(|e| serde_json::to_value(e).ok())
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "unknown".to_string());
+                record_orc_evidence(
+                    state,
+                    &format!("research:{task_id}"),
+                    None,
+                    "planner",
+                    "verified",
+                    "research_failed",
+                    serde_json::json!({
+                        "loop_id": loop_id,
+                        "task_id": task_id,
+                        "error": error,
+                    }),
+                );
+                return ResearchOutcome::Failed;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                record_orc_evidence(
+                    state,
+                    &format!("research:{task_id}"),
+                    None,
+                    "planner",
+                    "verified",
+                    "research_failed",
+                    serde_json::json!({
+                        "loop_id": loop_id,
+                        "task_id": task_id,
+                        "error": "unknown_loop",
+                    }),
+                );
+                return ResearchOutcome::Failed;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 async fn plan_or_generate(state: AppState, record: TaskFileRecord, force_execute: bool) {
     let task_id = record.task_id.clone();
     let parts = match read_task_files(&state, &record.directory) {
@@ -1234,7 +1454,7 @@ async fn plan_or_generate(state: AppState, record: TaskFileRecord, force_execute
     };
     let reply = match state
         .deepseek
-        .reply_with_rules_and_model(frozen_rules, &planner_model, &prompt)
+        .reply_with_rules_and_model(frozen_rules.clone(), &planner_model, &prompt)
         .await
     {
         DeepseekOutcome::Disabled => {
@@ -1274,13 +1494,81 @@ async fn plan_or_generate(state: AppState, record: TaskFileRecord, force_execute
             return;
         }
     }
-    let output = match parse_planner_output(&reply) {
+    let mut output = match parse_planner_output(&reply) {
         Ok(output) => output,
         Err(detail) => {
             fail_or_cancel_plan_round(&state, &task_id, &format!("规划回合输出无效：{detail}"));
             return;
         }
     };
+    // ORC-4 (Q-R4-01): the Planner asked for research
+    // instead of a blueprint — and only on a fresh
+    // plan (Q-R4-11: replan rounds never research).
+    // R4-J7: a research request wins over any steps
+    // the reply also carried; the contract says
+    // return only the question. Exactly one research
+    // round runs: a second-round reply that asks
+    // again is parsed as a normal (failing) blueprint.
+    if output.research.is_some() && existing_plan.is_none() {
+        let question = output
+            .research
+            .as_ref()
+            .map(|r| r.question.clone())
+            .unwrap_or_default();
+        let worktree_id = record
+            .execute_binding
+            .as_ref()
+            .map(|b| b.worktree_id.clone());
+        let research =
+            run_planner_research(&state, &task_id, &file_context, &question, worktree_id).await;
+        // A cancelled run stops here (same shell-close
+        // as the cancel checkpoint above); a failed
+        // research still gets its second Planner call,
+        // without a report section (Q-R4-09).
+        let prompt2 = match &research {
+            ResearchOutcome::Aborted => {
+                begin_execution(&state, &task_id);
+                crate::server::close_execution_for_task(&state, &task_id, "cancelled");
+                return;
+            }
+            ResearchOutcome::Reported { summary, evidence_id } => format!(
+                "{prompt}\n\n调研报告摘要（research 报告，证据行 {}）：\n{}\n请基于以上调研产出蓝图。",
+                evidence_id.as_deref().unwrap_or("未记录"),
+                summary
+            ),
+            ResearchOutcome::Failed => prompt.clone(),
+        };
+        let Some(reply2) = planner_round_reply(
+            &state,
+            &task_id,
+            frozen_rules.clone(),
+            &planner_model,
+            &prompt2,
+        )
+        .await
+        else {
+            return;
+        };
+        {
+            let tasks = state.tasks.lock().expect("task lock");
+            let status = tasks.get(&task_id).map(|r| r.status.clone());
+            if status.as_deref() != Some("running") {
+                drop(tasks);
+                if status.as_deref() == Some("cancelled") {
+                    begin_execution(&state, &task_id);
+                    crate::server::close_execution_for_task(&state, &task_id, "cancelled");
+                }
+                return;
+            }
+        }
+        output = match parse_planner_output(&reply2) {
+            Ok(output) => output,
+            Err(detail) => {
+                fail_or_cancel_plan_round(&state, &task_id, &format!("规划回合输出无效：{detail}"));
+                return;
+            }
+        };
+    }
     if !output.needs_file_change && !force_execute {
         triage_answer(state, record, output, planner_model, existing_plan).await;
         return;

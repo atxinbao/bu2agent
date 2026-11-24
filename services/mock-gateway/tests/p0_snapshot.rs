@@ -331,6 +331,7 @@ fn bad_line_divergence_snapshot() {
         &loops,
         &LoopRecord {
             loop_id: "loop-1".to_string(),
+            kind: "main".to_string(),
             prompt_digest: ContentDigest { sha256: "x".to_string(), bytes: 0 },
             model: "m".to_string(),
             status: LoopStatus::Created,
@@ -405,6 +406,7 @@ fn last_wins_and_counters_snapshot() {
     let loops = base.join("loops.jsonl");
     let loop_record = |status: LoopStatus| LoopRecord {
         loop_id: "loop-1".to_string(),
+            kind: "main".to_string(),
         prompt_digest: ContentDigest { sha256: "x".to_string(), bytes: 0 },
         model: "m".to_string(),
         status,
@@ -546,6 +548,7 @@ async fn task_restart_converts_running_to_interrupted() {
 fn loop_fixture(id: &str, status: LoopStatus, calls: Vec<CallRecord>) -> LoopRecord {
     LoopRecord {
         loop_id: id.to_string(),
+        kind: "main".to_string(),
         prompt_digest: ContentDigest { sha256: "x".to_string(), bytes: 0 },
         model: "m".to_string(),
         status,

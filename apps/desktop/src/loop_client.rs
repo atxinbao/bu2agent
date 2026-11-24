@@ -62,6 +62,9 @@ pub struct PendingReminder {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopSnapshot {
     pub loop_id: String,
+    /// ORC-4 (Q-R4-03/Q-R4-12): "research" or "main".
+    #[serde(default)]
+    pub kind: String,
     pub prompt_digest: ContentDigest,
     pub model: String,
     pub status: String,
@@ -138,5 +141,30 @@ impl LoopClient {
     }
     pub fn cancel(&self, loop_id: &str) -> Result<LoopSnapshot> {
         self.post("/agent/loop/cancel", serde_json::json!({"loop_id":loop_id}))
+    }
+    /// ORC-4: start a Planner research loop (planning
+    /// phase only; the gateway enforces it) and read
+    /// one back. Like `start`, this returns the initial
+    /// view — completion is polled via `research_get`.
+    pub fn research_start(
+        &self,
+        task_id: &str,
+        worktree_id: Option<&str>,
+        max_calls: Option<usize>,
+        budget_ms: Option<u64>,
+    ) -> Result<LoopSnapshot> {
+        self.post(
+            "/agent/loop/research/start",
+            serde_json::json!({"task_id":task_id,"worktree_id":worktree_id,"max_calls":max_calls,"budget_ms":budget_ms}),
+        )
+    }
+    pub fn research_get(&self, loop_id: &str) -> Result<LoopSnapshot> {
+        // ID 输入不能改变请求的查询结构。
+        let number = loop_id.strip_prefix("loop-").unwrap_or("");
+        if number.is_empty() || !number.bytes().all(|c| c.is_ascii_digit()) {
+            return Err(transport_error("invalid loop id"));
+        }
+        self.http
+            .get_json(&format!("/agent/loop/research/{loop_id}"))
     }
 }

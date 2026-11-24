@@ -299,6 +299,8 @@ fn main() {
             loop_commands::loop_resume,
             loop_commands::loop_cancel,
             loop_commands::loop_list,
+            loop_commands::research_start,
+            loop_commands::research_get,
             session_commands::session_create,
             session_commands::session_list,
             session_commands::session_get,

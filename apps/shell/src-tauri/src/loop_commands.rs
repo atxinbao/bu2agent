@@ -75,3 +75,30 @@ pub async fn loop_cancel(loop_id: String) -> Result<LoopSnapshot, String> {
     .await
     .map_err(|_| "取消响应未确认，请查询状态".to_string())?
 }
+#[tauri::command(rename_all = "snake_case")]
+pub async fn research_start(
+    task_id: String,
+    worktree_id: Option<String>,
+    max_calls: Option<usize>,
+    budget_ms: Option<u64>,
+) -> Result<LoopSnapshot, String> {
+    let base = base();
+    tauri::async_runtime::spawn_blocking(move || {
+        LoopClient::new(&base)
+            .and_then(|c| c.research_start(&task_id, worktree_id.as_deref(), max_calls, budget_ms))
+            .map_err(error)
+    })
+    .await
+    .map_err(|_| "调研循环启动失败，请查询状态".to_string())?
+}
+#[tauri::command(rename_all = "snake_case")]
+pub async fn research_get(loop_id: String) -> Result<LoopSnapshot, String> {
+    let base = base();
+    tauri::async_runtime::spawn_blocking(move || {
+        LoopClient::new(&base)
+            .and_then(|c| c.research_get(&loop_id))
+            .map_err(error)
+    })
+    .await
+    .map_err(|_| "调研循环查询失败".to_string())?
+}

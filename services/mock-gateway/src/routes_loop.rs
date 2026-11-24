@@ -1,4 +1,6 @@
 //! - POST /agent/tool/call       -> execute a tool, server re-checks its own approval record
+//! - POST /agent/loop/research/start -> start a Planner research loop (planning phase only)
+//! - GET /agent/loop/research/{id}  -> read one research loop (kind must be "research")
 //!
 //! Loop routes: /agent (6) — agent_tool_call + loop
 //! start/get/resume/cancel/list.
@@ -29,7 +31,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -37,7 +39,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::effect_store::NewEffect;
-use crate::loop_engine::{LoopError, LoopStatus, LoopView};
+use crate::loop_engine::{LoopError, LoopStatus, LoopView, StartLoop};
 use crate::routes_common::bad_request;
 use crate::server::{
     adapter_execution, approval_status_name, bound_write_gate, check_approval,
@@ -292,9 +294,187 @@ pub(crate) async fn loop_cancel(
     loop_response(&state, result)
 }
 pub(crate) async fn loops_list(State(state): State<AppState>) -> Json<Vec<LoopView>> {
+    // ORC-4 (Q-R4-12): the list shows main loops
+    // only; a research loop is visible through
+    // research_get alone.
     let mut views = state.loops.list();
+    views.retain(|view| view.record.kind != "research");
     for view in &mut views {
         fill_pending_reminder_title(&state, view);
     }
     Json(views)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResearchStartLoop {
+    task_id: String,
+    worktree_id: Option<String>,
+    max_calls: Option<usize>,
+    budget_ms: Option<u64>,
+}
+
+/// ORC-4 (Q-R4-01): the fixed research prompt
+/// prefix. The Planner's question and the task file
+/// context follow; the bound worktree (when one
+/// exists) is named so the model passes it to
+/// code.search / git.read (R4-J5).
+pub(crate) const RESEARCH_PROMPT_PREFIX: &str = "你是任务规划的只读调研员。只用 code_search、fs_read、git_read 调研，不写文件、不执行命令。先调研，再给出最终调研报告：先写结论，再列支撑结论的关键证据（文件路径、行号、命中行）。\n\n";
+
+pub(crate) fn research_prompt(
+    file_context: &str,
+    worktree_id: Option<&str>,
+    question: Option<&str>,
+) -> String {
+    let mut prompt = String::from(RESEARCH_PROMPT_PREFIX);
+    if let Some(worktree_id) = worktree_id {
+        prompt.push_str(&format!(
+            "本次调研的工作区：{worktree_id}。code.search / git.read 调用里把 worktree_id 传为该值；不传时用文件根。\n\n"
+        ));
+    }
+    if let Some(question) = question {
+        prompt.push_str(&format!("规划者的问题：{question}\n\n"));
+    }
+    if !file_context.trim().is_empty() {
+        prompt.push_str("任务文件如下：\n");
+        prompt.push_str(file_context);
+    }
+    prompt
+}
+
+/// ORC-4 (Q-R4-08 / R4-J1): planning phase = the
+/// task is `running` and no Executor step has been
+/// prepared yet. `executor_step_no` is set to
+/// Some(step_no) by prepare_file_write_step /
+/// prepare_worker_step the moment a step is prepared
+/// (task_runner.rs), and by the manual re-plan route
+/// (Some(1)); a failed/cancelled/handed-back task
+/// fails the `running` check first.
+pub(crate) fn check_research_phase(state: &AppState, task_id: &str) -> Result<(), LoopError> {
+    let tasks = state.tasks.lock().expect("task lock");
+    let Some(record) = tasks.get(task_id) else {
+        return Err(LoopError(404, "unknown_task"));
+    };
+    if record.status != "running" || record.executor_step_no.is_some() {
+        return Err(LoopError(409, "research_planning_only"));
+    }
+    Ok(())
+}
+
+/// ORC-4 (S-10): the worktree a research loop
+/// searches. An explicit id wins; otherwise the
+/// task's frozen execute_binding supplies it; no
+/// binding means the files root (the existing
+/// dispatch fallback). Existence is validated in
+/// start_research, not here.
+pub(crate) fn research_worktree_for_task(
+    state: &AppState,
+    task_id: &str,
+    explicit: Option<String>,
+) -> Option<String> {
+    if let Some(id) = explicit {
+        return Some(id);
+    }
+    let tasks = state.tasks.lock().expect("task lock");
+    tasks
+        .get(task_id)
+        .and_then(|r| r.execute_binding.as_ref().map(|b| b.worktree_id.clone()))
+}
+
+/// ORC-4: the single research start path (R4-J2).
+/// The HTTP route and the Planner's internal call
+/// both come through here, so both get the same
+/// phase check, worktree validation and model
+/// override. No Execution shell is created (Q-R4-07);
+/// the driver is spawned exactly like loop_start's.
+pub(crate) fn start_research(
+    state: &AppState,
+    task_id: &str,
+    prompt: String,
+    worktree_id: Option<String>,
+    max_calls: Option<usize>,
+    budget_ms: Option<u64>,
+) -> Result<LoopView, LoopError> {
+    check_research_phase(state, task_id)?;
+    if let Some(id) = &worktree_id {
+        resolve_worktree_binding(state, id).map_err(|_| LoopError(400, "invalid_worktree"))?;
+    }
+    // Q-R4-06: the research model is the planner_model
+    // slot. Building it is best-effort (R4-J4): no
+    // API key (e.g. scripted-model tests) falls back
+    // to the engine's own model, and research-ness
+    // still comes from the kind; a loop with no model
+    // at all fails in start_with_kind with 503.
+    let model_override = {
+        let config = state.deepseek.config();
+        let planner_config = crate::deepseek::DeepSeekConfig {
+            base_url: config.base_url.clone(),
+            model: crate::task_runner::planner_model_for(state),
+            api_key: config.api_key.clone(),
+        };
+        match crate::deepseek_loop::DeepSeekLoopModel::new(planner_config) {
+            Ok(Some(model)) => Some(Arc::new(
+                model.with_network_rules(state.policy_rules.clone()),
+            ) as Arc<dyn crate::loop_engine::LoopModel>),
+            _ => None,
+        }
+    };
+    let view = state.loops.start_with_kind(
+        StartLoop {
+            prompt,
+            max_calls,
+            budget_ms,
+            worktree_id,
+            session_id: None,
+            goal_id: None,
+        },
+        "research",
+        model_override,
+    )?;
+    spawn_driver(state, &view.record.loop_id);
+    Ok(view)
+}
+
+pub(crate) async fn research_start(
+    State(state): State<AppState>,
+    Json(req): Json<ResearchStartLoop>,
+) -> axum::response::Response {
+    let worktree_id = research_worktree_for_task(&state, &req.task_id, req.worktree_id.clone());
+    // The route's prompt carries the task file
+    // context (best-effort: an unreadable directory
+    // still starts a research loop on the task id
+    // alone); the Planner's internal call passes its
+    // own context + question instead.
+    let prompt = {
+        let directory = {
+            let tasks = state.tasks.lock().expect("task lock");
+            tasks.get(&req.task_id).map(|r| r.directory.clone())
+        };
+        let file_context = directory
+            .and_then(|dir| crate::task_runner::read_task_files(&state, &dir).ok())
+            .map(|parts| parts.join("\n\n"))
+            .unwrap_or_default();
+        research_prompt(&file_context, worktree_id.as_deref(), None)
+    };
+    loop_response(
+        &state,
+        start_research(
+            &state,
+            &req.task_id,
+            prompt,
+            worktree_id,
+            req.max_calls,
+            req.budget_ms,
+        ),
+    )
+}
+
+pub(crate) async fn research_get(
+    State(state): State<AppState>,
+    Path(loop_id): Path<String>,
+) -> axum::response::Response {
+    match state.loops.get(&loop_id) {
+        Ok(view) if view.record.kind == "research" => loop_response(&state, Ok(view)),
+        _ => loop_response(&state, Err(LoopError(404, "unknown_loop"))),
+    }
 }
