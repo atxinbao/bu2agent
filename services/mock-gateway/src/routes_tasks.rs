@@ -1,4 +1,4 @@
-//! Task routes: /tasks (13 routes).
+//! Task routes: /tasks (14 routes).
 //!
 //! The handlers moved here from `server.rs` (FU-5 S-6). The rest of the
 //! route directory lives in `server.rs`. There is no `//!` directory line
@@ -31,9 +31,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::deepseek::DeepseekOutcome;
 use crate::effect_store::NewEffect;
 use crate::operation_binding::plan_digest;
-use crate::plan_store::{validate_plan_steps, validate_replan_if, PlanReplanIfDto, PlanStepDto};
+use crate::plan_store::{
+    current_plan_for_task, get_plan, validate_plan_steps, validate_replan_if, PlanReplanIfDto,
+    PlanStepDto,
+};
 use crate::routes_common::{bad_request, sqlite_error_response, sqlite_not_configured};
 use crate::server::{
     check_idempotency, close_execution_for_task, consume_bound_approval_for_effect,
@@ -672,7 +676,7 @@ async fn apply_file_write_step(
         IdempotencyDecision::Proceed => record_effect(
             &state,
             NewEffect {
-                execution_id: task_execution,
+                execution_id: task_execution.clone(),
                 capability: "tasks".to_string(),
                 operation: "execute".to_string(),
                 scope: req.task_id.clone(),
@@ -720,7 +724,58 @@ async fn apply_file_write_step(
         }
     }
     if std::fs::write(&full, draft.as_bytes()).is_err() {
-        crate::task_runner::fail(&state, &req.task_id, "产物写入失败");
+        // ORC-3 (Q-R3-02): the file-write failure is
+        // evaluated before the task fails. A match
+        // hands the task back (draft_ready +
+        // needs_review; the 500 below still reports
+        // the write failure); a cancelled run fails
+        // nothing; anything else keeps the original
+        // fail() below. The Effect drives to `failed`
+        // either way — the write genuinely failed, and
+        // the hand-back concerns the task/plan, not
+        // the Effect (R3-J4). The parent-dir branch
+        // above returns 500 without fail() and stays
+        // unhooked (a pre-existing gap, not this
+        // batch's hook point).
+        let evaluation = match crate::task_runner::load_current_plan(&state, &req.task_id) {
+            Some(plan) => {
+                let step_no = record.executor_step_no.unwrap_or(0);
+                let step_kind = plan
+                    .steps()
+                    .ok()
+                    .and_then(|steps| {
+                        steps
+                            .iter()
+                            .find(|s| s.step_no == step_no)
+                            .map(|s| s.kind.clone())
+                    })
+                    .unwrap_or_else(|| "file_write".to_string());
+                Some(
+                    crate::task_runner::evaluate_step_failure(
+                        &state,
+                        &req.task_id,
+                        &plan,
+                        step_no,
+                        &step_kind,
+                        "产物写入失败",
+                        task_execution.as_deref(),
+                        Some(&task_effect.effect_id),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await,
+                )
+            }
+            None => None,
+        };
+        if !matches!(
+            evaluation,
+            Some(crate::task_runner::ReplanEvaluation::Triggered)
+                | Some(crate::task_runner::ReplanEvaluation::Aborted)
+        ) {
+            crate::task_runner::fail(&state, &req.task_id, "产物写入失败");
+        }
         // P0-C: the artifact write was attempted and failed,
         // and the task now persists as failed — the planned
         // Effect drives to `failed`.
@@ -1039,6 +1094,8 @@ pub(crate) async fn tasks_plan_draft(
         &planner_model,
         &digest,
         &state.origin_device_id,
+        false,
+        &[],
     ) {
         Ok(row) => row,
         Err(detail) => {
@@ -1162,5 +1219,332 @@ pub(crate) async fn tasks_plan_get(
             eprintln!("warning: plan get failed ({detail})");
             sqlite_error_response()
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PlanReplanDto {
+    #[serde(default)]
+    pub planner_model: Option<String>,
+}
+
+/// ORC-3 (Q-R3-05): the latest `replan_triggered`
+/// Evidence for this task — the stopped step number
+/// and the trigger signal the replan Planner round is
+/// built from. None when the task was never handed
+/// back (a direct replan): the prompt then says so.
+fn latest_replan_trigger(state: &AppState, task_id: &str) -> Option<(i64, String)> {
+    let sqlite = state.sqlite.as_ref()?;
+    let conn = sqlite.lock().ok()?;
+    let rows = sqlite_store::list_evidence(&conn).ok()?;
+    rows.iter().rev().find_map(|row| {
+        if row.reason != "replan_triggered" {
+            return None;
+        }
+        let observed: serde_json::Value = serde_json::from_str(&row.observed_json).ok()?;
+        if observed.get("task_id")?.as_str()? != task_id {
+            return None;
+        }
+        let step_no = observed.get("step_no")?.as_i64()?;
+        let signal = observed.get("signal")?.as_str()?.to_string();
+        Some((step_no, signal))
+    })
+}
+
+/// ORC-3 (Q-R3-10): the over-limit terminal state.
+/// `fail()` walks the task to `failed` and closes the
+/// Execution (opening the `failed` Inbox row and
+/// auto-closing the open `review_required` row, R3-J20);
+/// the `replan_exhausted` Evidence names the stopped step.
+/// The 15-edge state machine is untouched (the ORC
+/// plan's `blocked` word never existed).
+fn replan_limit_terminal(state: &AppState, task_id: &str, plan: &crate::plan_store::PlanRow) {
+    crate::task_runner::fail(state, task_id, "重规划次数已达上限");
+    let step_no = state
+        .tasks
+        .lock()
+        .expect("task lock")
+        .get(task_id)
+        .and_then(|record| record.executor_step_no)
+        .unwrap_or(0);
+    crate::task_runner::record_orc_evidence(
+        state,
+        &format!("executor:{task_id}:{step_no}"),
+        execution_for_task(state, task_id).as_deref(),
+        "executor",
+        "verified",
+        "replan_exhausted",
+        serde_json::json!({
+            "task_id": task_id,
+            "plan_id": plan.plan_id,
+            "step_no": step_no,
+            "replan_count": plan.replan_count,
+        }),
+    );
+}
+
+/// ORC-3 (Q-R3-05/06/07/09/10): re-plan a task's
+/// current plan after a hand-back (or directly — a
+/// manual re-plan through this route counts, a manual
+/// draft does not, Q-R3-08). The new steps come from
+/// a Planner round inside the route (old blueprint +
+/// stopped step + trigger signal + file context),
+/// validated by the shared validators and written by
+/// `create_plan` with the count + 1 and the old
+/// version's unconsumed approvals superseded in the
+/// same transaction. The task stays `draft_ready`;
+/// the batch re-runs from step 1 (`executor_step_no`
+/// = 1, every step re-approved); the Execution stays
+/// `needs_review` until execution actually resumes
+/// (R3-J6). At the 3-re-plan limit a further call
+/// fails the task with `replan_limit_exceeded`
+/// (Q-R3-10). A plan that is not the task's current
+/// version is 409 `plan_not_current`; an unknown id
+/// is 404, the `tasks_plan_get` wording. No
+/// task-status check (R3-J13, the draft-route
+/// precedent); the plan-currency + limit checks are
+/// the gates.
+pub(crate) async fn tasks_plan_replan(
+    State(state): State<AppState>,
+    Path(plan_id): Path<String>,
+    Json(req): Json<PlanReplanDto>,
+) -> impl IntoResponse {
+    if state.sqlite_is_broken() {
+        return sqlite_error_response();
+    }
+    let Some(sqlite) = &state.sqlite else {
+        return sqlite_not_configured();
+    };
+    if state.sqlite_mode() != StateBackend::Sqlite {
+        return sqlite_not_configured();
+    }
+    let current = {
+        let conn = sqlite.lock().expect("sqlite lock");
+        match get_plan(&conn, &plan_id) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "unknown plan" })),
+                )
+                    .into_response();
+            }
+            Err(detail) => {
+                eprintln!("warning: plan replan read failed ({detail})");
+                return sqlite_error_response();
+            }
+        }
+    };
+    let task_id = current.task_id.clone();
+    // The plan must be the task's current version; a
+    // superseded id is a 409, not a re-plan of history.
+    let is_current = {
+        let conn = sqlite.lock().expect("sqlite lock");
+        match current_plan_for_task(&conn, &task_id) {
+            Ok(Some(row)) => row.plan_id == plan_id,
+            _ => false,
+        }
+    };
+    if !is_current {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "plan_not_current" })),
+        )
+            .into_response();
+    }
+    // Q-R3-09/10: at the limit, a further replan fails
+    // the task (terminal: failed + failed Inbox row via
+    // fail()) and answers 409 — no Planner round runs.
+    if current.replan_count >= 3 {
+        replan_limit_terminal(&state, &task_id, &current);
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "replan_limit_exceeded" })),
+        )
+            .into_response();
+    }
+    let record = {
+        let tasks = state.tasks.lock().expect("task lock");
+        let Some(record) = tasks.get(&task_id).cloned() else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "unknown task" })),
+            )
+                .into_response();
+        };
+        record
+    };
+    // The Planner round (Q-R3-05): old blueprint +
+    // stopped step + trigger signal + file context.
+    // Any failure to produce a plan is 502
+    // `replan_planner_failed` — the task is untouched
+    // (R3-J5: a model-produced blueprint that fails
+    // validation is a server-side failure, not a 400).
+    let planner_failed = || {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "replan_planner_failed" })),
+        )
+            .into_response()
+    };
+    let file_context = match crate::task_runner::read_task_files(&state, &record.directory) {
+        Ok(parts) => parts.join("\n\n"),
+        Err(_) => return planner_failed(),
+    };
+    let (trigger_step_no, trigger_signal) = latest_replan_trigger(&state, &task_id)
+        .map(|(step_no, signal)| (step_no, Some(signal)))
+        .unwrap_or_else(|| (record.executor_step_no.unwrap_or(1), None));
+    let planner_model = req
+        .planner_model
+        .clone()
+        .unwrap_or_else(|| crate::task_runner::planner_model_for(&state));
+    let prompt = crate::task_runner::replan_planner_prompt(
+        &file_context,
+        &current,
+        trigger_step_no,
+        trigger_signal.as_deref(),
+    );
+    let reply = match state
+        .deepseek
+        .reply_with_rules_and_model(
+            crate::task_runner::frozen_rules_for(&state, &task_id),
+            &planner_model,
+            &prompt,
+        )
+        .await
+    {
+        DeepseekOutcome::Replied(text) => text,
+        DeepseekOutcome::Disabled | DeepseekOutcome::Denied(_) | DeepseekOutcome::Failed(_) => {
+            return planner_failed();
+        }
+    };
+    let output = match crate::task_runner::parse_planner_output(&reply) {
+        Ok(output) => output,
+        Err(_) => return planner_failed(),
+    };
+    if !output.needs_file_change {
+        return planner_failed();
+    }
+    let steps = match validate_plan_steps(&output.steps) {
+        Ok(steps) => steps,
+        Err(_) => return planner_failed(),
+    };
+    let replan_if = match validate_replan_if(&output.replan_if) {
+        Ok(conditions) => conditions,
+        Err(_) => return planner_failed(),
+    };
+    let steps_value = serde_json::to_value(&steps).unwrap_or(serde_json::Value::Null);
+    let replan_value = serde_json::to_value(&replan_if).unwrap_or(serde_json::Value::Null);
+    let digest = plan_digest(
+        &task_id,
+        &crate::sqlite_store::canonical_json(&steps_value),
+        &crate::sqlite_store::canonical_json(&replan_value),
+    );
+    // The write, under the tasks lock like the draft
+    // route: currency + limit are re-checked here, so
+    // a concurrent replan cannot double-count the
+    // last slot or supersede the new version. The
+    // whole write is one block so both guards (and
+    // the task borrow) are gone before the step-1
+    // prepare awaits below — a `std::sync::MutexGuard`
+    // is not Send, and a future holding one across an
+    // await cannot be an Axum handler.
+    let row = {
+        let mut tasks = state.tasks.lock().expect("task lock");
+        let Some(record) = tasks.get_mut(&task_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "unknown task" })),
+            )
+                .into_response();
+        };
+        let mut conn = sqlite.lock().expect("sqlite lock");
+    let current_now = match current_plan_for_task(&conn, &task_id) {
+        Ok(Some(row)) => row,
+        _ => return sqlite_error_response(),
+    };
+    if current_now.plan_id != plan_id {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "plan_not_current" })),
+        )
+            .into_response();
+    }
+    if current_now.replan_count >= 3 {
+        drop(tasks);
+        drop(conn);
+        replan_limit_terminal(&state, &task_id, &current_now);
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "replan_limit_exceeded" })),
+        )
+            .into_response();
+    }
+    // Q-R3-07: the supersede set is the task's current
+    // approval when it is still unconsumed (R3-J8 —
+    // approvals carry no plan/task link, so there is
+    // no finer set; the old version's step approvals
+    // are consumed by construction once their step
+    // ran). The pointer is cleared: the new plan's
+    // steps create fresh approvals at prepare.
+    let supersede: Vec<String> = match &record.approval_id {
+        Some(id) => match sqlite_store::get_approval(&conn, id) {
+            Ok(Some(row)) if !row.consumed => vec![id.clone()],
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    let row = match crate::plan_store::create_plan(
+        &mut conn,
+        &task_id,
+        &steps,
+        &replan_if,
+        &planner_model,
+        &digest,
+        &state.origin_device_id,
+        true,
+        &supersede,
+    ) {
+        Ok(row) => row,
+        Err(detail) => {
+            eprintln!("warning: plan replan failed ({detail})");
+            return sqlite_error_response();
+        }
+    };
+    // Q-R3-06: the batch re-runs from step 1.
+    record.plan_id = Some(row.plan_id.clone());
+    record.executor_step_no = Some(1);
+    record.approval_id = None;
+    record.error = None;
+    let updated = record.clone();
+    persist_task(&state, &updated);
+    // The supersede write lands in the approvals audit
+    // export too (best-effort, the persist_approval
+    // precedent — the in-memory map carries no version
+    // and needs no update).
+    if !supersede.is_empty() {
+        if let Some(path) = &state.approvals_path {
+            if let Err(detail) = sqlite_store::export_approvals(&conn, path) {
+                eprintln!("warning: ORC-3 approvals audit export failed: {detail}");
+            }
+        }
+    }
+    row
+    };
+    // ORC-3 (R3-J16): prepare the new plan's step 1
+    // before answering — the same prepare
+    // `plan_or_generate` runs after its Planner round
+    // (Executor call + approval for a file step, draft
+    // + binding check for a worker step). The task
+    // stays `draft_ready`; the user approves +
+    // executes exactly like an ORC-2 run.
+    crate::task_runner::prepare_replanned_first_step(state.clone(), &task_id, &row).await;
+    match row.to_record() {
+        Ok(record) => Json(record).into_response(),
+        Err(detail) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": detail })),
+        )
+            .into_response(),
     }
 }

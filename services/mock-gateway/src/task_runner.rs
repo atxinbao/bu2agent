@@ -38,8 +38,9 @@ use crate::plan_store::{
     PlanRow, PlanStepDto,
 };
 use crate::server::{
-    approval_status, close_execution_for_task, create_execution, create_worker_run_internal,
-    decide_approval_rejected, ensure_root, execution_for_task, persist_approval, persist_task,
+    approval_status, close_execution, close_execution_for_task, close_execution_with_inbox,
+    create_execution, create_worker_run_internal, decide_approval_rejected, ensure_root,
+    execution_for_task, execution_status, persist_approval, persist_task,
     record_evidence_best_effort, resolve_file, worker_command_digest, ApprovalState, AppState,
     WorkerRunCreateDto,
 };
@@ -76,7 +77,7 @@ pub(crate) const PLANNER_PROMPT_PREFIX: &str =
 /// appended to the file context. `answer` is required
 /// exactly when `needs_file_change` is false; `steps`
 /// must be non-empty exactly when it is true.
-const PLANNER_JSON_CONTRACT: &str = "\n\n请判断这个任务是否需要修改文件。只返回一个严格 JSON 对象，不要 markdown 围栏、不要解释文字：\n{\"needs_file_change\": true|false, \"answer\": \"无需改文件时直接回答任务问题的文字；需要改文件时可省略\", \"steps\": [{\"step_no\": 1, \"kind\": \"file_write|command|verify|review\", \"path\": \"相对路径\", \"symbol\": \"函数或符号名\", \"change\": \"改动描述\", \"verify_cmd\": \"验证命令\", \"expected\": \"预期输出\"}], \"replan_if\": [{\"signal\": \"触发信号描述\", \"action\": \"stop_and_hand_back\"}]}\n规则：\n- needs_file_change 为 false 时，steps 用空数组，answer 必须给出直接回答。\n- 需要改文件时，steps 至少 1 步，step_no 从 1 连续编号；每步四件套 path/symbol/change/verify_cmd/expected 都必填。\n- verify_cmd 只允许以下形式：cargo test -p <包名>、git status、git diff、git diff -- <路径>；不许写其他命令。\n- replan_if 可为空；有信号时 action 只能是 stop_and_hand_back。\n";
+pub(crate) const PLANNER_JSON_CONTRACT: &str = "\n\n请判断这个任务是否需要修改文件。只返回一个严格 JSON 对象，不要 markdown 围栏、不要解释文字：\n{\"needs_file_change\": true|false, \"answer\": \"无需改文件时直接回答任务问题的文字；需要改文件时可省略\", \"steps\": [{\"step_no\": 1, \"kind\": \"file_write|command|verify|review\", \"path\": \"相对路径\", \"symbol\": \"函数或符号名\", \"change\": \"改动描述\", \"verify_cmd\": \"验证命令\", \"expected\": \"预期输出\"}], \"replan_if\": [{\"signal\": \"触发信号描述\", \"action\": \"stop_and_hand_back\"}]}\n规则：\n- needs_file_change 为 false 时，steps 用空数组，answer 必须给出直接回答。\n- 需要改文件时，steps 至少 1 步，step_no 从 1 连续编号；每步四件套 path/symbol/change/verify_cmd/expected 都必填。\n- verify_cmd 只允许以下形式：cargo test -p <包名>、git status、git diff、git diff -- <路径>；不许写其他命令。\n- replan_if 可为空；有信号时 action 只能是 stop_and_hand_back。\n";
 
 /// ORC-2: when the user forces execution, the Planner
 /// is told to produce steps even if it judges no file
@@ -89,6 +90,17 @@ const PLANNER_JSON_CONTRACT: &str = "\n\n请判断这个任务是否需要修改
 const PLANNER_FORCE_SUFFIX: &str = "\n\n注意：用户已选择强制执行。即使你判断无需修改文件，也必须给出可执行的步骤：将 needs_file_change 设为 true 并填写 steps，不要只返回直接回答。";
 const PLANNER_REUSE_SUFFIX: &str = "\n\n任务已有蓝图，不要重新规划；只判断这次运行是否仍需修改文件。只返回一个严格 JSON 对象，不要 markdown 围栏、不要解释文字：\n{\"needs_file_change\": true|false, \"answer\": \"无需改文件时直接回答任务问题的文字\"}\n已有蓝图步骤如下：\n";
 
+/// ORC-3 (Q-R3-01): the Re-plan-if judge prompt
+/// (LOCAL DEFINITION). The judge answers one
+/// question — does this step failure match one of the
+/// step's `replan_if` signals — and returns only the
+/// verdict plus the matched signal, never a new
+/// blueprint. Strict JSON only, like the Planner
+/// contract above. The prompt is built per failure by
+/// `replan_judge_prompt`; this constant is the tail
+/// (the contract + rules).
+const REPLAN_JUDGE_CONTRACT: &str = "\n\n请判断这次步骤失败是否命中上面任一信号。只返回一个严格 JSON 对象，不要 markdown 围栏、不要解释文字：\n{\"triggered\": true|false, \"signal\": \"命中的信号原文，未命中时为 null\"}\n规则：\n- 只有当失败事实与某个信号描述的情形相符时，才返回 triggered true，并原样返回该信号。\n- 不相符、无法判断时，返回 triggered false、signal null。\n";
+
 /// ORC-2 (J2): the Executor's per-step file-content
 /// prompt (LOCAL DEFINITION). The model returns the
 /// step's finished file content verbatim — no fences,
@@ -100,15 +112,17 @@ const EXECUTOR_PROMPT_PREFIX: &str =
 /// Unknown fields are ignored; a missing or mistyped
 /// `needs_file_change` fails the parse (the judgment
 /// is the one field the runner cannot default).
+/// pub(crate): the replan route parses the Planner
+/// round's reply with the same struct.
 #[derive(Debug, Deserialize)]
-struct PlannerOutput {
-    needs_file_change: bool,
+pub(crate) struct PlannerOutput {
+    pub(crate) needs_file_change: bool,
     #[serde(default)]
-    answer: Option<String>,
+    pub(crate) answer: Option<String>,
     #[serde(default)]
-    steps: Vec<PlanStepDto>,
+    pub(crate) steps: Vec<PlanStepDto>,
     #[serde(default)]
-    replan_if: Vec<PlanReplanIfDto>,
+    pub(crate) replan_if: Vec<PlanReplanIfDto>,
 }
 
 /// ORC-2: resolve the Planner/Executor models for this
@@ -123,13 +137,24 @@ fn role_models(state: &AppState) -> (String, String) {
     resolve_role_models(&staged, &state.deepseek.config().model)
 }
 
+/// ORC-3 (Q-R3-01): the Planner slot, live from the
+/// staged record — the re-plan judge and the replan
+/// route's Planner round both call the planner slot,
+/// never the executor slot and never a hardcoded
+/// model. pub(crate): the replan route resolves it.
+pub(crate) fn planner_model_for(state: &AppState) -> String {
+    role_models(state).0
+}
+
 /// E2-B §3.4 (snapshot gate), shared by the Planner and
 /// Executor calls: the model call for this task's
 /// Execution is denied by the rules frozen in the
 /// Execution's snapshot at creation. No Execution yet
 /// (the Planner round runs before one exists) → live
 /// policy, exactly as the old draft flow did.
-fn frozen_rules_for(
+/// pub(crate): the replan route's Planner round calls
+/// with the same rules.
+pub(crate) fn frozen_rules_for(
     state: &AppState,
     task_id: &str,
 ) -> Option<Vec<crate::policy_store::NetworkRule>> {
@@ -140,8 +165,9 @@ fn frozen_rules_for(
 /// ORC-2: one audit Evidence row for a Planner/Executor
 /// decision (triage, step failure). Best-effort like
 /// every other Evidence write: a failure warns, never
-/// fails the step it records.
-fn record_orc_evidence(
+/// fails the step it records. pub(crate): the replan
+/// route writes its `replan_exhausted` row with it.
+pub(crate) fn record_orc_evidence(
     state: &AppState,
     effect_id: &str,
     execution_id: Option<&str>,
@@ -164,6 +190,254 @@ fn record_orc_evidence(
     record_evidence_best_effort(state, &draft);
 }
 
+/// ORC-3 (Q-R3-01): the Re-plan-if judge's reply,
+/// parsed strictly. `triggered` is the one field the
+/// evaluator cannot default; `signal` must name a
+/// signal from the step's list when triggered.
+#[derive(Debug, Deserialize)]
+struct ReplanJudgment {
+    triggered: bool,
+    #[serde(default)]
+    signal: Option<String>,
+}
+
+/// ORC-3 (Q-R3-01/02): the outcome of one trigger
+/// evaluation. Triggered = the failure matched a
+/// signal and the hand-back already landed;
+/// NotTriggered = the evaluation ran (one
+/// `replan_not_triggered` row) and the caller keeps
+/// its original failure path; Aborted = the run was
+/// cancelled while the judge call was in flight, so
+/// the caller writes nothing and fails nothing.
+pub(crate) enum ReplanEvaluation {
+    Triggered,
+    NotTriggered,
+    Aborted,
+}
+
+/// ORC-3 (Q-R3-01): build the judge prompt for one
+/// step failure: the failure facts plus the step's
+/// `replan_if` signal list. The judge returns only a
+/// verdict + the matched signal, never a blueprint.
+#[allow(clippy::too_many_arguments)]
+fn replan_judge_prompt(
+    task_id: &str,
+    plan: &PlanRow,
+    step_no: i64,
+    step_kind: &str,
+    failure: &str,
+    signals: &[crate::plan_store::ReplanIf],
+    run_id: Option<&str>,
+    run_status: Option<&str>,
+    exit_code: Option<i64>,
+) -> String {
+    let signal_list = signals
+        .iter()
+        .map(|condition| format!("- {}", condition.signal))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "你是任务的重规划判定者。只做判定，不产新蓝图、不写文件、不执行命令。\n\n失败事实如下：\n- 任务：{task_id}\n- 蓝图：{plan_id}\n- 步骤号：{step_no}（kind：{step_kind}）\n- 失败：{failure}\n- worker run：{run_id}，状态：{run_status}，退出码：{exit_code}\n\n该步骤的 replan_if 信号列表如下：\n{signal_list}\n{contract}",
+        plan_id = plan.plan_id,
+        run_id = run_id.unwrap_or("无"),
+        run_status = run_status.unwrap_or("无"),
+        exit_code = exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "无".to_string()),
+        contract = REPLAN_JUDGE_CONTRACT,
+    )
+}
+
+/// ORC-3 (Q-R3-05): build the replan route's Planner
+/// prompt: the file context plus the old blueprint,
+/// the stopped step number and the trigger signal.
+/// pub(crate): the replan route builds it.
+pub(crate) fn replan_planner_prompt(
+    file_context: &str,
+    old_plan: &PlanRow,
+    step_no: i64,
+    signal: Option<&str>,
+) -> String {
+    format!(
+        "{PLANNER_PROMPT_PREFIX}{file_context}{PLANNER_JSON_CONTRACT}\n\n本次为重新规划：旧蓝图如下（JSON）：\n{steps_json}\n停住的步骤号：{step_no}\n触发信号：{signal}\n请基于旧蓝图重新规划：保留仍有效的步骤，修正导致失败的步骤；返回完整的新蓝图（steps 非空，needs_file_change 为 true）。",
+        steps_json = old_plan.steps_json,
+        signal = signal.unwrap_or("未记录——本次为手动重新规划"),
+    )
+}
+
+/// ORC-3 (Q-R3-01/02/03/04): evaluate one step
+/// failure against the step's `replan_if` signals and,
+/// when one matches, hand the task back instead of
+/// failing it. Exactly one `replan_*` Evidence row is
+/// written per evaluation (R3-J10): `replan_triggered`
+/// on a match, `replan_not_triggered` otherwise; the
+/// observed carries only the Q-R3-04 fields (no
+/// `failure` text — the pre-existing `step_failed`
+/// row, when the caller writes one, keeps it).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn evaluate_step_failure(
+    state: &AppState,
+    task_id: &str,
+    plan: &PlanRow,
+    step_no: i64,
+    step_kind: &str,
+    failure: &str,
+    execution_id: Option<&str>,
+    effect_id: Option<&str>,
+    run_id: Option<&str>,
+    run_status: Option<&str>,
+    exit_code: Option<i64>,
+) -> ReplanEvaluation {
+    let observed = |signal: Option<&str>| {
+        serde_json::json!({
+            "task_id": task_id,
+            "plan_id": plan.plan_id,
+            "step_no": step_no,
+            "step_kind": step_kind,
+            "signal": signal,
+            "run_id": run_id,
+            "run_status": run_status,
+            "exit_code": exit_code,
+        })
+    };
+    let evidence_effect = effect_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("executor:{task_id}:{step_no}"));
+    let record = |reason: &str, signal: Option<&str>| {
+        record_orc_evidence(
+            state,
+            &evidence_effect,
+            execution_id,
+            "executor",
+            "verified",
+            reason,
+            observed(signal),
+        );
+    };
+    let signals = match plan.replan_if() {
+        Ok(signals) => signals,
+        Err(_) => {
+            // A plan whose replan_if cannot parse is
+            // corrupt; the evaluation cannot match
+            // anything — record the miss and keep the
+            // original failure path.
+            record("replan_not_triggered", None);
+            return ReplanEvaluation::NotTriggered;
+        }
+    };
+    if signals.is_empty() {
+        // R3-J12: no signals, no judge call — a match
+        // is impossible by construction.
+        record("replan_not_triggered", None);
+        return ReplanEvaluation::NotTriggered;
+    }
+    let planner_model = planner_model_for(state);
+    let prompt = replan_judge_prompt(
+        task_id,
+        plan,
+        step_no,
+        step_kind,
+        failure,
+        &signals,
+        run_id,
+        run_status,
+        exit_code,
+    );
+    let reply = match state
+        .deepseek
+        .reply_with_rules_and_model(frozen_rules_for(state, task_id), &planner_model, &prompt)
+        .await
+    {
+        DeepseekOutcome::Replied(text) => text,
+        // R3-J2: the judge is best-effort — a disabled
+        // model, a denied call, or a failed call
+        // degrades to NOT triggered and must never
+        // change the failure path.
+        DeepseekOutcome::Disabled | DeepseekOutcome::Denied(_) | DeepseekOutcome::Failed(_) => {
+            record("replan_not_triggered", None);
+            return ReplanEvaluation::NotTriggered;
+        }
+    };
+    // Cancel checkpoint: a cancelled run discards the
+    // judgment — the cancel path owns the audit, so
+    // this evaluation writes nothing.
+    if !task_is_active(state, task_id) {
+        return ReplanEvaluation::Aborted;
+    }
+    let judgment = match serde_json::from_str::<ReplanJudgment>(reply.trim()) {
+        Ok(judgment) => judgment,
+        Err(_) => {
+            record("replan_not_triggered", None);
+            return ReplanEvaluation::NotTriggered;
+        }
+    };
+    let Some(signal) = judgment
+        .signal
+        .as_deref()
+        .filter(|_| judgment.triggered)
+    else {
+        record("replan_not_triggered", None);
+        return ReplanEvaluation::NotTriggered;
+    };
+    if !signals.iter().any(|condition| condition.signal == signal) {
+        record("replan_not_triggered", None);
+        return ReplanEvaluation::NotTriggered;
+    }
+    record("replan_triggered", Some(signal));
+    if hand_back(state, task_id, execution_id, effect_id) {
+        ReplanEvaluation::Triggered
+    } else {
+        ReplanEvaluation::Aborted
+    }
+}
+
+/// ORC-3 (Q-R3-03/04): hand a task back after a
+/// triggered failure. The task stays `draft_ready`
+/// (direct assignment — `running → draft_ready` is
+/// not a legal edge, and the hand-back is not a
+/// failure); the Execution goes `needs_review`, which
+/// opens the `review_required` Inbox row naming the
+/// failed step's Effect when one exists. The Evidence
+/// row is written before the transition (in the
+/// caller). With no Execution there is nothing to
+/// transition — the task still lands, and the gap is
+/// a warning, not an error. The status check and the
+/// assignment share one lock acquisition, so a cancel
+/// cannot slip between them. Returns false when the
+/// task is no longer active (the caller then treats
+/// the evaluation as aborted).
+fn hand_back(
+    state: &AppState,
+    task_id: &str,
+    execution_id: Option<&str>,
+    effect_id: Option<&str>,
+) -> bool {
+    {
+        let mut tasks = state.tasks.lock().expect("task lock");
+        let Some(current) = tasks.get_mut(task_id) else {
+            return false;
+        };
+        if !matches!(current.status.as_str(), "running" | "draft_ready") {
+            return false;
+        }
+        current.status = "draft_ready".to_string();
+        current.error = None;
+        let updated = current.clone();
+        persist_task(state, &updated);
+    }
+    match execution_id {
+        Some(id) => {
+            close_execution_with_inbox(state, id, "needs_review", effect_id);
+        }
+        None => {
+            eprintln!(
+                "warning: ORC-3 hand-back for task {task_id} has no Execution; no Inbox row opened"
+            );
+        }
+    }
+    true
+}
+
 /// ORC-2: the run's Execution is created here — at the
 /// point execution actually starts — not in the run /
 /// resume handlers. A triage run never reaches this
@@ -171,6 +445,18 @@ fn record_orc_evidence(
 /// A fresh attempt supersedes any still-running
 /// Execution a crashed earlier attempt left behind.
 fn begin_execution(state: &AppState, task_id: &str) -> String {
+    // ORC-3 (R3-J6): resuming after a hand-back closes
+    // the review row: a `needs_review` Execution for
+    // the task returns to `running` before the new
+    // Execution is created. `supersede_old_task_executions`
+    // only touches `running` ones, so without this the
+    // row would stay open forever. The transition is
+    // what auto-closes it (any non-review status does).
+    if let Some(old_id) = execution_for_task(state, task_id) {
+        if execution_status(state, &old_id).as_deref() == Some("needs_review") {
+            close_execution(state, &old_id, "running");
+        }
+    }
     let execution = create_execution(state, Some(task_id.to_string()), None);
     crate::server::supersede_old_task_executions(state, task_id, &execution.execution_id);
     execution.execution_id
@@ -217,8 +503,18 @@ fn fail_or_cancel_plan_round(state: &AppState, task_id: &str, error: &str) {
 /// Ten arguments is deliberate: the failure record
 /// carries the step identity plus the worker run's
 /// outcome, and no caller bundles them.
+///
+/// ORC-3 (Q-R3-02): the failure is evaluated against
+/// the step's `replan_if` signals BEFORE it is
+/// recorded. A match hands the task back (no
+/// `step_failed` row, no `fail()`); a cancelled run
+/// writes nothing; anything else keeps the original
+/// failure path below. No Effect exists yet at the
+/// prepare-time failures this covers, so the
+/// evaluation's `effect_id` is None here — the
+/// worker-run branch passes the run's Effect itself.
 #[allow(clippy::too_many_arguments)]
-fn fail_step(
+async fn fail_step(
     state: &AppState,
     task_id: &str,
     plan: &PlanRow,
@@ -230,6 +526,24 @@ fn fail_step(
     run_status: Option<&str>,
     exit_code: Option<i64>,
 ) {
+    match evaluate_step_failure(
+        state,
+        task_id,
+        plan,
+        step_no,
+        step_kind,
+        failure,
+        execution_id,
+        None,
+        run_id,
+        run_status,
+        exit_code,
+    )
+    .await
+    {
+        ReplanEvaluation::Triggered | ReplanEvaluation::Aborted => return,
+        ReplanEvaluation::NotTriggered => {}
+    }
     record_orc_evidence(
         state,
         &format!("executor:{task_id}:{step_no}"),
@@ -683,7 +997,9 @@ async fn restore_or_regenerate(state: AppState, record: TaskFileRecord) {
 /// listing rule and per-file cap of the old draft
 /// flow, kept verbatim — and render them as prompt
 /// context. Errors keep the old draft flow's messages.
-fn read_task_files(state: &AppState, directory: &str) -> Result<Vec<String>, String> {
+/// pub(crate): the replan route reads the same file
+/// context the Planner round reads.
+pub(crate) fn read_task_files(state: &AppState, directory: &str) -> Result<Vec<String>, String> {
     if ensure_root(&state.files_root).is_err() {
         return Err("无法创建文件根".to_string());
     }
@@ -733,7 +1049,9 @@ fn read_task_files(state: &AppState, directory: &str) -> Result<Vec<String>, Str
 /// JSON. `serde_json` accepts trailing whitespace and
 /// nothing else — a fenced or commentary-wrapped reply
 /// fails here, and the task fails with it.
-fn parse_planner_output(text: &str) -> Result<PlannerOutput, String> {
+/// pub(crate): the replan route parses the Planner
+/// round's reply with the same strict rule.
+pub(crate) fn parse_planner_output(text: &str) -> Result<PlannerOutput, String> {
     serde_json::from_str::<PlannerOutput>(text.trim()).map_err(|e| e.to_string())
 }
 
@@ -1005,6 +1323,8 @@ async fn plan_or_generate(state: AppState, record: TaskFileRecord, force_execute
                     &planner_model,
                     &digest,
                     &state.origin_device_id,
+                    false,
+                    &[],
                 ) {
                     Ok(row) => row,
                     Err(detail) => {
@@ -1150,6 +1470,21 @@ fn task_is_active(state: &AppState, task_id: &str) -> bool {
 /// bound worktree, model failure, approval failure)
 /// is a step failure (Q-ORC-11): Evidence +
 /// task failed, no skip, no retry.
+/// ORC-3 (R3-J16): prepare step 1 of a freshly
+/// re-planned plan — the replan route's equivalent of
+/// the step-1 prepare `plan_or_generate` runs after
+/// its Planner round. Without it the re-planned batch
+/// could not resume through `tasks_execute`: a file
+/// step would 500 on the missing approval (the old
+/// step's `artifact_path` still set) and a worker
+/// step would run, but a file step reached through
+/// the worker branch is a silent no-op. The task
+/// stays `draft_ready`; the user approves + executes
+/// exactly like an ORC-2 run.
+pub(crate) async fn prepare_replanned_first_step(state: AppState, task_id: &str, plan: &PlanRow) {
+    prepare_executor_step(state, task_id, plan, 1).await;
+}
+
 async fn prepare_executor_step(state: AppState, task_id: &str, plan: &PlanRow, step_no: i64) {
     let steps = match plan.steps() {
         Ok(steps) => steps,
@@ -1170,7 +1505,7 @@ async fn prepare_executor_step(state: AppState, task_id: &str, plan: &PlanRow, s
             None,
             None,
             None,
-        );
+        ).await;
         return;
     };
     // Cancel checkpoint: only prepare while the run is
@@ -1198,7 +1533,7 @@ async fn prepare_executor_step(state: AppState, task_id: &str, plan: &PlanRow, s
                 None,
                 None,
                 None,
-            );
+            ).await;
         }
     }
 }
@@ -1249,7 +1584,7 @@ async fn prepare_file_write_step(
                 None,
                 None,
                 None,
-            );
+            ).await;
             return;
         }
         DeepseekOutcome::Denied(pattern) => {
@@ -1264,7 +1599,7 @@ async fn prepare_file_write_step(
                 None,
                 None,
                 None,
-            );
+            ).await;
             return;
         }
         DeepseekOutcome::Failed(_) => {
@@ -1279,7 +1614,7 @@ async fn prepare_file_write_step(
                 None,
                 None,
                 None,
-            );
+            ).await;
             return;
         }
         DeepseekOutcome::Replied(text) => {
@@ -1295,7 +1630,7 @@ async fn prepare_file_write_step(
                     None,
                     None,
                     None,
-                );
+                ).await;
                 return;
             }
             text
@@ -1321,7 +1656,7 @@ async fn prepare_file_write_step(
                 None,
                 None,
                 None,
-            );
+            ).await;
             return;
         }
     };
@@ -1394,7 +1729,7 @@ async fn prepare_worker_step(
                 None,
                 None,
                 None,
-            );
+            ).await;
             return;
         }
     };
@@ -1421,7 +1756,7 @@ async fn prepare_worker_step(
             None,
             None,
             None,
-        );
+        ).await;
         return;
     };
     let approval_id = if is_effect_command(&template) {
@@ -1439,7 +1774,7 @@ async fn prepare_worker_step(
                     None,
                     None,
                     None,
-                );
+                ).await;
                 return;
             }
         }
@@ -1540,7 +1875,7 @@ async fn execute_worker_step_inner(state: AppState, record: &TaskFileRecord, ste
             None,
             None,
             None,
-        );
+        ).await;
         return;
     };
     if !matches!(step.kind.as_str(), "command" | "verify" | "review") {
@@ -1563,7 +1898,7 @@ async fn execute_worker_step_inner(state: AppState, record: &TaskFileRecord, ste
                 None,
                 None,
                 None,
-            );
+            ).await;
             return;
         }
     };
@@ -1586,7 +1921,7 @@ async fn execute_worker_step_inner(state: AppState, record: &TaskFileRecord, ste
             None,
             None,
             None,
-        );
+        ).await;
         return;
     };
     // Effect steps carry the approval the user decided
@@ -1628,7 +1963,7 @@ async fn execute_worker_step_inner(state: AppState, record: &TaskFileRecord, ste
                 None,
                 None,
                 None,
-            );
+            ).await;
             return;
         }
     };
@@ -1652,7 +1987,7 @@ async fn execute_worker_step_inner(state: AppState, record: &TaskFileRecord, ste
                 Some(&run_id),
                 None,
                 None,
-            );
+            ).await;
             return;
         }
         let row = {
@@ -1668,7 +2003,7 @@ async fn execute_worker_step_inner(state: AppState, record: &TaskFileRecord, ste
                     Some(&run_id),
                     None,
                     None,
-                );
+                ).await;
                 return;
             };
             let conn = sqlite.lock().expect("sqlite lock");
@@ -1696,7 +2031,7 @@ async fn execute_worker_step_inner(state: AppState, record: &TaskFileRecord, ste
                     Some(&run_id),
                     None,
                     None,
-                );
+                ).await;
                 return;
             }
             Err(detail) => {
@@ -1711,13 +2046,62 @@ async fn execute_worker_step_inner(state: AppState, record: &TaskFileRecord, ste
                     Some(&run_id),
                     None,
                     None,
-                );
+                ).await;
                 return;
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     };
     if status != "succeeded" {
+        // ORC-3 (Q-R3-02): the worker-run failure is
+        // evaluated before its `step_failed` row is
+        // written. A match hands back with only the
+        // `replan_triggered` row; a cancelled run
+        // writes nothing; anything else keeps the
+        // original `step_failed` row + `fail()` below.
+        // The judge sees the run's outcome in words,
+        // not just the `worker_run_failed` tag.
+        let judge_failure = format!(
+            "worker run 失败，状态 {status}，退出码 {}",
+            exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "无".to_string())
+        );
+        match evaluate_step_failure(
+            &state,
+            &task_id,
+            &plan,
+            step_no,
+            &step.kind,
+            &judge_failure,
+            execution_id.as_deref(),
+            effect_id.as_deref(),
+            Some(&run_id),
+            Some(&status),
+            exit_code,
+        )
+        .await
+        {
+            ReplanEvaluation::Triggered | ReplanEvaluation::Aborted => return,
+            ReplanEvaluation::NotTriggered => {}
+        }
+        // ORC-3 (R3-J18b): P3-C §5.4 — a test step's
+        // failure opens no `failed` Inbox row. The
+        // worker-run finalizer used to close the
+        // Execution suppressed for cargo-test runs,
+        // but Executor-step runs no longer get that
+        // close (R3-J18: the step logic owns it), so
+        // the step logic suppresses here instead: close
+        // the Execution as failed with no Inbox row
+        // first, and `fail()` below then finds it
+        // already terminal, so its close is a no-op.
+        // Any other template keeps the unsuppressed
+        // close (the finalizer's old behaviour).
+        if template == "cargo-test" {
+            if let Some(execution_id) = execution_id.as_deref() {
+                crate::server::close_execution_no_inbox(&state, execution_id, "failed");
+            }
+        }
         record_orc_evidence(
             &state,
             effect_id

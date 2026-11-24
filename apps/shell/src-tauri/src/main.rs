@@ -286,6 +286,7 @@ fn main() {
             tool_commands::plan_draft,
             tool_commands::plan_get,
             tool_commands::plan_current,
+            tool_commands::plan_replan,
             tool_commands::device_reminders_list,
             tool_commands::device_actions_create,
             tool_commands::device_reminder_set,

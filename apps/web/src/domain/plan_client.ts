@@ -49,6 +49,9 @@ export interface Plan {
   createdMs: number;
   updatedMs: number;
   originDeviceId: string;
+  // ORC-3 (Q-R3-09): re-plan count of this version's
+  // lineage (3 is the limit).
+  replanCount: number;
 }
 
 // A plan draft request. No digest field, no
@@ -70,6 +73,10 @@ export interface PlanGateway {
   currentPlan(taskId: string): Promise<Plan>;
   plan(planId: string): Promise<Plan>;
   plans(limit: number | null, offset: number | null): Promise<Plan[]>;
+  // ORC-3 (Q-R3-05): re-plan the named plan version.
+  // The gateway runs the Planner round; the caller
+  // passes only an optional planner-model override.
+  replan(planId: string, plannerModel: string | null): Promise<Plan>;
 }
 
 interface ServerPlanStep {
@@ -100,6 +107,7 @@ interface ServerPlan {
   created_ms: number;
   updated_ms: number;
   origin_device_id: string;
+  replan_count: number;
 }
 
 export function toPlan(server: ServerPlan): Plan {
@@ -127,6 +135,7 @@ export function toPlan(server: ServerPlan): Plan {
     createdMs: server.created_ms,
     updatedMs: server.updated_ms,
     originDeviceId: server.origin_device_id,
+    replanCount: server.replan_count,
   };
 }
 
@@ -200,6 +209,14 @@ export class PlanClient implements PlanGateway {
     const server = await this.requestJson<ServerPlan>(
       "GET",
       `/tasks/plan/${encodeURIComponent(planId)}`,
+    );
+    return toPlan(server);
+  }
+
+  async replan(planId: string, plannerModel: string | null): Promise<Plan> {
+    const server = await this.postJson<ServerPlan>(
+      `/tasks/plan/${encodeURIComponent(planId)}/replan`,
+      { planner_model: plannerModel },
     );
     return toPlan(server);
   }

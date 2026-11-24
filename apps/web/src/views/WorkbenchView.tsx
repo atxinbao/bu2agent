@@ -26,6 +26,7 @@ import type {
   ExecutionsGateway,
 } from "../domain/executions_client";
 import type { InboxGateway, InboxRow } from "../domain/inbox_client";
+import type { PlanGateway } from "../domain/plan_client";
 import type {
   ApprovalView,
   ApprovalsGateway,
@@ -120,6 +121,11 @@ export interface WorkbenchViewProps {
   effects?: EffectsGateway | null;
   evidence?: EvidenceGateway | null;
   assignments?: AssignmentsGateway | null;
+  // ORC-3: the plan client for the Inbox re-plan
+  // button (review_required rows only). Optional
+  // like the other clients: without it the button
+  // does not render.
+  plans?: PlanGateway | null;
 }
 
 export function WorkbenchView(props: WorkbenchViewProps) {
@@ -132,6 +138,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
   const effectsClient = props.effects ?? null;
   const evidenceClient = props.evidence ?? null;
   const assignmentsClient = props.assignments ?? null;
+  const plansClient = props.plans ?? null;
   const [items, setItems] = useState<WorkItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -189,6 +196,8 @@ export function WorkbenchView(props: WorkbenchViewProps) {
   const [inboxEffects, setInboxEffects] = useState<EffectRecord[]>([]);
   const [inboxEvidence, setInboxEvidence] = useState<EvidenceRow[]>([]);
   const [exportingEvidence, setExportingEvidence] = useState(false);
+  // ORC-3: the inbox row a re-plan is running for.
+  const [replanBusyId, setReplanBusyId] = useState<string | null>(null);
 
   async function refreshInbox() {
     if (!inboxClient) return;
@@ -236,6 +245,47 @@ export function WorkbenchView(props: WorkbenchViewProps) {
       await refreshInbox();
     } catch (e) {
       setInboxError(errText(e));
+    }
+  }
+
+  // ORC-3 (Q-R3-05): re-plan from a review_required
+  // row. The row names an Execution, not a plan: the
+  // task comes from the Execution, the plan from the
+  // task's current plan. The 3-re-plan limit is
+  // checked here so the button explains itself
+  // instead of failing on the gateway; the gateway
+  // re-checks it under the tasks lock. A re-plan
+  // does not close the row — the row closes when
+  // execution actually resumes (R3-J6) — so the
+  // notice points the user at the task page to run
+  // the new plan from step 1.
+  async function replanInboxRow(row: InboxRow) {
+    if (!plansClient || !executionsClient) return;
+    setInboxError("");
+    setReplanBusyId(row.inboxId);
+    try {
+      if (row.executionId === null) {
+        setInboxNotice("该待办未关联执行记录，无法重新规划。");
+        return;
+      }
+      const executions = await executionsClient.list();
+      const execution = executions.find((e) => e.executionId === row.executionId);
+      if (!execution || execution.taskId === null) {
+        setInboxNotice("该待办未关联任务，无法重新规划。");
+        return;
+      }
+      const plan = await plansClient.currentPlan(execution.taskId);
+      if (plan.replanCount >= 3) {
+        setInboxNotice(`蓝图 ${plan.planId} 重规划次数已达上限（3 次），无法再次重新规划。`);
+        return;
+      }
+      const next = await plansClient.replan(plan.planId, null);
+      setInboxNotice(`已重新规划为 ${next.planId}（第 ${next.replanCount} 次），请到任务页从步骤 1 重新执行。`);
+      await refreshInbox();
+    } catch (e) {
+      setInboxError(errText(e));
+    } finally {
+      setReplanBusyId(null);
     }
   }
 
@@ -1419,7 +1469,16 @@ export function WorkbenchView(props: WorkbenchViewProps) {
                     </button>{" "}
                     <button type="button" onClick={() => void ackInboxRow(row)}>
                       确认
-                    </button>
+                    </button>{" "}
+                    {row.kind === "review_required" && plansClient && executionsClient && (
+                      <button
+                        type="button"
+                        disabled={replanBusyId === row.inboxId}
+                        onClick={() => void replanInboxRow(row)}
+                      >
+                        重新规划
+                      </button>
+                    )}
                     {expanded && execution && (
                       <ExecutionDetail
                         execution={execution}

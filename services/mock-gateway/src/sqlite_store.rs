@@ -1215,6 +1215,21 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     backfill_column(&tx, "contacts", "effect_id")?;
     backfill_column(&tx, "contacts", "policy_version")?;
     ensure_unique_index(&tx, "contacts", "idx_contacts_idempotency", "idempotency_key")?;
+    // ORC-3 (Q-R3-09) additive column: databases
+    // created before ORC-3 have no plans.replan_count.
+    // Nullable INTEGER backfill, idempotent, schema
+    // version stays 20 (column backfill, not a v21
+    // migration — the E2-D progress_json precedent).
+    // Old rows read NULL, which the row reader treats
+    // as 0 (no re-plan yet).
+    backfill_column_typed(&tx, "plans", "replan_count", "INTEGER")?;
+    if table_exists(&tx, "plans")? {
+        tx.execute(
+            "UPDATE plans SET replan_count = 0 WHERE replan_count IS NULL",
+            [],
+        )
+        .map_err(err)?;
+    }
     tx.commit().map_err(err)?;
     Ok(())
 }
@@ -2462,6 +2477,11 @@ fn upsert_execution_tx(
     record: &ExecutionFileRecord,
     event_type: &str,
     suppress_inbox: bool,
+    // ORC-3 (Q-R3-04): the failed step's Effect for the
+    // review_required row the needs_review close opens.
+    // None keeps the old behaviour (no effect named);
+    // only the hand-back path passes one.
+    inbox_effect_id: Option<&str>,
 ) -> Result<(), String> {
     let now = now_ms() as i64;
     let created_ms: Option<i64> = tx
@@ -2528,26 +2548,40 @@ fn upsert_execution_tx(
     // failures), while the Execution still closes to `failed`.
     // A suppressed close also skips the review auto-close:
     // it does nothing to the Inbox at all. Every other
-    // failed/needs_review close opens its row.
+    // failed/needs_review close opens its row; a failed
+    // close also auto-closes the review row (R3-J20).
     match record.status.as_str() {
         "needs_review" if !suppress_inbox => insert_inbox(
             tx,
             "review_required",
             Some(&record.execution_id),
-            None,
-            None,
-            &source,
-            now,
-        )?,
-        "failed" if !suppress_inbox => insert_inbox(
-            tx,
-            "failed",
-            Some(&record.execution_id),
-            None,
+            inbox_effect_id,
             None,
             &source,
             now,
         )?,
+        "failed" if !suppress_inbox => {
+            insert_inbox(
+                tx,
+                "failed",
+                Some(&record.execution_id),
+                None,
+                None,
+                &source,
+                now,
+            )?;
+            // R3-J20 (user decision 2026-11-24): a failed
+            // close auto-closes this execution's open
+            // review_required row — the hand-back is over
+            // once the Execution is terminally failed, so
+            // the review prompt must not outlive it. This
+            // is the same auto-close the running/completed/
+            // cancelled arm already does; `failed` was the
+            // only leaving-needs_review edge that skipped
+            // it. The failed row itself is never
+            // auto-closed (ack-only, see ack_inbox).
+            auto_close_inbox(tx, "review_required", "execution_id", &record.execution_id, now)?;
+        }
         "needs_review" | "failed" => {}
         _ => {
             // A non-review status closes open review rows for
@@ -2906,11 +2940,74 @@ fn upsert_approval_tx(
     Ok(())
 }
 
+/// ORC-3 (Q-R3-07): supersede one unconsumed approval
+/// in the re-plan transaction — a no-decision version
+/// write (`version` +1, `supersedes_version` = the
+/// superseded version, status word unchanged) plus
+/// one `approval.superseded` event. The payload is
+/// the FULL updated row serialization, exactly like
+/// every other approval event: `fold_matches_tables`
+/// requires the last approval event per id to equal
+/// the row, so a three-key payload would break the
+/// fold (R3-J14). The approval row carries no body
+/// text, so the full-row payload keeps the Q-R3-12
+/// substance (no blueprint / model / file content in
+/// events). A missing or already-consumed approval is
+/// a no-op (Ok(false)), never an error: the re-plan
+/// must not fail on an approval that is already
+/// spent. An open `approval_required` row for the
+/// approval is auto-closed — a superseded approval
+/// can no longer be acted on (R3-J15).
+pub fn supersede_approval_tx(
+    tx: &rusqlite::Transaction<'_>,
+    approval_id: &str,
+) -> Result<bool, String> {
+    let old: Option<ApprovalFileRecord> = tx
+        .query_row(
+            "SELECT seq, approval_id, tool, status, binding_json, consumed, operation_digest, action_binding, effect_binding, message, command_json, consumed_by_worker_session_id, version, supersedes_version FROM approvals WHERE approval_id = ?1",
+            params![approval_id],
+            approval_from_row,
+        )
+        .optional()
+        .map_err(err)?;
+    let Some(old) = old else {
+        return Ok(false);
+    };
+    if old.consumed {
+        return Ok(false);
+    }
+    let old_version = old.version.unwrap_or(1) as i64;
+    let new_version = old_version + 1;
+    let now = now_ms() as i64;
+    tx.execute(
+        "UPDATE approvals SET version = ?1, supersedes_version = ?2, updated_at_ms = ?3 WHERE approval_id = ?4",
+        params![new_version, old_version, now, approval_id],
+    )
+    .map_err(err)?;
+    let mut payload_record = old.clone();
+    payload_record.version = Some(new_version as u64);
+    payload_record.supersedes_version = Some(old_version as u64);
+    let payload = serde_json::to_string(&payload_record)
+        .map_err(|e| format!("sqlite: cannot encode approval: {e}"))?;
+    append_event(
+        tx,
+        "approval",
+        approval_id,
+        "approval.superseded",
+        &payload,
+        "unknown",
+        now,
+        1,
+    )?;
+    auto_close_inbox(tx, "approval_required", "approval_id", approval_id, now)?;
+    Ok(true)
+}
+
 /// One transaction: upsert one execution row + its event (+
 /// derived Inbox rows). Callers hold the `Mutex<Connection>`.
 pub fn upsert_execution(conn: &mut Connection, record: &ExecutionFileRecord) -> Result<(), String> {
     let tx = conn.transaction().map_err(err)?;
-    upsert_execution_tx(&tx, record, "execution.created", false)?;
+    upsert_execution_tx(&tx, record, "execution.created", false, None)?;
     tx.commit().map_err(err)?;
     Ok(())
 }
@@ -5774,7 +5871,7 @@ pub fn sweep_expired_assignment(
             return Ok(SweepOutcome { assignment_lost: true, execution_transitioned: false });
         }
         execution.status = "needs_review".to_string();
-        upsert_execution_tx(&tx, &execution, "execution.transitioned", false)?;
+        upsert_execution_tx(&tx, &execution, "execution.transitioned", false, None)?;
         // D1-3 (Q-D1-34附带项): the second dedupe hole.
         // The sweep row is execution-keyed (no effect_id),
         // so the guard counts open `unknown_requires_
@@ -6118,7 +6215,7 @@ pub fn upsert_execution_with_snapshot(
     snapshot: &SnapshotRow,
 ) -> Result<(), String> {
     let tx = conn.transaction().map_err(err)?;
-    upsert_execution_tx(&tx, record, "execution.created", false)?;
+    upsert_execution_tx(&tx, record, "execution.created", false, None)?;
     insert_snapshot_tx(&tx, snapshot)?;
     tx.commit().map_err(err)?;
     Ok(())
@@ -6369,7 +6466,30 @@ pub fn transition_execution(
     execution_id: &str,
     status: &str,
 ) -> Result<ExecutionFileRecord, ExecutionTransitionError> {
-    transition_execution_with_event(conn, execution_id, status, "execution.transitioned", false)
+    transition_execution_with_event(conn, execution_id, status, "execution.transitioned", false, None)
+}
+
+/// ORC-3 (Q-R3-04): like `transition_execution`, but the
+/// review_required row the needs_review close opens
+/// names the failed step's Effect (`effect_id` when
+/// one exists, else None — the old behaviour). The
+/// `source_event_id` stays the Execution transition
+/// event's id: Evidence rows produce no events, so
+/// there is no Evidence event id to reference (R3-J11).
+pub fn transition_execution_with_inbox(
+    conn: &mut Connection,
+    execution_id: &str,
+    status: &str,
+    effect_id: Option<&str>,
+) -> Result<ExecutionFileRecord, ExecutionTransitionError> {
+    transition_execution_with_event(
+        conn,
+        execution_id,
+        status,
+        "execution.transitioned",
+        false,
+        effect_id,
+    )
 }
 
 /// E2-A §2.3 + P3-C §5.4: like `transition_execution`, but
@@ -6380,7 +6500,7 @@ pub fn transition_execution_no_inbox(
     execution_id: &str,
     status: &str,
 ) -> Result<ExecutionFileRecord, ExecutionTransitionError> {
-    transition_execution_with_event(conn, execution_id, status, "execution.transitioned", true)
+    transition_execution_with_event(conn, execution_id, status, "execution.transitioned", true, None)
 }
 
 /// E2-A §2.8: reconcile one stranded "running" Execution to
@@ -6395,7 +6515,7 @@ pub fn reconcile_execution(
     execution_id: &str,
     status: &str,
 ) -> Result<ExecutionFileRecord, ExecutionTransitionError> {
-    transition_execution_with_event(conn, execution_id, status, "execution.reconciled", false)
+    transition_execution_with_event(conn, execution_id, status, "execution.reconciled", false, None)
 }
 
 fn transition_execution_with_event(
@@ -6404,6 +6524,7 @@ fn transition_execution_with_event(
     status: &str,
     event_type: &str,
     suppress_inbox: bool,
+    inbox_effect_id: Option<&str>,
 ) -> Result<ExecutionFileRecord, ExecutionTransitionError> {
     let tx = conn.transaction().map_err(err).map_err(ExecutionTransitionError::Internal)?;
     let run = || -> Result<ExecutionFileRecord, ExecutionTransitionError> {
@@ -6416,7 +6537,7 @@ fn transition_execution_with_event(
             return Err(ExecutionTransitionError::Illegal);
         }
         record.status = status.to_string();
-        upsert_execution_tx(&tx, &record, event_type, suppress_inbox)
+        upsert_execution_tx(&tx, &record, event_type, suppress_inbox, inbox_effect_id)
             .map_err(ExecutionTransitionError::Internal)?;
         if crate::execution_store::execution_status_group(status) == Some("terminal") {
             let now = now_ms() as i64;

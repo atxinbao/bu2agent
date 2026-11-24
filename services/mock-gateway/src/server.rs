@@ -6967,20 +6967,49 @@ pub(crate) fn loop_status_to_execution(loop_status: &crate::loop_engine::LoopSta
 /// closing twice must not error). Returns the new status
 /// when a transition landed.
 pub(crate) fn close_execution(state: &AppState, execution_id: &str, to: &str) -> Option<String> {
-    close_execution_inner(state, execution_id, to, false)
+    close_execution_inner(state, execution_id, to, false, None)
+}
+
+/// ORC-3 (Q-R3-04): like `close_execution`, but the
+/// review_required row the needs_review close opens
+/// names the failed step's Effect. Only the hand-back
+/// path passes one; every other caller keeps the old
+/// behaviour (no effect named).
+pub(crate) fn close_execution_with_inbox(
+    state: &AppState,
+    execution_id: &str,
+    to: &str,
+    effect_id: Option<&str>,
+) -> Option<String> {
+    close_execution_inner(state, execution_id, to, false, effect_id)
+}
+
+/// ORC-3 (R3-J6): the current status word of one
+/// Execution, for the resume transition in
+/// `begin_execution` (a needs_review Execution
+/// returns to running when execution resumes).
+pub(crate) fn execution_status(state: &AppState, execution_id: &str) -> Option<String> {
+    executions_snapshot(state)?
+        .into_iter()
+        .find(|record| record.execution_id == execution_id)
+        .map(|record| record.status)
 }
 
 /// E2-A §2.3 + P3-C §5.4: like `close_execution`, but the
-/// close opens no Inbox row. Only the Worker driver uses it,
-/// for a test run (a test result is a result, not something
-/// to review). In JSONL/Shadow modes there is no Inbox side
+/// close opens no Inbox row. The Worker driver uses it
+/// for a test run (a test result is a result, not
+/// something to review); ORC-3 (R3-J18b) the Executor
+/// step logic uses it too, for a failed cargo-test
+/// step — the finalizer no longer closes Executor-step
+/// runs, so the step logic suppresses the row itself.
+/// In JSONL/Shadow modes there is no Inbox side
 /// effect to suppress; the flag only threads the SQLite path.
 pub(crate) fn close_execution_no_inbox(
     state: &AppState,
     execution_id: &str,
     to: &str,
 ) -> Option<String> {
-    close_execution_inner(state, execution_id, to, true)
+    close_execution_inner(state, execution_id, to, true, None)
 }
 
 fn close_execution_inner(
@@ -6988,6 +7017,7 @@ fn close_execution_inner(
     execution_id: &str,
     to: &str,
     suppress_inbox: bool,
+    inbox_effect_id: Option<&str>,
 ) -> Option<String> {
     if state.sqlite_mode() == StateBackend::Sqlite {
         if state.sqlite_is_broken() {
@@ -7000,6 +7030,13 @@ fn close_execution_inner(
             let mut conn = sqlite.lock().expect("sqlite lock");
             if suppress_inbox {
                 sqlite_store::transition_execution_no_inbox(&mut conn, execution_id, to)
+            } else if let Some(effect_id) = inbox_effect_id {
+                sqlite_store::transition_execution_with_inbox(
+                    &mut conn,
+                    execution_id,
+                    to,
+                    Some(effect_id),
+                )
             } else {
                 sqlite_store::transition_execution(&mut conn, execution_id, to)
             }
@@ -8351,6 +8388,7 @@ pub fn app(state: AppState) -> Router {
         .route("/tasks/resume", post(crate::routes_tasks::tasks_resume))
         .route("/tasks/cancel", post(crate::routes_tasks::tasks_cancel))
         .route("/tasks/plan/draft", post(crate::routes_tasks::tasks_plan_draft))
+        .route("/tasks/plan/{id}/replan", post(crate::routes_tasks::tasks_plan_replan))
         .route("/tasks/plan", get(crate::routes_tasks::tasks_plan_list))
         .route("/tasks/plan/{id}", get(crate::routes_tasks::tasks_plan_get))
         .route("/executions/list", get(crate::routes_ledger::executions_list))

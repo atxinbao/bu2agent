@@ -665,6 +665,7 @@ export function App() {
             effects={clients.effects}
             evidence={clients.evidence}
             assignments={clients.assignments}
+            plans={clients.plans}
             onNavigate={(target) => setTab(target)}
           />
         ))}

@@ -28,7 +28,7 @@ fn err(detail: impl std::fmt::Display) -> String {
     format!("sqlite: {detail}")
 }
 
-const PLAN_COLS: &str = "plan_id, task_id, execution_id, version, status, steps_json, replan_if_json, planner_model, digest, created_ms, updated_ms, origin_device_id";
+const PLAN_COLS: &str = "plan_id, task_id, execution_id, version, status, steps_json, replan_if_json, planner_model, digest, created_ms, updated_ms, origin_device_id, replan_count";
 
 /// One blueprint step (LOCAL DEFINITION, plan §3).
 /// The four-piece set (`path` / `symbol` / `change` /
@@ -76,6 +76,12 @@ pub struct PlanRow {
     pub created_ms: i64,
     pub updated_ms: i64,
     pub origin_device_id: String,
+    /// ORC-3 (Q-R3-09): how many times this plan
+    /// lineage has been re-planned through the replan
+    /// route. Typed backfill column, no version bump;
+    /// old rows read 0. Manual drafts keep the old
+    /// value; a replan write sets old + 1.
+    pub replan_count: i64,
 }
 
 impl PlanRow {
@@ -106,6 +112,7 @@ impl PlanRow {
             created_ms: self.created_ms,
             updated_ms: self.updated_ms,
             origin_device_id: self.origin_device_id.clone(),
+            replan_count: self.replan_count,
         })
     }
 }
@@ -126,6 +133,10 @@ pub struct PlanRecord {
     pub created_ms: i64,
     pub updated_ms: i64,
     pub origin_device_id: String,
+    /// ORC-3 (Q-R3-09): re-plan count of this version's
+    /// lineage (additive API field — the UI needs it for
+    /// the re-plan button's disabled state).
+    pub replan_count: i64,
 }
 
 /// ORC-1 plan DTOs (plan §3, Q-ORC-03/04/05).
@@ -247,6 +258,10 @@ fn plan_from_row(row: &rusqlite::Row) -> rusqlite::Result<PlanRow> {
         created_ms: row.get(9)?,
         updated_ms: row.get(10)?,
         origin_device_id: row.get(11)?,
+        // Pre-ORC-3 rows backfill to 0 at migration;
+        // a NULL here (a fixture that skipped the
+        // backfill) reads as 0, never an error.
+        replan_count: row.get::<_, Option<i64>>(12)?.unwrap_or(0),
     })
 }
 
@@ -350,6 +365,17 @@ fn plan_event_payload(row: &PlanRow, step_count: usize) -> String {
 /// (Q-ORC-12). The steps / replan_if are stored as
 /// canonical JSON, so the stored text is exactly what
 /// the digest commits to.
+///
+/// ORC-3 (Q-R3-07/09): `replan` marks a re-plan
+/// write — the new row's `replan_count` is the old
+/// row's + 1; a draft write keeps the old value
+/// (Q-R3-08: a manual draft is not a re-plan).
+/// `supersede_approval_ids` names unconsumed
+/// approvals bound to the old version; each gets its
+/// no-decision version write + `approval.superseded`
+/// event in this same transaction (Q-R3-07). Empty
+/// for the draft route and the Planner round.
+#[allow(clippy::too_many_arguments)]
 pub fn create_plan(
     conn: &mut Connection,
     task_id: &str,
@@ -358,11 +384,18 @@ pub fn create_plan(
     planner_model: &str,
     digest: &str,
     origin_device_id: &str,
+    replan: bool,
+    supersede_approval_ids: &[String],
 ) -> Result<PlanRow, String> {
     let tx = conn.transaction().map_err(err)?;
     let next = next_plan_number_tx(&tx)?;
     let current = current_plan_for_task(&tx, task_id)?;
     let version = current.as_ref().map(|row| row.version + 1).unwrap_or(1);
+    let replan_count = match (&current, replan) {
+        (Some(old), true) => old.replan_count + 1,
+        (Some(old), false) => old.replan_count,
+        (None, _) => 0,
+    };
     let now = now_ms() as i64;
     let steps_json = canonical_json(
         &serde_json::to_value(steps).map_err(|e| format!("plan steps encode: {e}"))?,
@@ -383,6 +416,7 @@ pub fn create_plan(
         created_ms: now,
         updated_ms: now,
         origin_device_id: origin_device_id.to_string(),
+        replan_count,
     };
     if let Some(old) = &current {
         tx.execute(
@@ -404,7 +438,7 @@ pub fn create_plan(
     tx.execute(
         &format!(
             "INSERT INTO plans ({PLAN_COLS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
         ),
         params![
             row.plan_id,
@@ -419,6 +453,7 @@ pub fn create_plan(
             row.created_ms,
             row.updated_ms,
             row.origin_device_id,
+            row.replan_count,
         ],
     )
     .map_err(err)?;
@@ -432,6 +467,14 @@ pub fn create_plan(
         now,
         1,
     )?;
+    // ORC-3 (Q-R3-07): the old version's unconsumed
+    // approvals are superseded in this same
+    // transaction. A missing or already-consumed id is
+    // a no-op inside `supersede_approval_tx`, never a
+    // failure of the re-plan.
+    for approval_id in supersede_approval_ids {
+        crate::sqlite_store::supersede_approval_tx(&tx, approval_id)?;
+    }
     tx.commit().map_err(err)?;
     Ok(row)
 }

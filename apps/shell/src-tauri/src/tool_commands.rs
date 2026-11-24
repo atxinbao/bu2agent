@@ -1107,6 +1107,23 @@ pub fn plan_current(task_id: String) -> Result<PlanRecord, String> {
     plan_client()?.current_plan(&task_id).map_err(agent_err_string)
 }
 
+// --- Plan replan (ORC-3) ---
+//
+// One command mirrors the ORC-3 replan route: the
+// gateway runs a Planner round inside the route and
+// writes the new plan version (count + 1, old
+// version's unconsumed approvals superseded in the
+// same transaction). The caller passes only the plan
+// id (and an optional planner_model override); the
+// gateway resolves the task, the trigger and the file
+// context itself.
+#[tauri::command(rename_all = "snake_case")]
+pub fn plan_replan(plan_id: String, planner_model: Option<String>) -> Result<PlanRecord, String> {
+    plan_client()?
+        .replan_plan(&plan_id, planner_model)
+        .map_err(agent_err_string)
+}
+
 // --- Devices (B-layer single-device validation) ---
 
 #[derive(Debug, Serialize)]

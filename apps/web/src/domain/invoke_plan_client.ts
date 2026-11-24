@@ -45,6 +45,7 @@ interface ServerPlan {
   created_ms: number;
   updated_ms: number;
   origin_device_id: string;
+  replan_count: number;
 }
 
 export class InvokePlanClient implements PlanGateway {
@@ -76,6 +77,14 @@ export class InvokePlanClient implements PlanGateway {
   async plan(planId: string): Promise<Plan> {
     const server = await invoke<ServerPlan>("plan_get", {
       plan_id: planId,
+    });
+    return toPlan(server);
+  }
+
+  async replan(planId: string, plannerModel: string | null): Promise<Plan> {
+    const server = await invoke<ServerPlan>("plan_replan", {
+      plan_id: planId,
+      planner_model: plannerModel,
     });
     return toPlan(server);
   }

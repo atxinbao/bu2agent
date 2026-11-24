@@ -1809,6 +1809,43 @@ async fn completion_effect(
     (Some(effect.effect_id), evidence)
 }
 
+/// ORC-3 (R3-J18): is this run the current worker step
+/// of an Executor batch? All three must hold: the
+/// run's Execution belongs to a task, it is still that
+/// task's current Execution (a stale run from an
+/// earlier attempt never owns the close), and the task
+/// is mid-batch — running or draft_ready with a step
+/// number set. A loop run's Execution carries no
+/// task, so it can never satisfy this; a direct run
+/// naming a task's Execution while a batch is mid-step
+/// is pathological, and skipping its close is still
+/// safe — the step logic closes the Execution on its
+/// own paths. Every other run keeps the E2-A §2.3
+/// close in `finish_terminal`.
+fn executor_step_run(state: &AppState, execution_id: &str) -> bool {
+    let Some(records) = crate::server::executions_snapshot(state) else {
+        return false;
+    };
+    let Some(task_id) = records
+        .iter()
+        .find(|r| r.execution_id == execution_id)
+        .and_then(|r| r.task_id.clone())
+    else {
+        return false;
+    };
+    if crate::server::execution_for_task(state, &task_id).as_deref() != Some(execution_id) {
+        return false;
+    }
+    let tasks = state.tasks.lock().expect("task lock");
+    match tasks.get(&task_id) {
+        Some(record) => {
+            matches!(record.status.as_str(), "running" | "draft_ready")
+                && record.executor_step_no.is_some()
+        }
+        None => false,
+    }
+}
+
 /// Known terminal outcome (exit code): run row + (for
 /// write/test templates) the completion Effect and Evidence
 /// + plan_position checkpoint. Reads write no Effect.
@@ -1866,9 +1903,29 @@ async fn finish_terminal(
             // something to review — its close opens no failed
             // Inbox row (the (test,run) Effect already opens
             // none), while every other failed run does.
+            //
+            // ORC-3 (R3-J18): EXCEPT an Executor-step run.
+            // The step logic owns the Execution close on
+            // every path (success → completed at plan
+            // exhaustion, miss → fail() → failed, match →
+            // hand_back → needs_review), and this close
+            // lands first — the run row is only observable
+            // as terminal after this block — so a matched
+            // hand-back would find a terminal Execution
+            // and its `needs_review` transition would be
+            // Illegal, losing the review row (the
+            // `replan_triggered` Evidence was already
+            // written, the task already back at
+            // draft_ready: a half-landed hand-back). A
+            // mid-batch worker success is wrongly
+            // completed early by this close too. Skip it
+            // exactly for Executor-step runs; every other
+            // run keeps the §2.3 close.
             let target = if status == "succeeded" { "completed" } else { "failed" };
             drop(conn);
-            if run.command == "cargo-test" {
+            if executor_step_run(state, execution_id) {
+                // The step logic closes the Execution.
+            } else if run.command == "cargo-test" {
                 crate::server::close_execution_no_inbox(state, execution_id, target);
             } else {
                 crate::server::close_execution(state, execution_id, target);

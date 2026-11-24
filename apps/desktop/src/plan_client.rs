@@ -1,5 +1,5 @@
 //! Plan client: Rust shell -> Mock Gateway ORC-1 plan
-//! surface (draft + read).
+//! surface (draft + read) and the ORC-3 replan route.
 //!
 //! ORC-1 has no approval flow: drafting a plan is a
 //! plain SQLite write (plan row + `plan.created`
@@ -62,6 +62,10 @@ pub struct PlanRecord {
     pub created_ms: i64,
     pub updated_ms: i64,
     pub origin_device_id: String,
+    /// ORC-3 (Q-R3-09): re-plan count of this version's
+    /// lineage. The UI needs it for the re-plan button's
+    /// disabled state (3 is the limit).
+    pub replan_count: i64,
 }
 
 /// A draft step, as the caller passes it. Same fields
@@ -142,6 +146,25 @@ impl PlanClient {
 
     pub fn plan_get(&self, plan_id: &str) -> std::result::Result<PlanRecord, AgentError> {
         Ok(self.http.get_json(&format!("/tasks/plan/{plan_id}"))?)
+    }
+
+    /// ORC-3 (Q-R3-05): re-plan the named plan version
+    /// through the replan route (a Planner round inside
+    /// the route produces the new steps). Uses the 120 s
+    /// client like draft: the route holds the tasks lock
+    /// across the write and runs a model call.
+    pub fn replan_plan(
+        &self,
+        plan_id: &str,
+        planner_model: Option<String>,
+    ) -> std::result::Result<PlanRecord, AgentError> {
+        let body = serde_json::to_string(&serde_json::json!({
+            "planner_model": planner_model,
+        }))
+        .map_err(|_| crate::http_client::transport_error("cannot encode plan replan"))?;
+        Ok(self
+            .sync_http
+            .post_json(&format!("/tasks/plan/{plan_id}/replan"), &body)?)
     }
 
     pub fn plans_list(
