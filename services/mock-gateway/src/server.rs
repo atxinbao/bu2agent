@@ -1888,6 +1888,39 @@ impl AppState {
             }
             return outcome;
         }
+        // R4-F2 (Q-R4F-01/02): loop-only read of one text
+        // file under the resolved root — explicit
+        // worktree_id wins, else the loop's binding, else
+        // files_root (the same root code.search uses).
+        // Read-only: no Effect, no approval. The arm sits
+        // AFTER the backend seam above (R4F-J1): a custom
+        // backend owns fs.read in tests, and production
+        // runs with backend None. The dispatch_agent_tool
+        // fs.read arm is untouched: the HTTP agent-tools
+        // route keeps its files_root-only read.
+        if tool == "fs.read" {
+            let path = args.get("path").cloned().unwrap_or_default();
+            if path.is_empty() {
+                return ToolOutcome::failed(ErrorCode::InvalidArguments);
+            }
+            let root = match resolve_code_search_root(
+                self,
+                args.get("worktree_id")
+                    .filter(|id| !id.is_empty())
+                    .map(String::as_str),
+                binding.as_ref(),
+            ) {
+                Ok(root) => root,
+                Err(_) => return ToolOutcome::failed(ErrorCode::InvalidArguments),
+            };
+            let outcome =
+                tokio::task::spawn_blocking(move || read_loop_file(&root, &path)).await;
+            return match outcome {
+                Ok(Ok(text)) => ToolOutcome::success(text),
+                Ok(Err(code)) => ToolOutcome::failed(code),
+                Err(_) => ToolOutcome::unknown(),
+            };
+        }
         // 真实文件分派继续限制单根；拒绝路径中的符号链接，不能用链接绕开参数校验。
         let mut checked = self.files_root.clone();
         for component in Path::new(&args["path"]).components() {
@@ -6859,6 +6892,39 @@ fn execution_snapshot_binding_worktree(state: &AppState, execution_id: &str) -> 
     sqlite_store::get_snapshot(&conn, &snapshot_id)
         .ok()?
         .and_then(|row| row.binding_worktree_id)
+}
+
+/// R4-F2: read one text file under a loop-resolved
+/// root. Path rules mirror `search_code`:
+/// `normalize_search_path` rejects `..`, absolute
+/// paths, backslashes and NUL lexically; the joined
+/// path must canonicalize inside the (already
+/// canonical) root, so a symlinked escape fails.
+/// A missing file is ToolFailed and other read
+/// failures (non-UTF-8, directory) are ToolFailed
+/// too — the same outcome the files_root fallthrough
+/// maps a 404 / bad read to today.
+fn read_loop_file(root: &Path, raw_path: &str) -> Result<String, ErrorCode> {
+    let normalized = crate::code_search::normalize_search_path(raw_path)
+        .ok_or(ErrorCode::InvalidArguments)?;
+    if normalized.is_empty() {
+        return Err(ErrorCode::InvalidArguments);
+    }
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| ErrorCode::InvalidArguments)?;
+    let joined =
+        canonical_root.join(normalized.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let canonical = joined.canonicalize().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+            ErrorCode::ToolFailed
+        }
+        _ => ErrorCode::InvalidArguments,
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(ErrorCode::InvalidArguments);
+    }
+    std::fs::read_to_string(&canonical).map_err(|_| ErrorCode::ToolFailed)
 }
 
 /// P3-A: resolve the search root for a code.search call. An

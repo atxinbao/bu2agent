@@ -318,8 +318,8 @@ pub(crate) struct ResearchStartLoop {
 /// prefix. The Planner's question and the task file
 /// context follow; the bound worktree (when one
 /// exists) is named so the model passes it to
-/// code.search / git.read (R4-J5).
-pub(crate) const RESEARCH_PROMPT_PREFIX: &str = "你是任务规划的只读调研员。只用 code_search、fs_read、git_read 调研，不写文件、不执行命令。先调研，再给出最终调研报告：先写结论，再列支撑结论的关键证据（文件路径、行号、命中行）。\n\n";
+/// code.search / git.read / fs_read (R4-J5, R4-F2).
+pub(crate) const RESEARCH_PROMPT_PREFIX: &str = "你是任务规划的只读调研员。只用 code_search、fs_read、git_read 调研，不写文件、不执行命令。先调研，再给出最终调研报告：先写结论，再列支撑结论的关键证据（文件路径、行号、命中行）。\n\n两个命名空间不要混：任务文件在文件根下，用不传 worktree_id 的 fs_read 读；有工作区时，仓库文件用传 worktree_id 的 fs_read 读整文件，搜内容用 code.search（path 必须是目录前缀，传文件路径会失败），读 git 状态或差异用 git_read。\n\n";
 
 pub(crate) fn research_prompt(
     file_context: &str,
@@ -329,7 +329,7 @@ pub(crate) fn research_prompt(
     let mut prompt = String::from(RESEARCH_PROMPT_PREFIX);
     if let Some(worktree_id) = worktree_id {
         prompt.push_str(&format!(
-            "本次调研的工作区：{worktree_id}。code.search / git.read 调用里把 worktree_id 传为该值；不传时用文件根。\n\n"
+            "本次调研的工作区：{worktree_id}。code.search / git.read / fs_read 调用里把 worktree_id 传为该值；不传时用文件根。\n\n"
         ));
     }
     if let Some(question) = question {

@@ -15,6 +15,13 @@
 //!   case-insensitive),
 //! - symlinked directories (never entered); symlinked files
 //!   are canonical-checked one by one and skipped on escape.
+//! - build outputs, the version-control directory and
+//!   installed dependencies (`target`, `.git`,
+//!   `node_modules`, by directory name at any depth) —
+//!   a full-root scan over them exceeds the 10 s loop
+//!   tool timeout (R4-F2). `.codex` is deliberately NOT
+//!   skipped: window reports and notes live there and
+//!   stay searchable.
 //! - A single file is scanned only up to 1 MiB (streaming scan
 //!   stops there, outcome is `truncated`). At most 50 results
 //!   are returned; more matches set `truncated`.
@@ -218,6 +225,16 @@ fn walk(dir: &Path, root: &Path, state: &mut SearchState<'_>) {
             }
             scan_file(&canonical, &relative_path(root, &path), state);
         } else if file_type.is_dir() {
+            // R4-F2 (Q-R4F-03): never descend into build
+            // outputs, the version-control directory or
+            // installed dependencies. An explicitly scoped
+            // search (path = "target") still scans that
+            // directory itself — only the recursive descent
+            // skips these names.
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
+            if matches!(dir_name.as_str(), "target" | ".git" | "node_modules") {
+                continue;
+            }
             walk(&path, root, state);
         } else if file_type.is_file() {
             let file_name = entry.file_name().to_string_lossy().into_owned();
@@ -391,6 +408,55 @@ mod tests {
         );
         let out = search_code(&dir, "needle", "", 50).expect("search");
         assert_eq!(out.results.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_skips_target_git_and_node_modules() {
+        let dir = temp_dir("skips");
+        write(&dir, "target/build/out.rs", b"needle\n");
+        write(&dir, "deep/target/nested.rs", b"needle\n");
+        write(&dir, ".git/config", b"needle\n");
+        write(&dir, "node_modules/pkg/index.js", b"needle\n");
+        write(&dir, "keep.txt", b"needle\n");
+        // `.codex` stays searchable by design.
+        write(&dir, ".codex/report.md", b"needle\n");
+        let out = search_code(&dir, "needle", "", 50).expect("search");
+        assert!(!out.truncated);
+        assert_eq!(out.results.len(), 2);
+        let paths: Vec<&str> = out.results.iter().map(|h| h.path.as_str()).collect();
+        assert!(paths.contains(&".codex/report.md"));
+        assert!(paths.contains(&"keep.txt"));
+        // An explicitly scoped search still scans the
+        // named directory itself.
+        let out = search_code(&dir, "needle", "target", 50).expect("search");
+        assert_eq!(out.results.len(), 1);
+        assert_eq!(out.results[0].path, "target/build/out.rs");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_scoped_prefix_finds_hits() {
+        // R4-F2 (§1.3 regression): the ORC-4 window
+        // round's zero-hits report for a scoped search
+        // was a model misreport — the walker finds the
+        // hits. A scoped-prefix search must return them.
+        let dir = temp_dir("scoped");
+        write(
+            &dir,
+            "services/mock-gateway/src/loop_engine.rs",
+            b"// research loop\nfn research() {}\n// research again\n",
+        );
+        write(&dir, "services/mock-gateway/src/other.rs", b"nothing\n");
+        let out = search_code(&dir, "research", "services/mock-gateway/src", 50)
+            .expect("search");
+        assert_eq!(out.results.len(), 3);
+        assert_eq!(
+            out.results[0].path,
+            "services/mock-gateway/src/loop_engine.rs"
+        );
+        assert_eq!(out.results[0].line, 1);
+        assert_eq!(out.results[1].line, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

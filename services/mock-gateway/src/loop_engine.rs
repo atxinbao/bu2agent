@@ -967,8 +967,15 @@ pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, E
             ("completed".into(), completed.to_string()),
         ]));
     }
+    // R4-F2 (Q-R4F-01/02): fs.read takes an optional
+    // worktree_id (same extraction as git.read) so the
+    // loop arm can read a worktree file; without it the
+    // normalized map carries "" and the arm falls back
+    // to files_root. fs.list keeps path-only.
     let allowed = if tool == "fs.write" {
         vec!["path", "text"]
+    } else if tool == "fs.read" {
+        vec!["path", "worktree_id"]
     } else {
         vec!["path"]
     };
@@ -995,6 +1002,16 @@ pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, E
         crate::operation_binding::normalize_path(raw).ok_or(ErrorCode::InvalidArguments)?
     };
     let mut out = BTreeMap::from([("path".into(), path)]);
+    if tool == "fs.read" {
+        let worktree_id = match object.get("worktree_id") {
+            None => String::new(),
+            Some(Value::String(id)) if !id.trim().is_empty() && id.len() <= 4096 => {
+                id.to_string()
+            }
+            Some(_) => return Err(ErrorCode::InvalidArguments),
+        };
+        out.insert("worktree_id".into(), worktree_id);
+    }
     if tool == "fs.write" {
         let text = object
             .get("text")

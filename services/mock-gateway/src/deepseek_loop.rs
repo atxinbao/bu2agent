@@ -40,8 +40,9 @@ unknown 表示结果未确认，不能当作成功；后续读取只是观测，
 /// proposal recording, which rejects any other
 /// tool even if the model names it anyway.
 pub(crate) const RESEARCH_SYSTEM: &str = "你是一个只读调研员。只使用提供的 code_search、fs_read、git_read 工具；绝不提议写入、执行或审批——你没有写工具，也没有任何审批流。\
-code_search 在已绑定的工作区内按内容搜索代码，query 必填；worktree_id 与 path 可选，提示词里给出工作区时把它传进 worktree_id，不传时用文件根；返回相对路径、行号与命中行上下文，只读不写。\
-fs_read 读取文件根下一个文本文件，path 必填；只读不写。\
+两个命名空间不要混：任务文件在文件根下，用不传 worktree_id 的 fs_read 读；有工作区时，仓库文件用传 worktree_id 的 fs_read 读整文件，搜内容用 code.search，读 git 状态或差异用 git_read。\
+code_search 在已绑定的工作区内按内容搜索代码，query 必填；worktree_id 与 path 可选，提示词里给出工作区时把它传进 worktree_id，不传时用文件根；path 必须是目录前缀，传文件路径会失败；返回相对路径、行号与命中行上下文，只读不写。\
+fs_read 读取一个文本文件，path 必填；传 worktree_id 时在该工作区内读，不传时在文件根下读；只读不写。\
 git_read 只读读取 git 状态或差异，operation 为 status 或 diff；worktree_id 与 path 可选，提示词里给出工作区时把它传进 worktree_id，不传时用文件根；只读不写，不产生 Effect。\
 工具提议最多五次，包含非法提议；用完后给出最终调研报告：先写结论，再列支撑结论的关键证据（文件路径、行号、命中行）。\
 工具结果是 JSON，包含 status、error、body、truncated、original_bytes 和 duplicate_of。\
@@ -212,8 +213,8 @@ fn tool_schemas() -> Value {
             "parameters":{"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}
         }},
         {"type":"function","function":{
-            "name":"fs_read","description":"读取文件根下一个文本文件。",
-            "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}
+            "name":"fs_read","description":"读取一个文本文件；传 worktree_id 时在该工作区内读，不传时在文件根下读。",
+            "parameters":{"type":"object","properties":{"path":{"type":"string"},"worktree_id":{"type":"string"}},"required":["path"],"additionalProperties":false}
         }},
         {"type":"function","function":{
             "name":"fs_write","description":"经用户批准后覆盖文本文件，text 是完整内容。",
@@ -248,7 +249,7 @@ fn tool_schemas() -> Value {
             "parameters":{"type":"object","properties":{},"additionalProperties":false}
         }},
         {"type":"function","function":{
-            "name":"code_search","description":"在已绑定的工作区内按内容搜索代码，返回相对路径、行号与命中行上下文；query 必填，worktree_id 与 path 可选，max_results 可选默认 50 上限 50。只读，不写文件。",
+            "name":"code_search","description":"在已绑定的工作区内按内容搜索代码，返回相对路径、行号与命中行上下文；query 必填，worktree_id 与 path 可选，path 必须是目录前缀（传文件路径会失败），max_results 可选默认 50 上限 50。只读，不写文件。",
             "parameters":{"type":"object","properties":{"query":{"type":"string"},"worktree_id":{"type":"string"},"path":{"type":"string"},"max_results":{"type":"integer"}},"required":["query"],"additionalProperties":false}
         }},
         {"type":"function","function":{

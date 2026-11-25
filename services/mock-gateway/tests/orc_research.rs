@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mock_gateway::deepseek::DeepSeekConfig;
+use mock_gateway::operation_binding::sha256_hex;
 use mock_gateway::server::{app, AppState};
 use mock_gateway::sqlite_store::{self, DB_SCHEMA_VERSION};
 use reqwest::StatusCode;
@@ -115,6 +116,7 @@ struct FakeDeepseek {
     handle: tokio::task::JoinHandle<()>,
     seen: Arc<Mutex<Vec<Value>>>,
     gate: Arc<Gate>,
+    queue: Arc<Mutex<VecDeque<Value>>>,
 }
 
 async fn start_fake_deepseek(replies: Vec<Value>) -> (String, FakeDeepseek) {
@@ -128,6 +130,7 @@ async fn start_fake_deepseek_canned(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let queue = Arc::new(Mutex::new(VecDeque::from(replies)));
+    let queue_for_struct = queue.clone();
     let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let gate = Arc::new(Gate::new());
     let gate_clone = gate.clone();
@@ -249,11 +252,22 @@ async fn start_fake_deepseek_canned(
             handle,
             seen,
             gate,
+            queue: queue_for_struct,
         },
     )
 }
 
 impl FakeDeepseek {
+    /// Append a model reply to the back of the fake's
+    /// queue — for replies that need ids only known
+    /// after the fake starts (e.g. a worktree id).
+    fn push_reply(&self, message: Value) {
+        self.queue
+            .lock()
+            .expect("queue lock")
+            .push_back(message);
+    }
+
     fn seen_count(&self) -> usize {
         self.seen.lock().expect("seen lock").len()
     }
@@ -433,6 +447,36 @@ impl Harness {
         let (status, value) = self.post("/tasks/create", json!({"directory": "proj"})).await;
         assert_eq!(status, StatusCode::OK, "create task: {value}");
         value["task_id"].as_str().unwrap().to_string()
+    }
+
+    /// Binding + Location + Worktree for `repo`; returns
+    /// the worktree id (e2a_ledger pattern).
+    async fn setup_worktree(&self, repo: &Path) -> String {
+        let repo_str = repo.to_string_lossy().into_owned();
+        let (status, binding) = self
+            .post(
+                "/bindings/create",
+                json!({"display_name": "repo", "path": repo_str}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "binding: {binding}");
+        let workspace_id = binding["workspace_id"].as_str().unwrap().to_string();
+        let (status, location) = self
+            .post(
+                "/locations/create",
+                json!({"workspace_id": workspace_id, "name": "root", "path": repo_str}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "location: {location}");
+        let location_id = location["location_id"].as_str().unwrap().to_string();
+        let (status, worktree) = self
+            .post(
+                "/worktrees/create",
+                json!({"location_id": location_id, "directory_relative": "", "branch_label": "main", "project_id": null}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "worktree: {worktree}");
+        worktree["worktree_id"].as_str().unwrap().to_string()
     }
 
     async fn task_record(&self, task_id: &str) -> Value {
@@ -992,4 +1036,194 @@ async fn s4_research_start_is_planning_phase_only() {
 
     fake.gate.release();
     h.wait_task_status(&task_id, "draft_ready", 30).await;
+}
+
+const HELPER_RS: &str = "HELPER MARKER-READ-1\n";
+
+/// S5 (R4-F2): a research loop's `fs.read` with a
+/// worktree_id reads a worktree file — the call
+/// succeeds and its body digest is exactly the file
+/// bytes. No approval, no Effect. The research
+/// request's fs_read schema carries worktree_id, and
+/// its SYSTEM + prompt name the two namespaces.
+#[tokio::test]
+async fn s5_research_fs_read_reads_worktree_file() {
+    let (fake_url, fake) = start_fake_deepseek(vec![planner_triage_msg("ok")]).await;
+    let h = Harness::serve(&fake_url).await;
+    let repo = h.dir.join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src").join("helper.rs"), HELPER_RS).unwrap();
+    let worktree_id = h.setup_worktree(&repo).await;
+
+    let task_id = h.make_task().await;
+    fake.gate.arm();
+    let (status, value) = h.post("/tasks/run", json!({"task_id": task_id})).await;
+    assert_eq!(status, StatusCode::OK, "run: {value}");
+    fake.wait_seen(1, 10).await;
+    let record = h.task_record(&task_id).await;
+    assert_eq!(record["status"], "running");
+    assert_eq!(record["executor_step_no"], Value::Null);
+
+    // The research replies need the worktree id, only
+    // known after setup — push them behind the gated
+    // Planner reply.
+    fake.push_reply(calls_msg(vec![
+        (
+            "r1",
+            "fs_read",
+            json!({"worktree_id": worktree_id, "path": "src/helper.rs"}),
+        ),
+        ("r2", "code_search", json!({"query": "hello"})),
+    ]));
+    fake.push_reply(text_msg("调研结论：helper.rs 在工作区里。"));
+
+    let (status, view) = h
+        .post(
+            "/agent/loop/research/start",
+            json!({"task_id": task_id, "worktree_id": worktree_id}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "research start: {view}");
+    assert_eq!(view["kind"], "research");
+    let loop_id = view["loop_id"].as_str().unwrap().to_string();
+
+    fake.gate.release();
+    let view = h.wait_loop_terminal(&loop_id, true, 30).await;
+    assert_eq!(view["status"], "completed");
+    let calls = view["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 2, "calls: {calls:?}");
+    assert_eq!(calls[0]["tool"], "fs.read");
+    assert_eq!(calls[0]["status"], "succeeded");
+    assert_eq!(calls[0]["error"], Value::Null);
+    assert_eq!(calls[0]["approval_id"], Value::Null);
+    // The loop view never carries tool text, only its
+    // hash — the digest is the exact-bytes proof.
+    assert_eq!(
+        calls[0]["result"]["body_digest"]["sha256"],
+        sha256_hex(HELPER_RS.as_bytes())
+    );
+    assert_eq!(
+        calls[0]["result"]["body_digest"]["bytes"],
+        HELPER_RS.len()
+    );
+    assert_eq!(calls[0]["result"]["truncated"], false);
+    assert_eq!(calls[1]["tool"], "code.search");
+    assert_eq!(calls[1]["status"], "succeeded");
+
+    // No approval was requested anywhere, and no
+    // Effect row was produced by the read.
+    assert_eq!(h.approvals_lines().len(), 0, "no loop approval");
+    assert_eq!(h.effects().await.len(), 0, "no effect");
+
+    // The research model call saw the worktree-aware
+    // fs_read schema and the two-namespace wording.
+    let research_request = fake.seen_body(1);
+    let fs_read = research_request["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["function"]["name"] == "fs_read")
+        .expect("fs_read schema");
+    assert_eq!(
+        fs_read["function"]["parameters"]["properties"]["worktree_id"]["type"],
+        "string",
+        "fs_read schema: {fs_read}"
+    );
+    let system = research_request["messages"][0]["content"]
+        .as_str()
+        .unwrap();
+    assert!(
+        system.contains("两个命名空间不要混"),
+        "research SYSTEM: {system}"
+    );
+    assert!(
+        system.contains("传 worktree_id 时在该工作区内读"),
+        "research SYSTEM: {system}"
+    );
+    let prompt = fake.prompt_of(1);
+    assert!(
+        prompt.contains("两个命名空间不要混"),
+        "research prompt: {prompt}"
+    );
+    assert!(
+        prompt.contains(&worktree_id),
+        "research prompt names the worktree: {prompt}"
+    );
+
+    h.wait_task_status(&task_id, "completed", 30).await;
+}
+
+/// S6 (R4-F2): fs.read without a worktree_id still
+/// reads files_root; an escaping path is
+/// InvalidArguments and a missing file is ToolFailed.
+#[tokio::test]
+async fn s6_research_fs_read_files_root_and_errors() {
+    let (fake_url, fake) = start_fake_deepseek(vec![planner_triage_msg("ok")]).await;
+    let h = Harness::serve(&fake_url).await;
+    let repo = h.dir.join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src").join("helper.rs"), HELPER_RS).unwrap();
+    let worktree_id = h.setup_worktree(&repo).await;
+
+    let task_id = h.make_task().await;
+    fake.gate.arm();
+    let (status, value) = h.post("/tasks/run", json!({"task_id": task_id})).await;
+    assert_eq!(status, StatusCode::OK, "run: {value}");
+    fake.wait_seen(1, 10).await;
+
+    fake.push_reply(calls_msg(vec![
+        ("f1", "fs_read", json!({"path": "proj/notes.txt"})),
+        (
+            "f2",
+            "fs_read",
+            json!({"worktree_id": worktree_id, "path": "../escape.txt"}),
+        ),
+        (
+            "f3",
+            "fs_read",
+            json!({"worktree_id": worktree_id, "path": "missing.txt"}),
+        ),
+    ]));
+    fake.push_reply(text_msg("调研结论：三条读调用各有结果。"));
+
+    let (status, view) = h
+        .post(
+            "/agent/loop/research/start",
+            json!({"task_id": task_id, "worktree_id": worktree_id}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "research start: {view}");
+    let loop_id = view["loop_id"].as_str().unwrap().to_string();
+
+    fake.gate.release();
+    let view = h.wait_loop_terminal(&loop_id, true, 30).await;
+    assert_eq!(view["status"], "completed");
+    let calls = view["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 3, "calls: {calls:?}");
+
+    // No worktree_id: the files_root fallback still
+    // reads the task file (proj/notes.txt = "hello\n").
+    assert_eq!(calls[0]["tool"], "fs.read");
+    assert_eq!(calls[0]["status"], "succeeded");
+    assert_eq!(
+        calls[0]["result"]["body_digest"]["sha256"],
+        sha256_hex("hello\n".as_bytes())
+    );
+    assert_eq!(calls[0]["result"]["body_digest"]["bytes"], 6);
+
+    // `..` never reaches the arm: normalize rejects
+    // it at proposal time as InvalidArguments.
+    assert_eq!(calls[1]["tool"], "fs.read");
+    assert_eq!(calls[1]["status"], "failed");
+    assert_eq!(calls[1]["error"], "invalid_arguments");
+
+    // A well-formed but missing path reaches the arm
+    // and fails as ToolFailed.
+    assert_eq!(calls[2]["tool"], "fs.read");
+    assert_eq!(calls[2]["status"], "failed");
+    assert_eq!(calls[2]["error"], "tool_failed");
+
+    assert_eq!(h.approvals_lines().len(), 0, "no loop approval");
+    assert_eq!(h.effects().await.len(), 0, "no effect");
+    h.wait_task_status(&task_id, "completed", 30).await;
 }
