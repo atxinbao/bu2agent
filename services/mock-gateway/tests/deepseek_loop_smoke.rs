@@ -509,6 +509,10 @@ async fn excess_proposals_receive_cap_errors_and_closing_cannot_execute() {
             "fs_write",
             json!({"path":"out","text":"no"}),
         )]),
+        // ORC-4 R4-F3: the closing-turn proposal gets
+        // exactly one retry; the retry-turn final
+        // completes the loop instead of failing it.
+        final_reply(),
     ])
     .await;
     let id = h.start().await;
@@ -516,14 +520,37 @@ async fn excess_proposals_receive_cap_errors_and_closing_cannot_execute() {
     for _ in 0..6 {
         h.step(&id).await;
     }
+    // The closing proposal is recorded Failed +
+    // cap_exceeded but no longer finishes the loop.
     let view = h.step(&id).await;
-    assert_eq!(view["error"], "cap_exceeded");
+    assert_eq!(view["status"], "running");
+    assert_eq!(view["error"], Value::Null);
+    // One step delivers the failed closing call, the
+    // next issues the retry model call, which answers.
+    h.step(&id).await;
+    let view = h.step(&id).await;
+    assert_eq!(view["status"], "completed");
+    assert_eq!(view["error"], Value::Null);
     assert_eq!(view["proposal_count"], 7);
     assert_eq!(view["calls"][5]["status"], "failed");
+    assert_eq!(view["calls"][5]["error"], "cap_exceeded");
+    assert_eq!(view["calls"][6]["status"], "failed");
+    assert_eq!(view["calls"][6]["error"], "cap_exceeded");
     assert!(view["calls"][6]["approval_id"].is_null());
     assert_eq!(h.tools.executions.load(Ordering::SeqCst), 5);
     assert_eq!(results(&h.requests()[1])[5].1["error"], "cap_exceeded");
-    assert_eq!(h.requests().len(), 2);
+    assert_eq!(h.requests().len(), 3);
+    // The retry request carries the closing nudge and
+    // the closing proposal's CapExceeded result.
+    let retry = &h.requests()[2];
+    assert!(
+        retry["messages"].as_array().unwrap().iter().any(|m| m["role"] == "user"
+            && m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("工具提议次数已用完"))),
+        "retry request carries the nudge: {retry}"
+    );
+    assert_eq!(results(retry).last().unwrap().1["error"], "cap_exceeded");
 }
 
 #[tokio::test]

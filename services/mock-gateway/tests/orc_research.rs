@@ -1227,3 +1227,177 @@ async fn s6_research_fs_read_files_root_and_errors() {
     assert_eq!(h.effects().await.len(), 0, "no effect");
     h.wait_task_status(&task_id, "completed", 30).await;
 }
+
+/// S7 (R4-F3): a closing-turn proposal is retried once and
+/// the retry-turn report lands. Five reads spend the budget,
+/// the closing turn proposes one more tool, the retry turn
+/// answers, and the Planner drafts a blueprint from the
+/// report. The nudge is in the closing and retry requests
+/// (and in no earlier request).
+#[tokio::test]
+async fn s7_closing_proposal_retried_once_then_report_drafts() {
+    let (fake_url, fake) = start_fake_deepseek(vec![
+        planner_research_msg("哪些文件定义了问候语？"),
+        calls_msg(vec![(
+            "r1",
+            "fs_read",
+            json!({"path": "proj/notes.txt"}),
+        )]),
+        calls_msg(vec![("r2", "code_search", json!({"query": "hello"}))]),
+        calls_msg(vec![(
+            "r3",
+            "fs_read",
+            json!({"path": "proj/notes.txt"}),
+        )]),
+        calls_msg(vec![("r4", "code_search", json!({"query": "hello"}))]),
+        calls_msg(vec![(
+            "r5",
+            "fs_read",
+            json!({"path": "proj/notes.txt"}),
+        )]),
+        calls_msg(vec![("r6", "code_search", json!({"query": "hello"}))]),
+        text_msg("调研结论：notes.txt 定义了问候语，第 1 行。"),
+        planner_steps_msg(vec![file_write_step(1, "helper.rs", "git status")]),
+        // Step 1 prepare: the Executor model produces the
+        // step's file content from the change description.
+        text_msg("report content\n"),
+    ])
+    .await;
+    let h = Harness::serve(&fake_url).await;
+    let task_id = h.make_task().await;
+    let (status, value) = h.post("/tasks/run", json!({"task_id": task_id})).await;
+    assert_eq!(status, StatusCode::OK, "run: {value}");
+    let record = h.wait_task_status(&task_id, "draft_ready", 30).await;
+    let plan_id = record["plan_id"].as_str().expect("plan id").to_string();
+    assert_eq!(record["executor_step_no"], 1);
+
+    let (status, current) = h.get(&format!("/tasks/plan?task_id={task_id}")).await;
+    assert_eq!(status, StatusCode::OK, "current plan: {current}");
+    assert_eq!(current["plan_id"], plan_id);
+    assert_eq!(current["status"], "draft");
+
+    let evidence = h.evidence().await;
+    let reports: Vec<&Value> = evidence
+        .iter()
+        .filter(|e| e["reason"] == "research_report")
+        .collect();
+    assert_eq!(reports.len(), 1, "evidence: {evidence:?}");
+    let observed = observed_of(reports[0]);
+    assert_eq!(observed["task_id"], task_id);
+    assert!(observed["report_text"]
+        .as_str()
+        .unwrap()
+        .contains("调研结论"));
+    let loop_id = observed["loop_id"].as_str().unwrap().to_string();
+
+    let (status, view) = h.get(&format!("/agent/loop/research/{loop_id}")).await;
+    assert_eq!(status, StatusCode::OK, "research get: {view}");
+    assert_eq!(view["status"], "completed");
+    let calls = view["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 6, "calls: {calls:?}");
+    for call in &calls[..5] {
+        assert_eq!(call["status"], "succeeded", "calls: {calls:?}");
+    }
+    assert_eq!(calls[5]["status"], "failed", "calls: {calls:?}");
+    assert_eq!(calls[5]["error"], "cap_exceeded", "calls: {calls:?}");
+
+    // Request order: 0 Planner round 1, 1-5 reads, 6 closing
+    // proposal, 7 retry final, 8 Planner round 2, 9 Executor
+    // step-1 content. Exactly one retry: 10 model requests,
+    // no more.
+    assert_eq!(fake.seen_count(), 10, "one closing retry");
+    for i in 0..6 {
+        assert!(
+            !fake.prompt_of(i).contains("工具提议次数已用完"),
+            "no nudge before the closing turn (request {i})"
+        );
+    }
+    assert!(
+        fake.prompt_of(6).contains("工具提议次数已用完"),
+        "closing request carries the nudge"
+    );
+    assert!(
+        fake.prompt_of(7).contains("工具提议次数已用完"),
+        "retry request carries the nudge"
+    );
+}
+
+/// S8 (R4-F3): a second closing-turn proposal fails the loop
+/// with CapExceeded after exactly one retry, and the Planner
+/// triages without a report.
+#[tokio::test]
+async fn s8_closing_proposal_twice_fails_after_one_retry() {
+    let (fake_url, fake) = start_fake_deepseek(vec![
+        planner_research_msg("哪些文件定义了问候语？"),
+        calls_msg(vec![(
+            "r1",
+            "fs_read",
+            json!({"path": "proj/notes.txt"}),
+        )]),
+        calls_msg(vec![("r2", "code_search", json!({"query": "hello"}))]),
+        calls_msg(vec![(
+            "r3",
+            "fs_read",
+            json!({"path": "proj/notes.txt"}),
+        )]),
+        calls_msg(vec![("r4", "code_search", json!({"query": "hello"}))]),
+        calls_msg(vec![(
+            "r5",
+            "fs_read",
+            json!({"path": "proj/notes.txt"}),
+        )]),
+        calls_msg(vec![("r6", "code_search", json!({"query": "hello"}))]),
+        calls_msg(vec![("r7", "code_search", json!({"query": "hello"}))]),
+        planner_triage_msg("问候语在 notes.txt。"),
+    ])
+    .await;
+    let h = Harness::serve(&fake_url).await;
+    let task_id = h.make_task().await;
+    let (status, value) = h.post("/tasks/run", json!({"task_id": task_id})).await;
+    assert_eq!(status, StatusCode::OK, "run: {value}");
+    let record = h.wait_task_status(&task_id, "completed", 30).await;
+    assert_eq!(record["plan_id"], Value::Null);
+
+    let evidence = h.evidence().await;
+    let failed: Vec<&Value> = evidence
+        .iter()
+        .filter(|e| e["reason"] == "research_failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "evidence: {evidence:?}");
+    assert_eq!(observed_of(failed[0])["error"], "cap_exceeded");
+    assert_eq!(observed_of(failed[0])["task_id"], task_id);
+    let loop_id = observed_of(failed[0])["loop_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        evidence.iter().all(|e| e["reason"] != "research_report"),
+        "no report on a twice-proposing loop: {evidence:?}"
+    );
+
+    let (status, view) = h.get(&format!("/agent/loop/research/{loop_id}")).await;
+    assert_eq!(status, StatusCode::OK, "research get: {view}");
+    assert_eq!(view["status"], "failed");
+    assert_eq!(view["error"], "cap_exceeded");
+    let calls = view["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 7, "calls: {calls:?}");
+    for call in &calls[..5] {
+        assert_eq!(call["status"], "succeeded", "calls: {calls:?}");
+    }
+    for call in &calls[5..] {
+        assert_eq!(call["status"], "failed", "calls: {calls:?}");
+        assert_eq!(call["error"], "cap_exceeded", "calls: {calls:?}");
+    }
+
+    // 1 Planner round 1 + 7 research calls + 1 Planner
+    // round 2 (triage): exactly one closing retry.
+    assert_eq!(fake.seen_count(), 9, "one closing retry");
+    assert!(
+        fake.prompt_of(6).contains("工具提议次数已用完"),
+        "closing request carries the nudge"
+    );
+    assert!(
+        fake.prompt_of(7).contains("工具提议次数已用完"),
+        "retry request carries the nudge"
+    );
+}

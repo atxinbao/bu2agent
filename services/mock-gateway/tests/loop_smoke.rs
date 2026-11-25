@@ -807,18 +807,41 @@ async fn batch_over_cap_records_failures_but_allows_one_final_model_call() {
 
 #[tokio::test]
 async fn closing_model_proposal_stops_without_execution() {
-    let h = Harness::new(vec![calls(vec![read("a")]), calls(vec![write("out", "x")])]).await;
+    // ORC-4 R4-F3: the closing proposal is retried once,
+    // but the proposed write still never executes: it is
+    // recorded Failed + cap_exceeded and only the retry
+    // turn's final completes the loop.
+    let h = Harness::new(vec![
+        calls(vec![read("a")]),
+        calls(vec![write("out", "x")]),
+        done(),
+    ])
+    .await;
     let start = h
         .ok("/agent/loop/start", json!({"prompt":"test","max_calls":1}))
         .await;
     let id = start["loop_id"].as_str().unwrap();
     h.step(id).await;
     h.step(id).await;
+    // The closing proposal is recorded but no longer
+    // finishes the loop on its own.
+    let view = h.step(id).await;
+    assert_eq!(view["status"], "running");
+    assert_eq!(view["error"], Value::Null);
+    // One step delivers the failed closing call, the
+    // next issues the retry model call, which answers.
+    h.step(id).await;
     let final_view = h.step(id).await;
-    assert_eq!(final_view["status"], "failed");
-    assert_eq!(final_view["error"], "cap_exceeded");
+    assert_eq!(final_view["status"], "completed");
+    assert_eq!(final_view["error"], Value::Null);
     assert_eq!(final_view["proposal_count"], 2);
+    assert_eq!(final_view["calls"][1]["status"], "failed");
+    assert_eq!(final_view["calls"][1]["error"], "cap_exceeded");
     assert_eq!(h.files.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(h.model.contexts.lock().unwrap().len(), 3);
+    assert!(h.model.contexts.lock().unwrap()[2]
+        .iter()
+        .any(|m| matches!(m, Message::User(t) if t == CLOSING_NUDGE)));
 }
 
 #[tokio::test]

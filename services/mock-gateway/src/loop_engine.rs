@@ -394,6 +394,14 @@ pub struct ResumeLoop {
 #[derive(Debug, Clone)]
 pub struct LoopError(pub u16, pub &'static str);
 
+/// ORC-4 R4-F3: closing nudge. Appended as a `Message::User`
+/// to the live history on every closing model call, so the
+/// model is told its proposal budget is spent before it can
+/// propose again. Generic on purpose: the engine is shared
+/// by main and research loops, and the research report shape
+/// is already defined by RESEARCH_SYSTEM.
+pub const CLOSING_NUDGE: &str = "工具提议次数已用完，请直接给出最终回答，不要再提议工具。";
+
 struct LiveLoop {
     record: LoopRecord,
     messages: Vec<Message>,
@@ -406,6 +414,12 @@ struct LiveLoop {
     /// means the engine default. Memory-only, never
     /// serialized into LoopRecord or JSONL.
     model_override: Option<Arc<dyn LoopModel>>,
+    /// ORC-4 R4-F3: whether this loop already used its
+    /// one closing retry (a closing-turn Calls reply
+    /// that did not finish the loop). Memory-only, never
+    /// serialized: after a restart a non-terminal loop
+    /// becomes Interrupted anyway.
+    closing_retried: bool,
 }
 
 impl LiveLoop {
@@ -1117,6 +1131,7 @@ impl LoopEngine {
                     final_text: None,
                     active: None,
                     model_override: None,
+                    closing_retried: false,
                 };
                 live.update_unknown();
                 crate::loop_store::append(p, &live.record)?;
@@ -1208,6 +1223,7 @@ impl LoopEngine {
             final_text: None,
             active: None,
             model_override,
+            closing_retried: false,
         };
         self.save(&mut live)?;
         let view = live.view();
@@ -1558,9 +1574,19 @@ impl LoopEngine {
                 if request.approval_id.is_some() || request.binding.is_some() {
                     return Err(LoopError(403, "unexpected_approval"));
                 }
+                let closing = live.record.proposal_count >= live.record.max_calls;
+                if closing {
+                    // ORC-4 R4-F3: tell the model this is the
+                    // closing turn. The nudge goes into the
+                    // live history (not only the cloned Work)
+                    // so the retry round carries it too, and
+                    // the history shows what the model was
+                    // told. Messages never enter JSONL.
+                    live.messages.push(Message::User(CLOSING_NUDGE.to_string()));
+                }
                 work = Work::Model {
                     messages: live.messages.clone(),
-                    closing: live.record.proposal_count >= live.record.max_calls,
+                    closing,
                 };
                 live.record.model_attempts += 1;
                 limit = self.timeouts.model.min(Duration::from_millis(remaining));
@@ -1819,7 +1845,21 @@ impl LoopEngine {
                                 live.results.push(None);
                             }
                             if *closing {
-                                live.finish(LoopStatus::Failed, Some(ErrorCode::CapExceeded));
+                                if !live.closing_retried {
+                                    // ORC-4 R4-F3: one closing
+                                    // retry. Do not finish: the
+                                    // loop stays Running, the
+                                    // driver delivers these
+                                    // CapExceeded failures as tool
+                                    // results (resume's failed-call
+                                    // branch) and issues one more
+                                    // closing model call. A second
+                                    // closing-turn Calls reply
+                                    // finishes as before.
+                                    live.closing_retried = true;
+                                } else {
+                                    live.finish(LoopStatus::Failed, Some(ErrorCode::CapExceeded));
+                                }
                             }
                         }
                         _ => live.finish(LoopStatus::Failed, Some(ErrorCode::ModelFailed)),

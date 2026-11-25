@@ -242,3 +242,130 @@ async fn driver_cancel_stops_and_starts_no_further_model_call() {
     assert_eq!(h.model.contexts.lock().unwrap().len(), 1);
     assert_eq!(h.get(&loop_id).await["status"], "cancelled");
 }
+
+fn read(path: &str) -> ModelReply {
+    ModelReply::Calls {
+        proposals: vec![Proposal { tool: "fs.read".into(), args: json!({"path": path}), wire: None }],
+        content: None,
+    }
+}
+
+fn has_nudge(messages: &[Message]) -> bool {
+    messages.iter().any(|m| matches!(m, Message::User(t) if t == CLOSING_NUDGE))
+}
+
+fn seed_reads(h: &Harness, paths: &[&str]) {
+    let mut files = h.files.files.lock().unwrap();
+    for p in paths {
+        files.insert((*p).to_string(), format!("content {p}"));
+    }
+}
+
+/// ORC-4 R4-F3 T1: a closing-turn proposal is retried once and
+/// the retry-turn final completes the loop. The closing proposal
+/// stays Failed/CapExceeded in the calls array, the nudge is in
+/// both closing model calls (and in none before them), and the
+/// retry call sees the CapExceeded tool result.
+#[tokio::test]
+async fn closing_proposal_then_final_completes_with_one_retry() {
+    let h = Harness::new(vec![
+        (Duration::ZERO, read("a")),
+        (Duration::ZERO, read("b")),
+        (Duration::ZERO, read("c")),
+        (Duration::ZERO, read("d")),
+        (Duration::ZERO, read("e")),
+        (Duration::ZERO, read("f")),
+        (Duration::ZERO, done()),
+    ])
+    .await;
+    seed_reads(&h, &["a", "b", "c", "d", "e", "f"]);
+    let loop_id = h.start().await;
+    let view = h.poll_status(&loop_id, "completed").await;
+    let calls = view["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 6, "{view}");
+    for call in &calls[..5] {
+        assert_eq!(call["status"], "succeeded", "{view}");
+    }
+    assert_eq!(calls[5]["status"], "failed", "{view}");
+    assert_eq!(calls[5]["error"], "cap_exceeded", "{view}");
+    assert_eq!(view["model_attempts"], 7);
+    let contexts = h.model.contexts.lock().unwrap();
+    assert_eq!(contexts.len(), 7);
+    for ctx in contexts.iter().take(5) {
+        assert!(!has_nudge(ctx), "nudge must not appear before the closing turn");
+    }
+    assert!(has_nudge(&contexts[5]), "closing call must carry the nudge");
+    assert!(has_nudge(&contexts[6]), "retry call must carry the nudge");
+    assert!(
+        contexts[6].iter().any(
+            |m| matches!(m, Message::Tool { result, .. } if result.summary.error == Some(ErrorCode::CapExceeded))
+        ),
+        "retry call must see the CapExceeded tool result"
+    );
+}
+
+/// ORC-4 R4-F3 T2: a second closing-turn proposal fails the loop
+/// with CapExceeded, and exactly one retry happened (7 model
+/// calls: 5 reads + closing + retry).
+#[tokio::test]
+async fn closing_proposal_twice_fails_with_cap_exceeded_after_one_retry() {
+    let h = Harness::new(vec![
+        (Duration::ZERO, read("a")),
+        (Duration::ZERO, read("b")),
+        (Duration::ZERO, read("c")),
+        (Duration::ZERO, read("d")),
+        (Duration::ZERO, read("e")),
+        (Duration::ZERO, read("f")),
+        (Duration::ZERO, read("g")),
+    ])
+    .await;
+    seed_reads(&h, &["a", "b", "c", "d", "e", "f", "g"]);
+    let loop_id = h.start().await;
+    let view = h.poll_status(&loop_id, "failed").await;
+    assert_eq!(view["error"], "cap_exceeded", "{view}");
+    let calls = view["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 7, "{view}");
+    for call in &calls[..5] {
+        assert_eq!(call["status"], "succeeded", "{view}");
+    }
+    for call in &calls[5..] {
+        assert_eq!(call["status"], "failed", "{view}");
+        assert_eq!(call["error"], "cap_exceeded", "{view}");
+    }
+    assert_eq!(view["model_attempts"], 7);
+    let contexts = h.model.contexts.lock().unwrap();
+    assert_eq!(contexts.len(), 7, "exactly one closing retry");
+    assert!(has_nudge(&contexts[5]));
+    assert!(has_nudge(&contexts[6]));
+}
+
+/// ORC-4 R4-F3 T3: a closing-turn final completes with no retry
+/// (regression: the old happy path is unchanged apart from the
+/// nudge, which the closing call still carries).
+#[tokio::test]
+async fn closing_final_completes_without_retry() {
+    let h = Harness::new(vec![
+        (Duration::ZERO, read("a")),
+        (Duration::ZERO, read("b")),
+        (Duration::ZERO, read("c")),
+        (Duration::ZERO, read("d")),
+        (Duration::ZERO, read("e")),
+        (Duration::ZERO, done()),
+    ])
+    .await;
+    seed_reads(&h, &["a", "b", "c", "d", "e"]);
+    let loop_id = h.start().await;
+    let view = h.poll_status(&loop_id, "completed").await;
+    let calls = view["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 5, "{view}");
+    for call in calls {
+        assert_eq!(call["status"], "succeeded", "{view}");
+    }
+    assert_eq!(view["model_attempts"], 6);
+    let contexts = h.model.contexts.lock().unwrap();
+    assert_eq!(contexts.len(), 6, "no retry when the closing turn answers");
+    assert!(has_nudge(&contexts[5]), "closing call must carry the nudge");
+    for ctx in contexts.iter().take(5) {
+        assert!(!has_nudge(ctx));
+    }
+}
