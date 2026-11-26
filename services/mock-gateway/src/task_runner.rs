@@ -3656,9 +3656,40 @@ async fn drive_swarm_merging(
             conflict = Some((step.step_no, "patch_write_failed".to_string()));
             break;
         }
+        // R5-F1: pin `-c core.autocrlf=false` on the
+        // apply ONLY. Git for Windows defaults
+        // `core.autocrlf=true`, and an unpinned apply
+        // converts the merged content to CRLF (CI #167:
+        // both Windows orc_swarm failures expected LF,
+        // got CRLF). The pin must NOT extend to the
+        // `git diff` above: with autocrlf=false the
+        // diff compares raw bytes, so every untouched
+        // file the copy checked out as CRLF appears as
+        // a full-file rewrite (probe: 3 files, 4 CRs
+        // in the patch, vs 1 file, 0 CRs unpinned).
+        // It must NOT extend to the shared
+        // `git-worktree-add` template either: that
+        // template serves every worktree add, and its
+        // positional argv consumers (worker.rs
+        // `argv.get(3)`/`argv.get(5)`) assume the
+        // current shape. The copy's CRLF checkout is
+        // harmless — the diff normalizes it, and the
+        // file-write step overwrites stepped files
+        // with verbatim LF bytes.
+        //
+        // Known behavior, not a silent change: if the
+        // main worktree's target file is itself CRLF,
+        // the pinned apply fails to match the LF patch
+        // (probe: `patch does not apply`) and the
+        // swarm stops here with `apply_failed` ->
+        // hand-back, main untouched. The unpinned
+        // apply would have succeeded and landed CRLF,
+        // which is exactly the CI failure's shape.
         let applied = swarm_git(
             state,
             &[
+                "-c".to_string(),
+                "core.autocrlf=false".to_string(),
                 "apply".to_string(),
                 "--".to_string(),
                 patch_path.to_string_lossy().into_owned(),
