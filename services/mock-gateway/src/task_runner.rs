@@ -38,14 +38,18 @@ use crate::plan_store::{
     create_plan, current_plan_for_task, validate_plan_steps, validate_replan_if, PlanReplanIfDto,
     PlanRow, PlanStepDto,
 };
+use crate::effect_store::NewEffect;
 use crate::server::{
-    approval_status, close_execution, close_execution_for_task, close_execution_with_inbox,
-    create_execution, create_worker_run_internal, decide_approval_rejected, ensure_root,
-    execution_for_task, execution_status, persist_approval, persist_task,
-    record_evidence_best_effort, resolve_file, worker_command_digest, ApprovalState, AppState,
+    approval_status, check_idempotency, close_execution, close_execution_for_task,
+    close_execution_with_inbox, consume_bound_approval_for_effect, create_execution,
+    create_worker_run_internal, decide_approval_rejected, ensure_root, execution_for_task,
+    execution_status, persist_approval, persist_task, persist_worktree, record_effect,
+    record_evidence_best_effort, resolve_file, start_bound_effect, transition_effect,
+    worktree_canonical_root, worker_command_digest, ApprovalState, AppState, IdempotencyDecision,
     WorkerRunCreateDto,
 };
-use crate::sqlite_store::{canonical_json, now_ms};
+use crate::sqlite_store::{canonical_json, get_worker_run, now_ms};
+use crate::swarm_store::{SwarmRow, SwarmStep};
 use crate::task_store::TaskFileRecord;
 use crate::worker::{is_effect_command, is_terminal_run_status};
 
@@ -825,6 +829,19 @@ pub(crate) async fn run_task(
     let Some(record) = record else {
         return;
     };
+    // ORC-5: a task with an active swarm is driven by
+    // the swarm drive, not the serial runner — a
+    // re-spawned runner would prepare the serial
+    // step-1 approval over the swarm's steps. The
+    // merge continuation spawns `run_task` only after
+    // the swarm row is `completed`, so this guard
+    // never blocks it.
+    if let Some(sqlite) = &state.sqlite {
+        let conn = sqlite.lock().expect("sqlite lock");
+        if let Ok(Some(_)) = crate::swarm_store::active_swarm_for_task(&conn, &task_id) {
+            return;
+        }
+    }
     match record.status.as_str() {
         "created" => {
             // The run handler already claimed created -> running;
@@ -2460,4 +2477,1345 @@ async fn execute_worker_step_inner(state: AppState, record: &TaskFileRecord, ste
         }
     }
     prepare_executor_step(state, &task_id, &plan, next).await;
+}
+
+// --- ORC-5 swarm drive (Q-R5-04/05/06/07/10) ---
+//
+// The sweeper's new pass: after `start_due_worker_runs`
+// in the same 10 s tick (appendix pin), it drives every
+// non-terminal swarm one step. One pass per tick,
+// swarms in creation order, each drive awaited in
+// turn — a model-backed file-write prepare can stretch
+// a tick, but it never blocks the other passes of the
+// SAME tick (they already ran), and no lock is held
+// across an await.
+//
+// State machine (swarm_store.rs): created (idle,
+// fanout not yet called) → fanning_out (copy
+// add-runs) → running (prepare + approvals +
+// executions) → verifying (cross-check) → merging
+// (diffs applied to the main worktree) → completed /
+// failed / conflict (terminal). The task stays
+// `draft_ready` through the whole swarm — there is
+// NO `draft_ready → running` edge — so the swarm's
+// own status carries progress; completion walks the
+// legal `draft_ready → completed` edge, failure the
+// legal `draft_ready → failed` edge.
+
+/// ORC-5 (Q-R5-04): the swarm sweeper pass. Called
+/// from `spawn_assignment_sweeper` after
+/// `start_due_worker_runs`, same tick. Directly
+/// callable in tests (the test harness serves with
+/// no sweeper — the `e2d_long_tasks` precedent of
+/// calling the pass directly).
+pub(crate) async fn drive_ready_swarms(state: AppState) {
+    let Some(sqlite) = &state.sqlite else {
+        return;
+    };
+    let swarms = {
+        let conn = sqlite.lock().expect("sqlite lock");
+        match crate::swarm_store::list_swarms(&conn) {
+            Ok(rows) => rows,
+            Err(detail) => {
+                eprintln!("warning: swarm drive list failed ({detail})");
+                return;
+            }
+        }
+    };
+    for swarm in swarms {
+        if matches!(
+            swarm.status.as_str(),
+            "completed" | "failed" | "conflict"
+        ) {
+            continue;
+        }
+        drive_swarm(state.clone(), swarm).await;
+    }
+}
+
+/// The synthetic effect_id for swarm Evidence rows.
+/// There is no real Effect behind a fan-out /
+/// cross-check / merge row — the `executor:{task}:{step}`
+/// and `research:{task}` precedents use the same
+/// synthetic-label shape, and the row's `observed`
+/// JSON carries the swarm + step ids.
+fn swarm_effect_id(swarm_id: &str, step_no: Option<i64>) -> String {
+    match step_no {
+        Some(step_no) => format!("swarm:{swarm_id}:{step_no}"),
+        None => format!("swarm:{swarm_id}"),
+    }
+}
+
+/// Persist a swarm's steps + status. Logs and
+/// returns false on failure (the drive step is
+/// skipped, not forced).
+fn swarm_persist(
+    state: &AppState,
+    swarm_id: &str,
+    steps: &[SwarmStep],
+    status: &str,
+) -> bool {
+    let Some(sqlite) = &state.sqlite else {
+        return false;
+    };
+    let mut conn = sqlite.lock().expect("sqlite lock");
+    match crate::swarm_store::update_swarm(&mut conn, swarm_id, steps, status) {
+        Ok(()) => true,
+        Err(detail) => {
+            eprintln!("warning: swarm {swarm_id} persist failed ({detail})");
+            false
+        }
+    }
+}
+
+/// The copy's canonical directory, or None when the
+/// worktree record is gone.
+fn swarm_copy_root(state: &AppState, worktree_id: &str) -> Option<PathBuf> {
+    let worktree = state
+        .worktrees
+        .lock()
+        .expect("worktree lock")
+        .get(worktree_id)
+        .cloned()?;
+    worktree_canonical_root(state, &worktree)
+}
+
+/// ORC-2 `read_step_file` against a copy root
+/// instead of `files_root`: same per-file cap, same
+/// UTF-8 tail trim, same empty-on-missing rule (the
+/// step may be creating the file).
+fn read_step_file_at(root: &std::path::Path, path: &str) -> String {
+    let Ok(full) = resolve_file(root, path) else {
+        return String::new();
+    };
+    let Ok(bytes) = std::fs::read(full) else {
+        return String::new();
+    };
+    let mut capped = &bytes[..bytes.len().min(MAX_FILE_BYTES)];
+    while !capped.is_empty() && std::str::from_utf8(capped).is_err() {
+        capped = &capped[..capped.len() - 1];
+    }
+    String::from_utf8_lossy(capped).into_owned()
+}
+
+/// Run git directly (ORC-5 R5-J5): the merge's
+/// `git diff` / `git apply` / `git worktree remove`
+/// / `git branch -D` run as direct `git` Commands
+/// in the gateway, NOT via worker runs (a run tail
+/// truncates, and a full diff cannot be carried in
+/// one) and NOT via a new `git-worktree-remove`
+/// template (it would need an approval no one can
+/// give after merge, and conflicts with "no new loop
+/// tools"). None when git is not configured.
+fn swarm_git(
+    state: &AppState,
+    args: &[String],
+    cwd: &std::path::Path,
+) -> Option<crate::worker::SyncRunOutput> {
+    let git = state.git_path.clone()?;
+    let mut argv = vec![git.to_string_lossy().into_owned()];
+    argv.extend(args.iter().cloned());
+    Some(crate::worker::run_command_sync(
+        state,
+        &argv,
+        cwd,
+        &git,
+        std::time::Duration::from_secs(30),
+    ))
+}
+
+/// One swarm Evidence row (Q-R5-11). `observed`
+/// carries ids + counts + hashes only — never step
+/// text or board text.
+fn swarm_evidence(
+    state: &AppState,
+    swarm_id: &str,
+    step_no: Option<i64>,
+    execution_id: Option<&str>,
+    verdict: &str,
+    reason: &str,
+    observed: serde_json::Value,
+) {
+    record_orc_evidence(
+        state,
+        &swarm_effect_id(swarm_id, step_no),
+        execution_id,
+        "swarm",
+        verdict,
+        reason,
+        observed,
+    );
+}
+
+async fn drive_swarm(state: AppState, swarm: SwarmRow) {
+    let task_id = swarm.task_id.clone();
+    let Some(task) = state
+        .tasks
+        .lock()
+        .expect("task lock")
+        .get(&task_id)
+        .cloned()
+    else {
+        // The task is gone (deleted mid-swarm): the
+        // swarm cannot hand back to anything. Fail it
+        // with a board note and stop.
+        let steps = swarm.steps().unwrap_or_default();
+        crate::routes_swarm::swarm_board_write(
+            &state,
+            &swarm.swarm_id,
+            "swarm",
+            "conflict",
+            &format!("task_missing:{}", swarm.task_id),
+        );
+        swarm_persist(&state, &swarm.swarm_id, &steps, "failed");
+        return;
+    };
+    let plan = {
+        let Some(sqlite) = &state.sqlite else {
+            return;
+        };
+        let conn = sqlite.lock().expect("sqlite lock");
+        crate::plan_store::get_plan(&conn, &swarm.plan_id)
+            .ok()
+            .flatten()
+    };
+    let Some(plan) = plan else {
+        let steps = swarm.steps().unwrap_or_default();
+        crate::routes_swarm::swarm_board_write(
+            &state,
+            &swarm.swarm_id,
+            "swarm",
+            "conflict",
+            &format!("plan_missing:{}", swarm.plan_id),
+        );
+        swarm_persist(&state, &swarm.swarm_id, &steps, "failed");
+        fail(&state, &task_id, "蓝图缺失，无法继续 Swarm");
+        return;
+    };
+    let Some(steps) = swarm.steps().ok() else {
+        eprintln!(
+            "warning: swarm {} steps undecodable, drive skipped",
+            swarm.swarm_id
+        );
+        return;
+    };
+    match swarm.status.as_str() {
+        // `created` is idle: fanout is a user action,
+        // the drive has nothing to do.
+        "created" => {}
+        "fanning_out" => {
+            drive_swarm_fanning_out(&state, &swarm, steps, &task, &plan).await;
+        }
+        "running" => {
+            drive_swarm_running(&state, &swarm, steps, &task, &plan).await;
+        }
+        "verifying" => {
+            drive_swarm_verifying(&state, &swarm, steps, &task, &plan).await;
+        }
+        "merging" => {
+            drive_swarm_merging(&state, &swarm, steps, &task, &plan).await;
+        }
+        _ => {}
+    }
+}
+
+/// Fan-out failure terminal: board `conflict` +
+/// swarm `failed` + task `fail()` (Q-R5-12:
+/// fan-out failure → `failed` Inbox row, via the
+/// Execution close inside `fail()`).
+fn swarm_terminal_failed(
+    state: &AppState,
+    swarm: &SwarmRow,
+    steps: &[SwarmStep],
+    task_id: &str,
+    board_body: &str,
+    error: &str,
+) {
+    crate::routes_swarm::swarm_board_write(state, &swarm.swarm_id, "swarm", "conflict", board_body);
+    swarm_persist(state, &swarm.swarm_id, steps, "failed");
+    fail(state, task_id, error);
+}
+
+/// Verification / merge failure terminal: board
+/// `conflict` + `swarm_conflict` Evidence + ORC-3
+/// hand-back (task `draft_ready` + `needs_review`
+/// Execution close → one `review_required` Inbox
+/// row, Q-R5-12) + swarm `conflict`.
+/// The conflict detail rides in one struct so the
+/// terminal stays under clippy's argument limit.
+struct SwarmConflict<'a> {
+    execution_id: Option<&'a str>,
+    step_no: Option<i64>,
+    board_body: String,
+    observed: serde_json::Value,
+}
+
+fn swarm_terminal_conflict(
+    state: &AppState,
+    swarm: &SwarmRow,
+    steps: &[SwarmStep],
+    task_id: &str,
+    conflict: SwarmConflict<'_>,
+) {
+    crate::routes_swarm::swarm_board_write(
+        state,
+        &swarm.swarm_id,
+        "swarm",
+        "conflict",
+        &conflict.board_body,
+    );
+    swarm_evidence(
+        state,
+        &swarm.swarm_id,
+        conflict.step_no,
+        conflict.execution_id,
+        "mismatch",
+        "swarm_conflict",
+        conflict.observed,
+    );
+    hand_back(state, task_id, conflict.execution_id, None);
+    swarm_persist(state, &swarm.swarm_id, steps, "conflict");
+}
+
+async fn drive_swarm_fanning_out(
+    state: &AppState,
+    swarm: &SwarmRow,
+    mut steps: Vec<SwarmStep>,
+    task: &TaskFileRecord,
+    _plan: &PlanRow,
+) {
+    let task_id = task.task_id.clone();
+    let execution_id = execution_for_task(state, &task_id);
+    let mut failed: Option<(i64, String)> = None;
+    let mut all_succeeded = true;
+    for step in steps.iter() {
+        let Some(add_run_id) = &step.add_run_id else {
+            all_succeeded = false;
+            continue;
+        };
+        let run = {
+            let Some(sqlite) = &state.sqlite else {
+                return;
+            };
+            let conn = sqlite.lock().expect("sqlite lock");
+            get_worker_run(&conn, add_run_id).ok().flatten()
+        };
+        match run {
+            None => {
+                failed = Some((step.step_no, "add_run_missing".to_string()));
+                break;
+            }
+            Some(row) if row.status == "succeeded" => {}
+            Some(row) if is_terminal_run_status(&row.status) => {
+                failed = Some((step.step_no, format!("add_run_{}", row.status)));
+                break;
+            }
+            Some(_) => {
+                all_succeeded = false;
+            }
+        }
+    }
+    if let Some((step_no, reason)) = failed {
+        swarm_terminal_failed(
+            state,
+            swarm,
+            &steps,
+            &task_id,
+            &format!("fanout_failed:{step_no}:{reason}"),
+            &format!("Swarm 副本创建失败（步骤 {step_no}）：{reason}"),
+        );
+        return;
+    }
+    if !all_succeeded {
+        return;
+    }
+    // All add-runs succeeded: link the Worktree
+    // records the run finisher created (branch
+    // `swarm-{swarm_id}-{worker_id}`, R5-J4).
+    for step in steps.iter_mut() {
+        let branch = format!("swarm-{}-{}", swarm.swarm_id, step.worker_id);
+        let worktree_id = state
+            .worktrees
+            .lock()
+            .expect("worktree lock")
+            .values()
+            .find(|w| w.branch_label == branch)
+            .map(|w| w.worktree_id.clone());
+        match worktree_id {
+            Some(id) => step.worktree_id = Some(id),
+            None => {
+                failed = Some((step.step_no, "worktree_record_missing".to_string()));
+                break;
+            }
+        }
+    }
+    if let Some((step_no, reason)) = failed {
+        swarm_terminal_failed(
+            state,
+            swarm,
+            &steps,
+            &task_id,
+            &format!("fanout_failed:{step_no}:{reason}"),
+            &format!("Swarm 副本创建失败（步骤 {step_no}）：{reason}"),
+        );
+        return;
+    }
+    for step in steps.iter() {
+        swarm_evidence(
+            state,
+            &swarm.swarm_id,
+            Some(step.step_no),
+            execution_id.as_deref(),
+            "verified",
+            "swarm_fanout",
+            serde_json::json!({
+                "task_id": task_id,
+                "swarm_id": swarm.swarm_id,
+                "step_no": step.step_no,
+                "worker_id": step.worker_id,
+                "worktree_id": step.worktree_id,
+            }),
+        );
+    }
+    crate::routes_swarm::swarm_board_write(state, &swarm.swarm_id, "swarm", "status", "copies_ready");
+    swarm_persist(state, &swarm.swarm_id, &steps, "running");
+}
+
+/// ORC-2 `prepare_file_write_step` against a copy:
+/// the Executor model generates the content from
+/// the copy's current file (same prompt shape, same
+/// model call), and the fs.write approval is built
+/// from path + content. The content is stored in
+/// the step (SQLite-only, base64) — the drive's
+/// apply reads it back, and the cross-check hashes
+/// it. A model failure fails the step (aggregated
+/// later, Q-R5-10 — the swarm does NOT fail here).
+async fn swarm_prepare_file_step(
+    state: &AppState,
+    step: &mut SwarmStep,
+    plan_step: &crate::plan_store::PlanStep,
+    plan: &PlanRow,
+    task: &TaskFileRecord,
+) {
+    use base64::Engine;
+    let (_planner_model, executor_model) = role_models(state);
+    let Some(copy_root) = step
+        .worktree_id
+        .as_deref()
+        .and_then(|id| swarm_copy_root(state, id))
+    else {
+        step.run_status = "failed".to_string();
+        step.failure = Some("副本目录缺失".to_string());
+        return;
+    };
+    let current = read_step_file_at(&copy_root, &plan_step.path);
+    let prompt = format!(
+        "{EXECUTOR_PROMPT_PREFIX}步骤 {step_no}（共 {total} 步），蓝图 {plan_id}：\n- 文件：{path}\n- 符号：{symbol}\n- 改动：{change}\n- 验证：{verify_cmd}，预期：{expected}\n\n文件当前内容（不存在时为空）：\n{current}\n\n只返回改动后的文件完整内容，不要 markdown 围栏、不要解释文字。",
+        step_no = plan_step.step_no,
+        total = plan.steps().map(|s| s.len()).unwrap_or(0),
+        plan_id = plan.plan_id,
+        path = plan_step.path,
+        symbol = plan_step.symbol,
+        change = plan_step.change,
+        verify_cmd = plan_step.verify_cmd,
+        expected = plan_step.expected,
+        current = current,
+    );
+    let frozen_rules = frozen_rules_for(state, &task.task_id);
+    let content = match state
+        .deepseek
+        .reply_with_rules_and_model(frozen_rules, &executor_model, &prompt)
+        .await
+    {
+        DeepseekOutcome::Disabled => {
+            step.run_status = "failed".to_string();
+            step.failure = Some("模型未配置".to_string());
+            return;
+        }
+        DeepseekOutcome::Denied(pattern) => {
+            step.run_status = "failed".to_string();
+            step.failure = Some(format!("网络规则拒绝模型调用：{pattern}"));
+            return;
+        }
+        DeepseekOutcome::Failed(_) => {
+            step.run_status = "failed".to_string();
+            step.failure = Some("模型调用失败".to_string());
+            return;
+        }
+        DeepseekOutcome::Replied(text) => {
+            if text.trim().is_empty() {
+                step.run_status = "failed".to_string();
+                step.failure = Some("执行回合未返回文件内容".to_string());
+                return;
+            }
+            text
+        }
+    };
+    // Cancel checkpoint (the serial prepare's rule):
+    // a cancelled run discards the step content and
+    // creates no approval; the next tick re-prepares.
+    if !task_is_active(state, &task.task_id) {
+        step.run_status = "pending".to_string();
+        return;
+    }
+    let approval_id = match create_bound_write_approval(state, &plan_step.path, content.as_bytes())
+    {
+        Ok(id) => id,
+        Err(error) => {
+            step.run_status = "failed".to_string();
+            step.failure = Some(error);
+            return;
+        }
+    };
+    step.content_base64 = Some(
+        base64::engine::general_purpose::STANDARD.encode(content.as_bytes()),
+    );
+    step.content_sha256 = Some(operation_binding::sha256_hex(content.as_bytes()));
+    step.approval_id = Some(approval_id);
+    step.approval_kind = Some("fs.write".to_string());
+    step.run_status = "waiting_approval".to_string();
+}
+
+/// ORC-2 `prepare_worker_step` against a copy: the
+/// step's `verify_cmd` maps to a worker-run template
+/// (J7); effect commands get a bound worker.run
+/// approval, reads get none (and execute at once).
+fn swarm_prepare_command_step(
+    state: &AppState,
+    step: &mut SwarmStep,
+    plan_step: &crate::plan_store::PlanStep,
+) {
+    let Some(worktree_id) = step.worktree_id.clone() else {
+        step.run_status = "failed".to_string();
+        step.failure = Some("副本未就绪".to_string());
+        return;
+    };
+    let (template, params) = match resolve_verify_command(&plan_step.verify_cmd) {
+        Ok(resolved) => resolved,
+        Err(detail) => {
+            step.run_status = "failed".to_string();
+            step.failure = Some(detail);
+            return;
+        }
+    };
+    if is_effect_command(&template) {
+        match create_bound_worker_approval(state, &worktree_id, &template, &params) {
+            Ok(id) => {
+                step.approval_id = Some(id);
+                step.approval_kind = Some("worker.run".to_string());
+                step.run_status = "waiting_approval".to_string();
+            }
+            Err(detail) => {
+                step.run_status = "failed".to_string();
+                step.failure = Some(detail);
+            }
+        }
+    } else {
+        // A read step needs no approval: it is
+        // executable now (the execute phase creates
+        // its run on the same tick).
+        step.run_status = "running".to_string();
+    }
+}
+
+/// `apply_file_write_step` against a copy: consume
+/// the fs.write approval bound to a planned swarm
+/// Effect, write the stored content into the copy,
+/// drive the Effect to `succeeded`, and write the
+/// explicit write Evidence row (source `write`,
+/// reason `written`, `{kind:"file", sha256, len}` —
+/// the cross-check compares against this hash).
+/// The Effect key is `swarm.apply:{swarm_id}:{path}`
+/// (the swarm id in the scope, so two swarms
+/// writing the same path with different content do
+/// not collide on the idempotency key).
+async fn swarm_apply_file_step(
+    state: &AppState,
+    swarm: &SwarmRow,
+    step: &mut SwarmStep,
+    plan_step: &crate::plan_store::PlanStep,
+    execution_id: Option<&str>,
+) -> Result<String, String> {
+    let Some(approval_id) = step.approval_id.clone() else {
+        return Err("步骤审批缺失".to_string());
+    };
+    let Some(content_base64) = step.content_base64.clone() else {
+        return Err("步骤内容缺失".to_string());
+    };
+    use base64::Engine;
+    let Ok(content) = base64::engine::general_purpose::STANDARD.decode(&content_base64) else {
+        return Err("步骤内容解码失败".to_string());
+    };
+    let Some(digest) =
+        operation_binding::write_digest(&plan_step.path, &content, false)
+    else {
+        return Err("产物路径无效".to_string());
+    };
+    let scope = format!("{}:{}", swarm.swarm_id, plan_step.path);
+    if crate::server::idempotency_key_missing(execution_id, Some(&digest)) {
+        return Err("effect_idempotency_unavailable".to_string());
+    }
+    let effect = match check_idempotency(
+        state,
+        execution_id,
+        "swarm",
+        "apply",
+        &scope,
+        Some(&digest),
+        None,
+    ) {
+        // A retry after a crash between the write and
+        // the step persist: the write already happened
+        // — replay without consuming the approval again
+        // or writing twice.
+        IdempotencyDecision::Replay(effect) if effect.status == "succeeded" => {
+            return Ok(effect.effect_id);
+        }
+        IdempotencyDecision::Replay(effect) => {
+            return Err(format!("effect already {}", effect.status));
+        }
+        IdempotencyDecision::Blocked(other) => {
+            if other.status == "planned"
+                && other.approval_id.as_deref() == Some(approval_id.as_str())
+            {
+                other
+            } else {
+                return Err(format!(
+                    "effect_idempotency_blocked:{}:{}",
+                    other.effect_id, other.status
+                ));
+            }
+        }
+        IdempotencyDecision::Unavailable => {
+            return Err("sqlite_unavailable".to_string());
+        }
+        IdempotencyDecision::Proceed => record_effect(
+            state,
+            NewEffect {
+                execution_id: execution_id.map(str::to_string),
+                capability: "swarm".to_string(),
+                operation: "apply".to_string(),
+                scope,
+                input_digest: Some(digest.clone()),
+                approval_id: Some(approval_id.clone()),
+                status: "planned".to_string(),
+            },
+        ),
+    };
+    if let Err(response) = consume_bound_approval_for_effect(
+        state,
+        "fs.write",
+        &Some(approval_id.clone()),
+        &digest,
+        Some(&effect.effect_id),
+    ) {
+        let status = response.status();
+        return Err(format!("fs.write 审批消费失败（{status}）"));
+    }
+    if let Err(response) = start_bound_effect(state, &effect) {
+        let status = response.status();
+        return Err(format!("Effect 启动失败（{status}）"));
+    }
+    let Some(copy_root) = step
+        .worktree_id
+        .as_deref()
+        .and_then(|id| swarm_copy_root(state, id))
+    else {
+        let _ = transition_effect(state, &effect.effect_id, "failed", None, None);
+        return Err("副本目录缺失".to_string());
+    };
+    let Some(normalized) = operation_binding::normalize_path(&plan_step.path) else {
+        let _ = transition_effect(state, &effect.effect_id, "failed", None, None);
+        return Err("产物路径无效".to_string());
+    };
+    let Ok(full) = resolve_file(&copy_root, &normalized) else {
+        let _ = transition_effect(state, &effect.effect_id, "failed", None, None);
+        return Err("path escapes file root".to_string());
+    };
+    if let Some(parent) = full.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            let _ = transition_effect(state, &effect.effect_id, "failed", None, None);
+            return Err("cannot create parent directory".to_string());
+        }
+    }
+    if std::fs::write(&full, &content).is_err() {
+        let _ = transition_effect(state, &effect.effect_id, "failed", None, None);
+        return Err("产物写入失败".to_string());
+    }
+    let _ = transition_effect(state, &effect.effect_id, "succeeded", None, None);
+    let sha256 = operation_binding::sha256_hex(&content);
+    record_orc_evidence(
+        state,
+        &effect.effect_id,
+        execution_id,
+        "write",
+        "verified",
+        "written",
+        serde_json::json!({
+            "kind": "file",
+            "sha256": sha256,
+            "len": content.len(),
+        }),
+    );
+    Ok(effect.effect_id)
+}
+
+async fn drive_swarm_running(
+    state: &AppState,
+    swarm: &SwarmRow,
+    mut steps: Vec<SwarmStep>,
+    task: &TaskFileRecord,
+    plan: &PlanRow,
+) {
+    let task_id = task.task_id.clone();
+    let execution_id = execution_for_task(state, &task_id);
+    let plan_steps = plan.steps().unwrap_or_default();
+    // Phase A: prepare each pending step (model call
+    // for file writes, verify_cmd resolution +
+    // approval for effect commands). A prepare
+    // failure fails the step only — aggregation
+    // waits until every step is terminal (Q-R5-10).
+    for index in 0..steps.len() {
+        if steps[index].run_status != "pending" {
+            continue;
+        }
+        if steps[index].worktree_id.is_none() {
+            steps[index].run_status = "failed".to_string();
+            steps[index].failure = Some("副本未就绪".to_string());
+            continue;
+        }
+        let Some(plan_step) = plan_steps
+            .iter()
+            .find(|s| s.step_no == steps[index].step_no)
+        else {
+            steps[index].run_status = "failed".to_string();
+            steps[index].failure = Some("蓝图步骤缺失".to_string());
+            continue;
+        };
+        steps[index].run_status = "preparing".to_string();
+        if !swarm_persist(state, &swarm.swarm_id, &steps, "running") {
+            return;
+        }
+        match plan_step.kind.as_str() {
+            "file_write" => {
+                swarm_prepare_file_step(state, &mut steps[index], plan_step, plan, task).await;
+            }
+            "command" => {
+                swarm_prepare_command_step(state, &mut steps[index], plan_step);
+            }
+            _ => {
+                steps[index].run_status = "failed".to_string();
+                steps[index].failure = Some("不支持的步骤类型".to_string());
+            }
+        }
+        if !swarm_persist(state, &swarm.swarm_id, &steps, "running") {
+            return;
+        }
+    }
+    // Phase B: execute. An Approved approval starts
+    // its step (file write applies into the copy,
+    // command spawns its worker run); a decided but
+    // not Approved approval (rejected / edited)
+    // fails the step — the approval is digest-bound
+    // to the prepared command, an edit breaks the
+    // binding. Approval-free read steps run at once.
+    // Steps with a run already poll it.
+    for index in 0..steps.len() {
+        match steps[index].run_status.as_str() {
+            "waiting_approval" => {
+                let Some(approval_id) = steps[index].approval_id.clone() else {
+                    steps[index].run_status = "failed".to_string();
+                    steps[index].failure = Some("步骤审批缺失".to_string());
+                    continue;
+                };
+                match approval_status(state, &approval_id) {
+                    Some(ApprovalStatus::Approved) => {}
+                    // Pending / NotRequired / unknown: not
+                    // decided yet — wait for the next tick,
+                    // do not fail the step. Only a decided
+                    // non-approval (Rejected / Edited — an
+                    // edit breaks the digest binding) fails
+                    // it.
+                    Some(ApprovalStatus::Pending)
+                    | Some(ApprovalStatus::NotRequired)
+                    | None => {
+                        continue;
+                    }
+                    Some(_) => {
+                        steps[index].run_status = "failed".to_string();
+                        steps[index].failure = Some("审批未通过".to_string());
+                        continue;
+                    }
+                }
+                let Some(plan_step) = plan_steps
+                    .iter()
+                    .find(|s| s.step_no == steps[index].step_no)
+                else {
+                    steps[index].run_status = "failed".to_string();
+                    steps[index].failure = Some("蓝图步骤缺失".to_string());
+                    continue;
+                };
+                if plan_step.kind == "file_write" {
+                    match swarm_apply_file_step(
+                        state,
+                        swarm,
+                        &mut steps[index],
+                        plan_step,
+                        execution_id.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(effect_id) => {
+                            steps[index].effect_id = Some(effect_id);
+                            steps[index].run_status = "succeeded".to_string();
+                        }
+                        Err(detail) => {
+                            steps[index].run_status = "failed".to_string();
+                            steps[index].failure = Some(detail);
+                        }
+                    }
+                } else {
+                    steps[index] = swarm_execute_command_step(
+                        state,
+                        swarm,
+                        steps[index].clone(),
+                        plan_step,
+                        execution_id.clone(),
+                    )
+                    .await;
+                }
+            }
+            "running" => {
+                if steps[index].run_id.is_some() {
+                    steps[index] = swarm_poll_command_step(state, steps[index].clone());
+                } else {
+                    let Some(plan_step) = plan_steps
+                        .iter()
+                        .find(|s| s.step_no == steps[index].step_no)
+                    else {
+                        steps[index].run_status = "failed".to_string();
+                        steps[index].failure = Some("蓝图步骤缺失".to_string());
+                        continue;
+                    };
+                    steps[index] = swarm_execute_command_step(
+                        state,
+                        swarm,
+                        steps[index].clone(),
+                        plan_step,
+                        execution_id.clone(),
+                    )
+                    .await;
+                }
+            }
+            _ => {}
+        }
+        if !swarm_persist(state, &swarm.swarm_id, &steps, "running") {
+            return;
+        }
+    }
+    // Phase C: every step terminal → cross-check
+    // next tick.
+    if steps
+        .iter()
+        .all(|s| matches!(s.run_status.as_str(), "succeeded" | "failed"))
+    {
+        swarm_persist(state, &swarm.swarm_id, &steps, "verifying");
+    }
+}
+
+/// Spawn a command step's worker run (approval
+/// already Approved, or a read step with none).
+/// The run carries the swarm_id, so it bypasses
+/// the one-run-per-Execution guard — the N steps
+/// run in parallel on the task's Execution.
+async fn swarm_execute_command_step(
+    state: &AppState,
+    swarm: &SwarmRow,
+    mut step: SwarmStep,
+    plan_step: &crate::plan_store::PlanStep,
+    execution_id: Option<String>,
+) -> SwarmStep {
+    let Some(worktree_id) = step.worktree_id.clone() else {
+        step.run_status = "failed".to_string();
+        step.failure = Some("副本未就绪".to_string());
+        return step;
+    };
+    let (template, params) = match resolve_verify_command(&plan_step.verify_cmd) {
+        Ok(resolved) => resolved,
+        Err(detail) => {
+            step.run_status = "failed".to_string();
+            step.failure = Some(detail);
+            return step;
+        }
+    };
+    match create_worker_run_internal(
+        state,
+        WorkerRunCreateDto::internal(
+            worktree_id,
+            template,
+            Some(params),
+            execution_id,
+            step.approval_id.clone(),
+        )
+        .with_swarm_id(swarm.swarm_id.clone()),
+    )
+    .await
+    {
+        Ok(row) => {
+            step.run_id = Some(row.run_id);
+            step.run_status = "running".to_string();
+        }
+        Err(error) => {
+            step.run_status = "failed".to_string();
+            step.failure = Some(format!("worker run 创建失败：{}", error.code));
+        }
+    }
+    step
+}
+
+/// Poll a command step's run: succeeded stays
+/// succeeded; any other terminal status fails the
+/// step (the run's terminal Evidence row carries
+/// the detail; the failure string names the status
+/// + exit code).
+fn swarm_poll_command_step(state: &AppState, mut step: SwarmStep) -> SwarmStep {
+    let Some(run_id) = step.run_id.clone() else {
+        return step;
+    };
+    let run = {
+        let Some(sqlite) = &state.sqlite else {
+            return step;
+        };
+        let conn = sqlite.lock().expect("sqlite lock");
+        get_worker_run(&conn, &run_id).ok().flatten()
+    };
+    let Some(row) = run else {
+        step.run_status = "failed".to_string();
+        step.failure = Some("worker run 记录缺失".to_string());
+        return step;
+    };
+    if row.status == "succeeded" {
+        step.run_status = "succeeded".to_string();
+        step.effect_id = row.effect_id;
+    } else if is_terminal_run_status(&row.status) {
+        step.run_status = "failed".to_string();
+        step.failure = Some(format!(
+            "worker run {}（exit {:?}）",
+            row.status, row.exit_code
+        ));
+    }
+    step
+}
+
+async fn drive_swarm_verifying(
+    state: &AppState,
+    swarm: &SwarmRow,
+    steps: Vec<SwarmStep>,
+    task: &TaskFileRecord,
+    plan: &PlanRow,
+) {
+    let task_id = task.task_id.clone();
+    let execution_id = execution_for_task(state, &task_id);
+    // Cross-check each succeeded step (R5-J1: the
+    // verdict is computed deterministically by the
+    // gateway — a model cannot reliably compute
+    // digests, and fs.read truncates long files).
+    // file_write: the copy's file sha256 vs the
+    // write Evidence hash stored on the step.
+    // command: the run succeeded, so the terminal
+    // record matches — `record_match`.
+    let mut mismatch: Option<(i64, String)> = None;
+    for step in steps.iter().filter(|s| s.run_status == "succeeded") {
+        let plan_step = plan
+            .steps()
+            .ok()
+            .and_then(|all| all.into_iter().find(|s| s.step_no == step.step_no));
+        let verdict = match plan_step.as_ref().map(|s| s.kind.as_str()) {
+            Some("file_write") => {
+                let actual = step
+                    .worktree_id
+                    .as_deref()
+                    .and_then(|id| swarm_copy_root(state, id))
+                    .and_then(|root| {
+                        let path = plan_step.as_ref().map(|s| s.path.clone()).unwrap_or_default();
+                        let Ok(full) = resolve_file(&root, &path) else {
+                            return None;
+                        };
+                        std::fs::read(full).ok()
+                    })
+                    .map(|bytes| operation_binding::sha256_hex(&bytes));
+                match (actual, &step.content_sha256) {
+                    (Some(actual), Some(expected)) if actual == *expected => "hash_match",
+                    _ => "mismatch",
+                }
+            }
+            Some("command") => "record_match",
+            _ => "mismatch",
+        };
+        swarm_evidence(
+            state,
+            &swarm.swarm_id,
+            Some(step.step_no),
+            execution_id.as_deref(),
+            verdict,
+            "swarm_cross_check",
+            serde_json::json!({
+                "task_id": task_id,
+                "swarm_id": swarm.swarm_id,
+                "step_no": step.step_no,
+                "worker_id": step.worker_id,
+                "verdict": verdict,
+            }),
+        );
+        crate::routes_swarm::swarm_board_write(
+            state,
+            &swarm.swarm_id,
+            &step.worker_id,
+            "result",
+            &format!("cross_check:{}:{verdict}", step.step_no),
+        );
+        if verdict == "mismatch" && mismatch.is_none() {
+            mismatch = Some((step.step_no, "cross_check_mismatch".to_string()));
+        }
+    }
+    if let Some((step_no, reason)) = mismatch {
+        swarm_terminal_conflict(
+            state,
+            swarm,
+            &steps,
+            &task_id,
+            SwarmConflict {
+                execution_id: execution_id.as_deref(),
+                step_no: Some(step_no),
+                board_body: format!("cross_check_mismatch:{step_no}"),
+                observed: serde_json::json!({
+                    "task_id": task_id,
+                    "swarm_id": swarm.swarm_id,
+                    "step_no": step_no,
+                    "kind": "cross_check",
+                    "reason": reason,
+                }),
+            },
+        );
+        return;
+    }
+    // No mismatch: a failed step goes through the
+    // ORC-3 judge exactly once (Q-R5-10) — the
+    // judge hands back or fails the task; either
+    // way the swarm is done.
+    if let Some(failed) = steps.iter().find(|s| s.run_status == "failed") {
+        let plan_step = plan
+            .steps()
+            .ok()
+            .and_then(|all| all.into_iter().find(|s| s.step_no == failed.step_no));
+        let (run_status, exit_code) = failed
+            .run_id
+            .as_deref()
+            .and_then(|run_id| {
+                let sqlite = state.sqlite.as_ref()?;
+                let conn = sqlite.lock().expect("sqlite lock");
+                get_worker_run(&conn, run_id).ok().flatten()
+            })
+            .map(|row| (Some(row.status), row.exit_code))
+            .unwrap_or((None, None));
+        fail_step(
+            state,
+            &task_id,
+            plan,
+            failed.step_no,
+            plan_step
+                .as_ref()
+                .map(|s| s.kind.as_str())
+                .unwrap_or("unknown"),
+            failed.failure.as_deref().unwrap_or("步骤失败"),
+            execution_id.as_deref(),
+            failed.run_id.as_deref(),
+            run_status.as_deref(),
+            exit_code,
+        )
+        .await;
+        swarm_persist(state, &swarm.swarm_id, &steps, "failed");
+        return;
+    }
+    swarm_persist(state, &swarm.swarm_id, &steps, "merging");
+}
+
+async fn drive_swarm_merging(
+    state: &AppState,
+    swarm: &SwarmRow,
+    steps: Vec<SwarmStep>,
+    task: &TaskFileRecord,
+    plan: &PlanRow,
+) {
+    let task_id = task.task_id.clone();
+    let execution_id = execution_for_task(state, &task_id);
+    let Some(binding) = task.execute_binding.clone() else {
+        swarm_terminal_failed(
+            state,
+            swarm,
+            &steps,
+            &task_id,
+            "merge_failed:binding_missing",
+            "Swarm 合并失败：任务未绑定工作区",
+        );
+        return;
+    };
+    let Some(parent) = state
+        .worktrees
+        .lock()
+        .expect("worktree lock")
+        .get(&binding.worktree_id)
+        .cloned()
+    else {
+        swarm_terminal_failed(
+            state,
+            swarm,
+            &steps,
+            &task_id,
+            "merge_failed:parent_missing",
+            "Swarm 合并失败：主工作区记录缺失",
+        );
+        return;
+    };
+    let Some(main_root) = worktree_canonical_root(state, &parent) else {
+        swarm_terminal_failed(
+            state,
+            swarm,
+            &steps,
+            &task_id,
+            "merge_failed:parent_root_missing",
+            "Swarm 合并失败：主工作区目录缺失",
+        );
+        return;
+    };
+    if state.git_path.is_none() {
+        swarm_terminal_failed(
+            state,
+            swarm,
+            &steps,
+            &task_id,
+            "merge_failed:git_unavailable",
+            "Swarm 合并失败：git 不可用",
+        );
+        return;
+    }
+    // Merge order is the plan's own blueprint order
+    // (step_no ascending, R5-J1) — no separate
+    // Planner round for ordering.
+    let parent_branch = parent.branch_label.clone();
+    let mut merged_steps: Vec<i64> = Vec::new();
+    let mut conflict: Option<(i64, String)> = None;
+    for step in steps.iter().filter(|s| s.run_status == "succeeded") {
+        let Some(copy_root) = step
+            .worktree_id
+            .as_deref()
+            .and_then(|id| swarm_copy_root(state, id))
+        else {
+            conflict = Some((step.step_no, "copy_missing".to_string()));
+            break;
+        };
+        // The copy's full change vs the branch point:
+        // `git diff <base>` covers both committed-on-
+        // branch and uncommitted working-tree changes
+        // in one patch.
+        let base = match swarm_git(
+            state,
+            &[
+                "merge-base".to_string(),
+                "HEAD".to_string(),
+                parent_branch.clone(),
+            ],
+            &copy_root,
+        ) {
+            Some(out) if out.exit_code == Some(0) => out.stdout.trim().to_string(),
+            _ => {
+                conflict = Some((step.step_no, "merge_base_failed".to_string()));
+                break;
+            }
+        };
+        let patch = match swarm_git(state, &["diff".to_string(), base], &copy_root) {
+            Some(out) if out.exit_code == Some(0) => out.stdout,
+            _ => {
+                conflict = Some((step.step_no, "diff_failed".to_string()));
+                break;
+            }
+        };
+        if patch.is_empty() {
+            merged_steps.push(step.step_no);
+            continue;
+        }
+        // `git apply` reads the patch from a file
+        // (`run_command_sync` has no stdin): the patch
+        // goes to a temp file and is removed right
+        // after the apply, success or not.
+        let patch_path = std::env::temp_dir().join(format!(
+            "bu2agent-swarm-{}-{}.patch",
+            swarm.swarm_id, step.step_no
+        ));
+        if std::fs::write(&patch_path, &patch).is_err() {
+            conflict = Some((step.step_no, "patch_write_failed".to_string()));
+            break;
+        }
+        let applied = swarm_git(
+            state,
+            &[
+                "apply".to_string(),
+                "--".to_string(),
+                patch_path.to_string_lossy().into_owned(),
+            ],
+            &main_root,
+        );
+        let _ = std::fs::remove_file(&patch_path);
+        match applied {
+            // `git apply` is atomic: a failing hunk
+            // applies nothing, so the main worktree
+            // is untouched and the swarm can stop
+            // here, honestly, with the copies left
+            // for inspection.
+            Some(out) if out.exit_code == Some(0) => {
+                merged_steps.push(step.step_no);
+            }
+            _ => {
+                conflict = Some((step.step_no, "apply_failed".to_string()));
+                break;
+            }
+        }
+    }
+    if let Some((step_no, reason)) = conflict {
+        swarm_terminal_conflict(
+            state,
+            swarm,
+            &steps,
+            &task_id,
+            SwarmConflict {
+                execution_id: execution_id.as_deref(),
+                step_no: Some(step_no),
+                board_body: format!("merge_conflict:{step_no}"),
+                observed: serde_json::json!({
+                    "task_id": task_id,
+                    "swarm_id": swarm.swarm_id,
+                    "step_no": step_no,
+                    "kind": "merge",
+                    "reason": reason,
+                }),
+            },
+        );
+        return;
+    }
+    swarm_evidence(
+        state,
+        &swarm.swarm_id,
+        None,
+        execution_id.as_deref(),
+        "verified",
+        "swarm_merged",
+        serde_json::json!({
+            "task_id": task_id,
+            "swarm_id": swarm.swarm_id,
+            "merged_steps": merged_steps,
+        }),
+    );
+    crate::routes_swarm::swarm_board_write(state, &swarm.swarm_id, "swarm", "result", "merged");
+    // Cleanup (Q-R5-05): remove each merged copy
+    // (`git worktree remove --force` + branch delete
+    // per Q-ORC-19) and archive its Worktree record.
+    // A removal failure leaves the copy listed in
+    // `leftover_worktrees` — the merge already
+    // succeeded, so cleanup never reopens it.
+    for step in steps.iter().filter(|s| s.run_status == "succeeded") {
+        let Some(worktree_id) = step.worktree_id.clone() else {
+            continue;
+        };
+        let Some(copy_root) = swarm_copy_root(state, &worktree_id) else {
+            continue;
+        };
+        let branch = format!("swarm-{}-{}", swarm.swarm_id, step.worker_id);
+        let removed = swarm_git(
+            state,
+            &[
+                "worktree".to_string(),
+                "remove".to_string(),
+                "--force".to_string(),
+                copy_root.to_string_lossy().into_owned(),
+            ],
+            &main_root,
+        );
+        if !matches!(removed, Some(out) if out.exit_code == Some(0)) {
+            eprintln!(
+                "warning: swarm {} copy {} worktree remove failed, left listed",
+                swarm.swarm_id, worktree_id
+            );
+            continue;
+        }
+        if !matches!(
+            swarm_git(
+                state,
+                &["branch".to_string(), "-D".to_string(), branch],
+                &main_root,
+            ),
+            Some(out) if out.exit_code == Some(0)
+        ) {
+            eprintln!(
+                "warning: swarm {} branch for {} not deleted (worktree removed)",
+                swarm.swarm_id, worktree_id
+            );
+        }
+        let mut worktrees = state.worktrees.lock().expect("worktree lock");
+        if let Some(record) = worktrees.get_mut(&worktree_id) {
+            record.status = crate::worktree_store::WORKTREE_ARCHIVED.to_string();
+            record.updated_ms = now_ms();
+            let updated = record.clone();
+            persist_worktree(state, &updated);
+        }
+    }
+    if !swarm_persist(state, &swarm.swarm_id, &steps, "completed") {
+        return;
+    }
+    // The task completes here (legal
+    // `draft_ready → completed` edge), unless
+    // unfanned plan steps remain — then it walks
+    // `completed → running` and the serial runner
+    // takes the next step, exactly like
+    // `advance_executor_after_file_step` (both
+    // writes under one lock acquisition, no await
+    // between).
+    let remaining: Vec<i64> = plan
+        .steps()
+        .map(|all| {
+            all.into_iter()
+                .map(|s| s.step_no)
+                .filter(|no| !steps.iter().any(|s| s.step_no == *no))
+                .collect()
+        })
+        .unwrap_or_default();
+    let next = remaining.into_iter().min();
+    let resume = {
+        let mut tasks = state.tasks.lock().expect("task lock");
+        let Some(current) = tasks.get_mut(&task_id) else {
+            return;
+        };
+        current.status = "completed".to_string();
+        current.error = None;
+        current.executor_step_no = None;
+        let completed = current.clone();
+        persist_task(state, &completed);
+        match next {
+            Some(next_no) => {
+                current.status = "running".to_string();
+                current.executor_step_no = Some(next_no);
+                let running = current.clone();
+                persist_task(state, &running);
+                Some(next_no)
+            }
+            None => None,
+        }
+    };
+    match resume {
+        Some(next_no) => {
+            tokio::spawn(run_task(state.clone(), task_id, false, Some(next_no)));
+        }
+        None => {
+            close_execution_for_task(state, &task_id, "completed");
+        }
+    }
 }

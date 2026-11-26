@@ -127,6 +127,16 @@ pub struct WorkerRunRow {
     /// orders NULL as 0 (COALESCE).
     #[serde(default)]
     pub priority: Option<i64>,
+    /// ORC-5 (Q-R5-09): the swarm this run belongs to,
+    /// when the run is part of a fan-out. None for every
+    /// pre-ORC-5 run and for all serial runs. A run with
+    /// a swarm_id bypasses the one-run-per-Execution
+    /// guard (see `create_worker_run` in sqlite_store):
+    /// fan-out runs N steps on the same Execution in
+    /// parallel by design, and the swarm drive — not
+    /// the run finisher — owns their terminal close.
+    #[serde(default)]
+    pub swarm_id: Option<String>,
 }
 
 /// Terminal run statuses: no further driving (plan §3.2).

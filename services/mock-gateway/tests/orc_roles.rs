@@ -506,9 +506,9 @@ fn observed_of(row: &Value) -> Value {
 /// takes only the slot names.
 #[tokio::test]
 async fn r1_dual_slots_stage_fallback_restart() {
-    assert_eq!(DB_SCHEMA_VERSION, 20, "ORC-2 adds no migration");
+    assert_eq!(DB_SCHEMA_VERSION, 21, "ORC-5 bumps the schema to v21 (ORC-2 adds no migration)");
     let mut h = Harness::serve("http://127.0.0.1:1").await;
-    assert_eq!(h.schema_version(), 20);
+    assert_eq!(h.schema_version(), 21);
     // Defaults: both slots effective = the running
     // model; nothing staged.
     let (status, view) = h.get("/model").await;

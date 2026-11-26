@@ -79,6 +79,7 @@ use agent_desktop::task_client::{TaskClient, TaskExecuteBinding, TaskRecord};
 use agent_desktop::plan_client::{
     PlanClient, PlanDraftInput, PlanRecord, PlanReplanIfInput, PlanStepInput,
 };
+use agent_desktop::swarm_client::{SwarmClient, SwarmCreateInput, SwarmFanoutInput, SwarmView};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
 use agent_desktop::{ErrorCode, UnifiedError, UserAction};
 
@@ -1122,6 +1123,40 @@ pub fn plan_replan(plan_id: String, planner_model: Option<String>) -> Result<Pla
     plan_client()?
         .replan_plan(&plan_id, planner_model)
         .map_err(agent_err_string)
+}
+
+// --- Swarm (ORC-5) ---
+//
+// Three commands mirror the swarm routes (create /
+// fanout / get). The client never requests or decides
+// an approval: the step approvals are built
+// gateway-side by the sweeper drive, and the user
+// decides them through the existing approval surface.
+fn swarm_client() -> Result<SwarmClient, String> {
+    SwarmClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn swarm_create(task_id: String) -> Result<SwarmView, String> {
+    swarm_client()?
+        .swarm_create(&SwarmCreateInput { task_id })
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn swarm_fanout(
+    swarm_id: String,
+    step_nos: Vec<i64>,
+    priority: Option<i64>,
+) -> Result<SwarmView, String> {
+    swarm_client()?
+        .swarm_fanout(&swarm_id, &SwarmFanoutInput { step_nos, priority })
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn swarm_get(swarm_id: String) -> Result<SwarmView, String> {
+    swarm_client()?.swarm_get(&swarm_id).map_err(agent_err_string)
 }
 
 // --- Devices (B-layer single-device validation) ---

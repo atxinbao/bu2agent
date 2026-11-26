@@ -1775,6 +1775,9 @@ impl AppState {
                 // tool, plan §2.2).
                 start_at_ms: None,
                 priority: None,
+                // ORC-5: loop runs are never part of a
+                // swarm — only the swarm drive sets this.
+                swarm_id: None,
             };
             return match create_worker_run_internal(self, dto).await {
                 Ok(run) => ToolOutcome::success(
@@ -2669,6 +2672,17 @@ impl AppState {
     /// already claimed. A failure for one run is logged
     /// and never aborts the pass. Returns how many runs
     /// were started. SQLite mode only.
+    ///
+    /// ORC-5: the swarm drive rides the assignment
+    /// sweeper's 10 s tick (see
+    /// `spawn_assignment_sweeper`). A method so tests
+    /// can drive it directly (the `e2d_long_tasks`
+    /// precedent for `start_due_worker_runs` — the
+    /// harness serves with no sweeper).
+    pub async fn drive_ready_swarms(&self) {
+        crate::task_runner::drive_ready_swarms(self.clone()).await;
+    }
+
     pub async fn start_due_worker_runs(&self) -> usize {
         if self.sqlite_mode() != StateBackend::Sqlite || self.sqlite_is_broken() {
             return 0;
@@ -7350,6 +7364,15 @@ pub(crate) struct WorkerRunCreateDto {
     /// Not covered by the approval digest (plan §2.2).
     #[serde(default)]
     priority: Option<i64>,
+    /// ORC-5 (Q-R5-09): the swarm this run belongs to.
+    /// Set only by the swarm drive (fan-out add-runs
+    /// and step runs); the public route DTO never sets
+    /// it (a caller cannot attach an arbitrary run to a
+    /// swarm). A run carrying a swarm_id bypasses the
+    /// one-run-per-Execution guard — see
+    /// `create_worker_run` in sqlite_store.
+    #[serde(default)]
+    swarm_id: Option<String>,
 }
 
 impl WorkerRunCreateDto {
@@ -7375,7 +7398,26 @@ impl WorkerRunCreateDto {
             approval_id,
             start_at_ms: None,
             priority: None,
+            swarm_id: None,
         }
+    }
+
+    /// ORC-5: attach the run to a swarm (fan-out
+    /// add-runs and step runs only — the public route
+    /// DTO never carries a swarm_id).
+    pub(crate) fn with_swarm_id(mut self, swarm_id: String) -> Self {
+        self.swarm_id = Some(swarm_id);
+        self
+    }
+
+    /// ORC-5 (Q-R5-03): the fan-out priority, recorded
+    /// on the copy add-runs. Immediate runs are not
+    /// ordered by it (E2-D: priority orders the due
+    /// pass only); it is accepted and stored, not
+    /// silently dropped.
+    pub(crate) fn with_priority(mut self, priority: Option<i64>) -> Self {
+        self.priority = priority;
+        self
     }
 }
 
@@ -7989,7 +8031,15 @@ pub(crate) async fn create_worker_run_internal(
                     }
                 }
             }
-            let busy = {
+            // ORC-5 (Q-R5-04/Q-R5-09): a run carrying a
+            // swarm_id bypasses the one-run-per-Execution
+            // guard — fan-out runs N steps on the same
+            // Execution in parallel by design. The same
+            // bypass lives in `create_worker_run`
+            // (sqlite_store); both gates must agree.
+            let busy = if req.swarm_id.is_some() {
+                Ok(Vec::new())
+            } else {
                 let conn = sqlite.lock().expect("sqlite lock");
                 sqlite_store::list_worker_runs(&conn, Some(execution_id), None)
             };
@@ -8100,6 +8150,7 @@ pub(crate) async fn create_worker_run_internal(
         progress_json: None,
         start_at_ms: deferred_start_at,
         priority: Some(req.priority.unwrap_or(0)),
+        swarm_id: req.swarm_id.clone(),
     };
     let row = {
         let mut conn = sqlite.lock().expect("sqlite lock");
@@ -8472,6 +8523,9 @@ pub fn app(state: AppState) -> Router {
         .route("/tasks/plan/{id}/replan", post(crate::routes_tasks::tasks_plan_replan))
         .route("/tasks/plan", get(crate::routes_tasks::tasks_plan_list))
         .route("/tasks/plan/{id}", get(crate::routes_tasks::tasks_plan_get))
+        .route("/swarm/create", post(crate::routes_swarm::swarm_create))
+        .route("/swarm/{id}/fanout", post(crate::routes_swarm::swarm_fanout))
+        .route("/swarm/{id}", get(crate::routes_swarm::swarm_get))
         .route("/executions/list", get(crate::routes_ledger::executions_list))
         .route("/executions/get", get(crate::routes_ledger::executions_get))
         .route("/executions/transition", post(crate::routes_ledger::executions_transition))
@@ -8544,6 +8598,12 @@ pub fn spawn_assignment_sweeper(state: AppState) -> tokio::task::JoinHandle<()> 
             // E2-D batch 2: due deferred runs start from
             // the same tick — no second scheduler.
             state.start_due_worker_runs().await;
+            // ORC-5: the swarm drive rides the same
+            // 10 s tick, AFTER due worker runs (the
+            // drive creates step runs; the due pass
+            // must see them first) — no second
+            // scheduler.
+            crate::task_runner::drive_ready_swarms(state.clone()).await;
         }
     })
 }

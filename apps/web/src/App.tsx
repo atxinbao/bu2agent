@@ -91,6 +91,11 @@ import {
 } from "./domain/plan_client";
 import { InvokePlanClient } from "./domain/invoke_plan_client";
 import {
+  SwarmClient,
+  type SwarmGateway,
+} from "./domain/swarm_client";
+import { InvokeSwarmClient } from "./domain/invoke_swarm_client";
+import {
   DeviceClient,
   type DeviceGateway,
 } from "./domain/device_client";
@@ -200,6 +205,7 @@ interface Clients {
   connectors: ConnectorGateway;
   tasks: TaskGateway;
   plans: PlanGateway;
+  swarms: SwarmGateway;
   models: ModelGateway;
   devices: DeviceGateway;
   loops: LoopGateway;
@@ -318,6 +324,7 @@ export function App() {
           connectors: new InvokeConnectorClient(),
           tasks: new InvokeTaskClient(),
           plans: new InvokePlanClient(),
+          swarms: new InvokeSwarmClient(),
           models: new InvokeModelClient(),
           devices: new InvokeDeviceClient(),
           loops: new InvokeLoopClient(),
@@ -361,6 +368,7 @@ export function App() {
           connectors: new ConnectorClient(MOCK_BASE_URL),
           tasks: new TaskClient(MOCK_BASE_URL),
           plans: new PlanClient(MOCK_BASE_URL),
+          swarms: new SwarmClient(MOCK_BASE_URL),
           models: new ModelClient(MOCK_BASE_URL),
           devices: new DeviceClient(MOCK_BASE_URL),
           loops: new LoopClient(MOCK_BASE_URL),
@@ -666,6 +674,7 @@ export function App() {
             evidence={clients.evidence}
             assignments={clients.assignments}
             plans={clients.plans}
+            swarms={clients.swarms}
             onNavigate={(target) => setTab(target)}
           />
         ))}

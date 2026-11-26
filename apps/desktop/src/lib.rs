@@ -57,6 +57,7 @@ pub mod tools;
 pub mod transport;
 pub mod task_client;
 pub mod plan_client;
+pub mod swarm_client;
 pub mod effects_client;
 pub mod executions_client;
 pub mod engineering_client;

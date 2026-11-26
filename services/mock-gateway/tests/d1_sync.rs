@@ -339,7 +339,7 @@ async fn y1_first_sync_imports_inbox_first_50() {
     let h = Harness::serve(seed_60()).await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
     // F-1 将模式升级到 v18，新增联系人历史幂等索引；C-2 升到 v19，新增定时发送正文表；ORC-1 升到 v20，新增蓝图表。
-    assert_eq!(DB_SCHEMA_VERSION, 20);
+    assert_eq!(DB_SCHEMA_VERSION, 21);
 
     let result = h.sync_ok().await;
     assert_eq!(result["synced_count"], 50);

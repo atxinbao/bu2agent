@@ -27,6 +27,7 @@ import type {
 } from "../domain/executions_client";
 import type { InboxGateway, InboxRow } from "../domain/inbox_client";
 import type { PlanGateway } from "../domain/plan_client";
+import type { Swarm, SwarmGateway } from "../domain/swarm_client";
 import type {
   ApprovalView,
   ApprovalsGateway,
@@ -126,6 +127,11 @@ export interface WorkbenchViewProps {
   // like the other clients: without it the button
   // does not render.
   plans?: PlanGateway | null;
+  // ORC-5: the swarm client for the Swarm progress
+  // surface below the approvals list. Optional like
+  // the other clients: without it the section does
+  // not render.
+  swarms?: SwarmGateway | null;
 }
 
 export function WorkbenchView(props: WorkbenchViewProps) {
@@ -139,6 +145,7 @@ export function WorkbenchView(props: WorkbenchViewProps) {
   const evidenceClient = props.evidence ?? null;
   const assignmentsClient = props.assignments ?? null;
   const plansClient = props.plans ?? null;
+  const swarmsClient = props.swarms ?? null;
   const [items, setItems] = useState<WorkItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -386,6 +393,130 @@ export function WorkbenchView(props: WorkbenchViewProps) {
       setApprovalsError(errText(e));
     } finally {
       setEditBusy(false);
+    }
+  }
+
+  // ORC-5: one approval row (extracted so the
+  // swarm group and the rest of the list share one
+  // rendering — the grouping below is client-side,
+  // by `SwarmView.steps[].approval_id`, Q-R5-13).
+  function renderApprovalRow(row: ApprovalView) {
+    const expanded = expandedApprovalId === row.approvalId;
+    return (
+      <li key={row.approvalId}>
+        <button type="button" onClick={() => void expandApprovalRow(row)}>
+          {row.approvalId} · {row.tool} · {row.status}
+          {row.bound ? " · 已绑定" : " · 未绑定"}
+          {row.message ? ` · ${row.message}` : ""}
+          {row.version !== null ? ` · v${row.version}` : ""}
+        </button>
+        {expanded && approvalDetail && approvalDetail.approvalId === row.approvalId && (
+          <div>
+            <p>tool_call_id：{approvalDetail.toolCallId}</p>
+            <p>状态：{approvalDetail.status}</p>
+            <p>已消费：{approvalDetail.consumed ? "是" : "否"}</p>
+            <p>已绑定：{approvalDetail.bound ? "是" : "否"}</p>
+            {approvalDetail.binding && (
+              <p>
+                绑定：{approvalDetail.binding.loopId} · 调用 {approvalDetail.binding.callId}
+                {" · "}{approvalDetail.binding.tool}
+                {" · "}{approvalDetail.binding.argsSha256}
+              </p>
+            )}
+            <p>操作摘要：{approvalDetail.operationDigest ?? "—"}</p>
+            <p>Effect 绑定：{approvalDetail.effectBinding ?? "—"}</p>
+            <p>消息：{approvalDetail.message ?? "—"}</p>
+            <p>消费方 Worker 会话：{approvalDetail.consumedByWorkerSessionId ?? "—"}</p>
+            {approvalDetail.version !== null && (
+              <p>版本：v{approvalDetail.version}</p>
+            )}
+            {approvalDetail.supersedesVersion !== null && (
+              <p>取代版本：v{approvalDetail.supersedesVersion}</p>
+            )}
+            {approvalEditable && !editingApproval && (
+              <button type="button" onClick={() => setEditingApproval(true)}>
+                编辑消息
+              </button>
+            )}
+            {editingApproval && (
+              <div>
+                <input
+                  type="text"
+                  value={editDraft}
+                  onChange={(e) => setEditDraft(e.target.value)}
+                  aria-label="审批消息"
+                />{" "}
+                <button
+                  type="button"
+                  disabled={editBusy}
+                  onClick={() => void submitApprovalEdit()}
+                >
+                  保存
+                </button>{" "}
+                <button type="button" onClick={() => setEditingApproval(false)}>
+                  取消
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </li>
+    );
+  }
+
+  // ORC-5 swarm section: minimal progress surface
+  // (plan §6.3 straight out). The swarm id comes
+  // from the create/fanout response and stays in
+  // view state — there is no swarm list route, so
+  // the panel shows the swarm this view created.
+  const [swarm, setSwarm] = useState<Swarm | null>(null);
+  const [swarmTaskId, setSwarmTaskId] = useState("");
+  const [swarmStepNos, setSwarmStepNos] = useState("");
+  const [swarmError, setSwarmError] = useState("");
+  const [swarmBusy, setSwarmBusy] = useState(false);
+
+  async function createSwarm() {
+    if (!swarmsClient || !swarmTaskId.trim()) return;
+    setSwarmError("");
+    setSwarmBusy(true);
+    try {
+      setSwarm(await swarmsClient.createSwarm(swarmTaskId.trim()));
+    } catch (e) {
+      setSwarmError(errText(e));
+    } finally {
+      setSwarmBusy(false);
+    }
+  }
+
+  async function fanoutSwarm() {
+    if (!swarmsClient || !swarm) return;
+    const stepNos = swarmStepNos
+      .split(",")
+      .map((part) => Number(part.trim()))
+      .filter((n) => Number.isInteger(n) && n > 0);
+    if (stepNos.length === 0 || stepNos.length > 4) {
+      setSwarmError("步骤号用逗号分隔，1–4 个。");
+      return;
+    }
+    setSwarmError("");
+    setSwarmBusy(true);
+    try {
+      setSwarm(await swarmsClient.fanoutSwarm(swarm.swarmId, { stepNos, priority: null }));
+      await refreshApprovals();
+    } catch (e) {
+      setSwarmError(errText(e));
+    } finally {
+      setSwarmBusy(false);
+    }
+  }
+
+  async function refreshSwarm() {
+    if (!swarmsClient || !swarm) return;
+    setSwarmError("");
+    try {
+      setSwarm(await swarmsClient.swarm(swarm.swarmId));
+    } catch (e) {
+      setSwarmError(errText(e));
     }
   }
 
@@ -1105,6 +1236,17 @@ export function WorkbenchView(props: WorkbenchViewProps) {
     );
   }
 
+  // ORC-5 (Q-R5-13): the approvals list groups the
+  // loaded swarm's step approvals (client-side, by
+  // `SwarmView.steps[].approval_id`) above the rest.
+  const swarmApprovalIds = new Set(
+    (swarm?.steps ?? [])
+      .map((step) => step.approvalId)
+      .filter((id): id is string => id !== null),
+  );
+  const swarmApprovalRows = approvalRows.filter((row) => swarmApprovalIds.has(row.approvalId));
+  const otherApprovalRows = approvalRows.filter((row) => !swarmApprovalIds.has(row.approvalId));
+
   return (
     <section className="view workbench-view">
       <h2>工作台</h2>
@@ -1606,71 +1748,84 @@ export function WorkbenchView(props: WorkbenchViewProps) {
             {approvalsError && <p className="error" role="alert">{approvalsError}</p>}
             {approvalsNotice && <p className="note">{approvalsNotice}</p>}
             {approvalRows.length === 0 && <p className="empty">暂无审批。</p>}
-            <ul>
-              {approvalRows.map((row) => {
-                const expanded = expandedApprovalId === row.approvalId;
-                return (
-                  <li key={row.approvalId}>
-                    <button type="button" onClick={() => void expandApprovalRow(row)}>
-                      {row.approvalId} · {row.tool} · {row.status}
-                      {row.bound ? " · 已绑定" : " · 未绑定"}
-                      {row.message ? ` · ${row.message}` : ""}
-                      {row.version !== null ? ` · v${row.version}` : ""}
-                    </button>
-                    {expanded && approvalDetail && approvalDetail.approvalId === row.approvalId && (
-                      <div>
-                        <p>tool_call_id：{approvalDetail.toolCallId}</p>
-                        <p>状态：{approvalDetail.status}</p>
-                        <p>已消费：{approvalDetail.consumed ? "是" : "否"}</p>
-                        <p>已绑定：{approvalDetail.bound ? "是" : "否"}</p>
-                        {approvalDetail.binding && (
-                          <p>
-                            绑定：{approvalDetail.binding.loopId} · 调用 {approvalDetail.binding.callId}
-                            {" · "}{approvalDetail.binding.tool}
-                            {" · "}{approvalDetail.binding.argsSha256}
-                          </p>
-                        )}
-                        <p>操作摘要：{approvalDetail.operationDigest ?? "—"}</p>
-                        <p>Effect 绑定：{approvalDetail.effectBinding ?? "—"}</p>
-                        <p>消息：{approvalDetail.message ?? "—"}</p>
-                        <p>消费方 Worker 会话：{approvalDetail.consumedByWorkerSessionId ?? "—"}</p>
-                        {approvalDetail.version !== null && (
-                          <p>版本：v{approvalDetail.version}</p>
-                        )}
-                        {approvalDetail.supersedesVersion !== null && (
-                          <p>取代版本：v{approvalDetail.supersedesVersion}</p>
-                        )}
-                        {approvalEditable && !editingApproval && (
-                          <button type="button" onClick={() => setEditingApproval(true)}>
-                            编辑消息
-                          </button>
-                        )}
-                        {editingApproval && (
-                          <div>
-                            <input
-                              type="text"
-                              value={editDraft}
-                              onChange={(e) => setEditDraft(e.target.value)}
-                              aria-label="审批消息"
-                            />{" "}
-                            <button
-                              type="button"
-                              disabled={editBusy}
-                              onClick={() => void submitApprovalEdit()}
-                            >
-                              保存
-                            </button>{" "}
-                            <button type="button" onClick={() => setEditingApproval(false)}>
-                              取消
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
+            {swarm !== null && swarmApprovalRows.length > 0 && (
+              <>
+                <p>Swarm {swarm.swarmId} 审批组（{swarm.status}）：</p>
+                <ul>{swarmApprovalRows.map((row) => renderApprovalRow(row))}</ul>
+                <p>其他审批：</p>
+              </>
+            )}
+            <ul>{otherApprovalRows.map((row) => renderApprovalRow(row))}</ul>
+          </div>
+        )}
+      </div>
+      <div>
+        <h3>Swarm</h3>
+        {!swarmsClient && (
+          <p className="note">Swarm 客户端尚未接入：待 App 接线传入客户端后，这里可以创建 Swarm 并查看进度。</p>
+        )}
+        {swarmsClient && (
+          <div>
+            <p>
+              <input
+                type="text"
+                value={swarmTaskId}
+                onChange={(e) => setSwarmTaskId(e.target.value)}
+                aria-label="任务 ID"
+                placeholder="任务 ID，如 task-19"
+              />{" "}
+              <button type="button" disabled={swarmBusy || !swarmTaskId.trim()} onClick={() => void createSwarm()}>
+                创建 Swarm
+              </button>
+            </p>
+            {swarm && (
+              <div>
+                <p>
+                  {swarm.swarmId} · 任务 {swarm.taskId} · 蓝图 {swarm.planId} · 状态 {swarm.status}
+                </p>
+                <p>
+                  <input
+                    type="text"
+                    value={swarmStepNos}
+                    onChange={(e) => setSwarmStepNos(e.target.value)}
+                    aria-label="扇出步骤号"
+                    placeholder="步骤号，逗号分隔，如 1,2"
+                  />{" "}
+                  <button type="button" disabled={swarmBusy} onClick={() => void fanoutSwarm()}>
+                    扇出
+                  </button>{" "}
+                  <button type="button" disabled={swarmBusy} onClick={() => void refreshSwarm()}>
+                    刷新 Swarm
+                  </button>
+                </p>
+                <ul>
+                  {swarm.steps.map((step) => (
+                    <li key={step.stepNo}>
+                      步骤 {step.stepNo} · {step.workerId} · {step.runStatus}
+                      {step.worktreeId ? ` · ${step.worktreeId}` : ""}
+                      {step.runId ? ` · ${step.runId}` : ""}
+                      {step.approvalId ? ` · 审批 ${step.approvalId}（${step.approvalStatus ?? "—"}）` : ""}
+                    </li>
+                  ))}
+                </ul>
+                {swarm.messages.length > 0 && (
+                  <>
+                    <p>消息板（只存哈希，不存原文）：</p>
+                    <ul>
+                      {swarm.messages.map((message) => (
+                        <li key={message.messageId}>
+                          {message.messageId} · {message.senderWorkerId} · {message.kind} · {message.bodyHash}
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+                {swarm.leftoverWorktrees.length > 0 && (
+                  <p>残留副本：{swarm.leftoverWorktrees.join("、")}</p>
+                )}
+              </div>
+            )}
+            {swarmError && <p className="error" role="alert">{swarmError}</p>}
           </div>
         )}
       </div>

@@ -414,6 +414,18 @@ pub(crate) async fn tasks_execute(
         return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "task_status_transition_invalid" })))
             .into_response();
     }
+    // ORC-5: a task with an active swarm is driven by
+    // the swarm drive — the serial execute path would
+    // apply the serial step-1 approval over the
+    // swarm's steps. `run_task` has the same guard as
+    // a backstop.
+    if let Some(sqlite) = &state.sqlite {
+        let conn = sqlite.lock().expect("sqlite lock");
+        if let Ok(Some(_)) = crate::swarm_store::active_swarm_for_task(&conn, &req.task_id) {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "swarm_active" })))
+                .into_response();
+        }
+    }
     // E2 slice, scheme A (P3-C plan §2.3): the binding
     // freeze, shared with `tasks_run` (J10) — see
     // `freeze_execute_binding` below.

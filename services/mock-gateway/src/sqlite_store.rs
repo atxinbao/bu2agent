@@ -64,11 +64,14 @@ use crate::execution_store::ExecutionFileRecord;
 /// v18 adds the MCL-5 `contact_idempotency` table (see
 /// SCHEMA_V18); v19 adds the D1-3 C-2
 /// `scheduled_imessage_sends` table (see SCHEMA_V19);
-/// v20 adds the ORC-1 `plans` table (see SCHEMA_V20).
+/// v20 adds the ORC-1 `plans` table (see SCHEMA_V20);
+/// v21 adds the ORC-5 `swarms` + `swarm_messages`
+/// tables (see SCHEMA_V21).
 // v18 新增 contacts 历史写入幂等索引。
 // v19 新增 D1-3 C-2 定时发送正文表（Q-C2-01）。
 // v20 新增 ORC-1 蓝图表（Q-ORC-03）。
-pub const DB_SCHEMA_VERSION: i64 = 20;
+// v21 新增 ORC-5 Swarm 表（Q-R5-01）。
+pub const DB_SCHEMA_VERSION: i64 = 21;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -354,6 +357,7 @@ CREATE TABLE IF NOT EXISTS worker_runs (
     progress_json TEXT,
     start_at_ms INTEGER,
     priority INTEGER,
+    swarm_id TEXT,
     binding_location_id TEXT,
     binding_worktree_id TEXT,
     binding_root_digest TEXT,
@@ -364,6 +368,7 @@ CREATE TABLE IF NOT EXISTS worker_runs (
 CREATE INDEX IF NOT EXISTS idx_worker_runs_execution ON worker_runs(execution_id);
 CREATE INDEX IF NOT EXISTS idx_worker_runs_status ON worker_runs(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_runs_approval ON worker_runs(approval_id);
+CREATE INDEX IF NOT EXISTS idx_worker_runs_swarm ON worker_runs(swarm_id);
 ";
 
 /// D1-1 v5 migration: the `goals` table only, plus the
@@ -755,6 +760,46 @@ CREATE TABLE IF NOT EXISTS plans (
 );
 ";
 
+/// ORC-5 v21 step: `swarms` + `swarm_messages`
+/// (Q-R5-01/02). `swarms` is the fan-out object itself
+/// (one row per `POST /swarm/create`): the task + plan
+/// it belongs to, its status word, and the
+/// steps-to-runs mapping as canonical JSON
+/// (`steps_json`: step_no / worker_id / worktree_id /
+/// add_run_id / run_id / approval_id / approval_kind /
+/// run_status / effect_id / content_base64 /
+/// content_sha256). `swarm_messages` is the message
+/// board (Q-ORC-17): `body_hash` only — the board
+/// text is NEVER stored (red line 7), and board rows
+/// never enter the events table (the board is
+/// coordination state, not an audit log). Both tables
+/// start empty; rows arrive only from the swarm
+/// routes and the sweeper drive. Neither table has a
+/// JSONL export (the `plans` precedent — SQLite-only,
+/// no `*.jsonl` file).
+const SCHEMA_V21: &str = "
+CREATE TABLE IF NOT EXISTS swarms (
+    swarm_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    steps_json TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS swarm_messages (
+    message_id TEXT PRIMARY KEY,
+    swarm_id TEXT NOT NULL,
+    sender_worker_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    body_hash TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    origin_device_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_swarm_messages_swarm ON swarm_messages (swarm_id, created_ms);
+";
+
 /// MCL-4 v17 step: `sent_imessages` fact table.
 /// `sent_id` is the local `sent-imsg-N` id
 /// (max-suffix + 1 in the record transaction — the
@@ -1124,6 +1169,19 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         )
         .map_err(err)?;
     }
+    // ORC-5 v21 step: swarms + swarm_messages tables
+    // only. One transaction, v5–v20 style; both tables
+    // start empty — rows arrive only from POST
+    // /swarm/create and the sweeper drive.
+    if version < 21 {
+        tx.execute_batch(SCHEMA_V21).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '21')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
     // P0-E additive column: databases migrated by P0-D have no
     // worker_sessions.detail, but the approved plan's recovery
     // scan records its note ("process ended" / "clean shutdown")
@@ -1169,6 +1227,18 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
     // priority NULL orders as 0 (COALESCE at fetch).
     backfill_column_typed(&tx, "worker_runs", "start_at_ms", "INTEGER")?;
     backfill_column_typed(&tx, "worker_runs", "priority", "INTEGER")?;
+    // ORC-5 additive column: databases created before
+    // ORC-5 have no worker_runs.swarm_id. Nullable TEXT
+    // backfill (a swarm id is a string, so TEXT storage
+    // is correct by construction — the MCL-5 precedent),
+    // idempotent, schema version stays 20 (column
+    // backfill, not a v22 migration — the E2-D
+    // progress_json precedent). Old rows read NULL (no
+    // swarm); the row reader treats NULL as absent. The
+    // plain index is the swarm-progress lookup key
+    // (`GET /swarm/{id}` aggregates runs by swarm).
+    backfill_column(&tx, "worker_runs", "swarm_id")?;
+    ensure_index(&tx, "worker_runs", "idx_worker_runs_swarm", "swarm_id")?;
     // D1-3 C-1 additive column: databases created before
     // C-1 have no outbox.deliver_at_ms. Nullable, idempotent,
     // schema version stays 13 (column backfill, not a v14
@@ -1315,6 +1385,35 @@ fn ensure_unique_index(
     }
     tx.execute(
         &format!("CREATE UNIQUE INDEX IF NOT EXISTS {index} ON {table}({column})"),
+        [],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// Create a plain (non-unique) index when the table
+/// exists and the index is missing. Idempotent; a
+/// missing table is a no-op (same partial-fixture rule
+/// as `ensure_unique_index`).
+fn ensure_index(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    index: &str,
+    column: &str,
+) -> Result<(), String> {
+    let table_exists: bool = tx
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(err)
+        .map(|count| count > 0)?;
+    if !table_exists {
+        return Ok(());
+    }
+    tx.execute(
+        &format!("CREATE INDEX IF NOT EXISTS {index} ON {table}({column})"),
         [],
     )
     .map_err(err)?;
@@ -6591,7 +6690,7 @@ fn transition_execution_with_event(
 
 pub use crate::worker::WorkerRunRow;
 
-const WORKER_RUN_COLS: &str = "run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, approval_id, progress_json, start_at_ms, priority";
+const WORKER_RUN_COLS: &str = "run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, approval_id, progress_json, start_at_ms, priority, swarm_id";
 
 // E2-D 批 2 的新增列是回填列。早期数据库的通用回填器把
 // 它们建成 TEXT，而新库的基表定义是 INTEGER；读取时必须兼容
@@ -6639,7 +6738,32 @@ fn worker_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRunRow
         progress_json: row.get(21)?,
         start_at_ms: optional_i64_compat(row, 22)?,
         priority: optional_i64_compat(row, 23)?,
+        // ORC-5 (Q-R5-09): NULL on pre-ORC-5 rows (the
+        // backfill adds the column; the reader treats
+        // NULL as absent, not as a zero-length id).
+        swarm_id: row.get(24)?,
     })
+}
+
+/// Read worker runs by their swarm. The swarm drive
+/// aggregates run terminals per swarm; the swarm view
+/// shows each step's run status. Empty (not an error)
+/// when the swarm has no runs yet.
+pub fn list_worker_runs_by_swarm(
+    conn: &Connection,
+    swarm_id: &str,
+) -> Result<Vec<WorkerRunRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {WORKER_RUN_COLS} FROM worker_runs WHERE swarm_id = ?1 ORDER BY run_id ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![swarm_id], worker_run_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
 }
 
 /// Create a run row, one transaction: a second running run
@@ -6653,16 +6777,30 @@ pub fn create_worker_run(
     row: &WorkerRunRow,
 ) -> Result<WorkerRunRow, String> {
     let tx = conn.transaction().map_err(err)?;
-    if let Some(execution_id) = &row.execution_id {
-        let running: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM worker_runs WHERE execution_id = ?1 AND status IN ('queued', 'running')",
-                params![execution_id],
-                |r| r.get(0),
-            )
-            .map_err(err)?;
-        if running > 0 {
-            return Err("execution_has_running_worker".to_string());
+    // P3-C run-creation failure (D2): a run on an
+    // Execution that already has a queued or running
+    // run is an error — UNLESS the run carries a
+    // swarm_id. ORC-5 fan-out runs N parallel worker
+    // steps on the SAME Execution by design (Q-R5-04,
+    // one approval per step, sweeper builds N runs):
+    // the swarm's runs are the only runs that bypass
+    // this guard, and the swarm drive owns their
+    // terminal close (the task stays draft_ready with
+    // executor_step_no set, so the run finisher's
+    // executor_step_run check skips the Execution
+    // close for swarm runs).
+    if row.swarm_id.is_none() {
+        if let Some(execution_id) = &row.execution_id {
+            let running: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM worker_runs WHERE execution_id = ?1 AND status IN ('queued', 'running')",
+                    params![execution_id],
+                    |r| r.get(0),
+                )
+                .map_err(err)?;
+            if running > 0 {
+                return Err("execution_has_running_worker".to_string());
+            }
         }
     }
     // P3-C: a presented approval authorizes at most one run.
@@ -6686,9 +6824,9 @@ pub fn create_worker_run(
     let seq = tx_seq(&tx, "worker_runs", &inserted.run_id)?;
     let now = now_ms() as i64;
     tx.execute(
-        "INSERT INTO worker_runs (seq, run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, created_ms, updated_at_ms, approval_id, progress_json, start_at_ms, priority)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22, ?23, ?24, ?25, ?26)",
-        params![seq, inserted.run_id, inserted.execution_id, inserted.assignment_id, inserted.worker_session_id, inserted.command, inserted.argv_json, inserted.cwd, inserted.timeout_ms, inserted.status, inserted.exit_code, inserted.pid, inserted.started_ms, inserted.finished_ms, inserted.tail, inserted.truncated as i64, inserted.effect_id, inserted.binding_location_id, inserted.binding_worktree_id, inserted.binding_root_digest, inserted.schema_version, now, inserted.approval_id, inserted.progress_json, inserted.start_at_ms, inserted.priority],
+        "INSERT INTO worker_runs (seq, run_id, execution_id, assignment_id, worker_session_id, command, argv_json, cwd, timeout_ms, status, exit_code, pid, started_ms, finished_ms, tail, truncated, effect_id, binding_location_id, binding_worktree_id, binding_root_digest, schema_version, created_ms, updated_at_ms, approval_id, progress_json, start_at_ms, priority, swarm_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22, ?23, ?24, ?25, ?26, ?27)",
+        params![seq, inserted.run_id, inserted.execution_id, inserted.assignment_id, inserted.worker_session_id, inserted.command, inserted.argv_json, inserted.cwd, inserted.timeout_ms, inserted.status, inserted.exit_code, inserted.pid, inserted.started_ms, inserted.finished_ms, inserted.tail, inserted.truncated as i64, inserted.effect_id, inserted.binding_location_id, inserted.binding_worktree_id, inserted.binding_root_digest, inserted.schema_version, now, inserted.approval_id, inserted.progress_json, inserted.start_at_ms, inserted.priority, inserted.swarm_id],
     )
     .map_err(err)?;
     // E2-A §2.7: write the consuming worker session back onto
@@ -7096,6 +7234,10 @@ mod tests {
         // Build the legacy column typing by hand: running
         // apply_migrations would create INTEGER columns and
         // TEXT-looking inserts would be converted on storage.
+        // ORC-5: the fixture also carries swarm_id TEXT —
+        // the migration backfills it onto pre-ORC-5
+        // databases, and the reader selects it for
+        // every row.
         let conn = Connection::open_in_memory().expect("open sqlite");
         conn.execute_batch(
             "CREATE TABLE worker_runs (
@@ -7120,6 +7262,7 @@ mod tests {
                 progress_json TEXT,
                 start_at_ms TEXT,
                 priority TEXT,
+                swarm_id TEXT,
                 binding_location_id TEXT,
                 binding_worktree_id TEXT,
                 binding_root_digest TEXT,
