@@ -2144,6 +2144,30 @@ async fn execute_current_worker_step(state: AppState, record: TaskFileRecord) {
         .remove(&(task_id, step_no));
 }
 
+/// R5-F2 (Q-R5F2-03): only a `budget_exceeded` tail is
+/// safe to surface — it is a fixed system string, never
+/// command output. Any other tail stays in the run row
+/// only (`GET /worker/runs/{id}`), out of the task error
+/// and the Evidence row.
+pub(crate) fn disclosable_failure_tail(tail: &str) -> Option<&str> {
+    if tail.starts_with("budget_exceeded") {
+        Some(tail)
+    } else {
+        None
+    }
+}
+
+/// R5-F2 (Q-R5F2-03): the step-failure task error. When
+/// the failed run was refused by the Execution deadline,
+/// the cause goes into the error verbatim; otherwise the
+/// error keeps the old status-only shape.
+pub(crate) fn step_run_failed_error(step_no: i64, status: &str, tail: &str) -> String {
+    match disclosable_failure_tail(tail) {
+        Some(tail) => format!("步骤 {step_no} 的 worker run 失败：{status}（{tail}）"),
+        None => format!("步骤 {step_no} 的 worker run 失败：{status}"),
+    }
+}
+
 /// ORC-2 (J11): run one worker step to its terminal
 /// status, then advance or fail. The worker run is
 /// created through the internal `/worker/runs`
@@ -2279,7 +2303,7 @@ async fn execute_worker_step_inner(state: AppState, record: &TaskFileRecord, ste
     // indefinite hang.
     let run_id = run.run_id.clone();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    let (status, exit_code, effect_id) = loop {
+    let (status, exit_code, effect_id, tail) = loop {
         if std::time::Instant::now() > deadline {
             fail_step(
                 &state,
@@ -2321,6 +2345,7 @@ async fn execute_worker_step_inner(state: AppState, record: &TaskFileRecord, ste
                         run_row.status.clone(),
                         run_row.exit_code,
                         run_row.effect_id.clone(),
+                        run_row.tail.clone(),
                     );
                 }
             }
@@ -2407,6 +2432,23 @@ async fn execute_worker_step_inner(state: AppState, record: &TaskFileRecord, ste
                 crate::server::close_execution_no_inbox(&state, execution_id, "failed");
             }
         }
+        // R5-F2 (Q-R5F2-03): the deadline-refusal cause is
+        // a fixed system string, so it goes into the
+        // Evidence row too, under the same prefix gate as
+        // the task error. Any other tail stays out.
+        let mut observed = serde_json::json!({
+            "task_id": task_id,
+            "plan_id": plan.plan_id,
+            "step_no": step_no,
+            "step_kind": step.kind,
+            "failure": "worker_run_failed",
+            "run_id": run_id,
+            "run_status": status,
+            "exit_code": exit_code,
+        });
+        if let Some(failure_tail) = disclosable_failure_tail(&tail) {
+            observed["failure_tail"] = serde_json::json!(failure_tail);
+        }
         record_orc_evidence(
             &state,
             effect_id
@@ -2416,21 +2458,12 @@ async fn execute_worker_step_inner(state: AppState, record: &TaskFileRecord, ste
             "executor",
             "verified",
             "step_failed",
-            serde_json::json!({
-                "task_id": task_id,
-                "plan_id": plan.plan_id,
-                "step_no": step_no,
-                "step_kind": step.kind,
-                "failure": "worker_run_failed",
-                "run_id": run_id,
-                "run_status": status,
-                "exit_code": exit_code,
-            }),
+            observed,
         );
         fail(
             &state,
             &task_id,
-            &format!("步骤 {step_no} 的 worker run 失败：{status}"),
+            &step_run_failed_error(step_no, &status, &tail),
         );
         return;
     }
@@ -3848,5 +3881,44 @@ async fn drive_swarm_merging(
         None => {
             close_execution_for_task(state, &task_id, "completed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn step_run_failed_error_carries_budget_exceeded_tail() {
+        assert_eq!(
+            step_run_failed_error(
+                5,
+                "failed",
+                "budget_exceeded: execution deadline passed before start"
+            ),
+            "步骤 5 的 worker run 失败：failed（budget_exceeded: execution deadline passed before start）"
+        );
+    }
+
+    #[test]
+    fn step_run_failed_error_keeps_other_tails_out() {
+        assert_eq!(
+            step_run_failed_error(2, "failed", "error: package `does-not-exist` not found"),
+            "步骤 2 的 worker run 失败：failed"
+        );
+        assert_eq!(
+            step_run_failed_error(2, "failed", ""),
+            "步骤 2 的 worker run 失败：failed"
+        );
+    }
+
+    #[test]
+    fn disclosable_failure_tail_only_matches_the_prefix() {
+        assert_eq!(
+            disclosable_failure_tail("budget_exceeded: execution deadline passed before start"),
+            Some("budget_exceeded: execution deadline passed before start")
+        );
+        assert_eq!(disclosable_failure_tail("error: boom"), None);
+        assert_eq!(disclosable_failure_tail(""), None);
     }
 }

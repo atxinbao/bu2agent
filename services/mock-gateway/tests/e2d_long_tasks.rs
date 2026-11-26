@@ -959,6 +959,158 @@ async fn e2d_deferred_start_runs_after_due() {
     assert!(repo.join("scratch").join("w1").join(".git").exists());
 }
 
+/// R5-F2 (Q-R5F2-01(a)): a later run extends the
+/// Execution deadline to its own start + timeout — the
+/// deadline is the latest run's, not the earliest.
+/// Repro of the ORC-5 window W4b-5 failure: the swarm's
+/// 60 s add-runs anchored the shared Execution deadline
+/// via min(), and the serial continuation minutes later
+/// was refused before it started. Here the first run's
+/// 50 ms timeout expires, the second run is created on
+/// the same Execution afterwards, and it must start: its
+/// creation extends the deadline (max). Under the old
+/// min rule the stored deadline stays in the past and
+/// the second run is refused with `budget_exceeded`.
+#[tokio::test]
+async fn r5f2_later_run_extends_execution_deadline() {
+    let dir = temp_dir("r5f2-t1");
+    let repo = init_repo_with_cargo_packages(&dir);
+    let h = Harness::serve(vec![], Some(real_git()), Some(real_cargo())).await;
+    let worktree = h.setup_worktree(&repo).await;
+    // First run: a cargo test with a 50 ms timeout, only
+    // to write the deadline. Cargo startup alone exceeds
+    // 50 ms, so the run times out — and a timeout leaves
+    // the Execution in `needs_review` (non-terminal), so
+    // the per-Execution creation gate still lets the
+    // second run in (a succeeded run would close the
+    // Execution to `completed` and the creation would
+    // 409 `execution_terminal` instead).
+    let approval = h
+        .approve_worker_run(
+            &worktree,
+            "cargo-test",
+            json!({"package": "testpkg-pass"}),
+            Some(50),
+        )
+        .await;
+    let (status, run) = h
+        .create_run(json!({
+            "worktree_id": worktree,
+            "command": "cargo-test",
+            "params": {"package": "testpkg-pass"},
+            "timeout_ms": 50,
+            "approval_id": approval,
+        }))
+        .await;
+    assert_eq!(status, 201, "{run}");
+    let first = run["run_id"].as_str().unwrap().to_string();
+    let execution_id = run["execution_id"].as_str().unwrap().to_string();
+    let first_row = h.wait_run(&first, 30).await;
+    assert_eq!(first_row["status"], "timeout", "{first_row}");
+    let d1 = h
+        .execution_deadline(&execution_id)
+        .expect("deadline after first run");
+    // Past the first run's deadline (creation + 50 ms).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(now_ms() > d1, "test waited past the first deadline");
+    // Second run on the same Execution, default 30 s
+    // timeout: its creation must extend the deadline.
+    let (status, run) = h
+        .create_run(json!({
+            "worktree_id": worktree,
+            "command": "git-status",
+            "params": {},
+            "execution_id": execution_id,
+        }))
+        .await;
+    assert_eq!(status, 201, "{run}");
+    let second = run["run_id"].as_str().unwrap().to_string();
+    let d2 = h
+        .execution_deadline(&execution_id)
+        .expect("deadline after second run");
+    assert!(
+        d2 > d1 + 1000,
+        "later run extends the deadline: d1={d1} d2={d2}"
+    );
+    // And the second run actually starts (under min it
+    // would be refused before it starts).
+    let second_row = h.wait_run(&second, 30).await;
+    assert_eq!(second_row["status"], "succeeded", "{second_row}");
+}
+
+/// R5-F2 (Q-R5F2-03): the driver still refuses a run
+/// whose deadline passed before it starts, and the tail
+/// names the refusal exactly — that fixed string is what
+/// the task error gates on. The refusal is forced here
+/// by moving the stored deadline into the past (the
+/// creation path re-anchors it, so it cannot be forced
+/// through the API after the fix).
+#[tokio::test]
+async fn r5f2_deadline_refusal_tail() {
+    let dir = temp_dir("r5f2-t3d");
+    let repo = init_repo(&dir);
+    let h = Harness::serve(vec![], Some(real_git()), Some(real_cargo())).await;
+    let worktree = h.setup_worktree(&repo).await;
+    let start_at = now_ms() + 3_600_000;
+    let (status, run) = h
+        .create_run(json!({
+            "worktree_id": worktree,
+            "command": "git-status",
+            "params": {},
+            "timeout_ms": 30_000,
+            "start_at_ms": start_at,
+        }))
+        .await;
+    assert_eq!(status, 201, "{run}");
+    let run_id = run["run_id"].as_str().unwrap().to_string();
+    let execution_id = run["execution_id"].as_str().unwrap().to_string();
+    assert_eq!(run["status"], "queued", "{run}");
+    // Move the stored deadline into the past, then make
+    // the run due: the sweeper starts it, the driver
+    // refuses before it spawns.
+    {
+        let conn = h.db();
+        let changed = conn
+            .execute(
+                "UPDATE executions SET deadline_ms = ?1 WHERE execution_id = ?2",
+                rusqlite::params![now_ms() - 1000, execution_id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    h.simulate_due(&run_id);
+    let sweeper = mock_gateway::server::spawn_assignment_sweeper(h.state.clone());
+    let row = h.wait_run(&run_id, 30).await;
+    sweeper.abort();
+    assert_eq!(row["status"], "failed", "{row}");
+    let tail = {
+        let conn = h.db();
+        conn.query_row(
+            "SELECT tail FROM worker_runs WHERE run_id = ?1",
+            rusqlite::params![run_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        tail,
+        "budget_exceeded: execution deadline passed before start"
+    );
+    // The refusal fails the Execution and opens its
+    // failed Inbox row (Q-R5F2-04: kept).
+    let exec_status = {
+        let conn = h.db();
+        conn.query_row(
+            "SELECT status FROM executions WHERE execution_id = ?1",
+            rusqlite::params![execution_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(exec_status, "failed");
+    assert_eq!(h.open_inbox("failed").await.len(), 1);
+}
+
 /// D2 (batch 2, plan §7): due runs start in
 /// (priority DESC, seq ASC) order. Three deferred runs,
 /// different Executions (the per-Execution gate would

@@ -8103,8 +8103,10 @@ pub(crate) async fn create_worker_run_internal(
     // START, not at creation — a deferred run's budget
     // starts when it starts, so a run deferred an hour
     // cannot expire before it runs. `set_execution_deadline`
-    // still takes the min, so a later run never extends an
-    // Execution's budget.
+    // takes the max, so each run's budget is independent
+    // and a run deferred an hour cannot expire before it
+    // runs — nor can a later run be refused by an earlier
+    // run's short timeout (R5-F2, Q-R5F2-01(a)).
     let now = crate::effect_store::now_ms() as i64;
     let deferred_start_at = req.start_at_ms.filter(|&at| at > now);
     {

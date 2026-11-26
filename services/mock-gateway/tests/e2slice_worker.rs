@@ -733,13 +733,13 @@ async fn e2slice_c20_restart_orphans_running_run_and_keeps_counter_and_deadline(
 }
 
 #[tokio::test]
-async fn e2slice_c20_expired_deadline_refuses_new_run() {
+async fn e2slice_c20_expired_deadline_new_run_reanchors() {
     let dir = temp_dir("c20-deadline");
     let repo = init_repo(&dir);
     // E2-A §2.3: a run that succeeds closes its Execution, so
     // the old setup (run-1 succeeds, then a second run on the
     // same Execution) now 409s `execution_terminal` at create
-    // time. The deadline-refusal path instead needs a
+    // time. The deadline path instead needs a
     // NON-terminal Execution: run-1 times out, which leaves
     // its Execution at `needs_review` (recoverable, per the
     // §2.3 timeout mapping) — the exact recovery shape the
@@ -761,8 +761,13 @@ async fn e2slice_c20_expired_deadline_refuses_new_run() {
     );
     // Move the deadline into the past (test seam: direct
     // SQLite write; production sets it only at run
-    // creation). A new run must refuse to start and fail
-    // the Execution with budget_exceeded.
+    // creation). R5-F2 (Q-R5F2-01(a)): the deadline takes
+    // the max, so creating a new run re-anchors it to
+    // that run's own start + timeout — the run starts
+    // instead of being refused. (The refusal itself is
+    // still covered by r5f2_deadline_refusal_tail: a
+    // deferred run whose deadline passes before its due
+    // start is refused with budget_exceeded.)
     {
         let mut conn = db(&dir);
         let past = sqlite_store::now_ms() as i64 - 1000;
@@ -774,13 +779,26 @@ async fn e2slice_c20_expired_deadline_refuses_new_run() {
         )
         .await;
     assert_eq!(status, 201, "{run}");
-    let row = h.wait_run("run-2", 15).await;
-    assert_eq!(row["status"], "failed", "{row}");
-    assert!(row["tail"].as_str().unwrap().contains("budget_exceeded"));
+    // The new run starts (not refused) and its creation
+    // moved the deadline back into the future.
+    let row = h.wait_run_status("run-2", "running", 10).await;
+    assert_eq!(row["status"], "running", "{row}");
+    let deadline = sqlite_store::get_execution_deadline(&db(&dir), &execution_id)
+        .expect("deadline reread")
+        .expect("deadline kept");
+    assert!(
+        deadline > sqlite_store::now_ms() as i64,
+        "new run re-anchored the deadline: {deadline}"
+    );
+    // Run-2 executes the fake git (sleep 60); cancel it so
+    // no sleeper survives the test.
+    h.post("/worker/runs/run-2/cancel", json!({})).await;
+    let row = h.wait_run("run-2", 20).await;
+    assert_eq!(row["status"], "cancelled", "{row}");
     let execution = h
         .ok_get(&format!("/executions/get?execution_id={execution_id}"))
         .await;
-    assert_eq!(execution["status"], "failed");
+    assert_eq!(execution["status"], "cancelled");
 }
 
 // --- git unavailable ---

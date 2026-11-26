@@ -7083,9 +7083,11 @@ pub fn update_worker_progress(
 }
 
 /// Execution deadline (plan §2.4): NULL means no
-/// deadline. `set` keeps the earlier of the stored value
-/// and the new one — a later run must never extend an
-/// Execution's budget.
+/// deadline. `set` keeps the later of the stored value
+/// and the new one — a later run extends the Execution's
+/// deadline to its own start + timeout; each run's budget
+/// is independent, and the Execution deadline is the
+/// latest run's deadline (R5-F2, Q-R5F2-01(a)).
 pub fn get_execution_deadline(
     conn: &Connection,
     execution_id: &str,
@@ -7106,7 +7108,7 @@ pub fn set_execution_deadline(
     deadline_ms: i64,
 ) -> Result<(), String> {
     conn.execute(
-        "UPDATE executions SET deadline_ms = min(COALESCE(deadline_ms, ?1), ?1) WHERE execution_id = ?2",
+        "UPDATE executions SET deadline_ms = max(COALESCE(deadline_ms, ?1), ?1) WHERE execution_id = ?2",
         params![deadline_ms, execution_id],
     )
     .map_err(err)?;
@@ -8222,6 +8224,37 @@ mod tests {
                 "body_hash": "abc",
                 "message_id": "mail-1",
             }))
+        );
+    }
+
+    #[test]
+    fn r5f2_execution_deadline_takes_the_later_write() {
+        let path = temp_db("deadline-max");
+        let mut conn = open_db(&path).expect("open");
+        upsert_execution(&mut conn, &execution("execution-1", "running")).expect("exec");
+        // No deadline yet.
+        assert_eq!(
+            get_execution_deadline(&conn, "execution-1").expect("read"),
+            None
+        );
+        // First run anchors at its start + timeout.
+        set_execution_deadline(&mut conn, "execution-1", 1_000).expect("first");
+        assert_eq!(
+            get_execution_deadline(&conn, "execution-1").expect("read"),
+            Some(1_000)
+        );
+        // A later run extends the deadline to its own
+        // start + timeout (R5-F2: max, not min).
+        set_execution_deadline(&mut conn, "execution-1", 2_000).expect("second");
+        assert_eq!(
+            get_execution_deadline(&conn, "execution-1").expect("read"),
+            Some(2_000)
+        );
+        // An earlier write after that does not move it back.
+        set_execution_deadline(&mut conn, "execution-1", 1_500).expect("third");
+        assert_eq!(
+            get_execution_deadline(&conn, "execution-1").expect("read"),
+            Some(2_000)
         );
     }
 }

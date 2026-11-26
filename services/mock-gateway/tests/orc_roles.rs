@@ -450,6 +450,41 @@ fn init_repo(dir: &Path) -> PathBuf {
     repo
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_millis() as i64
+}
+
+/// A real git repo that is also a Cargo workspace with one
+/// tiny package whose single test sleeps: the cargo-test
+/// run stays `running` for seconds, so the test can
+/// intervene on its row while it runs.
+fn init_repo_with_slow_cargo_package(dir: &Path) -> PathBuf {
+    let repo = init_repo(dir);
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"testpkg-pass\"]\n",
+    )
+    .unwrap();
+    let pkg = repo.join("testpkg-pass");
+    std::fs::create_dir_all(pkg.join("src")).unwrap();
+    std::fs::write(
+        pkg.join("Cargo.toml"),
+        "[package]\nname = \"testpkg-pass\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join("src").join("lib.rs"),
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn passes() {\n        std::thread::sleep(std::time::Duration::from_secs(5));\n        assert_eq!(1 + 1, 2);\n    }\n}\n",
+    )
+    .unwrap();
+    git(&["add", "-A"], &repo);
+    git(&["commit", "-m", "add cargo package"], &repo);
+    repo
+}
+
 fn planner_triage_reply(answer: &str) -> String {
     serde_json::to_string(&json!({
         "needs_file_change": false,
@@ -923,4 +958,167 @@ async fn r7_worker_step_with_binding_succeeds() {
         evidence.iter().all(|e| e["reason"] != "step_failed"),
         "no step failure: {evidence:?}"
     );
+}
+
+/// R5-F2 (Q-R5F2-03): when a worker step's run fails
+/// with a `budget_exceeded` tail, the task error carries
+/// the cause verbatim and the `step_failed` Evidence row
+/// carries `failure_tail`. The refusal itself cannot be
+/// produced through the task path after the fix (a new
+/// run's creation re-anchors the deadline), so the test
+/// fails the run row the way the driver would on a
+/// refusal — while cargo is still running, so the
+/// driver's own finish cannot land first.
+#[tokio::test]
+async fn r5f2_step_failure_budget_exceeded_tail_surfaces() {
+    let (fake_url, _fake) = start_fake_deepseek(vec![planner_steps_reply(vec![
+        verify_step(1, "cargo test -p testpkg-pass"),
+    ])])
+    .await;
+    let h = Harness::serve(&fake_url).await;
+    let repo = init_repo_with_slow_cargo_package(&h.dir);
+    let worktree_id = h.setup_worktree(&repo).await;
+    let task_id = h.make_task().await;
+    let (status, value) = h
+        .post("/tasks/run", json!({"task_id": task_id, "worktree_id": worktree_id}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "run: {value}");
+    let record = h.wait_task_status(&task_id, "draft_ready", 30).await;
+    assert_eq!(record["executor_step_no"], 1);
+    assert!(record["approval_id"].is_string(), "step has an approval");
+    h.approve_current(&task_id).await;
+    let (status, value) = h.post("/tasks/execute", json!({"task_id": task_id})).await;
+    assert_eq!(status, StatusCode::OK, "execute: {value}");
+    // Fail the step's run the way the driver would on a
+    // deadline refusal, while cargo is still running.
+    let execution_id = h
+        .executions_for_task(&task_id)
+        .into_iter()
+        .next()
+        .expect("task execution");
+    let run_id = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let found = {
+                let conn = h.db();
+                conn.query_row(
+                    "SELECT run_id, status FROM worker_runs WHERE execution_id = ?1 ORDER BY seq DESC LIMIT 1",
+                    [&execution_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .ok()
+            };
+            if let Some((run_id, status)) = found {
+                if status == "queued" || status == "running" {
+                    break run_id;
+                }
+                panic!("step run went terminal before the flip: {run_id} {status}");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "step run never appeared"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    {
+        let conn = h.db();
+        let changed = conn
+            .execute(
+                "UPDATE worker_runs SET status = 'failed', tail = ?1, exit_code = NULL, finished_ms = ?2 WHERE run_id = ?3 AND status IN ('queued', 'running')",
+                rusqlite::params![
+                    "budget_exceeded: execution deadline passed before start",
+                    now_ms(),
+                    run_id
+                ],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "flip landed while the run was still active");
+    }
+    let record = h.wait_task_status(&task_id, "failed", 90).await;
+    let error = record["error"].as_str().unwrap_or("");
+    assert_eq!(
+        error,
+        "步骤 1 的 worker run 失败：failed（budget_exceeded: execution deadline passed before start）",
+        "task error carries the refusal cause: {record}"
+    );
+    let evidence = h.evidence().await;
+    let failed: Vec<&Value> = evidence
+        .iter()
+        .filter(|e| e["reason"] == "step_failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "evidence: {evidence:?}");
+    let observed = observed_of(failed[0]);
+    assert_eq!(observed["step_no"], 1);
+    assert_eq!(observed["failure"], "worker_run_failed");
+    assert_eq!(observed["run_status"], "failed");
+    assert_eq!(observed["run_id"], run_id);
+    assert_eq!(
+        observed["failure_tail"],
+        "budget_exceeded: execution deadline passed before start"
+    );
+    // Cargo-test steps close with no Inbox row (R3-J18b).
+    assert!(h.open_inbox("failed").await.is_empty());
+}
+
+/// R5-F2 (Q-R5F2-03): any other tail stays out of the
+/// task error and out of the Evidence row. The run here
+/// fails naturally (no such package) with a cargo
+/// stderr tail.
+#[tokio::test]
+async fn r5f2_step_failure_other_tail_stays_out() {
+    let (fake_url, _fake) = start_fake_deepseek(vec![planner_steps_reply(vec![
+        verify_step(1, "cargo test -p does-not-exist"),
+    ])])
+    .await;
+    let h = Harness::serve(&fake_url).await;
+    let repo = init_repo(&h.dir);
+    let worktree_id = h.setup_worktree(&repo).await;
+    let task_id = h.make_task().await;
+    let (status, value) = h
+        .post("/tasks/run", json!({"task_id": task_id, "worktree_id": worktree_id}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "run: {value}");
+    let record = h.wait_task_status(&task_id, "draft_ready", 30).await;
+    assert_eq!(record["executor_step_no"], 1);
+    h.approve_current(&task_id).await;
+    let (status, value) = h.post("/tasks/execute", json!({"task_id": task_id})).await;
+    assert_eq!(status, StatusCode::OK, "execute: {value}");
+    let record = h.wait_task_status(&task_id, "failed", 90).await;
+    let error = record["error"].as_str().unwrap_or("");
+    assert_eq!(error, "步骤 1 的 worker run 失败：failed", "task error: {record}");
+    let evidence = h.evidence().await;
+    let failed: Vec<&Value> = evidence
+        .iter()
+        .filter(|e| e["reason"] == "step_failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "evidence: {evidence:?}");
+    let observed = observed_of(failed[0]);
+    assert_eq!(observed["step_no"], 1);
+    assert_eq!(observed["failure"], "worker_run_failed");
+    assert_eq!(observed["run_status"], "failed");
+    assert!(observed["run_id"].is_string(), "the run is named: {observed}");
+    assert_eq!(
+        observed.get("failure_tail"),
+        None,
+        "no failure_tail for a non-budget tail: {observed}"
+    );
+    // Sanity: the run really failed with a non-empty,
+    // non-budget tail, so the gate was exercised.
+    let run_id = observed["run_id"].as_str().unwrap().to_string();
+    let tail = {
+        let conn = h.db();
+        conn.query_row(
+            "SELECT tail FROM worker_runs WHERE run_id = ?1",
+            [&run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    assert!(!tail.is_empty(), "run tail present: {tail}");
+    assert!(
+        !tail.starts_with("budget_exceeded"),
+        "run tail is a cargo error, not a refusal: {tail}"
+    );
+    assert!(h.open_inbox("failed").await.is_empty());
 }
