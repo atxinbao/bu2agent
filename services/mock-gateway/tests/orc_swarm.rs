@@ -1137,11 +1137,11 @@ async fn restart_freezes_swarm_and_drive_resumes() {
 
 /// The v21 pin: a fresh DB opens at schema 21.
 #[test]
-fn schema_version_is_21() {
-    assert_eq!(DB_SCHEMA_VERSION, 21);
+fn schema_version_is_22() {
+    assert_eq!(DB_SCHEMA_VERSION, 22);
     let dir = temp_dir("schema");
     std::fs::create_dir_all(dir.join("files")).unwrap();
     let _state = build_state(&dir, "http://127.0.0.1:1");
     let conn = sqlite_store::open_db(&dir.join("gateway.sqlite3")).expect("open db");
-    assert_eq!(sqlite_store::schema_version(&conn).unwrap(), 21);
+    assert_eq!(sqlite_store::schema_version(&conn).unwrap(), 22);
 }

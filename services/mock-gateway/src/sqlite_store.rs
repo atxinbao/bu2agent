@@ -66,12 +66,14 @@ use crate::execution_store::ExecutionFileRecord;
 /// `scheduled_imessage_sends` table (see SCHEMA_V19);
 /// v20 adds the ORC-1 `plans` table (see SCHEMA_V20);
 /// v21 adds the ORC-5 `swarms` + `swarm_messages`
-/// tables (see SCHEMA_V21).
+/// tables (see SCHEMA_V21); v22 adds the AO-1
+/// `agent_events` table (see SCHEMA_V22).
 // v18 新增 contacts 历史写入幂等索引。
 // v19 新增 D1-3 C-2 定时发送正文表（Q-C2-01）。
 // v20 新增 ORC-1 蓝图表（Q-ORC-03）。
 // v21 新增 ORC-5 Swarm 表（Q-R5-01）。
-pub const DB_SCHEMA_VERSION: i64 = 21;
+// v22 新增 AO-1 事件收件箱表（Q-AO-04）。
+pub const DB_SCHEMA_VERSION: i64 = 22;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -800,6 +802,38 @@ CREATE TABLE IF NOT EXISTS swarm_messages (
 CREATE INDEX IF NOT EXISTS idx_swarm_messages_swarm ON swarm_messages (swarm_id, created_ms);
 ";
 
+/// AO-1 v22 step: `agent_events` (Q-AO-04). One row
+/// per ingested event: the internal source that
+/// produced it (`source_kind`), the source's own
+/// event id (`source_event_id`, UNIQUE — the dedupe
+/// key), a summary + pointer payload
+/// (`payload_summary_json`, never raw text, red
+/// line 7), and the optional session the event
+/// belongs to (`session_id`, NULL when the event is
+/// session-less). Status words: `pending` (queued)
+/// → `claimed` (a driver owns it) → `done` /
+/// `failed` (terminal). `claimed_ms` is set on
+/// claim; `delivered_ms` is set only on done (the
+/// event left the queue delivered — AO1-J5). The
+/// table has no JSONL export (the `plans`
+/// precedent — SQLite-only).
+const SCHEMA_V22: &str = "
+CREATE TABLE IF NOT EXISTS agent_events (
+    event_id TEXT PRIMARY KEY,
+    seq INTEGER NOT NULL,
+    source_kind TEXT NOT NULL,
+    source_event_id TEXT NOT NULL UNIQUE,
+    payload_summary_json TEXT NOT NULL,
+    session_id TEXT,
+    status TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    claimed_ms INTEGER,
+    delivered_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_agent_events_status ON agent_events (status, created_ms);
+CREATE INDEX IF NOT EXISTS idx_agent_events_session ON agent_events (session_id, status);
+";
+
 /// MCL-4 v17 step: `sent_imessages` fact table.
 /// `sent_id` is the local `sent-imsg-N` id
 /// (max-suffix + 1 in the record transaction — the
@@ -1177,6 +1211,15 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V21).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '21')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    if version < 22 {
+        tx.execute_batch(SCHEMA_V22).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '22')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -2471,6 +2514,16 @@ const REDACTED_PAYLOAD_FIELDS: &[&str] = &[
     // like `body_hash` for sent mail: the planned
     // version is auditable without naming any step.
     "digest",
+    // AO-1 `agent_event.created` / `agent_event.failed`
+    // fields (each added with its reason, per this
+    // helper's own rule):
+    // `source_kind` — which internal source produced
+    // the event ("file.changed" / "timers" / ...), a
+    // kind only, never content.
+    "source_kind",
+    // `source_event_id` — the source's own event id,
+    // an id only, like `message_id` for synced mail.
+    "source_event_id",
 ];
 
 pub(crate) fn redact_event_payload(kind: &str, payload_json: &str) -> String {
@@ -7080,6 +7133,261 @@ pub fn update_worker_progress(
         )
         .map_err(err)?;
     Ok(changed > 0)
+}
+
+/// AO-1 (Q-AO-04/05/06): the event inbox. One
+/// `agent_events` row per ingested event (see
+/// SCHEMA_V22): the internal source that produced
+/// it, the source's own event id (UNIQUE — the
+/// dedupe key), a summary + pointer payload (never
+/// raw text, red line 7), and the optional session
+/// the event belongs to. Status words: `pending`
+/// (queued) → `claimed` (a driver owns it) → `done`
+/// / `failed` (terminal). `failed` never
+/// auto-retries (honest rules); the failure is
+/// written to the events audit by `fail_agent_event`
+/// (test A4). The inbox is a queue, not an audit
+/// log and not an attention row: ingest writes the
+/// fact record only — no Effect, no approval, no
+/// Inbox row, no Outbox row (the D1-6a mail-sync
+/// posture) — and the table has no JSONL export
+/// (the `plans` precedent — SQLite-only).
+///
+/// AO1-J1: `session_id` is nullable; the
+/// single-session gate applies only when it is
+/// non-null (a NULL-session event claims
+/// independently — there is no session to gate on).
+/// AO1-J5: `delivered_ms` is set only on the done
+/// transition (the event left the queue delivered);
+/// a failed event keeps it NULL.
+const AGENT_EVENT_COLS: &str = "event_id, seq, source_kind, source_event_id, payload_summary_json, session_id, status, created_ms, claimed_ms, delivered_ms";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentEventRow {
+    pub event_id: String,
+    pub seq: i64,
+    pub source_kind: String,
+    pub source_event_id: String,
+    pub payload_summary_json: String,
+    pub session_id: Option<String>,
+    pub status: String,
+    pub created_ms: i64,
+    pub claimed_ms: Option<i64>,
+    pub delivered_ms: Option<i64>,
+}
+
+fn agent_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentEventRow> {
+    Ok(AgentEventRow {
+        event_id: row.get(0)?,
+        seq: row.get(1)?,
+        source_kind: row.get(2)?,
+        source_event_id: row.get(3)?,
+        payload_summary_json: row.get(4)?,
+        session_id: row.get(5)?,
+        status: row.get(6)?,
+        created_ms: row.get(7)?,
+        claimed_ms: row.get(8)?,
+        delivered_ms: row.get(9)?,
+    })
+}
+
+/// The events-audit payload for an agent event:
+/// ids + status only (red line 7 — the payload
+/// passes through `redact_event_payload` anyway,
+/// but it must not need it). `source_kind` /
+/// `source_event_id` are allowlisted with reasons
+/// (AO1-J3).
+fn agent_event_audit_payload(row: &AgentEventRow) -> String {
+    canonical_json(&serde_json::json!({
+        "event_id": row.event_id,
+        "source_kind": row.source_kind,
+        "source_event_id": row.source_event_id,
+        "status": row.status,
+    }))
+}
+
+/// Ingest one event. `INSERT OR IGNORE` on the
+/// `UNIQUE(source_event_id)` constraint: a
+/// re-delivered trigger returns the existing row
+/// with `deduped: true` and writes nothing (the
+/// `insert_inbox` precedent). Returns the row and
+/// whether it already existed. Appends
+/// `agent_event.created` to the events audit on a
+/// fresh insert only (AO1-J4). All writers run
+/// under the single SQLite mutex, so the
+/// `next_seq_for` + insert pair inside this one
+/// transaction cannot interleave with another
+/// ingest.
+pub fn ingest_agent_event(
+    conn: &mut Connection,
+    source_kind: &str,
+    source_event_id: &str,
+    payload_summary_json: &str,
+    session_id: Option<&str>,
+    origin_device_id: &str,
+) -> Result<(AgentEventRow, bool), String> {
+    let tx = conn.transaction().map_err(err)?;
+    let seq = next_seq_for(&tx, "agent_events", "event_id")?;
+    let now = now_ms() as i64;
+    let event_id = format!("agent-event-{seq}");
+    let changed = tx
+        .execute(
+            &format!(
+                "INSERT OR IGNORE INTO agent_events ({AGENT_EVENT_COLS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, NULL, NULL)"
+            ),
+            params![
+                event_id,
+                seq,
+                source_kind,
+                source_event_id,
+                payload_summary_json,
+                session_id,
+                now,
+            ],
+        )
+        .map_err(err)?;
+    if changed == 0 {
+        let existing = tx
+            .query_row(
+                &format!(
+                    "SELECT {AGENT_EVENT_COLS} FROM agent_events WHERE source_event_id = ?1"
+                ),
+                params![source_event_id],
+                agent_event_from_row,
+            )
+            .map_err(err)?;
+        tx.commit().map_err(err)?;
+        return Ok((existing, true));
+    }
+    let row = AgentEventRow {
+        event_id: event_id.clone(),
+        seq,
+        source_kind: source_kind.to_string(),
+        source_event_id: source_event_id.to_string(),
+        payload_summary_json: payload_summary_json.to_string(),
+        session_id: session_id.map(str::to_string),
+        status: "pending".to_string(),
+        created_ms: now,
+        claimed_ms: None,
+        delivered_ms: None,
+    };
+    append_event(
+        &tx,
+        "agent_event",
+        &event_id,
+        "agent_event.created",
+        &agent_event_audit_payload(&row),
+        origin_device_id,
+        now,
+        1,
+    )?;
+    tx.commit().map_err(err)?;
+    Ok((row, false))
+}
+
+/// Atomically claim a pending event for a driver.
+/// One SQL statement, so two drivers racing the
+/// same row serialize on the write: exactly one
+/// sees `true` (the `mark_worker_run_running`
+/// precedent). The single-session gate (Q-AO-06,
+/// queue): the claim lands only when no OTHER
+/// event of the same non-null session is already
+/// claimed — a new event for a busy session stays
+/// `pending` for a later tick. Returns whether
+/// this call claimed the row.
+pub fn claim_agent_event(
+    conn: &mut Connection,
+    event_id: &str,
+    claimed_ms: i64,
+) -> Result<bool, String> {
+    let changed = conn
+        .execute(
+            "UPDATE agent_events SET status = 'claimed', claimed_ms = ?1
+             WHERE event_id = ?2 AND status = 'pending'
+             AND NOT EXISTS (
+                 SELECT 1 FROM agent_events AS other
+                 WHERE other.session_id IS NOT NULL
+                   AND other.session_id = agent_events.session_id
+                   AND other.status = 'claimed'
+                   AND other.event_id <> agent_events.event_id
+             )",
+            params![claimed_ms, event_id],
+        )
+        .map_err(err)?;
+    Ok(changed > 0)
+}
+
+/// Mark a claimed event done. Only a `claimed` row
+/// moves; `false` means the row was already terminal
+/// (or never claimed). Sets `delivered_ms`
+/// (AO1-J5). No events-audit row: done is the
+/// normal path, and the queue state itself is the
+/// record (AO1-J4).
+pub fn complete_agent_event(conn: &mut Connection, event_id: &str) -> Result<bool, String> {
+    let now = now_ms() as i64;
+    let changed = conn
+        .execute(
+            "UPDATE agent_events SET status = 'done', delivered_ms = ?1 WHERE event_id = ?2 AND status = 'claimed'",
+            params![now, event_id],
+        )
+        .map_err(err)?;
+    Ok(changed > 0)
+}
+
+/// Mark a claimed event failed. Only a `claimed` row
+/// moves; `false` means the row was already terminal
+/// (or never claimed). No auto-retry (honest rules):
+/// the failure is written to the events audit in the
+/// same transaction (test A4), so a failed event is
+/// never silent. `delivered_ms` stays NULL
+/// (AO1-J5).
+pub fn fail_agent_event(
+    conn: &mut Connection,
+    event_id: &str,
+    origin_device_id: &str,
+) -> Result<bool, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let changed = tx
+        .execute(
+            "UPDATE agent_events SET status = 'failed' WHERE event_id = ?1 AND status = 'claimed'",
+            params![event_id],
+        )
+        .map_err(err)?;
+    if changed == 0 {
+        tx.commit().map_err(err)?;
+        return Ok(false);
+    }
+    let row = tx
+        .query_row(
+            &format!("SELECT {AGENT_EVENT_COLS} FROM agent_events WHERE event_id = ?1"),
+            params![event_id],
+            agent_event_from_row,
+        )
+        .map_err(err)?;
+    let now = now_ms() as i64;
+    append_event(
+        &tx,
+        "agent_event",
+        event_id,
+        "agent_event.failed",
+        &agent_event_audit_payload(&row),
+        origin_device_id,
+        now,
+        1,
+    )?;
+    tx.commit().map_err(err)?;
+    Ok(true)
+}
+
+pub fn get_agent_event(conn: &Connection, event_id: &str) -> Result<Option<AgentEventRow>, String> {
+    conn.query_row(
+        &format!("SELECT {AGENT_EVENT_COLS} FROM agent_events WHERE event_id = ?1"),
+        params![event_id],
+        agent_event_from_row,
+    )
+    .optional()
+    .map_err(err)
 }
 
 /// Execution deadline (plan §2.4): NULL means no

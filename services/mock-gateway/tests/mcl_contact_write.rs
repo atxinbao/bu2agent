@@ -478,7 +478,7 @@ fn content_hash_of(row: &Value) -> String {
 async fn w1_create_end_to_end() {
     let h = Harness::serve().await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
-    assert_eq!(h.schema_version(), 21, "ORC-5 adds the v21 swarms tables (ORC-1 added v20, C-2 added v19, F-1 added v18)");
+    assert_eq!(h.schema_version(), 22, "AO-1 adds the v22 agent_events table (ORC-5 added v21, ORC-1 added v20, C-2 added v19, F-1 added v18)");
     let synced = h.sync().await;
     assert_eq!(synced["synced_count"], 2);
 
@@ -1691,7 +1691,7 @@ async fn f1_v18_migration_is_typed_repeatable_and_does_not_backfill() {
     conn.execute_batch("DROP TABLE contact_idempotency; UPDATE db_meta SET value='17' WHERE key='db_schema_version';").unwrap();
     sqlite_store::apply_migrations(&mut conn).unwrap();
     sqlite_store::apply_migrations(&mut conn).unwrap();
-    assert_eq!(sqlite_store::schema_version(&conn).unwrap(), 21);
+    assert_eq!(sqlite_store::schema_version(&conn).unwrap(), 22);
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM contact_idempotency", [], |r| r.get(0))
         .unwrap();

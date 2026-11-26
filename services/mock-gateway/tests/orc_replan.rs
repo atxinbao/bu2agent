@@ -915,7 +915,7 @@ async fn h5_manual_replan_supersedes_approval_and_reruns() {
 /// failure branch to hook).
 #[tokio::test]
 async fn h6_manual_draft_is_not_replan_and_triage_untouched() {
-    assert_eq!(DB_SCHEMA_VERSION, 21, "ORC-5 bumps the schema to v21 (ORC-3 adds no migration)");
+    assert_eq!(DB_SCHEMA_VERSION, 22, "AO-1 bumps the schema to v22 (ORC-5 added v21; ORC-3 adds no migration)");
     let (fake_url, _fake) = start_fake_deepseek(vec![serde_json::to_string(&json!({
         "needs_file_change": false,
         "answer": "No change needed.",
@@ -925,7 +925,7 @@ async fn h6_manual_draft_is_not_replan_and_triage_untouched() {
     .unwrap()])
     .await;
     let h = Harness::serve(&fake_url).await;
-    assert_eq!(h.schema_version(), 21);
+    assert_eq!(h.schema_version(), 22);
     let task_id = h.make_task().await;
     // Two manual drafts: v1 then v2, count stays 0.
     let draft = |steps: Vec<Value>| {

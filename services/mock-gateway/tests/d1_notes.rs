@@ -600,7 +600,7 @@ async fn nt1_sync_end_to_end() {
     let mut h = Harness::serve().await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
     // F-1 将模式升级到 v18，新增联系人历史幂等索引；C-2 升到 v19，新增定时发送正文表；ORC-1 升到 v20，新增蓝图表。
-    assert_eq!(DB_SCHEMA_VERSION, 21);
+    assert_eq!(DB_SCHEMA_VERSION, 22);
 
     let (status, synced) = h.sync("bu2agent-test").await;
     assert_eq!(status, 200, "sync: {synced}");

@@ -8528,6 +8528,7 @@ pub fn app(state: AppState) -> Router {
         .route("/swarm/create", post(crate::routes_swarm::swarm_create))
         .route("/swarm/{id}/fanout", post(crate::routes_swarm::swarm_fanout))
         .route("/swarm/{id}", get(crate::routes_swarm::swarm_get))
+        .route("/agent/events/ingest", post(crate::routes_agent_events::agent_events_ingest))
         .route("/executions/list", get(crate::routes_ledger::executions_list))
         .route("/executions/get", get(crate::routes_ledger::executions_get))
         .route("/executions/transition", post(crate::routes_ledger::executions_transition))
