@@ -96,6 +96,11 @@ import {
 } from "./domain/swarm_client";
 import { InvokeSwarmClient } from "./domain/invoke_swarm_client";
 import {
+  TimersClient,
+  type TimersGateway,
+} from "./domain/timers_client";
+import { InvokeTimersClient } from "./domain/invoke_timers_client";
+import {
   DeviceClient,
   type DeviceGateway,
 } from "./domain/device_client";
@@ -161,6 +166,7 @@ import { RemindersView } from "./views/RemindersView";
 import { LoopClient, type LoopGateway } from "./domain/loop_client";
 import { InvokeLoopClient } from "./domain/invoke_loop_client";
 import { LoopsView } from "./views/LoopsView";
+import { TimersView } from "./views/TimersView";
 import { SessionClient, type SessionGateway } from "./domain/session_client";
 import { InvokeSessionClient } from "./domain/invoke_session_client";
 import { WorkbenchView } from "./views/WorkbenchView";
@@ -206,6 +212,7 @@ interface Clients {
   tasks: TaskGateway;
   plans: PlanGateway;
   swarms: SwarmGateway;
+  timers: TimersGateway;
   models: ModelGateway;
   devices: DeviceGateway;
   loops: LoopGateway;
@@ -237,7 +244,7 @@ interface Clients {
   engineering: EngineeringGateway;
 }
 
-type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "goals" | "sources" | "memories" | "devices" | "reminders" | "loops" | "peers" | "spaces" | "feed" | "mail" | "messages" | "contacts" | "location" | "calendar" | "notes" | "engineering" | "patches" | "settings";
+type Tab = "workbench" | "chat" | "files" | "agent" | "connectors" | "tasks" | "goals" | "sources" | "memories" | "devices" | "reminders" | "loops" | "timers" | "peers" | "spaces" | "feed" | "mail" | "messages" | "contacts" | "location" | "calendar" | "notes" | "engineering" | "patches" | "settings";
 
 // Visible navigation: the workbench (sessions) is the only
 // chat entry and the default view (R1, 2026-10-28). The legacy
@@ -255,6 +262,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "devices", label: "Devices" },
   { id: "reminders", label: "Reminders" },
   { id: "loops", label: "Loops" },
+  { id: "timers", label: "定时器" },
   { id: "peers", label: "Peers" },
   { id: "spaces", label: "Spaces" },
   { id: "feed", label: "Feed" },
@@ -325,6 +333,7 @@ export function App() {
           tasks: new InvokeTaskClient(),
           plans: new InvokePlanClient(),
           swarms: new InvokeSwarmClient(),
+          timers: new InvokeTimersClient(),
           models: new InvokeModelClient(),
           devices: new InvokeDeviceClient(),
           loops: new InvokeLoopClient(),
@@ -369,6 +378,7 @@ export function App() {
           tasks: new TaskClient(MOCK_BASE_URL),
           plans: new PlanClient(MOCK_BASE_URL),
           swarms: new SwarmClient(MOCK_BASE_URL),
+          timers: new TimersClient(MOCK_BASE_URL),
           models: new ModelClient(MOCK_BASE_URL),
           devices: new DeviceClient(MOCK_BASE_URL),
           loops: new LoopClient(MOCK_BASE_URL),
@@ -820,6 +830,7 @@ export function App() {
           <RemindersView agent={clients.agent} devices={clients.devices} effects={clients.effects} evidence={clients.evidence} />
         ))}
       {tab === "loops" && clients && <LoopsView loops={clients.loops} agent={clients.agent} executions={clients.executions} effects={clients.effects} evidence={clients.evidence} />}
+      {tab === "timers" && clients && <TimersView timers={clients.timers} />}
       {tab === "settings" && (
         <SettingsView
           settings={new InvokeSettingsClient()}

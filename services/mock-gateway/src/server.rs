@@ -2649,6 +2649,123 @@ impl AppState {
         delivered
     }
 
+    /// AO-2 (Q-AO-07): the due-timer drive, run from
+    /// the assignment sweeper's 10 s tick — no second
+    /// scheduler. Fires due `active` timers AFTER the
+    /// Outbox due pass and BEFORE due worker runs
+    /// (plan §4 order: Outbox first, timers second).
+    /// A fire writes its event through AO-1's ingest
+    /// path (`ingest_agent_event`, source `timers`) —
+    /// never a direct table write — and the timer is
+    /// finalized in the same lock hold (AO2-J4). A
+    /// timer NEVER starts an Agent directly: the
+    /// event only queues for the AO-3 driver. A
+    /// failed fire (DB error) only warns: the row
+    /// stays `active` and the next tick retries.
+    /// Returns the number of timers fired on this
+    /// tick. A method so tests can drive it directly
+    /// (the `e2d_long_tasks` precedent for
+    /// `start_due_worker_runs` — the harness serves
+    /// with no sweeper).
+    pub fn drive_due_timers(&self) -> usize {
+        if self.sqlite_mode() != StateBackend::Sqlite || self.sqlite_is_broken() {
+            return 0;
+        }
+        let Some(sqlite) = &self.sqlite else {
+            return 0;
+        };
+        let due = {
+            let conn = sqlite.lock().expect("sqlite lock");
+            match sqlite_store::due_agent_timers(&conn, sqlite_store::now_ms() as i64) {
+                Ok(rows) => rows,
+                Err(detail) => {
+                    eprintln!("warning: AO-2 due timer list failed: {detail}");
+                    return 0;
+                }
+            }
+        };
+        let mut fired = 0;
+        for timer in &due {
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            // The fire's event identity (AO2-J3): one
+            // source_event_id per (timer, fire_ms), so
+            // a retried fire dedupes through AO-1
+            // ingest instead of writing a second event.
+            let source_event_id = format!("timer:{}:{}", timer.timer_id, timer.next_fire_ms);
+            let mut summary: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&timer.payload_summary_json)
+                    .ok()
+                    .and_then(|value: serde_json::Value| value.as_object().cloned())
+                    .unwrap_or_default();
+            summary.insert(
+                "timer_id".to_string(),
+                serde_json::Value::String(timer.timer_id.clone()),
+            );
+            summary.insert(
+                "kind".to_string(),
+                serde_json::Value::String(timer.kind.clone()),
+            );
+            let summary_json =
+                sqlite_store::canonical_json(&serde_json::Value::Object(summary));
+            if let Err(detail) = sqlite_store::ingest_agent_event(
+                &mut conn,
+                "timers",
+                &source_event_id,
+                &summary_json,
+                timer.session_id.as_deref(),
+                &self.origin_device_id,
+            ) {
+                eprintln!(
+                    "warning: AO-2 timer fire ingest failed for {}: {detail}",
+                    timer.timer_id
+                );
+                continue;
+            }
+            // Finalize under the same lock hold
+            // (AO2-J4): follow-up → done, schedule →
+            // next_fire_ms advances by the interval.
+            let (new_status, new_next) = if timer.kind == "schedule" {
+                match timer
+                    .recurrence_json
+                    .as_deref()
+                    .and_then(sqlite_store::recurrence_interval_ms)
+                {
+                    Some(interval) => ("active", timer.next_fire_ms + interval),
+                    None => {
+                        eprintln!(
+                            "warning: AO-2 schedule timer {} has no valid interval, skipped",
+                            timer.timer_id
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                ("done", timer.next_fire_ms)
+            };
+            match sqlite_store::finalize_timer_fire(
+                &mut conn,
+                &timer.timer_id,
+                timer.next_fire_ms,
+                new_status,
+                new_next,
+            ) {
+                Ok(true) => fired += 1,
+                Ok(false) => {
+                    // Another drive already finalized
+                    // this fire (the ingest above
+                    // deduped); not a failure.
+                }
+                Err(detail) => {
+                    eprintln!(
+                        "warning: AO-2 timer finalize failed for {}: {detail}",
+                        timer.timer_id
+                    );
+                }
+            }
+        }
+        fired
+    }
+
     /// E2-D batch 2: start due deferred runs, one pass.
     /// Rides the assignment sweeper's 10 s tick (plan
     /// §2.2) — no second scheduler. Fetches due runs in
@@ -8529,6 +8646,15 @@ pub fn app(state: AppState) -> Router {
         .route("/swarm/{id}/fanout", post(crate::routes_swarm::swarm_fanout))
         .route("/swarm/{id}", get(crate::routes_swarm::swarm_get))
         .route("/agent/events/ingest", post(crate::routes_agent_events::agent_events_ingest))
+        .route(
+            "/agent/timers",
+            post(crate::routes_timers::agent_timers_create)
+                .get(crate::routes_timers::agent_timers_list),
+        )
+        .route(
+            "/agent/timers/{id}",
+            delete(crate::routes_timers::agent_timers_delete),
+        )
         .route("/executions/list", get(crate::routes_ledger::executions_list))
         .route("/executions/get", get(crate::routes_ledger::executions_get))
         .route("/executions/transition", post(crate::routes_ledger::executions_transition))
@@ -8598,6 +8724,11 @@ pub fn spawn_assignment_sweeper(state: AppState) -> tokio::task::JoinHandle<()> 
             // D1-3 C-2: the due pass is async (a scheduled
             // send can take up to 30 s in AppleScript).
             state.deliver_due_outbox().await;
+            // AO-2: due timers ride the same tick,
+            // after the Outbox due pass and before due
+            // worker runs (plan §4 order) — no second
+            // scheduler.
+            state.drive_due_timers();
             // E2-D batch 2: due deferred runs start from
             // the same tick — no second scheduler.
             state.start_due_worker_runs().await;

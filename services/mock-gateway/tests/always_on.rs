@@ -3,6 +3,13 @@
 //! (A2), the single-session gate (A3), and failure
 //! handling (A4).
 //!
+//! AO-2 tests (plan §4, Q-AO-07/17): the general
+//! timers — follow-up fires once (B1), schedule
+//! advances and refires (B2), revoke never fires
+//! (B3), and restart keeps unexpired timers while
+//! the first post-restart drive fires expired ones
+//! once (B4).
+//!
 //! The harness serves with no sweeper (the
 //! `e2d_long_tasks` precedent for
 //! `start_due_worker_runs`): no drive call happens
@@ -84,6 +91,7 @@ struct Harness {
     dir: PathBuf,
     url: String,
     client: reqwest::Client,
+    deepseek_base_url: String,
     #[allow(dead_code)]
     server: Option<tokio::task::JoinHandle<()>>,
     #[allow(dead_code)]
@@ -107,9 +115,28 @@ impl Harness {
                 .timeout(Duration::from_secs(60))
                 .build()
                 .unwrap(),
+            deepseek_base_url,
             server: Some(server),
             state: harness_state,
         }
+    }
+
+    /// Restart the gateway on the same directory (same
+    /// SQLite file, same JSONL files): the production
+    /// restart path, not a fresh database (the
+    /// `orc_plan` precedent).
+    async fn restart(&mut self) {
+        if let Some(old) = self.server.take() {
+            old.abort();
+            let _ = old.await;
+        }
+        let state = build_state(&self.dir, &self.deepseek_base_url);
+        self.state = state.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        self.url = format!("http://{}", listener.local_addr().unwrap());
+        self.server = Some(
+            tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() }),
+        );
     }
 
     fn db(&self) -> rusqlite::Connection {
@@ -184,13 +211,111 @@ impl Harness {
             .unwrap();
         serde_json::from_str(&raw).unwrap()
     }
+
+    async fn create_timer(&self, body: Value) -> (StatusCode, Value) {
+        let resp = self
+            .client
+            .post(format!("{}/agent/timers", self.url))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let value: Value = resp.json().await.unwrap();
+        (status, value)
+    }
+
+    async fn list_timers(&self) -> (StatusCode, Value) {
+        let resp = self
+            .client
+            .get(format!("{}/agent/timers", self.url))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let value: Value = resp.json().await.unwrap();
+        (status, value)
+    }
+
+    async fn delete_timer(&self, timer_id: &str) -> (StatusCode, Value) {
+        let resp = self
+            .client
+            .delete(format!("{}/agent/timers/{timer_id}", self.url))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let value: Value = resp.json().await.unwrap();
+        (status, value)
+    }
+
+    fn count_agent_timers(&self) -> i64 {
+        let conn = self.db();
+        conn.query_row("SELECT COUNT(*) FROM agent_timers", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn timer_status(&self, timer_id: &str) -> String {
+        let conn = self.db();
+        conn.query_row(
+            "SELECT status FROM agent_timers WHERE timer_id = ?1",
+            [timer_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn timer_next_fire(&self, timer_id: &str) -> i64 {
+        let conn = self.db();
+        conn.query_row(
+            "SELECT next_fire_ms FROM agent_timers WHERE timer_id = ?1",
+            [timer_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn count_timer_events(&self) -> i64 {
+        let conn = self.db();
+        conn.query_row(
+            "SELECT COUNT(*) FROM agent_events WHERE source_kind = 'timers'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn timer_event_payload(&self) -> Value {
+        let conn = self.db();
+        let raw: String = conn
+            .query_row(
+                "SELECT payload_summary_json FROM agent_events WHERE source_kind = 'timers' ORDER BY seq LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    fn timer_event_source_ids(&self) -> Vec<String> {
+        let conn = self.db();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source_event_id FROM agent_events WHERE source_kind = 'timers' ORDER BY seq",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
 }
 
 #[tokio::test]
-async fn schema_version_is_22() {
-    assert_eq!(DB_SCHEMA_VERSION, 22, "AO-1 bumps the schema to v22");
+async fn schema_version_is_23() {
+    assert_eq!(DB_SCHEMA_VERSION, 23, "AO-2 bumps the schema to v23 (AO-1 added v22)");
     let h = Harness::serve().await;
-    assert_eq!(h.schema_version(), 22);
+    assert_eq!(h.schema_version(), 23);
 }
 
 /// A1: ingest writes one row; the same
@@ -421,4 +546,206 @@ async fn a4_failure_is_failed_without_retry_and_audited() {
             "agent_event.failed".to_string()
         ]
     );
+}
+
+/// B1: a due follow-up fires exactly once — one
+/// event through AO-1 ingest, the timer moves to
+/// `done`, and a second drive does not re-fire.
+#[tokio::test]
+async fn b1_follow_up_fires_once_then_done() {
+    let h = Harness::serve().await;
+    let now = sqlite_store::now_ms() as i64;
+    let (status, timer) = h
+        .create_timer(json!({
+            "kind": "follow_up",
+            "next_fire_ms": now - 1000,
+            "payload_summary_json": {"note": "remind"},
+            "session_id": "session-b1",
+        }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(timer["timer_id"], "timer-1");
+    assert_eq!(timer["status"], "active");
+    assert_eq!(timer["session_id"], "session-b1");
+    assert_eq!(h.count_agent_timers(), 1);
+
+    assert_eq!(h.state.drive_due_timers(), 1);
+    assert_eq!(h.timer_status("timer-1"), "done");
+    assert_eq!(h.count_timer_events(), 1);
+    assert_eq!(h.state.drive_due_timers(), 0);
+    assert_eq!(h.count_timer_events(), 1);
+
+    // The fired event carries the timer identity
+    // (AO2-J3) plus the timer's own summary, and the
+    // timer's session so the AO-3 driver knows it.
+    let payload = h.timer_event_payload();
+    assert_eq!(payload["timer_id"], "timer-1");
+    assert_eq!(payload["kind"], "follow_up");
+    assert_eq!(payload["note"], "remind");
+    assert_eq!(
+        h.timer_event_source_ids(),
+        vec![format!("timer:timer-1:{}", now - 1000)]
+    );
+}
+
+/// B1 (validation): an unknown kind, a schedule
+/// without a positive interval, a follow-up
+/// carrying a recurrence, and a non-object summary
+/// are all 400 `invalid_agent_timer`.
+#[tokio::test]
+async fn b1_create_rejects_invalid_body() {
+    let h = Harness::serve().await;
+    let now = sqlite_store::now_ms() as i64;
+    let (status, value) = h
+        .create_timer(json!({"kind": "snooze", "next_fire_ms": now}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["error"], "invalid_agent_timer");
+    let (status, value) = h
+        .create_timer(json!({"kind": "schedule", "next_fire_ms": now}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["error"], "invalid_agent_timer");
+    let (status, value) = h
+        .create_timer(json!({"kind": "schedule", "next_fire_ms": now, "recurrence_json": {"interval_ms": 0}}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["error"], "invalid_agent_timer");
+    let (status, value) = h
+        .create_timer(json!({"kind": "follow_up", "next_fire_ms": now, "recurrence_json": {"interval_ms": 1000}}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["error"], "invalid_agent_timer");
+    let (status, value) = h
+        .create_timer(json!({"kind": "follow_up", "next_fire_ms": now, "payload_summary_json": "nope"}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["error"], "invalid_agent_timer");
+    assert_eq!(h.count_agent_timers(), 0);
+
+    // The list is a bare array (the outbox list
+    // precedent), soonest first.
+    let (status, list) = h.list_timers().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list, json!([]));
+}
+
+/// B2: a schedule fires, advances `next_fire_ms`
+/// by the interval, stays `active`, and fires the
+/// next cycle with a distinct event id.
+#[tokio::test]
+async fn b2_schedule_advances_and_refires() {
+    let h = Harness::serve().await;
+    let now = sqlite_store::now_ms() as i64;
+    let fire_at = now - 60_000;
+    let (status, timer) = h
+        .create_timer(json!({
+            "kind": "schedule",
+            "next_fire_ms": fire_at,
+            "recurrence_json": {"interval_ms": 1000},
+            "session_id": "session-b2",
+        }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(timer["timer_id"], "timer-1");
+
+    assert_eq!(h.state.drive_due_timers(), 1);
+    assert_eq!(h.timer_status("timer-1"), "active");
+    assert_eq!(h.timer_next_fire("timer-1"), fire_at + 1000);
+    assert_eq!(h.count_timer_events(), 1);
+
+    // The advanced fire time is still in the past,
+    // so the next drive fires the second cycle.
+    assert_eq!(h.state.drive_due_timers(), 1);
+    assert_eq!(h.timer_status("timer-1"), "active");
+    assert_eq!(h.timer_next_fire("timer-1"), fire_at + 2000);
+    assert_eq!(h.count_timer_events(), 2);
+    assert_eq!(
+        h.timer_event_source_ids(),
+        vec![
+            format!("timer:timer-1:{fire_at}"),
+            format!("timer:timer-1:{}", fire_at + 1000),
+        ]
+    );
+}
+
+/// B3: a revoked timer never fires — due or
+/// future. Revoke is idempotent (AO2-J6) and an
+/// unknown id is 404 `unknown_timer`.
+#[tokio::test]
+async fn b3_revoke_never_fires() {
+    let h = Harness::serve().await;
+    let now = sqlite_store::now_ms() as i64;
+    let (_, timer) = h
+        .create_timer(json!({
+            "kind": "follow_up",
+            "next_fire_ms": now - 1000,
+        }))
+        .await;
+    let timer_id = timer["timer_id"].as_str().unwrap().to_string();
+    let (status, revoked) = h.delete_timer(&timer_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(revoked["status"], "cancelled");
+    assert_eq!(h.state.drive_due_timers(), 0);
+    assert_eq!(h.count_timer_events(), 0);
+
+    let (status, again) = h.delete_timer(&timer_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(again["status"], "cancelled");
+    assert_eq!(again["timer_id"], timer_id);
+
+    let (status, value) = h.delete_timer("timer-404").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["error"], "unknown_timer");
+
+    // A future timer revoked before its time also
+    // never fires.
+    let (_, future) = h
+        .create_timer(json!({
+            "kind": "follow_up",
+            "next_fire_ms": now + 3_600_000,
+        }))
+        .await;
+    let future_id = future["timer_id"].as_str().unwrap().to_string();
+    let (status, _) = h.delete_timer(&future_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(h.state.drive_due_timers(), 0);
+    assert_eq!(h.count_timer_events(), 0);
+    assert_eq!(h.count_agent_timers(), 2);
+}
+
+/// B4: restart keeps unexpired timers and fires
+/// expired ones exactly once on the first drive
+/// after restart (past = due, the D1-3 C-1 rule).
+#[tokio::test]
+async fn b4_restart_keeps_unexpired_and_fires_expired() {
+    let mut h = Harness::serve().await;
+    let now = sqlite_store::now_ms() as i64;
+    let (_, due) = h
+        .create_timer(json!({
+            "kind": "follow_up",
+            "next_fire_ms": now - 1000,
+        }))
+        .await;
+    let due_id = due["timer_id"].as_str().unwrap().to_string();
+    let (_, future) = h
+        .create_timer(json!({
+            "kind": "follow_up",
+            "next_fire_ms": now + 3_600_000,
+        }))
+        .await;
+    let future_id = future["timer_id"].as_str().unwrap().to_string();
+
+    h.restart().await;
+    assert_eq!(h.schema_version(), 23, "schema stays v23 across restart");
+    assert_eq!(h.count_agent_timers(), 2);
+    assert_eq!(h.timer_status(&due_id), "active");
+    assert_eq!(h.timer_status(&future_id), "active");
+
+    assert_eq!(h.state.drive_due_timers(), 1);
+    assert_eq!(h.timer_status(&due_id), "done");
+    assert_eq!(h.timer_status(&future_id), "active");
+    assert_eq!(h.count_timer_events(), 1);
+    assert_eq!(h.state.drive_due_timers(), 0);
+    assert_eq!(h.count_timer_events(), 1);
 }

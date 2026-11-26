@@ -218,9 +218,9 @@ fn is_hex64(value: &str) -> bool {
 
 #[tokio::test]
 async fn p1_draft_blueprint() {
-    assert_eq!(DB_SCHEMA_VERSION, 22, "AO-1 bumps the schema to v22 (ORC-5 added v21)");
+    assert_eq!(DB_SCHEMA_VERSION, 23, "AO-2 bumps the schema to v23 (AO-1 added v22)");
     let h = Harness::serve().await;
-    assert_eq!(h.schema_version(), 22);
+    assert_eq!(h.schema_version(), 23);
     let task_id = h.make_task().await;
     let before = now_ms();
     let (status, plan) = h.post("/tasks/plan/draft", draft_body(&task_id)).await;
@@ -405,7 +405,7 @@ async fn p5_restart_consistency() {
     let task_id = h.make_task().await;
     let (_, plan) = h.post("/tasks/plan/draft", draft_body(&task_id)).await;
     h.restart().await;
-    assert_eq!(h.schema_version(), 22, "schema stays v22 across restart");
+    assert_eq!(h.schema_version(), 23, "schema stays v23 across restart");
     let (status, current) = h.get(&format!("/tasks/plan?task_id={task_id}")).await;
     assert_eq!(status, StatusCode::OK, "current plan after restart: {current}");
     assert_eq!(current, plan, "same plan object after restart");

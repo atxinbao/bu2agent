@@ -33,6 +33,7 @@ pub mod plan_store;
 pub mod swarm_store;
 pub mod routes_swarm;
 pub mod routes_agent_events;
+pub mod routes_timers;
 pub mod routes_files;
 pub mod routes_engineering;
 pub mod routes_chat;

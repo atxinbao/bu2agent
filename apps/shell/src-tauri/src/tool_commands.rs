@@ -80,6 +80,7 @@ use agent_desktop::plan_client::{
     PlanClient, PlanDraftInput, PlanRecord, PlanReplanIfInput, PlanStepInput,
 };
 use agent_desktop::swarm_client::{SwarmClient, SwarmCreateInput, SwarmFanoutInput, SwarmView};
+use agent_desktop::timers_client::{TimerClient, TimerCreateInput, TimerView};
 use agent_desktop::file_gateway_client::{FileGatewayClient, GatewayFileEntry, GatewayFileStat, GatewayBatchReadItem, GatewayBatchReadResult, GatewayBatchStatResult, GatewaySearchResult, GatewayThumbnail, GatewayLibraryResult};
 use agent_desktop::{ErrorCode, UnifiedError, UserAction};
 
@@ -1157,6 +1158,47 @@ pub fn swarm_fanout(
 #[tauri::command(rename_all = "snake_case")]
 pub fn swarm_get(swarm_id: String) -> Result<SwarmView, String> {
     swarm_client()?.swarm_get(&swarm_id).map_err(agent_err_string)
+}
+
+// --- Timers (AO-2) ---
+
+// Three commands mirror the timer routes (create /
+// list / revoke). A timer is a fact row, not an
+// Agent run: the commands only record when it
+// should fire. The sweeper drive fires due rows by
+// writing an event through AO-1's ingest path — a
+// timer NEVER starts an Agent directly.
+fn timer_client() -> Result<TimerClient, String> {
+    TimerClient::new(&crate::gateway_endpoint::base_url()).map_err(|e| err_string(&e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn timer_create(
+    kind: String,
+    next_fire_ms: i64,
+    recurrence_json: Option<serde_json::Value>,
+    payload_summary_json: Option<serde_json::Value>,
+    session_id: Option<String>,
+) -> Result<TimerView, String> {
+    timer_client()?
+        .timer_create(&TimerCreateInput {
+            kind,
+            next_fire_ms,
+            recurrence_json,
+            payload_summary_json,
+            session_id,
+        })
+        .map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn timer_list(limit: Option<i64>) -> Result<Vec<TimerView>, String> {
+    timer_client()?.timer_list(limit).map_err(agent_err_string)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn timer_delete(timer_id: String) -> Result<TimerView, String> {
+    timer_client()?.timer_delete(&timer_id).map_err(agent_err_string)
 }
 
 // --- Devices (B-layer single-device validation) ---

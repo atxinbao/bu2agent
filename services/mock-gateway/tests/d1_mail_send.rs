@@ -353,7 +353,7 @@ async fn sd1_send_end_to_end() {
     let h = Harness::serve().await;
     assert_eq!(h.schema_version(), DB_SCHEMA_VERSION);
     // F-1 将模式升级到 v18，新增联系人历史幂等索引；C-2 升到 v19，新增定时发送正文表；ORC-1 升到 v20，新增蓝图表。
-    assert_eq!(DB_SCHEMA_VERSION, 22);
+    assert_eq!(DB_SCHEMA_VERSION, 23);
 
     let approval = h.approved_mail_send(&TO, SUBJECT, BODY).await;
     // The send presents the recipients in the other

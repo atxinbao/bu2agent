@@ -67,13 +67,15 @@ use crate::execution_store::ExecutionFileRecord;
 /// v20 adds the ORC-1 `plans` table (see SCHEMA_V20);
 /// v21 adds the ORC-5 `swarms` + `swarm_messages`
 /// tables (see SCHEMA_V21); v22 adds the AO-1
-/// `agent_events` table (see SCHEMA_V22).
+/// `agent_events` table (see SCHEMA_V22); v23 adds
+/// the AO-2 `agent_timers` table (see SCHEMA_V23).
 // v18 新增 contacts 历史写入幂等索引。
 // v19 新增 D1-3 C-2 定时发送正文表（Q-C2-01）。
 // v20 新增 ORC-1 蓝图表（Q-ORC-03）。
 // v21 新增 ORC-5 Swarm 表（Q-R5-01）。
 // v22 新增 AO-1 事件收件箱表（Q-AO-04）。
-pub const DB_SCHEMA_VERSION: i64 = 22;
+// v23 新增 AO-2 通用定时器表（Q-AO-07）。
+pub const DB_SCHEMA_VERSION: i64 = 23;
 
 /// Backend mode for the migrated domains. `Jsonl` is the
 /// pre-P0-D behaviour (SQLite absent or the emergency diagnostic
@@ -834,6 +836,37 @@ CREATE INDEX IF NOT EXISTS idx_agent_events_status ON agent_events (status, crea
 CREATE INDEX IF NOT EXISTS idx_agent_events_session ON agent_events (session_id, status);
 ";
 
+/// AO-2 v23 step: `agent_timers` (Q-AO-07). One row
+/// per timer: `kind` is `follow_up` (one-shot —
+/// fires once, then `done`) or `schedule`
+/// (periodic — fires every
+/// `recurrence_json.interval_ms`, `next_fire_ms`
+/// advances). `payload_summary_json` is a summary +
+/// pointer payload (never raw text, red line 7);
+/// `session_id` is copied onto the event the fire
+/// writes, so the AO-3 driver knows the session.
+/// Status words: `active` (live) → `done` /
+/// `cancelled` (terminal). A schedule row stays
+/// `active` across fires. `seq` is the
+/// `timer-{seq}` id counter (the `agent_events`
+/// precedent — `next_seq_for` reads `MAX(seq)`).
+/// The table has no JSONL export (the `plans`
+/// precedent — SQLite-only).
+const SCHEMA_V23: &str = "
+CREATE TABLE IF NOT EXISTS agent_timers (
+    timer_id TEXT PRIMARY KEY,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload_summary_json TEXT NOT NULL,
+    session_id TEXT,
+    next_fire_ms INTEGER NOT NULL,
+    recurrence_json TEXT,
+    status TEXT NOT NULL,
+    created_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_timers_due ON agent_timers (status, next_fire_ms);
+";
+
 /// MCL-4 v17 step: `sent_imessages` fact table.
 /// `sent_id` is the local `sent-imsg-N` id
 /// (max-suffix + 1 in the record transaction — the
@@ -1220,6 +1253,15 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.execute_batch(SCHEMA_V22).map_err(err)?;
         tx.execute(
             "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '22')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(err)?;
+    }
+    if version < 23 {
+        tx.execute_batch(SCHEMA_V23).map_err(err)?;
+        tx.execute(
+            "INSERT INTO db_meta (key, value) VALUES ('db_schema_version', '23')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )
@@ -7388,6 +7430,202 @@ pub fn get_agent_event(conn: &Connection, event_id: &str) -> Result<Option<Agent
     )
     .optional()
     .map_err(err)
+}
+
+/// `agent_timers` row (see SCHEMA_V23). Status
+/// words: `active` (live) → `done` / `cancelled`
+/// (terminal). A `schedule` row stays `active`
+/// across fires; only its `next_fire_ms` moves.
+/// `recurrence_json` is `{"interval_ms": N}` for a
+/// schedule row, NULL for a follow-up (AO2-J2).
+const AGENT_TIMER_COLS: &str = "timer_id, seq, kind, payload_summary_json, session_id, next_fire_ms, recurrence_json, status, created_ms";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentTimerRow {
+    pub timer_id: String,
+    pub seq: i64,
+    pub kind: String,
+    pub payload_summary_json: String,
+    pub session_id: Option<String>,
+    pub next_fire_ms: i64,
+    pub recurrence_json: Option<String>,
+    pub status: String,
+    pub created_ms: i64,
+}
+
+fn agent_timer_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentTimerRow> {
+    Ok(AgentTimerRow {
+        timer_id: row.get(0)?,
+        seq: row.get(1)?,
+        kind: row.get(2)?,
+        payload_summary_json: row.get(3)?,
+        session_id: row.get(4)?,
+        next_fire_ms: row.get(5)?,
+        recurrence_json: row.get(6)?,
+        status: row.get(7)?,
+        created_ms: row.get(8)?,
+    })
+}
+
+/// Create one timer, live from the start
+/// (`active` — a past `next_fire_ms` is due on
+/// the first tick, the D1-3 C-1 "past = due"
+/// rule, test B4). The id is `timer-{seq}` (the
+/// `agent-event-{seq}` precedent). No audit row
+/// (AO2-J5): the fired event's `agent_event.created`
+/// row is the audit trail for a fire.
+pub fn create_agent_timer(
+    conn: &mut Connection,
+    kind: &str,
+    payload_summary_json: &str,
+    session_id: Option<&str>,
+    next_fire_ms: i64,
+    recurrence_json: Option<&str>,
+) -> Result<AgentTimerRow, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let seq = next_seq_for(&tx, "agent_timers", "timer_id")?;
+    let now = now_ms() as i64;
+    let timer_id = format!("timer-{seq}");
+    tx.execute(
+        &format!(
+            "INSERT INTO agent_timers ({AGENT_TIMER_COLS})
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8)"
+        ),
+        params![
+            timer_id,
+            seq,
+            kind,
+            payload_summary_json,
+            session_id,
+            next_fire_ms,
+            recurrence_json,
+            now,
+        ],
+    )
+    .map_err(err)?;
+    let row = AgentTimerRow {
+        timer_id,
+        seq,
+        kind: kind.to_string(),
+        payload_summary_json: payload_summary_json.to_string(),
+        session_id: session_id.map(str::to_string),
+        next_fire_ms,
+        recurrence_json: recurrence_json.map(str::to_string),
+        status: "active".to_string(),
+        created_ms: now,
+    };
+    tx.commit().map_err(err)?;
+    Ok(row)
+}
+
+pub fn get_agent_timer(
+    conn: &Connection,
+    timer_id: &str,
+) -> Result<Option<AgentTimerRow>, String> {
+    conn.query_row(
+        &format!("SELECT {AGENT_TIMER_COLS} FROM agent_timers WHERE timer_id = ?1"),
+        params![timer_id],
+        agent_timer_from_row,
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// List timers, soonest first (AO2-J7). `limit`
+/// is clamped by the caller (the swarm GET
+/// precedent: default 50, 1..=200).
+pub fn list_agent_timers(conn: &Connection, limit: i64) -> Result<Vec<AgentTimerRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {AGENT_TIMER_COLS} FROM agent_timers
+             ORDER BY CAST(next_fire_ms AS INTEGER) ASC, timer_id ASC LIMIT ?1"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![limit], agent_timer_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+/// Revoke a timer (AO2-J6): an `active` row moves
+/// to `cancelled`; an already-terminal row is
+/// returned unchanged (idempotent — the
+/// deliver/requeue precedent); an unknown id
+/// returns None. The row is never deleted
+/// (red line 9).
+pub fn revoke_agent_timer(
+    conn: &mut Connection,
+    timer_id: &str,
+) -> Result<Option<AgentTimerRow>, String> {
+    conn.execute(
+        "UPDATE agent_timers SET status = 'cancelled'
+         WHERE timer_id = ?1 AND status = 'active'",
+        params![timer_id],
+    )
+    .map_err(err)?;
+    get_agent_timer(conn, timer_id)
+}
+
+/// Due timers for the sweeper drive: `active`
+/// rows whose `next_fire_ms` has passed. The
+/// `CAST` is the E2-D batch-2 lesson — a TEXT
+/// comparison would order lexicographically and
+/// miss rows on old databases.
+pub fn due_agent_timers(conn: &Connection, now_ms: i64) -> Result<Vec<AgentTimerRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {AGENT_TIMER_COLS} FROM agent_timers
+             WHERE status = 'active' AND CAST(next_fire_ms AS INTEGER) <= ?1
+             ORDER BY CAST(next_fire_ms AS INTEGER) ASC, timer_id ASC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![now_ms], agent_timer_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+/// AO2-J4: finalize one fire. Conditional on the
+/// row still being `active` at exactly the fired
+/// `next_fire_ms`, so a double-drive is a no-op
+/// (the ingest in the same lock hold already
+/// deduped through AO-1). Returns whether this
+/// call moved the row.
+pub fn finalize_timer_fire(
+    conn: &mut Connection,
+    timer_id: &str,
+    fire_ms: i64,
+    new_status: &str,
+    new_next_fire_ms: i64,
+) -> Result<bool, String> {
+    let changed = conn
+        .execute(
+            "UPDATE agent_timers SET status = ?1, next_fire_ms = ?2
+             WHERE timer_id = ?3 AND status = 'active'
+             AND CAST(next_fire_ms AS INTEGER) = ?4",
+            params![new_status, new_next_fire_ms, timer_id, fire_ms],
+        )
+        .map_err(err)?;
+    Ok(changed > 0)
+}
+
+/// AO2-J2: the schedule recurrence is one number,
+/// `{"interval_ms": N}` with N > 0. Anything else
+/// (missing, non-object, non-positive) is None —
+/// the create route rejects it with 400, and the
+/// drive skips a row that somehow carries it.
+pub fn recurrence_interval_ms(recurrence_json: &str) -> Option<i64> {
+    let value: serde_json::Value = serde_json::from_str(recurrence_json).ok()?;
+    let interval = value.get("interval_ms")?.as_i64()?;
+    if interval > 0 {
+        Some(interval)
+    } else {
+        None
+    }
 }
 
 /// Execution deadline (plan §2.4): NULL means no
