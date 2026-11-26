@@ -1,0 +1,732 @@
+   Compiling mock-gateway v0.1.0 (/Users/mac/Documents/bu2agent/services/mock-gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 46.88s
+     Running unittests src/lib.rs (target/debug/deps/agent_desktop-a20dedc542f31fa1)
+
+running 42 tests
+test credential_store::tests::keychain_roundtrip_when_enabled ... ok
+test chat_client::tests::chat_client_rejects_non_http_base_url ... ok
+test credential_store::tests::memory_store_roundtrip_and_missing ... ok
+test chat_client::tests::assemble_text_uses_only_text_append_payloads ... ok
+test contacts_client::tests::query_encoding_covers_spaces_and_unicode ... ok
+test chat_records_client::tests::query_encoding_covers_spaces_and_unicode ... ok
+test agent_client::tests::registry_contains_imessage_send ... ok
+test agent_client::tests::unknown_tools_still_rejected_before_any_request ... ok
+test approvals_client::tests::approval_view_decodes_all_fields ... ok
+test approvals_client::tests::approval_view_minimal_json_defaults_to_none ... ok
+test credential_store::tests::redact_shows_only_last_four ... ok
+test effect_presentation::tests::authorized_maps_to_approved ... ok
+test effect_presentation::tests::failed_maps_to_failed ... ok
+test effect_presentation::tests::next_step_copy_never_claims_external_confirmation ... ok
+test effect_presentation::tests::next_step_inconclusive_class_retries_or_escalates ... ok
+test effect_presentation::tests::next_step_mismatch_class_needs_human_review ... ok
+test effect_presentation::tests::next_step_unknown_reason_fails_closed_to_human_review ... ok
+test effect_presentation::tests::next_step_verified_class_needs_no_action ... ok
+test effect_presentation::tests::planned_maps_to_proposed ... ok
+test effect_presentation::tests::reconciled_completed_maps_to_verified ... ok
+test effect_presentation::tests::reconciled_failed_maps_to_failed ... ok
+test effect_presentation::tests::reconciling_maps_to_unknown_in_progress ... ok
+test effect_presentation::tests::started_maps_to_dispatched ... ok
+test effect_presentation::tests::succeeded_with_inconclusive_evidence_is_undetermined ... ok
+test effect_presentation::tests::succeeded_with_mismatch_evidence_is_drifted_not_verified ... ok
+test effect_presentation::tests::succeeded_with_verified_evidence_is_verified ... ok
+test effect_presentation::tests::succeeded_without_evidence_is_unverified ... ok
+test effect_presentation::tests::unknown_maps_to_unknown ... ok
+test http_client::tests::conflict_detail_surfaces_machine_code_and_hash ... ok
+test http_client::tests::denial_detail_names_the_rule ... ok
+test http_client::tests::other_bodies_stay_redacted ... ok
+test mandates_client::tests::mandate_row_decodes_all_fields ... ok
+test mandates_client::tests::mandate_row_minimal_json_defaults_links_to_none ... ok
+test outbox_client::tests::outbox_row_decodes_all_fields ... ok
+test loop_client::tests::loop_snapshot_without_kind_defaults_to_main ... ok
+test outbox_client::tests::outbox_row_minimal_json_decodes ... ok
+test policies_client::tests::policy_version_row_null_supersedes_decodes_to_none ... ok
+test policies_client::tests::policy_version_row_decodes_all_fields ... ok
+test task_client::tests::task_record_decodes_all_twelve_fields ... ok
+test task_client::tests::task_record_legacy_eight_fields_default_to_none ... ok
+test agent_client::tests::imessage_send_approval_posts_thread_id_and_body ... ok
+test agent_client::tests::imessage_send_approval_rejects_missing_or_empty_fields_without_a_request ... ok
+
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+     Running unittests src/bin/agent-cli.rs (target/debug/deps/agent_cli-ec64994b6b62e400)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/chat-cli.rs (target/debug/deps/chat_cli-47e0ce0a86664463)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/connector-cli.rs (target/debug/deps/connector_cli-b6ca70bc68259306)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/file-cli.rs (target/debug/deps/file_cli-29ad30c770313e49)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/chat_client_test.rs (target/debug/deps/chat_client_test-ec56c027cd822cf1)
+
+running 1 test
+test chat_client_history_start_apply_cancel ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contract_tests.rs (target/debug/deps/contract_tests-cadcf76dc42effa4)
+
+running 12 tests
+test approval_gate_blocks_unapproved_sensitive_calls ... ok
+test auth_refresh_retries_at_most_once ... ok
+test bridge_version_mismatch_fails ... ok
+test bridge_whitelist_is_closed ... ok
+test phase1_tool_registry_requires_approval_for_writes ... ok
+test approval_record_gate_matches_free_function ... ok
+test session_logout_clears_target ... ok
+test permission_snapshot_gates_capability ... ok
+test generation_bump_invalidates_old_target ... ok
+test redact_removes_token_marker ... ok
+test turn_terminal_states_are_exactly_three ... ok
+test url_or_vm_change_invalidates_old_target ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/email_sync_timeout_test.rs (target/debug/deps/email_sync_timeout_test-0cfe03b72006166b)
+
+running 1 test
+test sync_mail_survives_slow_gateway_while_default_calls_time_out ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.01s
+
+     Running tests/phase2_test.rs (target/debug/deps/phase2_test-4c1015811ded8d6e)
+
+running 3 tests
+test session_switch_invalidates_old_target ... ok
+test scoped_files_scope_approval_chunks_and_max ... ok
+test gateway_read_retries_once_on_401_write_never_retries ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/phase3_test.rs (target/debug/deps/phase3_test-a05a0a43e7311265)
+
+running 1 test
+test agent_approval_loop_end_to_end ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/phase4_test.rs (target/debug/deps/phase4_test-b7a827f4c0383cfc)
+
+running 3 tests
+test credential_store_is_memory_only_and_redacted ... ok
+test egress_policy_allows_only_mock_destinations ... ok
+test connector_client_approval_and_egress ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/phase5_test.rs (target/debug/deps/phase5_test-fbb95d587abd8938)
+
+running 3 tests
+test retry_stops_at_once_on_non_retryable_error ... ok
+test retry_succeeds_after_transient_failures ... ok
+test client_times_out_on_silent_server ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
+
+     Running unittests src/lib.rs (target/debug/deps/mock_gateway-64240ffeb8df033e)
+
+running 203 tests
+test code_search::tests::secret_filename_rules ... ok
+test approval_store::tests::next_id_number_ignores_unparsable_ids ... ok
+test binding_store::tests::next_workspace_number_follows_max_suffix ... ok
+test connector_store::tests::state_lines_roundtrip ... ok
+test chat_store::tests::state_lines_roundtrip_last_wins ... ok
+test contacts_source::tests::applescript_escape_neutralizes_control_characters ... ok
+test code_search::tests::normalize_search_path_rules ... ok
+test approval_store::tests::missing_file_loads_empty_and_bad_lines_are_skipped ... ok
+test contacts_source::tests::birthday_hash_is_sha256_of_the_iso_date ... ok
+test approval_store::tests::append_then_load_roundtrips_in_order ... ok
+test contacts_source::tests::dump_parsing_skips_malformed_lines ... ok
+test contacts_source::tests::dump_parsing_accepts_macos_carriage_returns ... ok
+test contacts_source::tests::content_line_parsing_reads_five_fields ... ok
+test contacts_source::tests::dump_parsing_reads_full_and_minimal_contacts ... ok
+test contacts_source::tests::addresses_hash_is_none_without_addresses_and_stable_otherwise ... ok
+test contacts_source::tests::dump_script_timeout_covers_gateway_cap ... ok
+test code_search::tests::search_path_prefix_escapes ... ok
+test contacts_source::tests::dump_script_has_no_single_line_if_else ... ok
+test contacts_source::tests::dump_script_asks_only_for_id_name_phones_emails_addresses_birthday ... ok
+test contacts_source::tests::write_scripts_timeout_covers_gateway_cap ... ok
+test contacts_source::tests::write_scripts_have_no_single_line_if_else ... ok
+test contacts_source::tests::string_list_hash_is_order_independent_and_hides_values ... ok
+test contacts_sync::tests::address_hash_helper_matches_the_stored_hash ... ok
+test deepseek::tests::completions_url_trims_trailing_slash ... ok
+test deepseek::tests::disabled_config_has_no_key ... ok
+test contacts_source::tests::write_scripts_are_write_only_and_save ... ok
+test contacts_sync::tests::synced_payload_carries_hashes_and_counts_only ... ok
+test deepseek::tests::first_content_missing_is_none ... ok
+test deepseek::tests::first_content_reads_first_choice ... ok
+test deepseek::tests::first_content_truncated_or_empty_is_none ... ok
+test contacts_sync::tests::synced_payload_flags_absent_address_and_birthday ... ok
+test code_search::tests::search_finds_hit_with_context_and_skips_binary_and_secrets ... ok
+test code_search::tests::search_scoped_prefix_finds_hits ... ok
+test device_backend::tests::execute_awaiting_authorization_attempts_no_write ... ok
+test device_backend::tests::execute_denied_fails_without_write ... ok
+test deepseek_loop::tests::reminder_wire_unknown_fields_remain_invalid_proposals ... ok
+test deepseek_loop::tests::reminder_wire_names_map_to_internal_tools_in_order ... ok
+test device_backend::tests::completion_returns_actual_readback_not_local_payload ... ok
+test device_backend::tests::execute_not_found_fails ... ok
+test device_backend::tests::backend_timeout_error_yields_unknown ... ok
+test deepseek_loop::tests::research_system_and_schemas_list_only_the_read_subset ... ok
+test device_backend::tests::fake_set_completed_roundtrip ... ok
+test device_backend::tests::fake_double_complete_is_idempotent ... ok
+test device_backend::tests::resolve_unknown_missing_fails ... ok
+test device_backend::tests::resolve_unknown_query_failure_keeps_unknown ... ok
+test device_backend::tests::resolve_unknown_state_match_completes ... ok
+test device_backend::tests::resolve_unknown_state_mismatch_keeps_unknown ... ok
+test device_backend::tests::save_success_with_old_state_is_unknown ... ok
+test device_backend::tests::save_success_with_missing_or_failed_readback_is_unknown ... ok
+test effect_store::tests::idempotency_key_is_stable_and_execution_scoped ... ok
+test effect_store::tests::legacy_mapping_covers_the_contract_table ... ok
+test effect_store::tests::lifecycle_allows_only_the_contract_edges ... ok
+test device_store::tests::next_number_skips_non_action_ids ... ok
+test effect_store::tests::next_effect_number_skips_gaps_and_unknown_ids ... ok
+test eventkit_backend::tests::explicit_state_clears_stale_completion_date ... ok
+test device_store::tests::load_missing_file_is_empty ... ok
+test execution_store::tests::load_missing_file_is_empty ... ok
+test execution_store::tests::p0e_transition_edges_and_recoverability ... ok
+test execution_store::tests::status_groups_cover_all_valid_values ... ok
+test feed_store::tests::seeds_are_labeled_mock ... ok
+test feed_store::tests::state_line_roundtrip ... ok
+test device_store::tests::append_and_reload_roundtrip ... ok
+test imessage_source::tests::dump_parsing_accepts_macos_carriage_returns ... ok
+test device_store::tests::unknown_and_rejected_roundtrip ... ok
+test effect_store::tests::old_lines_without_new_fields_still_parse ... ok
+test effect_store::tests::round_trip_skips_malformed_lines ... ok
+test imessage_source::tests::dump_script_enumerates_threads_without_reading_messages ... ok
+test execution_store::tests::append_and_reload_roundtrip ... ok
+test imessage_source::tests::dump_parsing_skips_malformed_lines ... ok
+test imessage_source::tests::dump_parsing_reads_threads_and_marks_groups ... ok
+test imessage_source::tests::participant_hash_is_order_independent_and_hides_handles ... ok
+test imessage_source::tests::send_script_targets_one_chat_and_never_reads_messages ... ok
+test location_record::tests::recorded_payload_names_no_coordinates ... ok
+test imessage_sync::tests::synced_payload_names_no_handle_and_no_message_field ... ok
+test location_source::tests::grid_hash_is_deterministic_and_hides_coordinates ... ok
+test execution_store::tests::p0a_fields_roundtrip_and_old_lines_read_as_schema_zero ... ok
+test location_source::tests::grid_indices_handle_negative_longitudes ... ok
+test location_store::tests::next_location_number_follows_max_suffix ... ok
+test location_source::tests::locality_hash_is_deterministic_and_cell_keyed ... ok
+test mail_source::tests::applescript_dates_are_iso8601_utc ... ok
+test mail_source::tests::delete_script_builds_a_trash_only_delete ... ok
+test mail_source::tests::applescript_escape_neutralizes_control_characters ... ok
+test execution_store::tests::malformed_lines_skipped_and_numbers_ignored ... ok
+test mail_source::tests::dump_parsing_accepts_macos_carriage_returns ... ok
+test mail_source::tests::dump_parsing_reads_snippets ... ok
+test mail_source::tests::dump_parsing_skips_malformed_lines ... ok
+test loop_fault::tests::fault_requires_dedicated_temp_root_and_lower_timeout ... ok
+test mail_source::tests::group_threads_uses_snippet_map ... ok
+test mail_source::tests::mock_groups_replies_into_one_thread ... ok
+test mail_source::tests::send_script_builds_a_plain_text_send ... ok
+test mail_source::tests::subject_normalization_strips_reply_prefixes ... ok
+test code_search::tests::search_skips_target_git_and_node_modules ... ok
+test mail_source::tests::mock_pagination_and_404s ... ok
+test mail_source::tests::thread_ids_are_stable_for_replies ... ok
+test mail_source::tests::unavailable_source_fails_everywhere ... ok
+test loop_fault::tests::default_delegates_once_without_deleting_and_keeps_normal_timeouts ... ok
+test model_store::tests::role_models_fall_back_through_staged_model_to_running ... ok
+test loop_fault::tests::removal_only_follows_successful_write_dispatch ... ok
+test model_store::tests::state_line_roundtrip ... ok
+test node_store::tests::next_node_number_follows_max_suffix ... ok
+test notes_source::tests::notes_dump_parses_locked_and_multiline_notes ... ok
+test notes_source::tests::unavailable_source_is_never_fake_data ... ok
+test notes_source::tests::plaintext_escape_round_trips_exactly ... ok
+test notes_source::tests::plain_text_to_html_escapes_and_wraps_lines ... ok
+test notes_source::tests::notes_scripts_carry_the_doc_verified_forms ... ok
+test operation_binding::tests::digests_reject_bad_paths ... ok
+test operation_binding::tests::iso8601_unparseable_is_zero ... ok
+test operation_binding::tests::iso8601_round_trips_and_offsets ... ok
+test operation_binding::tests::mail_delete_digest_is_stable_and_sensitive ... ok
+test operation_binding::tests::normalize_rejoins_normal_components ... ok
+test operation_binding::tests::digests_are_stable_but_sensitive_to_every_parameter ... ok
+test patch_store::tests::changed_line_shows_minus_plus_with_context ... ok
+test operation_binding::tests::rename_and_mkdir_digests_are_stable_and_sensitive ... ok
+test patch_store::tests::far_apart_changes_become_two_hunks ... ok
+test patch_store::tests::identical_content_has_headers_only ... ok
+test operation_binding::tests::contact_digests_are_stable_but_sensitive_to_every_parameter ... ok
+test patch_store::tests::missing_trailing_newline_is_marked ... ok
+test patch_store::tests::new_file_uses_dev_null_and_adds_all_lines ... ok
+test peer_store::tests::next_numbers_skip_gaps ... ok
+test operation_binding::tests::note_digests_are_stable_but_sensitive_to_every_parameter ... ok
+test policy_store::tests::effective_policy_prefers_overrides ... ok
+test peer_store::tests::state_line_roundtrip ... ok
+test policy_store::tests::network_rule_deny_wins_default_allow ... ok
+test policy_store::tests::network_rule_matching ... ok
+test policy_store::tests::network_rule_validation ... ok
+test operation_binding::tests::normalize_rejects_unsafe_paths ... ok
+test policy_store::tests::state_lines_roundtrip ... ok
+test project_store::tests::next_project_number_follows_max_suffix ... ok
+test operation_binding::tests::mail_send_digest_is_stable_and_sensitive ... ok
+test routes_misc::model_merge_tests::merge_env_wins_over_staged ... ok
+test routes_misc::model_merge_tests::merge_applies_staged_without_env ... ok
+test routes_misc::model_merge_tests::merge_partial_staged_only_touches_set_fields ... ok
+test routes_contacts::tests::contacts_error_response_maps_each_variant ... ok
+test routes_misc::model_merge_tests::restart_needed_env_shadow_is_dormant_not_pending ... ok
+test session_store::tests::context_keeps_last_ten_complete_turns ... ok
+test session_store::tests::context_skips_deleted_turns ... ok
+test session_store::tests::context_excludes_oversized_single_pair ... ok
+test session_store::tests::context_skips_incomplete_trailing_user ... ok
+test session_store::tests::title_truncates_by_characters ... ok
+test session_store::tests::context_trims_by_bytes_oldest_first ... ok
+test session_store::tests::tombstone_defaults_to_not_deleted ... ok
+test space_store::tests::state_line_roundtrip ... ok
+test sqlite_store::tests::due_deferred_worker_runs_orders_legacy_text_priorities_numerically ... ok
+test device_backend::tests::execute_timeout_yields_unknown ... ok
+test device_backend::tests::slow_readback_uses_same_timeout_budget ... ok
+test sqlite_store::tests::p0e_canonical_json_sorts_keys_and_snapshot_hash_is_stable ... ok
+test sqlite_store::tests::p0e_migration_backfills_worker_detail_column ... ok
+test sqlite_store::tests::p0d_import_keeps_both_device_label_sets_verbatim ... ok
+test sqlite_store::tests::p0d_outbox_dedup_no_auto_retry_and_explicit_requeue ... ok
+test sqlite_store::tests::p0d_event_payloads_carry_no_new_privacy_fields ... ok
+test sqlite_store::tests::p0d_failed_inbox_closes_only_by_ack ... ok
+test sqlite_store::tests::p3a_snapshot_hash_covers_binding_keys ... ok
+test sqlite_store::tests::p0d_schema_applies_cleanly_and_reapply_is_idempotent ... ok
+test sqlite_store::tests::p0d_shadow_compare_and_export_roundtrip ... ok
+test sqlite_store::tests::redact_fails_closed_on_unparseable_payloads ... ok
+test sqlite_store::tests::redact_drops_body_and_secrets_from_new_kinds ... ok
+test sqlite_store::tests::redact_keeps_file_changed_unchanged ... ok
+test sqlite_store::tests::redact_passes_row_serializations_byte_identical ... ok
+test sqlite_store::tests::worker_run_time_fields_accept_integer_and_legacy_text_storage ... ok
+test stream_store::tests::cursor_survives_tombstone_without_duplicates ... ok
+test stream_store::tests::numbering_follows_max_suffix ... ok
+test stream_store::tests::projection_maps_assistant_turns_and_merges_pokes ... ok
+test task_runner::tests::disclosable_failure_tail_only_matches_the_prefix ... ok
+test task_runner::tests::step_run_failed_error_carries_budget_exceeded_tail ... ok
+test task_runner::tests::step_run_failed_error_keeps_other_tails_out ... ok
+test task_store::tests::append_and_reload_roundtrip ... ok
+test task_store::tests::load_missing_file_is_empty ... ok
+test task_store::tests::next_number_skips_non_task_ids ... ok
+test task_store::tests::task_status_transition_table ... ok
+test routes_ledger::p0e_tests::p0e_create_execution_stamps_worker_and_snapshot_per_driver ... ok
+test tests::cancel_blocks_later_records ... ok
+test tests::dedup_drops_replayed_records ... ok
+test tests::mock_approval_gate_refuses_pending_sensitive_calls ... ok
+test tests::seed_history_has_user_and_assistant_turn ... ok
+test tests::tool_approval_flags_match_phase1_registry ... ok
+test tests::stream_sequences_are_strictly_increasing_from_one ... ok
+test vault_store::tests::ticket_expiry_is_pending_only ... ok
+test vault_store::tests::state_lines_roundtrip ... ok
+test voice_store::tests::overlay_rename_and_tombstone_apply ... ok
+test voice_store::tests::seeds_and_filters_agree ... ok
+test worker::tests::allowlist_rejects_everything_not_listed ... ok
+test worker::tests::diff_path_validation_rejects_escapes_and_shell ... ok
+test worker::tests::contained_path_rejects_symlink_escape ... ok
+test sqlite_store::tests::p0d_upserts_events_fold_back_to_tables ... ok
+test worker::tests::parse_test_output_reads_full_output_beyond_tail_limit ... ok
+test worker::tests::parse_test_output_sums_suites_and_hashes_failures ... ok
+test sqlite_store::tests::p0d_import_folds_preserves_old_rows_and_is_idempotent ... ok
+test worker::tests::resolve_status_and_diff_argv ... ok
+test worker::tests::relative_scope_uses_api_separators_before_and_after_creation ... ok
+test worker::tests::resolve_write_templates_reject_bad_params ... ok
+test worker::tests::resolve_worktree_add_commit_and_cargo_test_argv ... ok
+test worker::tests::tail_keeps_last_4096_bytes_only ... ok
+test worktree_store::tests::next_worktree_number_follows_max_suffix ... ok
+test sqlite_store::tests::p0d_p0e_tables_exist_and_seam_rows_insert ... ok
+test worker::tests::exited_unreaped_child_is_not_alive ... ok
+test sqlite_store::tests::p0e_recovery_scan_ends_only_active_and_loses_their_assignments ... ok
+test sqlite_store::tests::p3a_migration_backfills_snapshot_binding_columns ... ok
+test sqlite_store::tests::p0e_takeover_writes_checkpoint_and_refuses_cleanly ... ok
+test sqlite_store::tests::r5f2_execution_deadline_takes_the_later_write ... ok
+test sqlite_store::tests::redact_runs_inside_append_event_and_fold_still_holds ... ok
+test sqlite_store::tests::p0e_transition_moves_status_and_dones_assignments_on_terminal ... ok
+test worker::tests::kill_process_group_kills_grandchildren ... ok
+test device_backend::tests::late_write_resolves_unknown_to_completed ... ok
+
+test result: ok. 203 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running unittests src/main.rs (target/debug/deps/mock_gateway-56760b3b0b15c2a7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/agent_smoke.rs (target/debug/deps/agent_smoke-4b65a97673ac1a32)
+
+running 1 test
+test agent_approval_loop_over_http ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/approval_persistence.rs (target/debug/deps/approval_persistence-603a88e2d46fbc98)
+
+running 2 tests
+test decide_approve_is_idempotent_for_approved_unconsumed_bound_approval ... ok
+test approval_survives_server_restart ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/approvals_query_smoke.rs (target/debug/deps/approvals_query_smoke-0b0b8fad190a9b35)
+
+running 2 tests
+test history_without_persistence_falls_back_to_current_state ... ok
+test approvals_query_edit_and_history_flow ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/chat_smoke.rs (target/debug/deps/chat_smoke-154ee898d04bcc0c)
+
+running 1 test
+test chat_records_flow_and_restart ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/config_smoke.rs (target/debug/deps/config_smoke-9402f16e9b2fa695)
+
+running 1 test
+test config_get_and_patch_405 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/connector_smoke.rs (target/debug/deps/connector_smoke-6cc04d2716e79401)
+
+running 1 test
+test mock_connectors_over_http ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/connectors_registry_smoke.rs (target/debug/deps/connectors_registry_smoke-a9e296f92088a3a1)
+
+running 1 test
+test registry_account_lifecycle_roundtrip ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/d1_calendar_create.rs (target/debug/deps/d1_calendar_create-a65ac3a9d4a4066f)
+
+running 6 tests
+test cc_disconnected_source_rejects_writes ... ok
+test cc4_redaction ... ok
+test cc2_approval_gates ... ok
+test cc3_calendar_selection ... ok
+test cc1_create_end_to_end ... ok
+test cc5_error_mapping ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/d1_events.rs (target/debug/deps/d1_events-a888977551ee46a9)
+
+running 5 tests
+test e5_fold_covers_policy_mandates_cursors ... ok
+test e3_failed_branch_dedupe ... ok
+test e4_sweep_path_dedupe ... ok
+test e2_outbox_end_to_end ... ok
+test e1_consumer_cursor_same_tx_and_restart ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/d1_goals.rs (target/debug/deps/d1_goals-a640465f8b2e5351)
+
+running 4 tests
+test g1_goal_create_list_detail_archive ... ok
+test g2_task_link_fields_roundtrip_and_old_rows ... ok
+test g4_snapshot_content_drift_detectable ... ok
+test g3_execution_binds_session_and_goal ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+     Running tests/d1_mail_delete.rs (target/debug/deps/d1_mail_delete-8b175dc651094a5f)
+
+running 7 tests
+test md4_redaction_and_fold ... ok
+test md3_redelete_idempotency ... ok
+test md5_never_synced_delete ... ok
+test md_reader_and_restart ... ok
+test md2_approval_digest_gates ... ok
+test md1_delete_end_to_end ... ok
+test md5_error_mapping ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/d1_mail_send.rs (target/debug/deps/d1_mail_send-fec6070d9acb0a6b)
+
+running 6 tests
+test sd_disconnected_source_rejects_writes ... ok
+test sd4_redaction ... ok
+test sd3_approval_gates ... ok
+test sd2_idempotency ... ok
+test sd1_send_end_to_end ... ok
+test sd5_error_mapping ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/d1_memory.rs (target/debug/deps/d1_memory-b0d6b21035f95316)
+
+running 5 tests
+test m2_cross_scope_read_visible_write_rejected ... ok
+test m1_save_provenance_round_trip ... ok
+test m4_source_cleanup_cascade ... ok
+test m3_snapshot_freezes_real_scope_triple ... ok
+test m5_restart_recovery ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/d1_notes.rs (target/debug/deps/d1_notes-d397a30809bc4131)
+
+running 8 tests
+test nt4_redaction_and_fold ... ok
+test nt3_append_conflict ... ok
+test nt2_approval_digest_gates ... ok
+test nt3_append_end_to_end ... ok
+test nt2_create_end_to_end ... ok
+test nt1_sync_end_to_end ... ok
+test nt4_delete_end_to_end ... ok
+test nt5_error_mapping ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running tests/d1_policy.rs (target/debug/deps/d1_policy-9d0f6c20be1f43e7)
+
+running 7 tests
+test p3_approval_version_and_single_decision ... ok
+test p2_mandate_pins_policy_version ... ok
+test p6_approvals_history_reads_table ... ok
+test p5_restart_recovery_from_sqlite ... ok
+test p1_policy_write_versions_and_onetime_import ... ok
+test p5b_restart_recovery_with_jsonl_present ... ok
+test p4_consumed_by_backfill_emits_bound_event ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/d1_sources.rs (target/debug/deps/d1_sources-2ea971d47bd7e063)
+
+running 6 tests
+test test_s1b_connector_jsonl_import ... ok
+test test_s2b_reconnect_http_route ... ok
+test test_s1_registry_lists_all_kinds ... ok
+test test_s2_disconnect_flag_flip_only ... ok
+test test_s4_cleanup_isolation ... ok
+test test_s3_file_change_enters_event_log ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/d1_sync.rs (target/debug/deps/d1_sync-4d24f9ffb389cf7b)
+
+running 5 tests
+test y5_no_body_or_secret_in_the_event_log ... ok
+test y1_first_sync_imports_inbox_first_50 ... ok
+test y2_second_sync_adds_no_duplicates ... ok
+test y3_rebuild_reassigns_the_same_local_ids ... ok
+test y4_calendar_list_is_501_off_macos ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s
+
+     Running tests/d1_timed_outbox.rs (target/debug/deps/d1_timed_outbox-21ef58249f75c57a)
+
+running 7 tests
+test t7_legacy_text_due_times_order_numerically ... ok
+test t4_manual_deliver_before_due_sends_immediately ... ok
+test t5_reschedule_moves_due_and_logs_event ... ok
+test t1_timed_row_not_delivered_before_due ... ok
+test t3_dual_channels_no_double_no_drop ... ok
+test t2_timed_row_delivered_once_when_due ... ok
+test t6_restart_keeps_undue_pending_and_sent_sent ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/d1_timed_send.rs (target/debug/deps/d1_timed_send-b1d069d8987df8b5)
+
+running 12 tests
+test c2_schedule_unknown_thread_404 ... ok
+test c2_disconnect_409_at_schedule ... ok
+test c2_schedule_same_key_different_content_conflicts ... ok
+test c2_no_due_flag_is_still_immediate_send ... ok
+test c2_manual_deliver_sends_now ... ok
+test c2_schedule_replay_after_send ... ok
+test c2_future_due_stays_pending ... ok
+test c2_schedule_creates_pending_row_and_consumes_approval ... ok
+test c2_past_due_delivered_on_next_pass ... ok
+test c2_timeout_no_auto_retry ... ok
+test c2_restart_backfill ... ok
+test c2_rejection_requeue_redelivers ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running tests/deepseek_loop_smoke.rs (target/debug/deps/deepseek_loop_smoke-3330d3f299782297)
+
+running 18 tests
+test configured_production_builder_enables_loop_and_keeps_chat_request_unchanged ... ok
+test missing_or_non_string_arguments_still_count_as_invalid_proposals ... ok
+test invalid_index_and_unknown_envelope_fields_still_fail_without_execution ... ok
+test indexed_non_stream_calls_keep_array_order_ids_and_write_approval ... ok
+test invalid_proposals_count_and_return_errors_without_execution ... ok
+test duplicate_unknown_write_keeps_distinct_wire_ids_and_needs_review ... ok
+test excess_proposals_receive_cap_errors_and_closing_cannot_execute ... ok
+test adapter_itself_enforces_http_deadline_without_engine_timer ... ok
+test no_key_builder_keeps_loop_503_and_chat_echo ... ok
+test non_object_and_wrong_typed_arguments_are_invalid_proposals ... ok
+test rejected_write_is_returned_and_duplicate_never_reopens_approval ... ok
+test utf8_tool_body_is_bounded_on_wire_and_absent_from_audit ... ok
+test multi_call_ids_history_schema_and_bound_write_roundtrip ... ok
+test remaining_budget_limits_real_http_wait ... ok
+test malformed_json_and_unpairable_or_truncated_responses_fail_whole_step ... ok
+test cancel_pending_http_response_archives_without_enqueuing_calls ... ok
+test http_errors_end_without_retry_or_provider_body_leak ... ok
+test model_http_timeout_charges_time_without_retry_or_late_tool_execution ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+     Running tests/deepseek_smoke.rs (target/debug/deps/deepseek_smoke-06b0d21465363aa0)
+
+running 5 tests
+test stream_start_echoes_without_key ... ok
+test stream_start_returns_502_when_completion_empty ... ok
+test stream_start_returns_model_reply_when_configured ... ok
+test stream_start_returns_502_when_completion_truncated ... ok
+test stream_start_returns_502_when_model_call_fails ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/device_persistence.rs (target/debug/deps/device_persistence-c7a47cefddb38997)
+
+running 1 test
+test device_action_survives_server_restart ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/device_smoke.rs (target/debug/deps/device_smoke-ceb7c7be424b8d1f)
+
+running 11 tests
+test device_default_backend_lists_demo_reminder ... ok
+test device_authorization_reports_denied ... ok
+test device_pin_refuses_other_reminder ... ok
+test device_authorization_reports_fake_status ... ok
+test device_mark_rejected_records_without_device_call ... ok
+test device_set_requires_approved_approval ... ok
+test device_set_rejected_approval_forbidden ... ok
+test device_mark_rejected_requires_rejected_approval ... ok
+test device_refresh_non_unknown_and_unknown_ids ... ok
+test device_refresh_keeps_unknown_then_resolves ... ok
+test device_create_set_get_roundtrip ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/driver_smoke.rs (target/debug/deps/driver_smoke-cc639d60afa731ca)
+
+running 6 tests
+test closing_proposal_twice_fails_with_cap_exceeded_after_one_retry ... ok
+test closing_proposal_then_final_completes_with_one_retry ... ok
+test closing_final_completes_without_retry ... ok
+test driver_rejection_continues_to_final_without_writing ... ok
+test driver_runs_to_approval_then_completes_after_one_resume ... ok
+test driver_cancel_stops_and_starts_no_further_model_call ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
+
+     Running tests/e2a_ledger.rs (target/debug/deps/e2a_ledger-4729c4befd7efce4)
+
+running 24 tests
+test e2a_a10_second_upsert_no_duplicate_unknown_inbox ... ok
+test e2a_a13_task_status_validator_rejects_illegal_edge ... ok
+test e2a_a12_loop_fs_write_single_path ... ok
+test e2a_a2_loop_terminal_closes_execution ... ok
+test e2a_a8_patch_apply_idempotency_replay_blocked ... ok
+test e2a_a7_connector_write_idempotency_replay_blocked ... ok
+test e2a_a9_empty_key_rejected ... ok
+test e2a_a11_approval_consumed_by_worker_session_id ... ok
+test e2a_a1_task_terminal_closes_execution ... ok
+test e2a_f1_execute_retry_resumes_own_planned_effect ... ok
+test e2a_a14_historical_reconciliation ... ok
+test e2a_f3_rerun_from_failed ... ok
+test e2a_f2_rerun_from_completed ... ok
+test e2a_f6_resume_refuses_other_approval_planned_row ... ok
+test e2a_f4_resume_from_completed_regenerates ... ok
+test e2a_f6_resume_refuses_started_row ... ok
+test e2a_f7_concurrent_double_execute_writes_once ... ok
+test e2a_f5_terminal_states_cannot_rerun ... ok
+test e2a_a2_loop_interrupted_closes_nothing ... ok
+test e2a_a6_recovery_scan_uses_record_effect ... ok
+test e2a_a3_worker_terminal_closes_execution ... ok
+test e2a_a4_timeout_maps_to_needs_review ... ok
+test e2a_a1_task_failed_and_cancelled_close_execution ... ok
+test e2a_a5_rerun_supersedes_old_execution ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.70s
+
+     Running tests/e2b_durability.rs (target/debug/deps/e2b_durability-2e8f285a2bc7e760)
+
+running 7 tests
+test e2b_snapshot_gate_old_execution_uses_snapshot ... ok
+test e2b_windows_t1 ... ok
+test e2b_snapshot_gate_new_execution_uses_live_policy ... ok
+test e2b_recovery_scan_reads_plan_position ... ok
+test e2b_takeover_reads_plan_position ... ok
+test e2b_heartbeat_expiry_marks_assignment_lost ... ok
+test e2b_sweeper_marks_expired_without_restart ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.17s
+
+     Running tests/e2c_entries.rs (target/debug/deps/e2c_entries-4e5d6ac7cfb0c020)
+
+running 10 tests
+test e2c_connector_write_reuses_caller_execution ... ok
+test e2c_device_write_full_chain ... ok
+test e2c_evidence_export_jsonl ... ok
+test e2c_unification_loop_false_write_verifies ... ok
+test e2c_connector_write_direct_route_adapter_fallback ... ok
+test e2c_unification_loop_false_write_reconciles ... ok
+test e2c_no_effect_positions ... ok
+test e2c_unification_actionless_device_row_falls_through ... ok
+test e2c_unification_no_write_time_evidence_row ... ok
+test e2c_device_loop_path_same_budget ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.24s
+
+     Running tests/e2d_long_tasks.rs (target/debug/deps/e2d_long_tasks-617366aa56e80463)
+
+running 9 tests
+test e2d_loop_waits_for_run_terminal ... ok
+test e2d_over_1h_creation_rejected ... ok
+test r5f2_later_run_extends_execution_deadline ... ok
+test e2d_progress_visible_while_running ... ok
+test e2d_deferred_same_execution_gate ... ok
+test e2d_loop_wait_budget_returns_still_running ... ok
+test r5f2_deadline_refusal_tail ... ok
+test e2d_priority_ordering ... ok
+test e2d_deferred_start_runs_after_due ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.63s
+
+     Running tests/e2slice_worker.rs (target/debug/deps/e2slice_worker-ce3eb10dea29aa67)
+
+running 12 tests
+test e2slice_c13_allowlist_rejects ... ok
+test e2slice_git_unavailable_fails_closed ... ok
+test e2slice_c14_diff_path_containment ... ok
+test e2slice_c12_status_run_succeeds_with_exit_code ... ok
+test e2slice_task_binding_freeze_mismatch_is_409 ... ok
+test e2slice_c15_status_leaves_repo_clean_and_truncates_diff ... ok
+test e2slice_c12_second_run_while_running_is_409 ... ok
+test e2slice_c12_cancel_kills_group_and_cancels_execution ... ok
+test e2slice_c20_restart_orphans_running_run_and_keeps_counter_and_deadline ... ok
+test e2slice_c20_expired_deadline_new_run_reanchors ... ok
+test e2slice_c19_takeover_bound_run_superseded_after_assignment_ends ... ok
+test e2slice_c12_timeout_kills_process_group_including_grandchild ... FAILED
+
+failures:
+
+---- e2slice_c12_timeout_kills_process_group_including_grandchild stdout ----
+
+thread 'e2slice_c12_timeout_kills_process_group_including_grandchild' (144456832) panicked at services/mock-gateway/tests/e2slice_worker.rs:365:10:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    e2slice_c12_timeout_kills_process_group_including_grandchild
+
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.90s
+
+error: test failed, to rerun pass `-p mock-gateway --test e2slice_worker`

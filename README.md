@@ -2,13 +2,19 @@
 
 [![CI](https://github.com/atxinbao/bu2agent/actions/workflows/ci.yml/badge.svg)](https://github.com/atxinbao/bu2agent/actions/workflows/ci.yml)
 
-## 当前能力与边界（2026-10-28，Codex 更新）
+## 产品核心价值
+
+**持续积累个人世界模型，并在需要时调用上下文、工具和执行能力完成事情。**
+
+bu2agent 的产品目标是让同一个个人助理（PA）从 Muse 类可见工作台开始，与用户共同处理生活、办公与专业工作。用户和 Agent 一起查看资料、规划任务、确认动作和检查结果，在共同工作中持续积累个人世界模型。经过验证的流程再逐步交给文字和语音入口，由 PA 自动调用上下文、工具和执行能力完成事情。[产品战略](PRODUCT-STRATEGY.md) · [个人助理产品设计与能力审计](PA-PRODUCT-DESIGN.md)
+
+## 当前能力与边界（2026-11-03，Codex 更新）
 
 ### 当前产品定义
 
-`bu2agent` 的长期目标是本地单用户 Personal Agent 控制平面：在明确授权边界内持续理解用户目标、安排可恢复执行、验证真实结果，并尽量减少用户注意力成本。聊天、模型、连接器、设备和语音是入口或适配器，不是系统的事实中心。
+当前交付是本地单用户、PC 优先的 Personal Agent 控制平面：在明确授权边界内持续理解用户目标、安排可恢复执行、验证真实结果，并尽量减少用户注意力成本。长期产品目标是 Local-first、多设备、跨 PC/手机/手表和其他可信设备连续工作的 Personal Agent；“本地单用户”描述当前的所有权和信任边界，不表示最终只能有一台设备。
 
-架构总览、领域模型、DSH 映射和 P0/P1/P2 路线见 [PA 底层架构](PA-ARCHITECTURE.md)。Muse 逆向基线到当前 Rust/TypeScript 模块的实现映射见 [客户端底层架构](ARCHITECTURE.md)。
+产品战略见 [跨设备 PA 产品战略](PRODUCT-STRATEGY.md)；架构总览、领域模型、DSH 映射和 P0/P1/P2 路线见 [PA 底层架构](PA-ARCHITECTURE.md)。Muse 逆向基线到当前 Rust/TypeScript 模块的实现映射见 [客户端底层架构](ARCHITECTURE.md)。
 
 下文编号章节保留阶段推进历史；其中“未实现”“待跑”等描述是当时状态，当前以本节及所链接的专项文档为准。
 
@@ -27,11 +33,23 @@
 已观测的 CI 基线为 `b8e61ac`（用户报告 5 个任务全绿）；后续本地提交不能沿用这次 CI 结果。
 
 - 目标记录：`goal_a083c94c3d89`（bu2agent；2026-10-24 由旧目标 `goal_33244669e730` 重建，slug 统一为 bu2agent）
-- 产品目标（长期）：建设一个本地单用户 Personal Agent 控制平面；Muse 是客户端结构和能力面的逆向参考，不是“服务端等价”或最终产品边界。首期仍按 Rust 客户端 + TS 前端 + Mock Gateway 跑通主线，底层架构按契约先行、可替换设计。
+- 产品目标（2026-11-03 已调整）：建设一个 Local-first、多设备连续的 Personal Agent；当前先以本地单用户 PC 形态交付个人数据和执行内核，未来扩展到手机、手表及其他可信设备。Muse 是客户端结构和能力面的逆向参考，不是“服务端等价”或最终产品边界。
 - 基线文档：《Muse macOS 8.0 逆向工程与重建规格》（2026-10-24）
 - 详细规划：`~/workspace/goals/bu2agent/files/phase1-foundation-architecture-and-plan.md`
 - 本目录是 Mac 本地项目家目录：/Users/mac/Documents/bu2agent，先放项目文档与 Phase 0 契约骨架，代码实现按 Phase 0 → Phase 5 推进。
 - 语言：本文新写内容使用 zh-CN。
+
+## 产品阶段
+
+```text
+可见工作台
+  → 人和 Agent 共同完成
+  → 稳定流程沉淀
+  → 文字／语音委托
+  → PA 自动执行与主动跟进
+```
+
+第一阶段以工作台为主要入口。用户可以看到个人资料、上下文、任务、计划、工具调用、审批、产物和执行结果，并在关键步骤参与判断。文字和语音先作为工作台中的辅助交互，随着流程和个人世界模型成熟，逐步成为主要入口。
 
 ## 1. 一句话目标
 
@@ -83,6 +101,8 @@ TS 前端 UI → Domain Store → Rust↔TS 桥
 ```text
 bu2agent/
   README.md                 # 本项目文档
+  PRODUCT-STRATEGY.md       # 跨设备连续 PA 的长期产品战略
+  PA-PRODUCT-DESIGN.md      # 基于个人世界模型的产品设计与能力审计
   PA-ARCHITECTURE.md        # PA 第一性原理、领域模型、长期执行与路线图
   ARCHITECTURE.md           # Muse 基线到客户端代码模块的实现映射
   apps/desktop/             # Rust 客户端壳（Tauri 2 推荐）：窗口、桥、传输、文件、会话、权限、可观测性

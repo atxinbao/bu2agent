@@ -1,0 +1,7 @@
+{
+  "memory_read_back": true,
+  "model_requests": 3,
+  "same_session_recalled_previous_turn": true,
+  "fresh_session_received_only_question": true,
+  "saved_memory_in_model_input": false
+}

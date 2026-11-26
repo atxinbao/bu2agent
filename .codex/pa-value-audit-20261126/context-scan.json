@@ -1,0 +1,17 @@
+{
+  "日期": "2026-11-26",
+  "执行者": "Codex",
+  "基线": "1237ff7",
+  "入口": "WorkbenchView.sendSession → sessions_send → select_context → reply_with_history",
+  "重点疑问": [
+    "显式保存的偏好有没有进入普通会话的模型请求",
+    "任务规划能否描述生活与办公动作",
+    "已执行的结果如何在新会话被找到"
+  ],
+  "交叉验证": [
+    "memory_store 和 routes_data",
+    "task_runner 和 deepseek_loop",
+    "语音记录和日历后端",
+    "同版工程续跑验收"
+  ]
+}

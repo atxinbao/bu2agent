@@ -4,17 +4,22 @@
 > `ARCHITECTURE.md` 负责 Muse 客户端基线到代码模块的映射；README 负责当前状态和历史验证记录。
 
 - 文档日期：2026-11-02
-- 产品定位：本地单用户 Personal Agent 平台
+- 当前交付：本地单用户、PC 优先的 Personal Agent 平台
+- 长期产品定位：Local-first、多设备、跨设备连续的 Personal Agent
 - 当前实现：Tauri 2 + Rust 客户端/网关 + React/Vite/TypeScript 前端 + Mock Gateway
 - 参考来源：Muse、Ambi、DSH-superagent 的逆向和源码研究
 
 本文保留 `Goal`、`Project`、`Workspace`、`Task` 等通用产品词，但它们不是一棵严格的父子树。规范关系是：`Goal / Project → Task → Execution`；`Workspace` 是 Execution 使用的资源与权限边界；`Policy` 横向约束整个流程。
+
+跨设备产品战略见 [`PRODUCT-STRATEGY.md`](PRODUCT-STRATEGY.md)。本文负责把该战略落实为领域模型、执行语义和当前代码演进路线。
 
 ## 1. 结论先行
 
 `bu2agent` 不应只是“带工具调用的聊天客户端”，而应成为：
 
 > 在明确授权边界内，持续理解用户目标、安排可恢复执行、验证真实结果，并以最少用户注意力交付结果的本地 Agent 控制平面。
+
+产品落地从 Muse 类可见工作台开始。用户与 Agent 共同查看现场、补充信息、确认计划、检查产物和处理异常。文字与语音先作为工作台中的交互方式，经过真实任务验证后，再逐步收敛为主要委托入口。底层领域模型从第一天支持这条演进，让共同完成的任务、用户判断和执行结果能够沉淀为后续委托可调用的个人世界模型。
 
 聊天、模型、连接器、设备和语音都是入口或适配器，不是系统的事实中心。系统的核心链路是：
 
@@ -58,6 +63,7 @@ Agent 应安静工作，只在以下情况打扰用户：需要授权、需要�
 | 文档 | 职责 |
 | --- | --- |
 | `README.md` | 当前能力、运行方式、已验证结果和历史推进记录 |
+| `PRODUCT-STRATEGY.md` | 跨设备连续 PA 的长期产品目标、数据平面和设备战略 |
 | `PA-ARCHITECTURE.md` | PA 第一性原理、领域模型、长期运行时、缺口和路线图 |
 | `ARCHITECTURE.md` | Muse 逆向基线、客户端分层、契约和代码模块映射 |
 | `services/mock-gateway/LOOP.md` | 当前模型循环的具体协议、审批、unknown 和恢复边界 |
@@ -127,7 +133,7 @@ Workspace
 └── policy bindings
 ```
 
-当前 `MOCK_FILES_ROOT`、文件作用域、Connector Egress、Device 权限和部分 Policy Scope，都是 Workspace 的分散组成部分。Workspace 不是当前的 `Space`、文件目录、Git Worktree、Session 或 Loop。
+当前 `MOCK_FILES_ROOT`、文件作用域、Connector Egress、Device 权限和部分 Policy Scope，都是 Workspace 的分散组成部分。Workspace 不是当前的 `Space`、文件目录、Git Worktree、Session 或 Loop。长期上，Workspace 还要包含设备绑定和可迁移的 Workspace Snapshot，才能支持跨设备连续执行。
 
 一次 Execution 使用的是 Workspace 的不可变快照；这样 Workspace 后续变更不会改写历史执行的权限边界。
 
@@ -349,6 +355,27 @@ Tools / Connectors / Devices / Model Providers
 - Event、Inbox 和 Outbox 负责恢复、去重和交付。
 
 这延续了 Muse 的统一 Gateway、Ambi 的长生命周期 Native Runtime 和 DSH 的 Engine/Store/Effects/SourceRegistry 分层，但不把任何一个逆向产品的服务端 schema 当作已验证事实。
+
+### 5.1 多设备连续性的运行时目标
+
+`bu2agent` 的最终运行时不是多个互相独立的 Agent，而是一个逻辑 Personal Agent 加多个设备节点：
+
+```text
+Personal Data Plane
+  ├── Goal / Project / Task
+  ├── Conversation / Memory
+  ├── Policy / Approval
+  ├── Execution Ledger
+  └── Device / Capability Registry
+
+Execution Plane
+  ├── PC Worker
+  ├── Phone Worker
+  ├── Watch Attention Node
+  └── Local Tools / Connectors / Devices
+```
+
+当前 PC 是唯一交付节点，但模型必须提前满足：Task 的逻辑 ID 不绑定设备，Execution 可以有设备 Assignment，Session 可以跨设备恢复，Effect 必须记录实际执行设备，Worker 临时上下文只同步摘要和 Checkpoint。完整战略见 `PRODUCT-STRATEGY.md`。
 
 ## 6. DSH 到 bu2agent 的映射规则与边界
 
