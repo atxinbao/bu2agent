@@ -971,20 +971,36 @@ async fn e2d_deferred_start_runs_after_due() {
 /// creation extends the deadline (max). Under the old
 /// min rule the stored deadline stays in the past and
 /// the second run is refused with `budget_exceeded`.
+/// The first run is a fake cargo sleeping 60 s, NOT a
+/// real cargo test: the driver only observes timeouts at
+/// 200 ms poll boundaries (worker.rs), so a real
+/// sub-second command with a 50 ms timeout is a race —
+/// on a fast runner it finishes inside the first slice
+/// and succeeds (CI #169: 153 ms on Ubuntu).
 #[tokio::test]
 async fn r5f2_later_run_extends_execution_deadline() {
     let dir = temp_dir("r5f2-t1");
     let repo = init_repo_with_cargo_packages(&dir);
-    let h = Harness::serve(vec![], Some(real_git()), Some(real_cargo())).await;
+    let h = Harness::serve(vec![], Some(real_git()), Some(fake_cargo_sleeping(&dir))).await;
     let worktree = h.setup_worktree(&repo).await;
-    // First run: a cargo test with a 50 ms timeout, only
-    // to write the deadline. Cargo startup alone exceeds
-    // 50 ms, so the run times out — and a timeout leaves
-    // the Execution in `needs_review` (non-terminal), so
-    // the per-Execution creation gate still lets the
-    // second run in (a succeeded run would close the
-    // Execution to `completed` and the creation would
-    // 409 `execution_terminal` instead).
+    // First run: a fake cargo that sleeps 60 s, with a
+    // 50 ms timeout, only to write the deadline. The
+    // timeout must fire deterministically: the driver
+    // polls `child.wait()` in 200 ms slices (worker.rs)
+    // and checks the timeout only when a slice expires
+    // with the child still running, so a real cargo test
+    // with a 50 ms timeout is a race — on a fast runner
+    // it finishes inside the first slice and succeeds
+    // (CI #169). The fake cargo is provably alive at the
+    // first 200 ms boundary by construction (it sleeps
+    // 60 s), so the timeout fires on any machine, and
+    // the driver kills the sleeper — no sleeper survives
+    // the test. A timeout leaves the Execution in
+    // `needs_review` (non-terminal), so the per-Execution
+    // creation gate still lets the second run in (a
+    // succeeded run would close the Execution to
+    // `completed` and the creation would 409
+    // `execution_terminal` instead).
     let approval = h
         .approve_worker_run(
             &worktree,
