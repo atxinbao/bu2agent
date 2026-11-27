@@ -4952,6 +4952,374 @@ pub fn schedule_outbox(
     deliver_at_ms: i64,
 ) -> Result<Option<OutboxRow>, String> {
     let tx = conn.transaction().map_err(err)?;
+    let row = set_outbox_due_tx(&tx, outbox_id, deliver_at_ms)?;
+    tx.commit().map_err(err)?;
+    Ok(row)
+}
+
+/// AO-5 (Q-AO-11/Q-AO-12/Q-AO-13): the Outbox
+/// Dispatcher — three gates + retry backoff, all
+/// riding the existing deliverers (no new table, no
+/// new route, no version bump; DB stays v23).
+///
+/// The gates live at the row-fetch point of the two
+/// deliverers (`consume_outbox_events` for immediate
+/// rows, `deliver_due_outbox` for timed rows):
+///   1. merge window — same-destination, same-session,
+///      same-topic rows created within 10 minutes of
+///      each other fold into one delivery;
+///   2. daily cap — 20 user-visible deliveries per
+///      local day; over-limit rows stay pending and
+///      are deferred to the next 08:00;
+///   3. quiet hours — 23:00–08:00 device-local: rows
+///      are held (deferred to the next 08:00), and at
+///      08:00 the held local notifications fold into
+///      one morning digest row.
+///
+/// A held row is never dropped: holding rewrites its
+/// `deliver_at_ms` (an `outbox.rescheduled` event),
+/// so the due scan owns it from then on. A failed
+/// delivery attempt consumes backoff (1/5/15 min);
+/// the 4th failed attempt marks the row failed.
+///
+/// `attempts` (pinned this batch — the investigation
+/// §5 item 4): attempts counts delivery attempts
+/// that produced an outcome. Insert sets 0. Each
+/// attempt ends in sent, failed, or a scheduled
+/// retry, and increments attempts by exactly 1. A
+/// row is marked failed after its 4th failed attempt.
+/// `requeue_outbox` never touches attempts (the
+/// P0-D test `p0d_outbox_dedup_no_auto_retry_and_explicit_requeue`
+/// pins failed attempts = 1, sent-after-requeue = 2).
+pub const DISPATCHER_MERGE_WINDOW_MS: i64 = 600_000;
+pub const DISPATCHER_DAILY_CAP: i64 = 20;
+pub const DISPATCHER_QUIET_START_HOUR: u8 = 23;
+pub const DISPATCHER_QUIET_END_HOUR: u8 = 8;
+pub const DISPATCHER_BACKOFF_MS: [i64; 3] = [60_000, 300_000, 900_000];
+pub const DISPATCHER_MAX_ATTEMPTS: i64 = 4;
+
+/// AO-5: the dispatcher's view of device-local time,
+/// derived from SQLite's `localtime` (no new
+/// dependency, no unsafe code — the bundled SQLite
+/// already links the platform C library). All
+/// boundaries are local: the daily cap resets at
+/// local midnight, quiet hours are local 23:00–08:00.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatcherClock {
+    pub hour: u8,
+    pub minute: u8,
+    /// The instant this clock was derived from — the
+    /// due scan's "now" (production: real now; tests:
+    /// the fixture's anchor). Keeping it in the clock
+    /// makes the whole due pass deterministic under a
+    /// fixed clock instead of mixing a fixed hour with
+    /// a wall-clock due scan.
+    pub now_ms: i64,
+    pub day_start_ms: i64,
+    pub local_date: String,
+    pub today_0800_ms: i64,
+    pub tomorrow_0800_ms: i64,
+}
+
+impl DispatcherClock {
+    pub fn is_quiet(&self) -> bool {
+        self.hour >= DISPATCHER_QUIET_START_HOUR || self.hour < DISPATCHER_QUIET_END_HOUR
+    }
+
+    /// The next 08:00 after this clock's instant: today
+    /// 08:00 if before 08:00, else tomorrow 08:00.
+    pub fn next_0800_ms(&self) -> i64 {
+        if self.hour < DISPATCHER_QUIET_END_HOUR {
+            self.today_0800_ms
+        } else {
+            self.tomorrow_0800_ms
+        }
+    }
+
+    /// Deterministic fixture for tests: a clock pinned
+    /// to (`hour`, `minute`) on the local day containing
+    /// `now_ms`, where "local" is the fixture's own
+    /// day (midnight = `now_ms` rounded down to a whole
+    /// UTC day). The production path never builds a
+    /// clock this way — it always derives via
+    /// `dispatcher_clock` (SQLite localtime). The date
+    /// uses the days-to-civil algorithm (Howard
+    /// Hinnant, public domain), verified against
+    /// Python's datetime for epoch 0 and 2026-11-26/27.
+    pub fn fixed_for_test(hour: u8, minute: u8, now_ms: i64) -> Self {
+        let day_start_ms = now_ms - now_ms.rem_euclid(86_400_000);
+        let days = day_start_ms / 86_400_000;
+        let (year, month, day) = civil_from_days(days);
+        DispatcherClock {
+            hour,
+            minute,
+            now_ms,
+            day_start_ms,
+            local_date: format!("{year:04}-{month:02}-{day:02}"),
+            today_0800_ms: day_start_ms + 28_800_000,
+            tomorrow_0800_ms: day_start_ms + 115_200_000,
+        }
+    }
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// AO-5: derive the dispatcher's clock from
+/// `now_ms` via SQLite localtime — one query, all
+/// fields. The `start of day` / `+8 hours` /
+/// `+1 day` modifiers make the 08:00 boundaries
+/// exact across DST transitions (no ms addition on
+/// a local midnight). The trailing `utc` modifier
+/// is load-bearing, not cosmetic: after `localtime`
+/// the value is the local wall-clock reading, and
+/// `start of day` truncates THAT — `%s` would then
+/// read local midnight as if it were UTC, shifting
+/// every boundary late by the UTC offset (verified
+/// firsthand: under TZ=Pacific/Tongatapu the
+/// un-`utc` query put "today 08:00" 13 h late, and
+/// the live HTTP check caught the hold landing on
+/// it). `utc` shifts back to the true instant.
+pub fn dispatcher_clock(conn: &Connection, now_ms: i64) -> Result<DispatcherClock, String> {
+    let (hour, minute, now_ms_out, day_start_ms, local_date, today_0800_ms, tomorrow_0800_ms) = conn
+        .query_row(
+            "SELECT CAST(strftime('%H', ?1/1000, 'unixepoch', 'localtime') AS INTEGER), CAST(strftime('%M', ?1/1000, 'unixepoch', 'localtime') AS INTEGER), ?1, CAST(strftime('%s', ?1/1000, 'unixepoch', 'localtime', 'start of day', 'utc') AS INTEGER) * 1000, CAST(strftime('%Y-%m-%d', ?1/1000, 'unixepoch', 'localtime') AS TEXT), CAST(strftime('%s', ?1/1000, 'unixepoch', 'localtime', 'start of day', '+8 hours', 'utc') AS INTEGER) * 1000, CAST(strftime('%s', ?1/1000, 'unixepoch', 'localtime', 'start of day', '+1 day', '+8 hours', 'utc') AS INTEGER) * 1000",
+            params![now_ms],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .map_err(err)?;
+    Ok(DispatcherClock {
+        hour: hour as u8,
+        minute: minute as u8,
+        now_ms: now_ms_out,
+        day_start_ms,
+        local_date,
+        today_0800_ms,
+        tomorrow_0800_ms,
+    })
+}
+
+/// AO-5: user-visible deliveries today — the count
+/// of `outbox.sent` events since local midnight.
+/// Folded rows carry `outbox.merged`, not
+/// `outbox.sent`, so a merged delivery counts once
+/// (the survivor); a digest counts once (its own
+/// sent event). Manual delivers also append
+/// `outbox.sent`, so they count too.
+pub fn dispatcher_sent_today(conn: &Connection, day_start_ms: i64) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE aggregate_kind = 'outbox' AND event_type = 'outbox.sent' AND CAST(created_ms AS INTEGER) >= ?1",
+        params![day_start_ms],
+        |row| row.get(0),
+    )
+    .map_err(err)
+}
+
+/// AO-5 (AO5-J1): the merge key. "Session" is the
+/// summary's `session_id` when present; today's rows
+/// carry none, so they share the default (empty)
+/// session — AO-3 rows that carry a session_id will
+/// group tighter, with no code change here. "Topic"
+/// is the summary's `topic`, else `kind`, else
+/// `status`, else the whole summary JSON.
+fn outbox_merge_key(row: &OutboxRow) -> (String, String, String) {
+    let summary: serde_json::Value =
+        serde_json::from_str(&row.payload_summary_json).unwrap_or(serde_json::Value::Null);
+    let session = summary
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let topic = summary
+        .get("topic")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            summary
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            summary
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| row.payload_summary_json.clone());
+    (row.destination_kind.clone(), session, topic)
+}
+
+/// AO-5: the pass plan — a pure function of the
+/// candidate rows, today's sent count, and the
+/// clock, so tests can pin it without a database.
+/// Each candidate lands in exactly one list.
+/// Order is preserved: delivery order is input order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeliveryPlan {
+    pub deliver: Vec<String>,
+    pub fold: Vec<(String, String)>,
+    pub hold: Vec<String>,
+}
+
+pub fn plan_outbox_delivery(
+    rows: &[OutboxRow],
+    sent_today: i64,
+    clock: &DispatcherClock,
+) -> DeliveryPlan {
+    let mut plan = DeliveryPlan::default();
+    if clock.is_quiet() {
+        plan.hold = rows.iter().map(|r| r.outbox_id.clone()).collect();
+        return plan;
+    }
+    // Group mergeable rows by key in input order. A
+    // row joins the open group for its key only within
+    // the merge window of that group's first row
+    // (AO5-J1); a later row starts a new group. Only
+    // `local_notification` rows merge (AO5-J2): folding
+    // an `imessage_send` row would silently drop a
+    // user message, so each message is its own group.
+    struct Group<'a> {
+        survivor: &'a OutboxRow,
+        first_created_ms: i64,
+        folds: Vec<&'a OutboxRow>,
+    }
+    let mut groups: Vec<Group<'_>> = Vec::new();
+    for row in rows {
+        let key = if row.destination_kind == "local_notification" {
+            Some(outbox_merge_key(row))
+        } else {
+            None
+        };
+        let mut joined = false;
+        if let Some(key) = key {
+            for group in groups.iter_mut().rev() {
+                if outbox_merge_key(group.survivor) != key {
+                    continue;
+                }
+                if row.created_ms - group.first_created_ms <= DISPATCHER_MERGE_WINDOW_MS {
+                    group.folds.push(row);
+                    joined = true;
+                }
+                break;
+            }
+        }
+        if !joined {
+            groups.push(Group {
+                survivor: row,
+                first_created_ms: row.created_ms,
+                folds: Vec::new(),
+            });
+        }
+    }
+    // The cap counts user-visible deliveries: each
+    // delivered survivor counts 1, folded rows count
+    // 0. A group whose survivor is over the cap holds
+    // whole (its folds cannot merge into a delivery
+    // that never happens).
+    let mut delivered_count = sent_today;
+    for group in groups {
+        if delivered_count >= DISPATCHER_DAILY_CAP {
+            plan.hold.push(group.survivor.outbox_id.clone());
+            for folded in group.folds {
+                plan.hold.push(folded.outbox_id.clone());
+            }
+        } else {
+            plan.deliver.push(group.survivor.outbox_id.clone());
+            for folded in group.folds {
+                plan.fold
+                    .push((folded.outbox_id.clone(), group.survivor.outbox_id.clone()));
+            }
+            delivered_count += 1;
+        }
+    }
+    plan
+}
+
+/// AO-5: mark a pending row resolved by a merge —
+// status `sent` (AO5-J3: "sent" means resolved by
+// delivery, direct or merged), attempts + 1, and an
+// `outbox.merged` event naming the survivor, so the
+// audit log distinguishes a folded row from a
+// directly delivered one. Non-pending rows are
+// returned unchanged (the `set_outbox_status`
+// precedent).
+pub fn mark_outbox_merged(
+    conn: &mut Connection,
+    outbox_id: &str,
+    merged_into: &str,
+) -> Result<Option<OutboxRow>, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let row = mark_outbox_merged_tx(&tx, outbox_id, merged_into)?;
+    tx.commit().map_err(err)?;
+    Ok(row)
+}
+
+fn mark_outbox_merged_tx(
+    tx: &rusqlite::Transaction<'_>,
+    outbox_id: &str,
+    merged_into: &str,
+) -> Result<Option<OutboxRow>, String> {
+    let current: Option<OutboxRow> = tx
+        .query_row(
+            "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE outbox_id = ?1",
+            params![outbox_id],
+            outbox_from_row,
+        )
+        .optional()
+        .map_err(err)?;
+    let Some(mut row) = current else {
+        return Ok(None);
+    };
+    if row.status != "pending" {
+        return Ok(Some(row));
+    }
+    let now = now_ms() as i64;
+    tx.execute(
+        "UPDATE outbox SET status = 'sent', attempts = attempts + 1, updated_at_ms = ?1 WHERE outbox_id = ?2",
+        params![now, outbox_id],
+    )
+    .map_err(err)?;
+    row.status = "sent".to_string();
+    row.attempts += 1;
+    row.updated_at_ms = now;
+    let mut payload = serde_json::to_value(&row).map_err(|e| e.to_string())?;
+    payload["merged_into"] = serde_json::Value::String(merged_into.to_string());
+    let payload = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    append_event(tx, "outbox", outbox_id, "outbox.merged", &payload, "unknown", now, 1)?;
+    Ok(Some(row))
+}
+
+/// AO-5: the transaction-level due-time write,
+/// shared by the manual `schedule_outbox` route and
+/// the Dispatcher holds (both append one
+/// `outbox.rescheduled` event carrying the post-state
+/// row). Pending-only, like every other outbox write.
+fn set_outbox_due_tx(
+    tx: &rusqlite::Transaction<'_>,
+    outbox_id: &str,
+    deliver_at_ms: i64,
+) -> Result<Option<OutboxRow>, String> {
     let current: Option<OutboxRow> = tx
         .query_row(
             "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE outbox_id = ?1",
@@ -4975,12 +5343,137 @@ pub fn schedule_outbox(
     row.deliver_at_ms = Some(deliver_at_ms);
     row.updated_at_ms = now;
     let payload = serde_json::to_string(&row).map_err(|e| e.to_string())?;
+    append_event(tx, "outbox", outbox_id, "outbox.rescheduled", &payload, "unknown", now, 1)?;
+    Ok(Some(row))
+}
+
+/// AO-5: hold one pending row to a due time
+/// (connection-level wrapper for the deliverers).
+pub fn defer_outbox(
+    conn: &mut Connection,
+    outbox_id: &str,
+    deliver_at_ms: i64,
+) -> Result<Option<OutboxRow>, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let row = set_outbox_due_tx(&tx, outbox_id, deliver_at_ms)?;
+    tx.commit().map_err(err)?;
+    Ok(row)
+}
+
+/// AO-5: one failed delivery attempt. Attempts + 1.
+/// The 1st/2nd/3rd failures reschedule the row to
+/// now + 1/5/15 minutes (still pending, one
+/// `outbox.rescheduled` event); the 4th failure
+/// marks it failed (one `outbox.failed` event, via
+/// the same `set_outbox_status` path as every other
+/// terminal transition). A non-pending row is
+/// returned unchanged and consumes no attempt.
+pub fn fail_outbox_with_backoff(
+    conn: &mut Connection,
+    outbox_id: &str,
+    now_ms: i64,
+) -> Result<Option<OutboxRow>, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let current: Option<OutboxRow> = tx
+        .query_row(
+            "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE outbox_id = ?1",
+            params![outbox_id],
+            outbox_from_row,
+        )
+        .optional()
+        .map_err(err)?;
+    let Some(row) = current else {
+        return Ok(None);
+    };
+    if row.status != "pending" {
+        return Ok(Some(row));
+    }
+    let attempts = row.attempts + 1;
+    if attempts >= DISPATCHER_MAX_ATTEMPTS {
+        let row = set_outbox_status(&tx, outbox_id, "failed", "outbox.failed")?;
+        tx.commit().map_err(err)?;
+        return Ok(row);
+    }
+    let delay = DISPATCHER_BACKOFF_MS[(attempts - 1) as usize];
+    let due = now_ms + delay;
+    let now = now_ms;
+    tx.execute(
+        "UPDATE outbox SET attempts = attempts + 1, deliver_at_ms = ?1, updated_at_ms = ?2 WHERE outbox_id = ?3",
+        params![due, now, outbox_id],
+    )
+    .map_err(err)?;
+    let mut row = row;
+    row.attempts = attempts;
+    row.deliver_at_ms = Some(due);
+    row.updated_at_ms = now;
+    let payload = serde_json::to_string(&row).map_err(|e| e.to_string())?;
     append_event(&tx, "outbox", outbox_id, "outbox.rescheduled", &payload, "unknown", now, 1)?;
     tx.commit().map_err(err)?;
     Ok(Some(row))
 }
 
-/// D1-3 C-2 (Q-C2-01): one scheduled-send body row.
+/// AO-5: the morning digest. After 08:00, pending
+/// `local_notification` rows deferred to today's
+/// 08:00 fold into one digest row — but only when
+/// there are at least 2 (a single row is delivered
+/// directly, no digest needed). The digest insert
+/// and the folds commit in one transaction, so the
+/// folded rows are never marked sent without a
+/// durable digest row behind them. The digest row's
+/// summary is ids + count only (no content); its
+/// dedup key is `digest:<local date>`, so a second
+/// call the same day folds further rows into the
+/// existing digest instead of creating a second one
+/// (the summary then lists only the first batch —
+/// the `outbox.merged` events are the authoritative
+/// record of what folded where). The digest row is
+/// itself an immediate row: the event channel
+/// delivers it on a later tick, subject to the same
+/// gates (including the daily cap). Never runs
+/// during quiet hours (AO5-J5).
+pub fn create_morning_digest(
+    conn: &mut Connection,
+    clock: &DispatcherClock,
+) -> Result<Option<OutboxRow>, String> {
+    if clock.is_quiet() {
+        return Ok(None);
+    }
+    let tx = conn.transaction().map_err(err)?;
+    let due = {
+        let mut stmt = tx
+            .prepare("SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE status = 'pending' AND destination_kind = 'local_notification' AND CAST(deliver_at_ms AS INTEGER) = ?1 ORDER BY seq ASC")
+            .map_err(err)?;
+        let rows = stmt
+            .query_map(params![clock.today_0800_ms], outbox_from_row)
+            .map_err(err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(err)?;
+        rows
+    };
+    if due.len() < 2 {
+        return Ok(None);
+    }
+    let ids: Vec<String> = due.iter().map(|r| r.outbox_id.clone()).collect();
+    let summary = canonical_json(&serde_json::json!({
+        "kind": "digest",
+        "date": clock.local_date,
+        "count": due.len(),
+        "outbox_ids": ids,
+    }));
+    let (digest, _) = enqueue_outbox_kind_tx(
+        &tx,
+        "dispatcher",
+        &summary,
+        "local_notification",
+        &format!("digest:{}", clock.local_date),
+        None,
+    )?;
+    for row in &due {
+        mark_outbox_merged_tx(&tx, &row.outbox_id, &digest.outbox_id)?;
+    }
+    tx.commit().map_err(err)?;
+    Ok(Some(digest))
+}
 /// No serde derives on purpose — the body must never be
 /// serialized into an event payload, an HTTP response,
 /// or an export; it is read only by the delivery execute
@@ -5214,6 +5707,29 @@ pub fn consume_outbox_events(
     consumer_name: &str,
     origin_device_id: &str,
 ) -> Result<Vec<OutboxRow>, String> {
+    consume_outbox_events_with_clock(conn, consumer_name, origin_device_id, None)
+}
+
+/// AO-5: the event channel with the Dispatcher gates.
+/// `clock_override` is the test seam: `None` derives
+/// the real device-local clock (production path);
+/// tests pass a fixed clock so delivery does not
+/// depend on the wall-clock hour the suite runs in.
+/// The gates run once over the whole pass's candidate
+/// set (pending + immediate rows only — the D1-3 C-1
+/// dual-channel split is unchanged: a timed row is
+/// skipped here and the cursor still advances past
+/// its enqueued event). Held rows are deferred to
+/// the next 08:00 (they become timed rows owned by
+/// the due scan); folded rows resolve as merged;
+/// survivors are delivered as before. Cursor advance
+/// + all writes commit in one transaction.
+pub fn consume_outbox_events_with_clock(
+    conn: &mut Connection,
+    consumer_name: &str,
+    origin_device_id: &str,
+    clock_override: Option<&DispatcherClock>,
+) -> Result<Vec<OutboxRow>, String> {
     let tx = conn.transaction().map_err(err)?;
     let last: i64 = tx
         .query_row(
@@ -5246,7 +5762,7 @@ pub fn consume_outbox_events(
         return Ok(Vec::new());
     }
     let max_id = events.last().map(|(id, _, _, _)| *id).unwrap_or(last);
-    let mut delivered: Vec<OutboxRow> = Vec::new();
+    let mut candidates: Vec<OutboxRow> = Vec::new();
     for (_, kind, aggregate_id, event_type) in &events {
         if kind != "outbox" || (event_type != "outbox.enqueued" && event_type != "outbox.requeued") {
             continue;
@@ -5269,11 +5785,37 @@ pub fn consume_outbox_events(
         if !pending || timed {
             continue;
         }
-        if let Some(row) = set_outbox_status(&tx, aggregate_id, "sent", "outbox.sent")? {
-            delivered.push(row);
+        if let Some(row) = tx
+            .query_row(
+                "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE outbox_id = ?1",
+                params![aggregate_id],
+                outbox_from_row,
+            )
+            .optional()
+            .map_err(err)?
+        {
+            candidates.push(row);
         }
     }
     let now = now_ms() as i64;
+    let clock = match clock_override {
+        Some(clock) => clock.clone(),
+        None => dispatcher_clock(&tx, now)?,
+    };
+    let sent_today = dispatcher_sent_today(&tx, clock.day_start_ms)?;
+    let plan = plan_outbox_delivery(&candidates, sent_today, &clock);
+    for outbox_id in &plan.hold {
+        set_outbox_due_tx(&tx, outbox_id, clock.next_0800_ms())?;
+    }
+    for (folded_id, survivor_id) in &plan.fold {
+        mark_outbox_merged_tx(&tx, folded_id, survivor_id)?;
+    }
+    let mut delivered: Vec<OutboxRow> = Vec::new();
+    for outbox_id in &plan.deliver {
+        if let Some(row) = set_outbox_status(&tx, outbox_id, "sent", "outbox.sent")? {
+            delivered.push(row);
+        }
+    }
     tx.execute(
         "INSERT INTO event_cursors (consumer_name, last_event_id, updated_ms, origin_device_id)
          VALUES (?1, ?2, ?3, ?4)
@@ -8802,5 +9344,76 @@ mod tests {
             get_execution_deadline(&conn, "execution-1").expect("read"),
             Some(2_000)
         );
+    }
+
+    /// AO-5 (AO5-J8 regression): `dispatcher_clock`
+    /// must return TRUE local-midnight / 08:00
+    /// boundaries, not wall-clock readings mistaken
+    /// for UTC. SQLite's `localtime` shifts the value
+    /// and `start of day` truncates the shifted value,
+    /// so without the trailing `utc` modifier every
+    /// boundary lands late by the UTC offset (the live
+    /// HTTP check caught +13 h under
+    /// TZ=Pacific/Tongatapu). Expected values below
+    /// are computed independently in Python
+    /// (timezone-aware datetime), not copied from
+    /// gateway output. The test sets TZ in-process and
+    /// calls `tzset()` after each change: glibc runs
+    /// tzset only on the first localtime call, so a
+    /// bare `set_var` would leave the second case
+    /// stuck on the first zone. Unix-only: Windows
+    /// has no `tzset`, and no other test in this
+    /// binary reads localtime, so the mutation cannot
+    /// leak into another test.
+    #[test]
+    #[cfg(unix)]
+    fn dispatcher_clock_uses_true_local_midnight() {
+        let path = temp_db("dispatcher-clock");
+        let conn = open_db(&path).expect("open");
+        let prev_tz = std::env::var("TZ").ok();
+        // 2026-11-26 18:56:06.589 UTC.
+        let now_ms = 1_795_719_366_589i64;
+        let cases = [
+            (
+                "Pacific/Tongatapu",
+                7u8,
+                56u8,
+                1_795_690_800_000i64,
+                "2026-11-27",
+                1_795_719_600_000i64,
+                1_795_806_000_000i64,
+            ),
+            (
+                "America/Los_Angeles",
+                10u8,
+                56u8,
+                1_795_680_000_000i64,
+                "2026-11-26",
+                1_795_708_800_000i64,
+                1_795_795_200_000i64,
+            ),
+        ];
+        for (tz, hour, minute, day_start, date, today_0800, tomorrow_0800) in cases {
+            std::env::set_var("TZ", tz);
+            unsafe { tzset() };
+            let clock = dispatcher_clock(&conn, now_ms).expect("clock");
+            assert_eq!(clock.hour, hour, "TZ={tz}");
+            assert_eq!(clock.minute, minute, "TZ={tz}");
+            assert_eq!(clock.now_ms, now_ms, "TZ={tz}");
+            assert_eq!(clock.day_start_ms, day_start, "TZ={tz}");
+            assert_eq!(clock.local_date, date, "TZ={tz}");
+            assert_eq!(clock.today_0800_ms, today_0800, "TZ={tz}");
+            assert_eq!(clock.tomorrow_0800_ms, tomorrow_0800, "TZ={tz}");
+        }
+        match prev_tz {
+            Some(tz) => std::env::set_var("TZ", tz),
+            None => std::env::remove_var("TZ"),
+        }
+        unsafe { tzset() };
+    }
+
+    #[cfg(unix)]
+    extern "C" {
+        fn tzset();
     }
 }

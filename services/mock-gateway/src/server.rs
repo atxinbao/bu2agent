@@ -2559,7 +2559,18 @@ impl AppState {
     /// `consume_outbox_events` (cursor advance + delivery in
     /// one transaction). Returns the number of rows
     /// delivered on this tick.
+    /// AO-5: the Dispatcher gates ride this channel —
+    /// see `consume_outbox_events_with_clock`. The
+    /// `clock_override` is the test seam (`None` =
+    /// real device-local clock).
     pub fn deliver_pending_outbox(&self) -> usize {
+        self.deliver_pending_outbox_with_clock(None)
+    }
+
+    pub fn deliver_pending_outbox_with_clock(
+        &self,
+        clock: Option<sqlite_store::DispatcherClock>,
+    ) -> usize {
         if self.sqlite_mode() != StateBackend::Sqlite || self.sqlite_is_broken() {
             return 0;
         }
@@ -2567,10 +2578,11 @@ impl AppState {
             return 0;
         };
         let mut conn = sqlite.lock().expect("sqlite lock");
-        match sqlite_store::consume_outbox_events(
+        match sqlite_store::consume_outbox_events_with_clock(
             &mut conn,
             "outbox-deliverer",
             &self.origin_device_id,
+            clock.as_ref(),
         ) {
             Ok(rows) => rows.len(),
             Err(detail) => {
@@ -2599,16 +2611,69 @@ impl AppState {
     /// call can take up to 30 s, so this function is
     /// async and the sweeper awaits it); an unknown kind
     /// is warned + skipped, never fatal.
+    /// D1-3 C-1: the timed-Outbox row scan, run from the
+    /// assignment sweeper's 10 s tick — no second
+    /// scheduler. Delivers due timed rows
+    /// (`deliver_at_ms <= now`); the pending-only guard in
+    /// `set_outbox_status` is the anti-double-delivery
+    /// guard, so a row the event channel just delivered
+    /// (or a manual deliver just sent) is a no-op here.
+    /// A failed row scan (DB error) only warns and
+    /// returns 0 — the next tick retries, and no row is
+    /// marked failed. A single row's failure never aborts
+    /// the pass. Returns the number of rows delivered.
+    /// D1-3 C-2: the scan dispatches by
+    /// `destination_kind` (the Q-C-11 dispatch table, as
+    /// a match branch): `local_notification` → the log
+    /// sink (unchanged); `imessage_send` → the internal
+    /// scheduled-send execute (async — the AppleScript
+    /// call can take up to 30 s, so this function is
+    /// async and the sweeper awaits it); an unknown kind
+    /// is warned + skipped, never fatal.
+    /// AO-5: the Dispatcher gates ride this scan — the
+    /// morning digest folds first, then the pass plan
+    /// (merge / cap / quiet) is applied to the due rows
+    /// before dispatch. A failed `imessage_send` attempt
+    /// consumes backoff inside `mark_scheduled_row`
+    /// (1/5/15 min, 4th failure marks failed). The
+    /// `clock_override` is the test seam (`None` = real
+    /// device-local clock).
     pub async fn deliver_due_outbox(&self) -> usize {
+        self.deliver_due_outbox_with_clock(None).await
+    }
+
+    pub async fn deliver_due_outbox_with_clock(
+        &self,
+        clock: Option<sqlite_store::DispatcherClock>,
+    ) -> usize {
         if self.sqlite_mode() != StateBackend::Sqlite || self.sqlite_is_broken() {
             return 0;
         }
         let Some(sqlite) = &self.sqlite else {
             return 0;
         };
+        let clock = match clock {
+            Some(clock) => clock,
+            None => {
+                let conn = sqlite.lock().expect("sqlite lock");
+                match sqlite_store::dispatcher_clock(&conn, sqlite_store::now_ms() as i64) {
+                    Ok(clock) => clock,
+                    Err(detail) => {
+                        eprintln!("warning: AO-5 dispatcher clock failed: {detail}");
+                        return 0;
+                    }
+                }
+            }
+        };
+        if !clock.is_quiet() {
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            if let Err(detail) = sqlite_store::create_morning_digest(&mut conn, &clock) {
+                eprintln!("warning: AO-5 morning digest failed: {detail}");
+            }
+        }
         let due = {
             let conn = sqlite.lock().expect("sqlite lock");
-            match sqlite_store::due_outbox_rows(&conn, sqlite_store::now_ms() as i64) {
+            match sqlite_store::due_outbox_rows(&conn, clock.now_ms) {
                 Ok(rows) => rows,
                 Err(detail) => {
                     eprintln!("warning: D1-3 C-1 due outbox list failed: {detail}");
@@ -2616,8 +2681,40 @@ impl AppState {
                 }
             }
         };
+        let sent_today = {
+            let conn = sqlite.lock().expect("sqlite lock");
+            match sqlite_store::dispatcher_sent_today(&conn, clock.day_start_ms) {
+                Ok(count) => count,
+                Err(detail) => {
+                    eprintln!("warning: AO-5 dispatcher cap count failed: {detail}");
+                    return 0;
+                }
+            }
+        };
+        let plan = sqlite_store::plan_outbox_delivery(&due, sent_today, &clock);
+        for outbox_id in &plan.hold {
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            if let Err(detail) =
+                sqlite_store::defer_outbox(&mut conn, outbox_id, clock.next_0800_ms())
+            {
+                eprintln!("warning: AO-5 dispatcher hold failed for {outbox_id}: {detail}");
+            }
+        }
+        for (folded_id, survivor_id) in &plan.fold {
+            let mut conn = sqlite.lock().expect("sqlite lock");
+            if let Err(detail) =
+                sqlite_store::mark_outbox_merged(&mut conn, folded_id, survivor_id)
+            {
+                eprintln!("warning: AO-5 dispatcher fold failed for {folded_id}: {detail}");
+            }
+        }
+        let deliver_ids: std::collections::HashSet<&str> =
+            plan.deliver.iter().map(|s| s.as_str()).collect();
         let mut delivered = 0;
         for row in &due {
+            if !deliver_ids.contains(row.outbox_id.as_str()) {
+                continue;
+            }
             match row.destination_kind.as_str() {
                 "local_notification" => {
                     let mut conn = sqlite.lock().expect("sqlite lock");

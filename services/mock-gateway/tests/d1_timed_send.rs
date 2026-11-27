@@ -318,8 +318,30 @@ impl Harness {
     }
 
     /// The sweeper's due pass, driven directly.
+    /// AO-5: a fixed 10:00 clock so the Dispatcher gates
+    /// (quiet hours 23:00-08:00) never hold rows no
+    /// matter what hour CI runs in.
     async fn deliver_due(&self) -> usize {
-        self.state.deliver_due_outbox().await
+        let clock = sqlite_store::DispatcherClock::fixed_for_test(
+            10,
+            0,
+            sqlite_store::now_ms() as i64,
+        );
+        self.state.deliver_due_outbox_with_clock(Some(clock)).await
+    }
+
+    /// Re-due a pending row to the past through the
+    /// manual schedule route (ungated, AO5-J7): the
+    /// test's way to make a backoff row due again
+    /// without waiting out the tier.
+    async fn redue_to_past(&self, outbox_id: &str) {
+        let (status, body) = self
+            .post(
+                &format!("/outbox/{outbox_id}/schedule"),
+                json!({ "deliver_at_ms": now_ms() - 1_000 }),
+            )
+            .await;
+        assert_eq!(status, 200, "redue to past: {body}");
     }
 
     async fn post(&self, path: &str, value: Value) -> (u16, Value) {
@@ -611,13 +633,17 @@ async fn c2_disconnect_409_at_schedule() {
     assert!(!h.approval_consumed(&approval_id), "approval not burned");
 }
 
-/// Timeout (Q-C-06): the Effect goes unknown + an
-/// Inbox row opens, the Outbox row goes failed (a
-/// pending row would be auto-retried on the next tick),
-/// the body is retained — and a second due pass does
-/// NOT resend (no auto-retry).
+/// Timeout (Q-C-06, as amended by AO-5/Q-AO-12): the
+/// Effect goes unknown + an Inbox row opens, the body
+/// is retained — and the Outbox row goes pending with
+/// a 1-minute backoff (AO-5 replaces C-2's immediate
+/// `failed` with bounded retry: attempts 1-3 reschedule
+/// at 1/5/15 min, the 4th failure marks failed). A
+/// second due pass right after does NOT resend — the
+/// row is not due until the backoff elapses, so there
+/// is still no immediate auto-retry.
 #[tokio::test]
-async fn c2_timeout_no_auto_retry() {
+async fn c2_timeout_backoff_no_immediate_retry() {
     let h = Harness::serve().await;
     let thread_id = h.sync_threads().await;
     let body = "c2-timeout-body-kept";
@@ -628,6 +654,7 @@ async fn c2_timeout_no_auto_retry() {
     assert_eq!(status, 200, "schedule: {scheduled}");
     let outbox_id = scheduled["outbox_id"].as_str().unwrap().to_string();
     h.source.set_mode(FakeMode::Timeout);
+    let before = now_ms();
     assert_eq!(h.deliver_due().await, 0, "a timeout delivers nothing");
     assert!(h.sent_rows().is_empty(), "no sent row on timeout");
     assert_eq!(h.source.attempt_count(), 1, "one AppleScript attempt");
@@ -642,10 +669,16 @@ async fn c2_timeout_no_auto_retry() {
         "unknown Inbox row opened for the timed-out Effect: {inbox:?}"
     );
     let row = h.outbox_row(&outbox_id);
-    assert_eq!(row.status, "failed");
+    assert_eq!(row.status, "pending", "AO-5: first failure backs off, not failed");
     assert_eq!(row.attempts, 1);
+    let due = row.deliver_at_ms.expect("backoff sets a due time");
+    assert!(
+        (60_000..=120_000).contains(&(due - before)),
+        "first backoff tier is 1 min: delay {}",
+        due - before
+    );
     assert!(h.body_row(&outbox_id).is_some(), "body retained on timeout");
-    assert_eq!(h.deliver_due().await, 0, "second pass does not retry");
+    assert_eq!(h.deliver_due().await, 0, "second pass does not retry before the backoff elapses");
     assert_eq!(h.source.attempt_count(), 1, "no second AppleScript attempt");
     assert_eq!(h.source.send_count(), 0, "still no successful send");
     assert_eq!(h.imessage_effects().len(), 1, "no second Effect");
@@ -654,9 +687,12 @@ async fn c2_timeout_no_auto_retry() {
     }
 }
 
-/// Rejection (Q-C-06): the Effect fails, the row
-/// fails, the body is retained — then a manual requeue
-/// redelivers it successfully under a fresh Effect.
+/// Rejection (Q-C-06, as amended by AO-5/Q-AO-12):
+/// the Effect fails on every attempt; attempts 1-3
+/// back off (pending, 1/5/15 min), the 4th marks the
+/// row failed and the body is retained — then a manual
+/// requeue redelivers it successfully under a fresh
+/// Effect.
 #[tokio::test]
 async fn c2_rejection_requeue_redelivers() {
     let h = Harness::serve().await;
@@ -669,12 +705,25 @@ async fn c2_rejection_requeue_redelivers() {
     assert_eq!(status, 200, "schedule: {scheduled}");
     let outbox_id = scheduled["outbox_id"].as_str().unwrap().to_string();
     h.source.set_mode(FakeMode::NotRunning);
-    assert_eq!(h.deliver_due().await, 0, "a rejection delivers nothing");
+    // AO-5: four failed attempts to reach `failed`
+    // (attempts 1-3 back off; re-due through the manual
+    // schedule route between attempts).
+    for attempt in 1..=4 {
+        assert_eq!(h.deliver_due().await, 0, "a rejection delivers nothing");
+        let row = h.outbox_row(&outbox_id);
+        assert_eq!(row.attempts, attempt, "attempt {attempt}");
+        if attempt < 4 {
+            assert_eq!(row.status, "pending", "attempt {attempt} backs off");
+            h.redue_to_past(&outbox_id).await;
+        }
+    }
     assert!(h.sent_rows().is_empty());
     let effects = h.imessage_effects();
-    assert_eq!(effects.len(), 1);
-    assert_eq!(effects[0].status, "failed");
-    assert_eq!(h.outbox_row(&outbox_id).status, "failed");
+    assert_eq!(effects.len(), 4, "one failed Effect per attempt");
+    assert!(effects.iter().all(|e| e.status == "failed"));
+    let row = h.outbox_row(&outbox_id);
+    assert_eq!(row.status, "failed", "4th failure marks failed");
+    assert_eq!(row.attempts, 4);
     assert!(h.body_row(&outbox_id).is_some(), "body retained on rejection");
     let (status, requeued) = h.post(&format!("/outbox/{outbox_id}/requeue"), json!({})).await;
     assert_eq!(status, 200, "requeue: {requeued}");
@@ -682,12 +731,12 @@ async fn c2_rejection_requeue_redelivers() {
     h.source.set_mode(FakeMode::Ok);
     assert_eq!(h.deliver_due().await, 1, "requeued row redelivers");
     assert_eq!(h.sent_rows().len(), 1);
-    assert_eq!(h.source.attempt_count(), 2, "two attempts in total");
+    assert_eq!(h.source.attempt_count(), 5, "four failed attempts + redelivery");
     assert_eq!(h.source.send_count(), 1, "one real send");
     assert_eq!(h.outbox_row(&outbox_id).status, "sent");
     assert!(h.body_row(&outbox_id).is_none(), "body deleted on sent");
     let effects = h.imessage_effects();
-    assert_eq!(effects.len(), 2, "failed attempt + redelivery");
+    assert_eq!(effects.len(), 5, "four failed attempts + redelivery");
     assert!(effects.iter().any(|e| e.status == "failed"));
     assert!(effects.iter().any(|e| e.status == "succeeded"));
 }

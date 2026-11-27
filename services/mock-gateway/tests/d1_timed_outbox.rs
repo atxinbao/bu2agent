@@ -257,7 +257,16 @@ impl Harness {
 /// function through `AppState::deliver_pending_outbox`).
 fn consume(h: &Harness) -> Vec<OutboxRow> {
     let mut conn = h.db();
-    sqlite_store::consume_outbox_events(&mut conn, "outbox-deliverer", "test").expect("consume")
+    // AO-5: drive the channel with a fixed 10:00 clock so
+    // the Dispatcher gates (quiet hours 23:00-08:00) never
+    // hold rows no matter what hour CI runs in.
+    let clock = sqlite_store::DispatcherClock::fixed_for_test(
+        10,
+        0,
+        sqlite_store::now_ms() as i64,
+    );
+    sqlite_store::consume_outbox_events_with_clock(&mut conn, "outbox-deliverer", "test", Some(&clock))
+        .expect("consume")
 }
 
 /// Drive the tick's row scan directly: fetch due timed

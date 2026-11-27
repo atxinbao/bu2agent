@@ -780,6 +780,10 @@ fn schedule_imessage_send(
 /// is returned unchanged and no second event is
 /// written). Returns true only when the row now reads
 /// `sent`.
+/// AO-5 (Q-AO-12): a failed attempt does NOT mark the
+/// row failed outright — it consumes retry backoff
+/// (attempts + 1, rescheduled to now + 1/5/15 min);
+/// only the 4th failed attempt marks it failed.
 fn mark_scheduled_row(state: &AppState, row: &sqlite_store::OutboxRow, success: bool) -> bool {
     let Some(sqlite) = &state.sqlite else {
         return false;
@@ -787,7 +791,17 @@ fn mark_scheduled_row(state: &AppState, row: &sqlite_store::OutboxRow, success: 
     let Ok(mut conn) = sqlite.lock() else {
         return false;
     };
-    match sqlite_store::deliver_outbox(&mut conn, &row.outbox_id, success) {
+    if !success {
+        return match sqlite_store::fail_outbox_with_backoff(
+            &mut conn,
+            &row.outbox_id,
+            sqlite_store::now_ms() as i64,
+        ) {
+            Ok(Some(updated)) => updated.status == "sent",
+            _ => false,
+        };
+    }
+    match sqlite_store::deliver_outbox(&mut conn, &row.outbox_id, true) {
         Ok(Some(updated)) => updated.status == "sent",
         _ => false,
     }

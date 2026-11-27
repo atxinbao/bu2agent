@@ -10,6 +10,15 @@
 //! the first post-restart drive fires expired ones
 //! once (B4).
 //!
+//! AO-5 tests (plan §5, Q-AO-11/12/13): the Outbox
+//! Dispatcher — same-topic merge within 10 minutes
+//! (E1), the 20-per-day cap holding the 21st row
+//! (E2), quiet-hours hold + the next-morning digest
+//! (E3), and the 1/5/15-minute retry backoff ending
+//! in failed after the 4th attempt (E4). All four
+//! drive the deliverers with fixed clocks, so the
+//! hour the suite runs in cannot change the outcome.
+//!
 //! The harness serves with no sweeper (the
 //! `e2d_long_tasks` precedent for
 //! `start_due_worker_runs`): no drive call happens
@@ -31,6 +40,7 @@ use mock_gateway::deepseek::{DeepSeekClient, DeepSeekConfig};
 use mock_gateway::server::{app, AppState};
 use mock_gateway::sqlite_store::{self, DB_SCHEMA_VERSION};
 use reqwest::StatusCode;
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
@@ -309,6 +319,152 @@ impl Harness {
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
     }
+
+    // --- AO-5 Dispatcher helpers ---
+
+    fn enqueue_notification(&self, execution_id: &str, topic: &str) -> sqlite_store::OutboxRow {
+        let mut conn = self.db();
+        let summary = sqlite_store::canonical_json(&json!({
+            "kind": "notification",
+            "topic": topic,
+        }));
+        sqlite_store::enqueue_outbox(&mut conn, execution_id, &summary)
+            .expect("enqueue notification")
+    }
+
+    fn outbox_row(&self, outbox_id: &str) -> sqlite_store::OutboxRow {
+        let conn = self.db();
+        conn.query_row(
+            "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE outbox_id = ?1",
+            [outbox_id],
+            |row| {
+                Ok(sqlite_store::OutboxRow {
+                    outbox_id: row.get(0)?,
+                    execution_id: row.get(1)?,
+                    payload_summary_json: row.get(2)?,
+                    destination_kind: row.get(3)?,
+                    status: row.get(4)?,
+                    attempts: row.get(5)?,
+                    dedup_key: row.get(6)?,
+                    created_ms: row.get(7)?,
+                    updated_at_ms: row.get(8)?,
+                    deliver_at_ms: row.get(9)?,
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    fn count_outbox_events(&self, event_type: &str) -> i64 {
+        let conn = self.db();
+        conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE aggregate_kind = 'outbox' AND event_type = ?1",
+            [event_type],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn outbox_event_aggregate_ids(&self, event_type: &str) -> Vec<String> {
+        let conn = self.db();
+        let mut stmt = conn
+            .prepare(
+                "SELECT aggregate_id FROM events WHERE aggregate_kind = 'outbox' AND event_type = ?1 ORDER BY seq",
+            )
+            .unwrap();
+        stmt.query_map([event_type], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn merged_into_of(&self, outbox_id: &str) -> String {
+        let conn = self.db();
+        let raw: String = conn
+            .query_row(
+                "SELECT payload_json FROM events WHERE aggregate_kind = 'outbox' AND aggregate_id = ?1 AND event_type = 'outbox.merged'",
+                [outbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str::<Value>(&raw).unwrap()["merged_into"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn find_digest(&self, date: &str) -> Option<sqlite_store::OutboxRow> {
+        let conn = self.db();
+        conn.query_row(
+            "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox WHERE dedup_key = ?1",
+            [format!("digest:{date}")],
+            |row| {
+                Ok(sqlite_store::OutboxRow {
+                    outbox_id: row.get(0)?,
+                    execution_id: row.get(1)?,
+                    payload_summary_json: row.get(2)?,
+                    destination_kind: row.get(3)?,
+                    status: row.get(4)?,
+                    attempts: row.get(5)?,
+                    dedup_key: row.get(6)?,
+                    created_ms: row.get(7)?,
+                    updated_at_ms: row.get(8)?,
+                    deliver_at_ms: row.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .unwrap()
+    }
+
+    /// One scheduled `imessage_send` row whose body row
+    /// is deleted right after enqueue: the deterministic
+    /// failure for E4 (step 3, "no stored body") — no
+    /// AppleScript, no network, no real thread.
+    fn enqueue_scheduled_send_no_body(&self, deliver_at_ms: i64) -> sqlite_store::OutboxRow {
+        let body = "e4 test body";
+        let body_hash = mock_gateway::imessage_send::imessage_body_hash(body);
+        let payload = sqlite_store::canonical_json(&json!({
+            "thread_id": "thread-1",
+            "body_hash": body_hash,
+            "idempotency_key": "e4-key",
+            "approval_id": "approval-e4",
+        }));
+        let mut conn = self.db();
+        let (row, created) = sqlite_store::enqueue_scheduled_imessage_send(
+            &mut conn,
+            "exec-e4",
+            &payload,
+            deliver_at_ms,
+            "thread-1",
+            body,
+            &body_hash,
+            "e4-key",
+            "approval-e4",
+        )
+        .expect("enqueue scheduled send");
+        assert!(created, "e4 row must be newly created");
+        sqlite_store::delete_scheduled_imessage_send(&mut conn, &row.outbox_id)
+            .expect("delete body row");
+        row
+    }
+
+    /// Re-due a pending row to the past through the
+    /// manual schedule route (ungated, AO5-J7): the
+    /// test's way to make a backoff row due again
+    /// without waiting out the tier.
+    fn redue_to_past(&self, outbox_id: &str) {
+        let mut conn = self.db();
+        let past = sqlite_store::now_ms() as i64 - 60_000;
+        sqlite_store::schedule_outbox(&mut conn, outbox_id, past).expect("redue to past");
+    }
+}
+
+/// AO-5: a fixed 10:00 daytime clock, so the
+/// Dispatcher gates (quiet hours 23:00-08:00) never
+/// hold rows no matter what hour CI runs in.
+fn daytime_clock() -> sqlite_store::DispatcherClock {
+    sqlite_store::DispatcherClock::fixed_for_test(10, 0, sqlite_store::now_ms() as i64)
 }
 
 #[tokio::test]
@@ -748,4 +904,211 @@ async fn b4_restart_keeps_unexpired_and_fires_expired() {
     assert_eq!(h.count_timer_events(), 1);
     assert_eq!(h.state.drive_due_timers(), 0);
     assert_eq!(h.count_timer_events(), 1);
+}
+
+/// E1 (Q-AO-11): three `local_notification` rows with
+/// the same topic, enqueued within seconds of each
+/// other, merge into ONE delivery — one survivor
+/// delivered, the other two folded into it (one
+/// `outbox.sent`, two `outbox.merged` naming the
+/// survivor). No row is held: all three stay
+/// immediate (`deliver_at_ms` untouched).
+#[tokio::test]
+async fn e1_same_topic_merges_within_window() {
+    let h = Harness::serve().await;
+    let rows: Vec<_> = (1..=3)
+        .map(|i| h.enqueue_notification(&format!("exec-e1-{i}"), "digest-topic"))
+        .collect();
+    assert_eq!(
+        h.state.deliver_pending_outbox_with_clock(Some(daytime_clock())),
+        1,
+        "one survivor delivered"
+    );
+    assert_eq!(h.count_outbox_events("outbox.sent"), 1);
+    assert_eq!(h.count_outbox_events("outbox.merged"), 2);
+    let sent_ids = h.outbox_event_aggregate_ids("outbox.sent");
+    assert_eq!(sent_ids.len(), 1);
+    let survivor = &sent_ids[0];
+    for row in &rows {
+        let after = h.outbox_row(&row.outbox_id);
+        assert_eq!(after.status, "sent", "row {}", row.outbox_id);
+        assert_eq!(after.attempts, 1, "row {}", row.outbox_id);
+        assert_eq!(after.deliver_at_ms, None, "row {}", row.outbox_id);
+        if row.outbox_id != *survivor {
+            assert_eq!(h.merged_into_of(&row.outbox_id), *survivor);
+        }
+    }
+}
+
+/// E2 (Q-AO-11): 21 distinct-topic rows against a
+/// 20-per-day cap — the first 20 deliver, the 21st
+/// stays pending, deferred to tomorrow 08:00
+/// (day_start + 115_200_000 ms = 32 h: 24 h + 8 h).
+/// A second pass delivers nothing more.
+#[tokio::test]
+async fn e2_daily_cap_holds_21st_row() {
+    let h = Harness::serve().await;
+    let now = sqlite_store::now_ms() as i64;
+    let clock = sqlite_store::DispatcherClock::fixed_for_test(10, 0, now);
+    let rows: Vec<_> = (0..21)
+        .map(|i| h.enqueue_notification(&format!("exec-e2-{i}"), &format!("topic-{i}")))
+        .collect();
+    assert_eq!(
+        h.state.deliver_pending_outbox_with_clock(Some(clock)),
+        20,
+        "20 of 21 deliver"
+    );
+    assert_eq!(h.count_outbox_events("outbox.sent"), 20);
+    assert_eq!(h.count_outbox_events("outbox.merged"), 0);
+    for row in &rows[..20] {
+        assert_eq!(h.outbox_row(&row.outbox_id).status, "sent");
+    }
+    let held = h.outbox_row(&rows[20].outbox_id);
+    assert_eq!(held.status, "pending");
+    // 115_200_000 ms = 32 h = (24 + 8) h — tomorrow 08:00.
+    let day_start = now - now.rem_euclid(86_400_000);
+    assert_eq!(held.deliver_at_ms, Some(day_start + 115_200_000));
+    assert_eq!(
+        h.state.deliver_pending_outbox_with_clock(Some(daytime_clock())),
+        0,
+        "the held row is timed now, not in the event channel"
+    );
+}
+
+/// E3 (Q-AO-11): two rows enqueued at 23:30 are held
+/// (nothing delivered, both deferred to tomorrow
+/// 08:00); at 08:05 the next day the due pass folds
+/// them into ONE morning digest row (count 2, ids
+/// listed), and the digest itself delivers on the
+/// next pending-channel tick — exactly one
+/// `outbox.sent` for the whole morning.
+#[tokio::test]
+async fn e3_quiet_hours_hold_then_morning_digest() {
+    let h = Harness::serve().await;
+    let now = sqlite_store::now_ms() as i64;
+    let day_start = now - now.rem_euclid(86_400_000);
+    let quiet = sqlite_store::DispatcherClock::fixed_for_test(23, 30, now);
+    let rows: Vec<_> = (1..=2)
+        .map(|i| h.enqueue_notification(&format!("exec-e3-{i}"), &format!("topic-{i}")))
+        .collect();
+    assert_eq!(
+        h.state.deliver_pending_outbox_with_clock(Some(quiet)),
+        0,
+        "quiet hours deliver nothing"
+    );
+    assert_eq!(h.count_outbox_events("outbox.sent"), 0);
+    for row in &rows {
+        let held = h.outbox_row(&row.outbox_id);
+        assert_eq!(held.status, "pending");
+        assert_eq!(held.deliver_at_ms, Some(day_start + 115_200_000));
+    }
+    // Next day 08:05 — 300_000 ms past tomorrow 08:00.
+    let morning = sqlite_store::DispatcherClock::fixed_for_test(
+        8,
+        5,
+        day_start + 115_200_000 + 300_000,
+    );
+    assert_eq!(
+        h.state
+            .deliver_due_outbox_with_clock(Some(morning.clone()))
+            .await,
+        0,
+        "the due pass folds, it does not deliver the digest itself"
+    );
+    let digest = h
+        .find_digest(&morning.local_date)
+        .expect("one digest row for the morning");
+    assert_eq!(digest.status, "pending");
+    let summary: Value = serde_json::from_str(&digest.payload_summary_json).unwrap();
+    assert_eq!(summary["kind"], "digest");
+    assert_eq!(summary["date"], morning.local_date);
+    assert_eq!(summary["count"], 2);
+    let ids: Vec<String> = serde_json::from_value(summary["outbox_ids"].clone()).unwrap();
+    assert_eq!(
+        ids,
+        rows.iter().map(|r| r.outbox_id.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(h.count_outbox_events("outbox.merged"), 2);
+    for row in &rows {
+        assert_eq!(h.outbox_row(&row.outbox_id).status, "sent");
+        assert_eq!(h.merged_into_of(&row.outbox_id), digest.outbox_id);
+    }
+    assert_eq!(
+        h.state.deliver_pending_outbox_with_clock(Some(morning)),
+        1,
+        "the digest delivers on the next tick"
+    );
+    assert_eq!(h.outbox_row(&digest.outbox_id).status, "sent");
+    assert_eq!(h.count_outbox_events("outbox.sent"), 1);
+}
+
+/// E4 (Q-AO-12): a scheduled `imessage_send` row with
+/// no stored body fails deterministically at step 3.
+/// Attempts 1-3 reschedule it (backoff 1/5/15 min —
+/// each delay lands in [tier, tier + 60_000] ms of
+/// the attempt's start); the 4th failed attempt marks
+/// it failed, and it stays failed (no 5th attempt,
+/// no `outbox.sent`).
+#[tokio::test]
+async fn e4_failure_backoff_then_failed() {
+    let h = Harness::serve().await;
+    let now = sqlite_store::now_ms() as i64;
+    let row = h.enqueue_scheduled_send_no_body(now - 60_000);
+    let tiers: [i64; 3] = [60_000, 300_000, 900_000];
+    for (attempt, tier) in tiers.iter().enumerate() {
+        let before = sqlite_store::now_ms() as i64;
+        assert_eq!(
+            h.state
+                .deliver_due_outbox_with_clock(Some(daytime_clock()))
+                .await,
+            0,
+            "attempt {} delivers nothing",
+            attempt + 1
+        );
+        let after = h.outbox_row(&row.outbox_id);
+        assert_eq!(after.status, "pending", "attempt {}", attempt + 1);
+        assert_eq!(after.attempts, (attempt + 1) as i64, "attempt {}", attempt + 1);
+        let due = after.deliver_at_ms.expect("backoff sets a due time");
+        let delay = due - before;
+        assert!(
+            (*tier..=*tier + 60_000).contains(&delay),
+            "attempt {} delay {delay} outside [{tier}, {}]",
+            attempt + 1,
+            tier + 60_000
+        );
+        // `outbox.rescheduled` counts BOTH sources: one backoff
+        // reschedule per failed attempt (n so far) plus one
+        // manual redue per completed cycle (n - 1 so far) —
+        // the manual `schedule_outbox` route appends the
+        // same event type. Total after attempt n: 2n - 1.
+        let n = (attempt + 1) as i64;
+        assert_eq!(h.count_outbox_events("outbox.rescheduled"), 2 * n - 1);
+        assert_eq!(h.count_outbox_events("outbox.failed"), 0);
+        h.redue_to_past(&row.outbox_id);
+    }
+    // 4th failed attempt: failed, attempts 4.
+    assert_eq!(
+        h.state
+            .deliver_due_outbox_with_clock(Some(daytime_clock()))
+            .await,
+        0,
+        "the 4th attempt delivers nothing"
+    );
+    let after = h.outbox_row(&row.outbox_id);
+    assert_eq!(after.status, "failed");
+    assert_eq!(after.attempts, 4);
+    // 3 backoff reschedules + 3 manual redues = 6.
+    assert_eq!(h.count_outbox_events("outbox.rescheduled"), 6);
+    assert_eq!(h.count_outbox_events("outbox.failed"), 1);
+    assert_eq!(h.count_outbox_events("outbox.sent"), 0);
+    // It stays failed: no 5th attempt, no resurrection.
+    assert_eq!(
+        h.state
+            .deliver_due_outbox_with_clock(Some(daytime_clock()))
+            .await,
+        0
+    );
+    let still = h.outbox_row(&row.outbox_id);
+    assert_eq!(still.status, "failed");
+    assert_eq!(still.attempts, 4);
 }
