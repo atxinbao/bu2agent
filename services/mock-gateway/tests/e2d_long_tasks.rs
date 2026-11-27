@@ -966,7 +966,7 @@ async fn e2d_deferred_start_runs_after_due() {
 /// 60 s add-runs anchored the shared Execution deadline
 /// via min(), and the serial continuation minutes later
 /// was refused before it started. Here the first run's
-/// 50 ms timeout expires, the second run is created on
+/// 5 s timeout expires, the second run is created on
 /// the same Execution afterwards, and it must start: its
 /// creation extends the deadline (max). Under the old
 /// min rule the stored deadline stays in the past and
@@ -976,7 +976,12 @@ async fn e2d_deferred_start_runs_after_due() {
 /// 200 ms poll boundaries (worker.rs), so a real
 /// sub-second command with a 50 ms timeout is a race —
 /// on a fast runner it finishes inside the first slice
-/// and succeeds (CI #169: 153 ms on Ubuntu).
+/// and succeeds (CI #169: 153 ms on Ubuntu). 5 s, not
+/// 50 ms: the driver refuses a run whose deadline
+/// passed before it starts (worker.rs), and on a loaded
+/// Windows runner the creation-to-driver-start latency
+/// can exceed 50 ms (CI #176) — 5 s is far above start
+/// latency and far below the 60 s sleep.
 #[tokio::test]
 async fn r5f2_later_run_extends_execution_deadline() {
     let dir = temp_dir("r5f2-t1");
@@ -984,7 +989,7 @@ async fn r5f2_later_run_extends_execution_deadline() {
     let h = Harness::serve(vec![], Some(real_git()), Some(fake_cargo_sleeping(&dir))).await;
     let worktree = h.setup_worktree(&repo).await;
     // First run: a fake cargo that sleeps 60 s, with a
-    // 50 ms timeout, only to write the deadline. The
+    // 5 s timeout, only to write the deadline. The
     // timeout must fire deterministically: the driver
     // polls `child.wait()` in 200 ms slices (worker.rs)
     // and checks the timeout only when a slice expires
@@ -1006,7 +1011,7 @@ async fn r5f2_later_run_extends_execution_deadline() {
             &worktree,
             "cargo-test",
             json!({"package": "testpkg-pass"}),
-            Some(50),
+            Some(5000),
         )
         .await;
     let (status, run) = h
@@ -1014,7 +1019,7 @@ async fn r5f2_later_run_extends_execution_deadline() {
             "worktree_id": worktree,
             "command": "cargo-test",
             "params": {"package": "testpkg-pass"},
-            "timeout_ms": 50,
+            "timeout_ms": 5000,
             "approval_id": approval,
         }))
         .await;
@@ -1026,7 +1031,7 @@ async fn r5f2_later_run_extends_execution_deadline() {
     let d1 = h
         .execution_deadline(&execution_id)
         .expect("deadline after first run");
-    // Past the first run's deadline (creation + 50 ms).
+    // Past the first run's deadline (creation + 5 s).
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(now_ms() > d1, "test waited past the first deadline");
     // Second run on the same Execution, default 30 s
