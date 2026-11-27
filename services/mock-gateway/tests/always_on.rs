@@ -31,12 +31,31 @@
 //! ingest route never calls the model, so it is
 //! never hit. The fake key is `test-key`; no real
 //! credential is used.
+//!
+//! AO-4 tests (plan §6, Q-AO-10): per-round memory
+//! loading + dreaming — loop_start loads the user
+//! instruction layer (D1), over-budget rows degrade
+//! to index lines (D2), and the dreaming pass writes
+//! a summary row while tombstoning the older exact
+//! duplicate (D3). D1/D2 need to see what the
+//! gateway actually sends the model, so they serve
+//! a recording fake DeepSeek (it stores each
+//! `/chat/completions` body and answers one final
+//! text reply); the system prompt is not observable
+//! through `GET /agent/loop/get`, which carries no
+//! messages — the recorded model request is the
+//! honest observation point.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::{extract::State, routing::post, Json, Router};
 use mock_gateway::deepseek::{DeepSeekClient, DeepSeekConfig};
+use mock_gateway::deepseek_loop::DeepSeekLoopModel;
+use mock_gateway::loop_engine::Timeouts;
+use mock_gateway::memory_store::{self, DreamSession, MemoryRow, MemorySource};
 use mock_gateway::server::{app, AppState};
 use mock_gateway::sqlite_store::{self, DB_SCHEMA_VERSION};
 use reqwest::StatusCode;
@@ -71,18 +90,61 @@ async fn start_fake_deepseek() -> String {
     format!("http://{addr}")
 }
 
+/// AO-4: a recording fake DeepSeek — it stores each
+/// `/chat/completions` body (so D1/D2 can assert what
+/// the gateway actually sent the model) and answers
+/// one final-text reply with no tool calls, so the
+/// loop completes.
+async fn recording_completion(
+    State(requests): State<Arc<Mutex<Vec<Value>>>>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    requests.lock().unwrap().push(body);
+    (
+        StatusCode::OK,
+        Json(json!({"choices":[{"message":{"role":"assistant","content":"done","tool_calls":null},"finish_reason":"stop"}]})),
+    )
+}
+
+async fn start_recording_deepseek() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/chat/completions", post(recording_completion))
+        .with_state(requests.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), requests)
+}
+
 fn build_state(dir: &Path, deepseek_base_url: &str) -> AppState {
+    let config = DeepSeekConfig {
+        base_url: deepseek_base_url.to_string(),
+        model: "fixture".to_string(),
+        api_key: Some("test-key".to_string()),
+    };
+    // AO-4: the loop engine needs a model backend, or
+    // loop_start 503s with loop_model_not_configured.
+    // The model points at the (fake) DeepSeek URL, so
+    // D1/D2 reach the recording fake; A/B/E tests never
+    // start a loop, so this changes nothing for them.
+    let model = DeepSeekLoopModel::new(config.clone())
+        .expect("loop model builds")
+        .expect("test key configures a loop model");
     let state = AppState::with_files_root_and_approvals(
         dir.join("files"),
         Some(dir.join("approvals.jsonl")),
     )
     .with_tasks_path(dir.join("tasks.jsonl"))
     .with_task_drafts_dir(dir.join("drafts"))
-    .with_deepseek(DeepSeekClient::new(DeepSeekConfig {
-        base_url: deepseek_base_url.to_string(),
-        model: "fixture".to_string(),
-        api_key: Some("test-key".to_string()),
-    }))
+    .with_deepseek(DeepSeekClient::new(config))
+    .with_loop_backends(
+        Some(dir.join("loops.jsonl")),
+        Some(std::sync::Arc::new(model)),
+        None,
+        Timeouts::default(),
+    )
+    .expect("loop backends")
     .with_auto_drive(false)
     .with_executions_path(dir.join("executions.jsonl"))
     .with_effects_path(dir.join("effects.jsonl"))
@@ -106,6 +168,9 @@ struct Harness {
     server: Option<tokio::task::JoinHandle<()>>,
     #[allow(dead_code)]
     state: AppState,
+    /// AO-4: bodies the recording fake DeepSeek saw
+    /// (empty for `serve`, which drops connections).
+    model_requests: Arc<Mutex<Vec<Value>>>,
 }
 
 impl Harness {
@@ -128,7 +193,91 @@ impl Harness {
             deepseek_base_url,
             server: Some(server),
             state: harness_state,
+            model_requests: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// AO-4: like `serve`, but the fake DeepSeek
+    /// records every model request and answers one
+    /// final-text reply, so D1/D2 can assert what the
+    /// gateway sent the model.
+    async fn serve_recording() -> Self {
+        let dir = temp_dir("ao4");
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        let (deepseek_base_url, model_requests) = start_recording_deepseek().await;
+        let state = build_state(&dir, &deepseek_base_url);
+        let harness_state = state.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+        Self {
+            dir,
+            url,
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .unwrap(),
+            deepseek_base_url,
+            server: Some(server),
+            state: harness_state,
+            model_requests,
+        }
+    }
+
+    fn model_requests(&self) -> Vec<Value> {
+        self.model_requests.lock().unwrap().clone()
+    }
+
+    /// AO-4: seed one memory row through the store
+    /// (fresh connection, the `mcl_contact_write`
+    /// precedent), with an explicit id and timestamp
+    /// so the test controls ordering.
+    fn seed_memory(&self, memory_id: &str, layer: &str, content: &str, created_ms: u64) {
+        let mut conn = self.db();
+        let source = MemorySource {
+            session_id: None,
+            execution_id: None,
+            source_id: None,
+            author: "user".to_string(),
+            created_ms,
+        };
+        let row = MemoryRow {
+            memory_id: memory_id.to_string(),
+            layer: layer.to_string(),
+            scope_json: "{}".to_string(),
+            content: content.to_string(),
+            source_json: source.canonical(),
+            created_ms,
+            updated_ms: created_ms,
+            deleted: false,
+            origin_device_id: "test".to_string(),
+            schema_version: 1,
+        };
+        memory_store::insert_memory(&mut conn, &row).unwrap();
+    }
+
+    async fn loop_start(&self, body: Value) -> (StatusCode, Value) {
+        let resp = self
+            .client
+            .post(format!("{}/agent/loop/start", self.url))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, resp.json().await.unwrap())
+    }
+
+    async fn loop_resume(&self, loop_id: &str) -> (StatusCode, Value) {
+        let resp = self
+            .client
+            .post(format!("{}/agent/loop/resume", self.url))
+            .json(&json!({"loop_id": loop_id}))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, resp.json().await.unwrap())
     }
 
     /// Restart the gateway on the same directory (same
@@ -1111,4 +1260,149 @@ async fn e4_failure_backoff_then_failed() {
     let still = h.outbox_row(&row.outbox_id);
     assert_eq!(still.status, "failed");
     assert_eq!(still.attempts, 4);
+}
+
+/// D1 (Q-AO-10): loop_start loads the user
+/// instruction layer — the recorded model request
+/// carries the instruction verbatim as the first
+/// user message, ahead of the prompt, and the loop
+/// completes on the fake's final reply.
+#[tokio::test]
+async fn ao4_d1_loop_start_loads_instruction_layer() {
+    let h = Harness::serve_recording().await;
+    let instruction = "每天早上九点提醒我喝水。";
+    h.seed_memory("memory-1", "user", instruction, 1_000);
+    let (status, started) = h
+        .loop_start(json!({"prompt": "帮我看看今天要做什么"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let loop_id = started["loop_id"].as_str().unwrap().to_string();
+    let (status, view) = h.loop_resume(&loop_id).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["status"], "completed");
+    assert_eq!(view["final_text"], "done");
+    let requests = h.model_requests();
+    assert_eq!(requests.len(), 1);
+    let messages = requests[0]["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[1]["role"], "user");
+    assert!(
+        messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains(instruction),
+        "{}",
+        messages[1]
+    );
+    assert_eq!(messages[2]["content"], "帮我看看今天要做什么");
+}
+
+/// D2 (Q-AO-10): four 1000-CJK-char instruction rows
+/// against the 4k budget — header (5) + three full
+/// rows (1004 each) = 3017; a fourth full row would
+/// reach 4021 > 4000, so it degrades to its index
+/// line (47), and the notes index follows (header 5
+/// + 48 = 3117 total). The over-budget row's full
+/// text never enters the context; its index line
+/// does. All token figures were computed
+/// independently in Python before this test was
+/// written, not copied from the loader's output.
+#[tokio::test]
+async fn ao4_d2_over_budget_rows_load_as_index_only() {
+    let h = Harness::serve_recording().await;
+    h.seed_memory("memory-1", "user", &"甲".repeat(1000), 1_000);
+    h.seed_memory("memory-2", "user", &"乙".repeat(1000), 2_000);
+    h.seed_memory("memory-3", "user", &"丙".repeat(1000), 3_000);
+    h.seed_memory("memory-4", "user", &"丁".repeat(1000), 4_000);
+    h.seed_memory("memory-5", "project", &"戊".repeat(100), 5_000);
+    let (status, started) = h.loop_start(json!({"prompt": "开始"})).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let loop_id = started["loop_id"].as_str().unwrap().to_string();
+    let (status, view) = h.loop_resume(&loop_id).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["status"], "completed");
+    let requests = h.model_requests();
+    assert_eq!(requests.len(), 1);
+    let messages = requests[0]["messages"].as_array().unwrap();
+    let context = messages[1]["content"].as_str().unwrap().to_string();
+    assert!(context.contains("[记忆·指令]"));
+    assert!(context.contains("[记忆·笔记]"));
+    assert!(!context.contains("[记忆·任务进度]"));
+    assert!(context.contains(&"甲".repeat(1000)));
+    assert!(context.contains(&"乙".repeat(1000)));
+    assert!(context.contains(&"丙".repeat(1000)));
+    assert!(!context.contains(&"丁".repeat(1000)));
+    assert!(context.contains("memory-4"));
+    assert!(context.contains("索引"));
+    assert!(context.contains(&"丁".repeat(40)));
+    assert!(context.contains("memory-5"));
+    assert!(!context.contains(&"戊".repeat(100)));
+    assert!(context.contains(&"戊".repeat(40)));
+}
+
+/// D3 (Q-AO-10): the dreaming pass writes a weekly
+/// summary row, tombstones the older of two
+/// exact-duplicate rows, and loses no content — the
+/// tombstoned row stays readable with its text
+/// intact, and the surviving rows are byte-identical.
+/// The expected summary string was computed
+/// independently in Python before this test was
+/// written.
+#[tokio::test]
+async fn ao4_d3_dreaming_writes_back_and_tombstones() {
+    let h = Harness::serve().await;
+    h.seed_memory("memory-1", "user", "喜欢红茶", 1_000);
+    h.seed_memory("memory-2", "user", "喜欢红茶", 2_000);
+    h.seed_memory("memory-3", "user", "每周五跑步", 3_000);
+    let now_ms = 1_800_000_000_000u64;
+    let sessions = vec![
+        DreamSession {
+            session_id: "loop-1".to_string(),
+            created_ms: now_ms - 1_000,
+            kind: "main".to_string(),
+            status: "completed".to_string(),
+            tools: vec!["fs.read".to_string()],
+        },
+        DreamSession {
+            session_id: "loop-2".to_string(),
+            created_ms: now_ms - 2_000,
+            kind: "research".to_string(),
+            status: "failed".to_string(),
+            tools: vec!["code.search".to_string(), "fs.read".to_string()],
+        },
+    ];
+    let mut conn = h.db();
+    let outcome =
+        memory_store::run_dreaming_pass(&mut conn, &sessions, now_ms, "test").unwrap();
+    assert!(outcome.summary_written);
+    assert_eq!(outcome.summary_id.as_deref(), Some("memory-4"));
+    assert_eq!(outcome.tombstoned, vec!["memory-1".to_string()]);
+    assert_eq!(outcome.sessions_seen, 2);
+    drop(conn);
+    let conn = h.db();
+    let summary = memory_store::get_memory(&conn, "memory-4")
+        .unwrap()
+        .expect("summary row");
+    assert_eq!(
+        summary.content,
+        "近 7 天会话整理：共 2 个会话（main 1 个，research 1 个）；完成 1 个，失败 1 个，其他 0 个；用过工具：code.search、fs.read。"
+    );
+    assert_eq!(summary.layer, "user");
+    assert!(!summary.deleted);
+    assert!(summary.source_json.contains("dreaming"));
+    let old = memory_store::get_memory(&conn, "memory-1")
+        .unwrap()
+        .expect("tombstoned row stays readable");
+    assert!(old.deleted);
+    assert_eq!(old.content, "喜欢红茶");
+    let kept = memory_store::get_memory(&conn, "memory-2")
+        .unwrap()
+        .expect("surviving duplicate");
+    assert!(!kept.deleted);
+    assert_eq!(kept.content, "喜欢红茶");
+    let other = memory_store::get_memory(&conn, "memory-3")
+        .unwrap()
+        .expect("untouched row");
+    assert!(!other.deleted);
+    assert_eq!(other.content, "每周五跑步");
 }

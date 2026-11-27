@@ -420,6 +420,20 @@ struct LiveLoop {
     /// serialized: after a restart a non-terminal loop
     /// becomes Interrupted anyway.
     closing_retried: bool,
+    /// AO-4 (J4/J5): whether this loop reloads memory
+    /// on every model round — true for kind "main"
+    /// only; research loops never carry memory.
+    /// Memory-only, never serialized.
+    memory_active: bool,
+    /// AO-4 (J5): whether live.messages[0] is
+    /// currently the memory prefix (inserted at start,
+    /// synced on resume). Memory-only.
+    memory_loaded: bool,
+    /// AO-4 (J7): the session the memory was loaded
+    /// for; None means no progress layer, but the
+    /// instruction/notes layers still load.
+    /// Memory-only.
+    memory_session_id: Option<String>,
 }
 
 impl LiveLoop {
@@ -1132,6 +1146,9 @@ impl LoopEngine {
                     active: None,
                     model_override: None,
                     closing_retried: false,
+                    memory_active: false,
+                    memory_loaded: false,
+                    memory_session_id: None,
                 };
                 live.update_unknown();
                 crate::loop_store::append(p, &live.record)?;
@@ -1162,7 +1179,20 @@ impl LoopEngine {
     }
 
     pub fn start(&self, request: StartLoop) -> Result<LoopView, LoopError> {
-        self.start_with_kind(request, "main", None)
+        self.start_with_kind(request, "main", None, None)
+    }
+
+    /// AO-4 (J4): start a main loop with memory
+    /// already loaded by the handler (the handler owns
+    /// AppState/SQLite; the engine only inserts the
+    /// rendered text). `start` stays the no-memory
+    /// entry point.
+    pub fn start_with_memory(
+        &self,
+        request: StartLoop,
+        memory: Option<crate::memory_context::MemoryContext>,
+    ) -> Result<LoopView, LoopError> {
+        self.start_with_kind(request, "main", None, memory)
     }
 
     /// ORC-4: start a loop of the given kind, with an
@@ -1170,11 +1200,18 @@ impl LoopEngine {
     /// the planner_model slot; None keeps the engine
     /// default — R4-J4). Limits and the 503/400 codes
     /// are exactly `start`'s (Q-R4-10).
+    ///
+    /// AO-4 (J4): `memory` is the rendered context
+    /// for a main loop (None for research, which never
+    /// carries memory); a non-empty text becomes
+    /// messages[0], ahead of the user's prompt, so
+    /// every model round in this loop sees it.
     pub fn start_with_kind(
         &self,
         request: StartLoop,
         kind: &str,
         model_override: Option<Arc<dyn LoopModel>>,
+        memory: Option<crate::memory_context::MemoryContext>,
     ) -> Result<LoopView, LoopError> {
         let model = model_override
             .as_ref()
@@ -1215,15 +1252,29 @@ impl LoopEngine {
             late_model_arrivals_ms: vec![],
             final_digest: None,
         };
+        let memory_session_id = request.session_id.clone();
+        let (messages, memory_loaded) = match &memory {
+            Some(ctx) if !ctx.text.is_empty() => (
+                vec![
+                    Message::User(ctx.text.clone()),
+                    Message::User(request.prompt),
+                ],
+                true,
+            ),
+            _ => (vec![Message::User(request.prompt)], false),
+        };
         let mut live = LiveLoop {
             record,
-            messages: vec![Message::User(request.prompt)],
+            messages,
             arguments: vec![],
             results: vec![],
             final_text: None,
             active: None,
             model_override,
             closing_retried: false,
+            memory_active: kind == "main",
+            memory_loaded,
+            memory_session_id,
         };
         self.save(&mut live)?;
         let view = live.view();
@@ -1583,6 +1634,33 @@ impl LoopEngine {
                     // the history shows what the model was
                     // told. Messages never enter JSONL.
                     live.messages.push(Message::User(CLOSING_NUDGE.to_string()));
+                }
+                // AO-4 (J5): a main loop reloads memory on
+                // every model round, so instructions saved
+                // mid-loop reach the next round. The prefix
+                // is live.messages[0] exactly when
+                // memory_loaded; a failed reload keeps the
+                // stale prefix rather than blanking context
+                // mid-loop (J6 fail-soft).
+                if live.memory_active {
+                    let fresh = crate::memory_context::load_loop_memory(
+                        &app,
+                        live.memory_session_id.as_deref(),
+                    );
+                    match (live.memory_loaded, fresh) {
+                        (true, Some(ctx)) if !ctx.text.is_empty() => {
+                            live.messages[0] = Message::User(ctx.text);
+                        }
+                        (true, Some(ctx)) if ctx.text.is_empty() => {
+                            live.messages.remove(0);
+                            live.memory_loaded = false;
+                        }
+                        (false, Some(ctx)) if !ctx.text.is_empty() => {
+                            live.messages.insert(0, Message::User(ctx.text));
+                            live.memory_loaded = true;
+                        }
+                        _ => {}
+                    }
                 }
                 work = Work::Model {
                     messages: live.messages.clone(),

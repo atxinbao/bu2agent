@@ -21,6 +21,8 @@
 //! as the row (D1-2 `insert_mandate` pattern), so the
 //! fold covers this domain.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
@@ -449,4 +451,182 @@ pub fn next_memory_number(conn: &Connection) -> Result<u64, String> {
         }
     }
     Ok(next)
+}
+
+// ---------------------------------------------------------------------
+// AO-4 dreaming (Q-AO-10).
+//
+// A dreaming pass is deterministic metadata
+// consolidation, not model-based preference mining
+// (AO4-J8): the only stored "sessions" are LoopRecord
+// rows, which carry digests — no prompt or result
+// text — so the pass can only mine counts (kinds,
+// statuses, tools used) and exact-duplicate staleness.
+// Model-based preference extraction rides AO-3's Run
+// shape (a read-only loop run) later. The pass
+// itself is only an interface in this batch: it is a
+// pure store function, not wired to the sweeper, with
+// no route and no background task (AO-3 is not
+// approved yet).
+// ---------------------------------------------------------------------
+
+/// AO-4 dreaming window: 7 days (local definition).
+pub const DREAMING_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// One recent session, as the dreaming pass sees it.
+/// Mapped from a LoopRecord by the caller (AO-3's
+/// driver, via `loop_store::load`); the pass never
+/// reads the JSONL file itself, so it stays testable
+/// without a driver. `loop_id` is the session id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DreamSession {
+    pub session_id: String,
+    pub created_ms: u64,
+    pub kind: String,
+    pub status: String,
+    pub tools: Vec<String>,
+}
+
+/// What one dreaming pass did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DreamingOutcome {
+    /// A weekly summary row was written.
+    pub summary_written: bool,
+    /// The new row's id, when one was written.
+    pub summary_id: Option<String>,
+    /// Older exact-duplicate rows tombstoned, oldest
+    /// first. Text stays on disk (red line 9).
+    pub tombstoned: Vec<String>,
+    /// Sessions inside the 7-day window.
+    pub sessions_seen: usize,
+}
+
+/// The weekly summary text for the sessions inside
+/// the window, or None when there are none. Pure and
+/// deterministic: kinds and tools sort
+/// alphabetically, statuses fold to completed /
+/// failed / other.
+pub fn dream_summary(sessions: &[DreamSession], now_ms: u64) -> Option<String> {
+    let recent: Vec<&DreamSession> = sessions
+        .iter()
+        .filter(|s| s.created_ms <= now_ms && now_ms - s.created_ms <= DREAMING_WINDOW_MS)
+        .collect();
+    if recent.is_empty() {
+        return None;
+    }
+    let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut completed = 0usize;
+    let mut failed = 0usize;
+    let mut other = 0usize;
+    let mut tools: BTreeSet<&str> = BTreeSet::new();
+    for session in &recent {
+        *kinds.entry(session.kind.as_str()).or_insert(0) += 1;
+        match session.status.as_str() {
+            "completed" => completed += 1,
+            "failed" => failed += 1,
+            _ => other += 1,
+        }
+        for tool in &session.tools {
+            tools.insert(tool.as_str());
+        }
+    }
+    let kinds = kinds
+        .iter()
+        .map(|(kind, count)| format!("{kind} {count} 个"))
+        .collect::<Vec<_>>()
+        .join("，");
+    let tools = if tools.is_empty() {
+        "无".to_string()
+    } else {
+        tools.into_iter().collect::<Vec<_>>().join("、")
+    };
+    Some(format!(
+        "近 7 天会话整理：共 {} 个会话（{}）；完成 {} 个，失败 {} 个，其他 {} 个；用过工具：{}。",
+        recent.len(),
+        kinds,
+        completed,
+        failed,
+        other,
+        tools,
+    ))
+}
+
+/// One dreaming pass (AO4-J8): tombstone older
+/// exact-duplicate live user rows (staleness the pass
+/// can prove without a model), then write one weekly
+/// summary row — unless an identical live row already
+/// exists. No rows are deleted; tombstoned text stays
+/// readable. The summary is skipped entirely when no
+/// session falls inside the window, but the dedupe
+/// still runs.
+pub fn run_dreaming_pass(
+    conn: &mut Connection,
+    sessions: &[DreamSession],
+    now_ms: u64,
+    origin_device_id: &str,
+) -> Result<DreamingOutcome, String> {
+    let sessions_seen = sessions
+        .iter()
+        .filter(|s| s.created_ms <= now_ms && now_ms - s.created_ms <= DREAMING_WINDOW_MS)
+        .count();
+    // Dedupe first: group live user rows by trimmed
+    // content; keep the newest of each group.
+    let live = list_memories(conn, Some("user"), &MemoryScope::default())?;
+    let mut by_content: BTreeMap<String, Vec<&MemoryRow>> = BTreeMap::new();
+    for row in &live {
+        by_content
+            .entry(row.content.trim().to_string())
+            .or_default()
+            .push(row);
+    }
+    let mut tombstoned = Vec::new();
+    for rows in by_content.values() {
+        if rows.len() < 2 {
+            continue;
+        }
+        let mut rows = rows.clone();
+        rows.sort_by_key(|row| (row.created_ms, row.memory_id.clone()));
+        for old in &rows[..rows.len() - 1] {
+            delete_memory(conn, &old.memory_id, origin_device_id)?;
+            tombstoned.push(old.memory_id.clone());
+        }
+    }
+    // Weekly summary, unless an identical live row
+    // already says it.
+    let mut summary_written = false;
+    let mut summary_id = None;
+    if let Some(text) = dream_summary(sessions, now_ms) {
+        let live_now = list_memories(conn, Some("user"), &MemoryScope::default())?;
+        if !live_now.iter().any(|row| row.content.trim() == text.trim()) {
+            let id = format!("memory-{}", next_memory_number(conn)?);
+            let source = MemorySource {
+                session_id: None,
+                execution_id: None,
+                source_id: None,
+                author: "dreaming".to_string(),
+                created_ms: now_ms,
+            };
+            let row = MemoryRow {
+                memory_id: id.clone(),
+                layer: "user".to_string(),
+                scope_json: MemoryScope::default().canonical(),
+                content: text,
+                source_json: source.canonical(),
+                created_ms: now_ms,
+                updated_ms: now_ms,
+                deleted: false,
+                origin_device_id: origin_device_id.to_string(),
+                schema_version: 1,
+            };
+            insert_memory(conn, &row)?;
+            summary_written = true;
+            summary_id = Some(id);
+        }
+    }
+    Ok(DreamingOutcome {
+        summary_written,
+        summary_id,
+        tombstoned,
+        sessions_seen,
+    })
 }

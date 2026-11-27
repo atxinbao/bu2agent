@@ -238,7 +238,12 @@ pub(crate) async fn loop_start(
     };
     let session_id = req.session_id.clone();
     let goal_id = req.goal_id.clone();
-    let result = state.loops.start(req);
+    // AO-4 (J4/J6): memory is advisory context, loaded
+    // here — the handler owns AppState/SQLite — before
+    // the loop starts. Any load failure means "no
+    // memory", never a failed start.
+    let memory = crate::memory_context::load_loop_memory(&state, session_id.as_deref());
+    let result = state.loops.start_with_memory(req, memory);
     if let Ok(view) = &result {
         // P0 phase 1: the loop attempt gets its Execution shell record.
         create_execution_with_binding(
@@ -430,6 +435,8 @@ pub(crate) fn start_research(
         },
         "research",
         model_override,
+        // AO-4 (J4): research loops never carry memory.
+        None,
     )?;
     spawn_driver(state, &view.record.loop_id);
     Ok(view)
