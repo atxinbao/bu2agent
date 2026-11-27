@@ -349,6 +349,8 @@ fn bad_line_divergence_snapshot() {
             unknown_reads: vec![],
             late_model_arrivals_ms: vec![],
             final_digest: None,
+            background: false,
+            estimated_tokens: 0,
         },
     )
     .expect("seed loop");
@@ -424,6 +426,8 @@ fn last_wins_and_counters_snapshot() {
         unknown_reads: vec![],
         late_model_arrivals_ms: vec![],
         final_digest: None,
+        background: false,
+        estimated_tokens: 0,
     };
     append_loop(&loops, &loop_record(LoopStatus::Created)).expect("append loop");
     append_loop(&loops, &loop_record(LoopStatus::Completed)).expect("append loop");
@@ -566,6 +570,8 @@ fn loop_fixture(id: &str, status: LoopStatus, calls: Vec<CallRecord>) -> LoopRec
         unknown_reads: vec![],
         late_model_arrivals_ms: vec![],
         final_digest: None,
+        background: false,
+        estimated_tokens: 0,
     }
 }
 

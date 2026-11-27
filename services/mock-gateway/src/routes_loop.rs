@@ -437,6 +437,8 @@ pub(crate) fn start_research(
         model_override,
         // AO-4 (J4): research loops never carry memory.
         None,
+        // AO-3: a research loop is never a wake run.
+        false,
     )?;
     spawn_driver(state, &view.record.loop_id);
     Ok(view)

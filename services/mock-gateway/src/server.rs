@@ -2863,6 +2863,15 @@ impl AppState {
         fired
     }
 
+    /// AO-3: drive pending agent events into wake Runs.
+    /// Called from the sweeper after `drive_due_timers`,
+    /// so a just-fired timer event is claimed in the
+    /// same pass. Never blocks the tick: claims are
+    /// synchronous, Runs spawn as background tasks.
+    pub fn drive_wake_events(&self) -> usize {
+        crate::wake_driver::drive_wake_events(self)
+    }
+
     /// E2-D batch 2: start due deferred runs, one pass.
     /// Rides the assignment sweeper's 10 s tick (plan
     /// §2.2) — no second scheduler. Fetches due runs in
@@ -8826,6 +8835,11 @@ pub fn spawn_assignment_sweeper(state: AppState) -> tokio::task::JoinHandle<()> 
             // worker runs (plan §4 order) — no second
             // scheduler.
             state.drive_due_timers();
+            // AO-3: pending agent events wake loop Runs
+            // from the same tick, after due timers fire
+            // (a just-fired timer event is claimed in
+            // this same pass) — no second scheduler.
+            state.drive_wake_events();
             // E2-D batch 2: due deferred runs start from
             // the same tick — no second scheduler.
             state.start_due_worker_runs().await;

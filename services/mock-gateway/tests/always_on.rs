@@ -117,7 +117,50 @@ async fn start_recording_deepseek() -> (String, Arc<Mutex<Vec<Value>>>) {
     (format!("http://{addr}"), requests)
 }
 
-fn build_state(dir: &Path, deepseek_base_url: &str) -> AppState {
+/// AO-3: a scripted fake DeepSeek — it serves the
+/// given replies in order (one per model request,
+/// falling back to the recording fake's final-text
+/// reply once the script runs out) and records every
+/// request body, so C3/C6/C7 can script the model's
+/// exact replies (a refused write proposal, a giant
+/// final text).
+#[derive(Clone)]
+struct ScriptedFake {
+    replies: Arc<Vec<Value>>,
+    next: Arc<Mutex<usize>>,
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+async fn scripted_completion(
+    State(shared): State<ScriptedFake>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    shared.requests.lock().unwrap().push(body);
+    let mut index = shared.next.lock().unwrap();
+    let reply = shared.replies.get(*index).cloned().unwrap_or_else(|| {
+        json!({"choices":[{"message":{"role":"assistant","content":"done","tool_calls":null},"finish_reason":"stop"}]})
+    });
+    *index += 1;
+    (StatusCode::OK, Json(reply))
+}
+
+async fn start_scripted_deepseek(replies: Vec<Value>) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let fake = ScriptedFake {
+        replies: Arc::new(replies),
+        next: Arc::new(Mutex::new(0)),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let requests = fake.requests.clone();
+    let app = Router::new()
+        .route("/chat/completions", post(scripted_completion))
+        .with_state(fake);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), requests)
+}
+
+fn build_state(dir: &Path, deepseek_base_url: &str, auto_drive: bool) -> AppState {
     let config = DeepSeekConfig {
         base_url: deepseek_base_url.to_string(),
         model: "fixture".to_string(),
@@ -145,7 +188,11 @@ fn build_state(dir: &Path, deepseek_base_url: &str) -> AppState {
         Timeouts::default(),
     )
     .expect("loop backends")
-    .with_auto_drive(false)
+    // AO-3: C-tests drive wake Runs through the real
+    // driver path (spawn_driver + waiter), so the
+    // driven harness leaves auto-drive on; A/B/D/E
+    // tests keep it off for determinism.
+    .with_auto_drive(auto_drive)
     .with_executions_path(dir.join("executions.jsonl"))
     .with_effects_path(dir.join("effects.jsonl"))
     .with_evidence_path(dir.join("evidence.jsonl"))
@@ -171,41 +218,25 @@ struct Harness {
     /// AO-4: bodies the recording fake DeepSeek saw
     /// (empty for `serve`, which drops connections).
     model_requests: Arc<Mutex<Vec<Value>>>,
+    /// AO-3: whether this harness leaves the loop
+    /// auto-driver on (driven harnesses run wake Runs
+    /// through the real spawn_driver + waiter path).
+    auto_drive: bool,
 }
 
 impl Harness {
-    async fn serve() -> Self {
-        let dir = temp_dir("ao1");
+    /// Shared serve body: build state on `dir` with the
+    /// given model, serve the app, keep the state for
+    /// direct drive calls (`drive_due_timers`,
+    /// `drive_wake_events`).
+    async fn serve_from(
+        dir: PathBuf,
+        deepseek_base_url: String,
+        model_requests: Arc<Mutex<Vec<Value>>>,
+        auto_drive: bool,
+    ) -> Self {
         std::fs::create_dir_all(dir.join("files")).unwrap();
-        let deepseek_base_url = start_fake_deepseek().await;
-        let state = build_state(&dir, &deepseek_base_url);
-        let harness_state = state.clone();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
-        Self {
-            dir,
-            url,
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
-                .build()
-                .unwrap(),
-            deepseek_base_url,
-            server: Some(server),
-            state: harness_state,
-            model_requests: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    /// AO-4: like `serve`, but the fake DeepSeek
-    /// records every model request and answers one
-    /// final-text reply, so D1/D2 can assert what the
-    /// gateway sent the model.
-    async fn serve_recording() -> Self {
-        let dir = temp_dir("ao4");
-        std::fs::create_dir_all(dir.join("files")).unwrap();
-        let (deepseek_base_url, model_requests) = start_recording_deepseek().await;
-        let state = build_state(&dir, &deepseek_base_url);
+        let state = build_state(&dir, &deepseek_base_url, auto_drive);
         let harness_state = state.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -221,11 +252,222 @@ impl Harness {
             server: Some(server),
             state: harness_state,
             model_requests,
+            auto_drive,
         }
+    }
+
+    async fn serve() -> Self {
+        let dir = temp_dir("ao1");
+        let deepseek_base_url = start_fake_deepseek().await;
+        Self::serve_from(
+            dir,
+            deepseek_base_url,
+            Arc::new(Mutex::new(Vec::new())),
+            false,
+        )
+        .await
+    }
+
+    /// AO-3: like `serve`, but the loop auto-driver
+    /// stays on, so a wake Run's spawn_driver + waiter
+    /// take the real production path.
+    async fn serve_driven() -> Self {
+        let dir = temp_dir("ao3");
+        let deepseek_base_url = start_fake_deepseek().await;
+        Self::serve_from(
+            dir,
+            deepseek_base_url,
+            Arc::new(Mutex::new(Vec::new())),
+            true,
+        )
+        .await
+    }
+
+    /// AO-4: like `serve`, but the fake DeepSeek
+    /// records every model request and answers one
+    /// final-text reply, so D1/D2 can assert what the
+    /// gateway sent the model.
+    async fn serve_recording() -> Self {
+        let dir = temp_dir("ao4");
+        let (deepseek_base_url, model_requests) = start_recording_deepseek().await;
+        Self::serve_from(dir, deepseek_base_url, model_requests, false).await
+    }
+
+    /// AO-3: the recording fake with the auto-driver
+    /// on — the C1/C2/C5 harness.
+    async fn serve_recording_driven() -> Self {
+        let dir = temp_dir("ao3");
+        let (deepseek_base_url, model_requests) = start_recording_deepseek().await;
+        Self::serve_from(dir, deepseek_base_url, model_requests, true).await
+    }
+
+    /// AO-3: the scripted fake (replies served in
+    /// order) with the auto-driver off — the C7
+    /// foreground harness, driven by `loop_resume`.
+    async fn serve_scripted(replies: Vec<Value>) -> Self {
+        let dir = temp_dir("ao3");
+        let (deepseek_base_url, model_requests) = start_scripted_deepseek(replies).await;
+        Self::serve_from(dir, deepseek_base_url, model_requests, false).await
+    }
+
+    /// AO-3: the scripted fake with the auto-driver
+    /// on — the C3/C6 harness.
+    async fn serve_scripted_driven(replies: Vec<Value>) -> Self {
+        let dir = temp_dir("ao3");
+        let (deepseek_base_url, model_requests) = start_scripted_deepseek(replies).await;
+        Self::serve_from(dir, deepseek_base_url, model_requests, true).await
     }
 
     fn model_requests(&self) -> Vec<Value> {
         self.model_requests.lock().unwrap().clone()
+    }
+
+    /// AO-3: one event row, by id.
+    fn event_row(&self, event_id: &str) -> sqlite_store::AgentEventRow {
+        let conn = self.db();
+        sqlite_store::get_agent_event(&conn, event_id)
+            .unwrap()
+            .expect("event row")
+    }
+
+    /// AO-3: poll an event's status until it reaches
+    /// `want` (up to 30 s — a wake Run is bounded by
+    /// the 120 s loop budget, but the recording fake
+    /// answers at once, so the happy path lands in
+    /// well under a second; the long window is for the
+    /// failing-model case only). Returns the last status
+    /// seen, so a timeout reads as the wrong status in
+    /// the caller's assert instead of hanging the test.
+    async fn wait_event_status(&self, event_id: &str, want: &str) -> String {
+        for _ in 0..300 {
+            let status = self.event_row(event_id).status;
+            if status == want {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        self.event_row(event_id).status
+    }
+
+    /// AO-3: memory rows across both layers.
+    fn count_memories(&self) -> i64 {
+        let conn = self.db();
+        conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM project_memories) + (SELECT COUNT(*) FROM user_memories)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// AO-3: (memory_id, layer, content) across both
+    /// layers, creation order.
+    fn memory_rows(&self) -> Vec<(String, String, String)> {
+        let conn = self.db();
+        let mut rows = Vec::new();
+        for table in ["project_memories", "user_memories"] {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT memory_id, layer, content FROM {table} ORDER BY created_ms"
+                ))
+                .unwrap();
+            let mut found = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0).unwrap(),
+                        row.get::<_, String>(1).unwrap(),
+                        row.get::<_, String>(2).unwrap(),
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows.append(&mut found);
+        }
+        rows.sort_by_key(|(id, _, _)| {
+            id.strip_prefix("memory-")
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0)
+        });
+        rows
+    }
+
+    /// AO-3: outbox row count.
+    fn count_outbox(&self) -> i64 {
+        let conn = self.db();
+        conn.query_row("SELECT COUNT(*) FROM outbox", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// AO-3: all outbox rows, creation order.
+    fn outbox_rows(&self) -> Vec<sqlite_store::OutboxRow> {
+        let conn = self.db();
+        let mut stmt = conn
+            .prepare(
+                "SELECT outbox_id, execution_id, payload_summary_json, destination_kind, status, attempts, dedup_key, created_ms, updated_at_ms, deliver_at_ms FROM outbox ORDER BY created_ms",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok(sqlite_store::OutboxRow {
+                outbox_id: row.get(0)?,
+                execution_id: row.get(1)?,
+                payload_summary_json: row.get(2)?,
+                destination_kind: row.get(3)?,
+                status: row.get(4)?,
+                attempts: row.get(5)?,
+                dedup_key: row.get(6)?,
+                created_ms: row.get(7)?,
+                updated_at_ms: row.get(8)?,
+                deliver_at_ms: row.get(9)?,
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
+    /// AO-3: inbox row count.
+    fn count_inbox(&self) -> i64 {
+        let conn = self.db();
+        conn.query_row("SELECT COUNT(*) FROM inbox", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// AO-3: inbox `source_event_id`s, creation order.
+    fn inbox_source_ids(&self) -> Vec<String> {
+        let conn = self.db();
+        let mut stmt = conn
+            .prepare("SELECT source_event_id FROM inbox ORDER BY seq")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// AO-3: the workbench loop list (main loops only;
+    /// a wake loop is kind "main", so it shows up).
+    async fn loop_list(&self) -> (StatusCode, Value) {
+        let resp = self
+            .client
+            .get(format!("{}/agent/loop/list", self.url))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, resp.json().await.unwrap())
+    }
+
+    /// AO-3: one loop view, by id.
+    async fn loop_get(&self, loop_id: &str) -> (StatusCode, Value) {
+        let resp = self
+            .client
+            .get(format!("{}/agent/loop/get?loop_id={loop_id}", self.url))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, resp.json().await.unwrap())
     }
 
     /// AO-4: seed one memory row through the store
@@ -289,7 +531,7 @@ impl Harness {
             old.abort();
             let _ = old.await;
         }
-        let state = build_state(&self.dir, &self.deepseek_base_url);
+        let state = build_state(&self.dir, &self.deepseek_base_url, self.auto_drive);
         self.state = state.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         self.url = format!("http://{}", listener.local_addr().unwrap());
@@ -1405,4 +1647,474 @@ async fn ao4_d3_dreaming_writes_back_and_tombstones() {
         .expect("untouched row");
     assert!(!other.deleted);
     assert_eq!(other.content, "每周五跑步");
+}
+
+/// C1 (AO-3): a due follow-up timer fires, the wake
+/// driver claims its event, the Run completes, the
+/// event is done, one project memory row carries the
+/// writeback, the wake Outbox row carries the
+/// notification (plus the D1-3 execution row, AO3-J7),
+/// and the Dispatcher delivers both. The wake prompt
+/// the model saw names the timer and its summary.
+#[tokio::test]
+async fn ao3_c1_timer_event_wakes_run_to_done() {
+    let h = Harness::serve_recording_driven().await;
+    let now = sqlite_store::now_ms() as i64;
+    let (status, timer) = h
+        .create_timer(json!({
+            "kind": "follow_up",
+            "next_fire_ms": now - 1000,
+            "payload_summary_json": {"note": "remind"},
+            "session_id": "session-c1",
+        }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(timer["timer_id"], "timer-1");
+
+    assert_eq!(h.state.drive_due_timers(), 1);
+    assert_eq!(h.count_timer_events(), 1);
+    assert_eq!(h.state.drive_wake_events(), 1, "one Run spawned");
+    assert_eq!(
+        h.wait_event_status("agent-event-1", "done").await,
+        "done"
+    );
+
+    // Exactly one model request, and the wake prompt in
+    // it names the timer and its summary.
+    let requests = h.model_requests();
+    assert_eq!(requests.len(), 1);
+    let messages = requests[0]["messages"].as_array().unwrap();
+    let prompt = messages
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .find(|c| c.contains("定时器唤醒"))
+        .expect("wake prompt in the request");
+    assert!(prompt.contains("timer-1"), "{prompt}");
+    assert!(prompt.contains("follow_up"), "{prompt}");
+    assert!(prompt.contains("remind"), "{prompt}");
+    assert!(prompt.contains("agent-event-1"), "{prompt}");
+
+    // The Run completed: one background loop, with a
+    // positive token estimate under the 100k cap.
+    let (status, list) = h.loop_list().await;
+    assert_eq!(status, StatusCode::OK);
+    let loops = list.as_array().unwrap();
+    assert_eq!(loops.len(), 1);
+    assert_eq!(loops[0]["status"], "completed");
+    assert_eq!(loops[0]["background"], true);
+    let estimated = loops[0]["estimated_tokens"].as_u64().unwrap();
+    assert!(estimated > 0, "the estimator ran");
+    assert!(estimated < 100_000, "under the per-run cap");
+
+    // Memory writeback: one project row, naming the
+    // event and the Run's final text.
+    assert_eq!(h.count_memories(), 1);
+    let memories = h.memory_rows();
+    assert_eq!(memories[0].1, "project");
+    assert!(memories[0].2.contains("agent-event-1"), "{}", memories[0].2);
+    assert!(memories[0].2.contains("done"), "{}", memories[0].2);
+
+    // Outbox: TWO rows. The D1-3 producer writes one
+    // local_notification per terminal Execution (dedup
+    // `{execution_id}:local_notification`, summary ids +
+    // status only — pre-existing behaviour for every
+    // loop, foreground included), and the wake driver
+    // writes its own row carrying the Run's result
+    // (dedup `{event_id}:local_notification`, per-event
+    // topic so it never merges). AO3-J7: C1's "Outbox
+    // 行" is the wake row; the D1-3 row is not the
+    // wake driver's, and suppressing it is out of
+    // AO-3's scope.
+    assert_eq!(h.count_outbox(), 2);
+    let rows = h.outbox_rows();
+    let wake = rows
+        .iter()
+        .find(|r| r.dedup_key == "agent-event-1:local_notification")
+        .expect("wake notification row");
+    assert_eq!(wake.destination_kind, "local_notification");
+    assert_eq!(wake.status, "pending");
+    let summary: Value = serde_json::from_str(&wake.payload_summary_json).unwrap();
+    assert_eq!(summary["topic"], "wake:agent-event-1");
+    assert_eq!(summary["event_id"], "agent-event-1");
+    assert_eq!(summary["result"], "done");
+    assert!(wake.execution_id.starts_with("execution-"));
+    let exec_row = rows
+        .iter()
+        .find(|r| r.dedup_key == format!("{}:local_notification", wake.execution_id))
+        .expect("D1-3 execution notification row");
+    let exec_summary: Value =
+        serde_json::from_str(&exec_row.payload_summary_json).unwrap();
+    assert_eq!(exec_summary["status"], "completed");
+    assert_eq!(exec_row.execution_id, wake.execution_id);
+
+    // The Dispatcher delivers both on the next pass
+    // (daytime, under the daily cap, distinct merge
+    // keys — the wake topic is per event, the D1-3
+    // row merges by status only).
+    assert_eq!(
+        h.state.deliver_pending_outbox_with_clock(Some(daytime_clock())),
+        2,
+        "wake + execution notifications delivered"
+    );
+    assert_eq!(h.count_outbox_events("outbox.sent"), 2);
+    assert_eq!(h.outbox_row(&wake.outbox_id).status, "sent");
+    assert_eq!(h.outbox_row(&wake.outbox_id).attempts, 1);
+
+    // The event carries its delivery timestamp.
+    assert!(h.event_row("agent-event-1").delivered_ms.is_some());
+}
+
+/// C2 (Q-AO-06): two events of one session — the
+/// first claims and runs, the second queues (no
+/// concurrency); once the first is done, the next
+/// drive claims the second. The second claim lands
+/// after the first delivery, never during it.
+#[tokio::test]
+async fn ao3_c2_same_session_queues_without_concurrency() {
+    let h = Harness::serve_recording_driven().await;
+    for (id, note) in [("timer:c2:1", "first"), ("timer:c2:2", "second")] {
+        let (status, ingested) = h
+            .ingest(json!({
+                "source_kind": "timers",
+                "source_event_id": id,
+                "payload_summary_json": {"note": note},
+                "session_id": "session-c2",
+            }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{ingested}");
+    }
+    assert_eq!(h.state.drive_wake_events(), 1, "only the first claims");
+    assert_eq!(h.event_row("agent-event-1").status, "claimed");
+    assert_eq!(h.event_row("agent-event-2").status, "pending");
+    assert_eq!(
+        h.wait_event_status("agent-event-1", "done").await,
+        "done"
+    );
+    let first_delivered = h.event_row("agent-event-1").delivered_ms.unwrap();
+
+    assert_eq!(h.state.drive_wake_events(), 1, "the second claims now");
+    let second_claimed = h.event_row("agent-event-2").claimed_ms.unwrap();
+    assert!(
+        second_claimed >= first_delivered,
+        "second claim ({second_claimed}) must not precede first delivery ({first_delivered})"
+    );
+    assert_eq!(
+        h.wait_event_status("agent-event-2", "done").await,
+        "done"
+    );
+    assert_eq!(h.count_memories(), 2);
+    // Two wake rows (one per event) plus the two D1-3
+    // execution rows (AO3-J7 — see C1).
+    assert_eq!(h.count_outbox(), 4);
+    let wake_keys: Vec<_> = h
+        .outbox_rows()
+        .iter()
+        .filter(|r| r.dedup_key.starts_with("agent-event-"))
+        .map(|r| r.dedup_key.clone())
+        .collect();
+    assert_eq!(
+        wake_keys,
+        vec![
+            "agent-event-1:local_notification".to_string(),
+            "agent-event-2:local_notification".to_string(),
+        ]
+    );
+    let (status, list) = h.loop_list().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    assert!(list
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|l| l["status"] == "completed"));
+}
+
+/// C3 (Q-AO-09): the model proposes `fs.write` in a
+/// wake Run — the loop-layer gate refuses it with
+/// InvalidTool, the call is recorded Failed, the file
+/// is never written, no approval is ever parked, and
+/// the Run still completes (the model answers with a
+/// final text on the next round).
+#[tokio::test]
+async fn ao3_c3_write_tool_refused_before_dispatch() {
+    let write_reply = json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"fs_write","arguments":"{\"path\":\"wake-should-not-exist.txt\",\"text\":\"x\"}"}}]},"finish_reason":"tool_calls"}]});
+    let h = Harness::serve_scripted_driven(vec![write_reply]).await;
+    let (status, ingested) = h
+        .ingest(json!({
+            "source_kind": "timers",
+            "source_event_id": "timer:c3:1",
+            "payload_summary_json": {"note": "write-please"},
+            "session_id": "session-c3",
+        }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{ingested}");
+    assert_eq!(h.state.drive_wake_events(), 1);
+    assert_eq!(
+        h.wait_event_status("agent-event-1", "done").await,
+        "done"
+    );
+
+    // Two model rounds: the refused proposal, then the
+    // final text the scripted fake falls back to.
+    assert_eq!(h.model_requests().len(), 2);
+    let (status, list) = h.loop_list().await;
+    assert_eq!(status, StatusCode::OK);
+    let loops = list.as_array().unwrap();
+    assert_eq!(loops.len(), 1);
+    assert_eq!(loops[0]["status"], "completed");
+    let (status, view) = h.loop_get("loop-1").await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let calls = view["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], "fs.write");
+    assert_eq!(calls[0]["status"], "failed");
+    assert_eq!(calls[0]["error"], "invalid_tool");
+    assert_eq!(calls[0]["approval_id"], Value::Null);
+    assert_eq!(calls[0]["submitted"], false);
+
+    // The write never landed anywhere.
+    assert!(!h.dir.join("files").join("wake-should-not-exist.txt").exists());
+    assert_eq!(h.count_memories(), 1);
+    // One wake row + the D1-3 execution row (AO3-J7).
+    assert_eq!(h.count_outbox(), 2);
+    assert!(h
+        .outbox_rows()
+        .iter()
+        .any(|r| r.dedup_key == "agent-event-1:local_notification"));
+}
+
+/// C4: the model is unreachable (the dropping fake) —
+/// the Run fails, the event is failed, the wake driver
+/// writes no Outbox row and no memory writeback, and a
+/// later drive does not retry it. (AO3-J7: "Outbox
+/// 无行" means no WAKE row — the D1-3 producer still
+/// writes its one execution-failed row when the wake
+/// Execution closes, exactly as for any failed
+/// foreground loop; that row is the Execution layer's,
+/// not the wake driver's.)
+#[tokio::test]
+async fn ao3_c4_run_failure_is_failed_without_retry() {
+    let h = Harness::serve_driven().await;
+    let (status, ingested) = h
+        .ingest(json!({
+            "source_kind": "timers",
+            "source_event_id": "timer:c4:1",
+            "payload_summary_json": {"note": "will-fail"},
+            "session_id": "session-c4",
+        }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{ingested}");
+    assert_eq!(h.state.drive_wake_events(), 1);
+    assert_eq!(
+        h.wait_event_status("agent-event-1", "failed").await,
+        "failed"
+    );
+    assert!(!h
+        .outbox_rows()
+        .iter()
+        .any(|r| r.dedup_key == "agent-event-1:local_notification"),
+        "no wake notification row on a failed Run");
+    assert_eq!(h.count_outbox(), 1, "only the D1-3 execution row");
+    assert_eq!(h.count_memories(), 0, "no writeback on a failed Run");
+    // One Inbox row: the execution-failed row
+    // `upsert_execution_tx` opens for every failed
+    // Execution close (P0-D, pre-existing — not a wake
+    // row, and no wake-budget/token row exists here).
+    assert_eq!(h.count_inbox(), 1);
+    assert!(h
+        .inbox_source_ids()
+        .iter()
+        .all(|id| !id.starts_with("wake-")));
+    let (status, list) = h.loop_list().await;
+    assert_eq!(status, StatusCode::OK);
+    let loops = list.as_array().unwrap();
+    assert_eq!(loops.len(), 1);
+    assert_eq!(loops[0]["status"], "failed");
+
+    // No auto-retry: a later drive claims nothing and
+    // the event stays failed.
+    assert_eq!(h.state.drive_wake_events(), 0);
+    assert_eq!(h.event_row("agent-event-1").status, "failed");
+    assert_eq!(h.count_outbox(), 1);
+}
+
+/// C5: a claimed event whose Run never finished
+/// (stale claim) returns to pending and runs on the
+/// next drive; a fresh claim is left alone.
+#[tokio::test]
+async fn ao3_c5_stale_claim_recovers_fresh_claim_untouched() {
+    let h = Harness::serve_recording_driven().await;
+    let now = sqlite_store::now_ms() as i64;
+    for (id, session) in [("timer:c5:1", "session-c5a"), ("timer:c5:2", "session-c5b")] {
+        let (status, ingested) = h
+            .ingest(json!({
+                "source_kind": "timers",
+                "source_event_id": id,
+                "payload_summary_json": {"note": "stale"},
+                "session_id": session,
+            }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{ingested}");
+    }
+    // Simulate a gateway that died mid-Run for event 2
+    // (claimed 700_000 ms ago — past the 600_000 ms
+    // stale threshold) and a live Run for event 1
+    // (claimed just now).
+    {
+        let mut conn = h.db();
+        assert!(sqlite_store::claim_agent_event(&mut conn, "agent-event-1", now).unwrap());
+        assert!(sqlite_store::claim_agent_event(&mut conn, "agent-event-2", now - 700_000).unwrap());
+    }
+    assert_eq!(h.state.drive_wake_events(), 1, "only the stale one re-drives");
+    assert_eq!(h.event_row("agent-event-1").status, "claimed");
+    assert_eq!(
+        h.wait_event_status("agent-event-2", "done").await,
+        "done"
+    );
+    assert_eq!(h.event_row("agent-event-1").status, "claimed");
+
+    // Age the first claim past the threshold too, and
+    // it recovers the same way.
+    {
+        let conn = h.db();
+        conn.execute(
+            "UPDATE agent_events SET claimed_ms = ?1 WHERE event_id = 'agent-event-1'",
+            [now - 700_000],
+        )
+        .unwrap();
+    }
+    assert_eq!(h.state.drive_wake_events(), 1);
+    assert_eq!(
+        h.wait_event_status("agent-event-1", "done").await,
+        "done"
+    );
+    assert_eq!(h.count_memories(), 2);
+}
+
+/// C6 (Q-AO-12): a wake Run whose estimated tokens
+/// pass 100k fails with BudgetExceeded, the event is
+/// failed, and a wake-token Inbox row names the breach
+/// (alongside the pre-existing execution-failed row,
+/// AO3-J7 — see C4). The giant reply alone estimates
+/// 100_001 tokens (each CJK char counts 1 under the
+/// AO-4 estimator), so the total is over the cap
+/// regardless of the input prompt's size.
+#[tokio::test]
+async fn ao3_c6_token_cap_fails_run_and_writes_inbox_row() {
+    let giant = "甲".repeat(100_001);
+    let giant_reply =
+        json!({"choices":[{"message":{"role":"assistant","content":giant,"tool_calls":null},"finish_reason":"stop"}]});
+    let h = Harness::serve_scripted_driven(vec![giant_reply]).await;
+    let (status, ingested) = h
+        .ingest(json!({
+            "source_kind": "timers",
+            "source_event_id": "timer:c6:1",
+            "payload_summary_json": {"note": "giant"},
+            "session_id": "session-c6",
+        }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{ingested}");
+    assert_eq!(h.state.drive_wake_events(), 1);
+    assert_eq!(
+        h.wait_event_status("agent-event-1", "failed").await,
+        "failed"
+    );
+    let (status, list) = h.loop_list().await;
+    assert_eq!(status, StatusCode::OK);
+    let loops = list.as_array().unwrap();
+    assert_eq!(loops.len(), 1);
+    assert_eq!(loops[0]["status"], "failed");
+    assert_eq!(loops[0]["error"], "budget_exceeded");
+    assert!(
+        loops[0]["estimated_tokens"].as_u64().unwrap() > 100_000,
+        "estimate must clear the cap: {}",
+        loops[0]["estimated_tokens"]
+    );
+    assert_eq!(h.count_memories(), 0);
+    // Two Inbox rows: the execution-failed row
+    // `upsert_execution_tx` opens for every failed
+    // Execution close (P0-D, pre-existing) plus the
+    // wake-token row for the cap breach.
+    assert_eq!(h.count_inbox(), 2);
+    let inbox_ids = h.inbox_source_ids();
+    assert!(inbox_ids.contains(&"wake-token-agent-event-1".to_string()));
+    assert!(
+        inbox_ids.iter().any(|id| id.starts_with("event-")),
+        "execution-failed row present: {inbox_ids:?}"
+    );
+    // No wake notification row; the one outbox row is
+    // the D1-3 execution-failed row (AO3-J7 — see C4).
+    assert!(!h
+        .outbox_rows()
+        .iter()
+        .any(|r| r.dedup_key == "agent-event-1:local_notification"));
+    assert_eq!(h.count_outbox(), 1);
+}
+
+/// C7 (Q-AO-12): the same giant reply in a
+/// FOREGROUND loop completes — the token cap fails
+/// background Runs only; a foreground loop only
+/// accumulates the estimate.
+#[tokio::test]
+async fn ao3_c7_foreground_loop_not_capped_by_token_estimate() {
+    let giant = "甲".repeat(100_001);
+    let giant_reply =
+        json!({"choices":[{"message":{"role":"assistant","content":giant,"tool_calls":null},"finish_reason":"stop"}]});
+    let h = Harness::serve_scripted(vec![giant_reply]).await;
+    let (status, started) = h.loop_start(json!({"prompt": "开始"})).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let loop_id = started["loop_id"].as_str().unwrap().to_string();
+    let (status, view) = h.loop_resume(&loop_id).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["status"], "completed");
+    assert_eq!(view["final_text"], "甲".repeat(100_001));
+    assert!(view["estimated_tokens"].as_u64().unwrap() > 100_000);
+    assert_eq!(view["background"], false);
+}
+
+/// C8 (Q-AO-12): 48 wakes already started today — the
+/// 49th event is not claimed, stays pending, and one
+/// Inbox row per day names the breach; a second drive
+/// writes no second row.
+#[tokio::test]
+async fn ao3_c8_daily_cap_holds_49th_event() {
+    let h = Harness::serve_recording_driven().await;
+    let now = sqlite_store::now_ms() as i64;
+    for i in 0..49 {
+        let (status, ingested) = h
+            .ingest(json!({
+                "source_kind": "timers",
+                "source_event_id": format!("timer:c8:{i}"),
+                "payload_summary_json": {"note": format!("event-{i}")},
+                "session_id": format!("session-c8-{i}"),
+            }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{ingested}");
+    }
+    // 48 wakes already started today (distinct sessions,
+    // so the per-session gate never blocks the claims).
+    {
+        let mut conn = h.db();
+        for i in 1..=48 {
+            assert!(
+                sqlite_store::claim_agent_event(&mut conn, &format!("agent-event-{i}"), now)
+                    .unwrap(),
+                "claim event {i}"
+            );
+        }
+    }
+    assert_eq!(h.state.drive_wake_events(), 0, "cap exhausted");
+    assert_eq!(h.event_row("agent-event-49").status, "pending");
+    assert_eq!(h.count_inbox(), 1);
+    let ids = h.inbox_source_ids();
+    assert_eq!(ids.len(), 1);
+    assert!(
+        ids[0].starts_with("wake-budget-20"),
+        "daily-cap row names the day: {}",
+        ids[0]
+    );
+    assert_eq!(h.state.drive_wake_events(), 0, "still capped");
+    assert_eq!(h.count_inbox(), 1, "one row per day, deduped");
+    assert_eq!(h.event_row("agent-event-49").status, "pending");
 }

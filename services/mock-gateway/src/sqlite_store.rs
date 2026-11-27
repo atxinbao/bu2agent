@@ -7909,8 +7909,22 @@ pub fn claim_agent_event(
 /// normal path, and the queue state itself is the
 /// record (AO1-J4).
 pub fn complete_agent_event(conn: &mut Connection, event_id: &str) -> Result<bool, String> {
+    let tx = conn.transaction().map_err(err)?;
+    let done = complete_agent_event_tx(&tx, event_id)?;
+    tx.commit().map_err(err)?;
+    Ok(done)
+}
+
+/// Tx variant of `complete_agent_event` (AO-3): the
+/// wake success path commits the memory writeback,
+/// the Outbox row and the event-done mark in one
+/// transaction, so a Run never lands half-written.
+pub fn complete_agent_event_tx(
+    tx: &rusqlite::Transaction<'_>,
+    event_id: &str,
+) -> Result<bool, String> {
     let now = now_ms() as i64;
-    let changed = conn
+    let changed = tx
         .execute(
             "UPDATE agent_events SET status = 'done', delivered_ms = ?1 WHERE event_id = ?2 AND status = 'claimed'",
             params![now, event_id],
@@ -7972,6 +7986,78 @@ pub fn get_agent_event(conn: &Connection, event_id: &str) -> Result<Option<Agent
     )
     .optional()
     .map_err(err)
+}
+
+/// AO-3: pending events in wake order (oldest
+/// first). The driver claims from this list, one
+/// pass per tick.
+pub fn list_pending_agent_events(
+    conn: &Connection,
+    limit: i64,
+) -> Result<Vec<AgentEventRow>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {AGENT_EVENT_COLS} FROM agent_events WHERE status = 'pending' ORDER BY created_ms ASC, seq ASC LIMIT ?1"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![limit], agent_event_from_row)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows)
+}
+
+/// AO-3 (Q-AO-12): wakes started since `since_ms`.
+/// `claimed_ms` is set at claim and never cleared,
+/// so done/failed rows still count — the cap counts
+/// starts, not outcomes.
+pub fn count_claimed_agent_events_since(
+    conn: &Connection,
+    since_ms: i64,
+) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM agent_events WHERE claimed_ms IS NOT NULL AND claimed_ms >= ?1",
+        params![since_ms],
+        |row| row.get(0),
+    )
+    .map_err(err)
+}
+
+/// AO-3: a claimed event whose Run never finished
+/// (gateway died mid-Run) returns to pending so a
+/// later tick can drive it. The cutoff must exceed
+/// the longest possible Run (loop 120 s budget +
+/// one final step), so 10 min cannot strand a live
+/// Run. No audit row: the reset is recovery, not a
+/// state transition — the claim itself was never
+/// audited either (AO1-J4).
+pub fn reset_stale_claimed_agent_events(
+    conn: &mut Connection,
+    cutoff_ms: i64,
+) -> Result<usize, String> {
+    let changed = conn
+        .execute(
+            "UPDATE agent_events SET status = 'pending', claimed_ms = NULL WHERE status = 'claimed' AND claimed_ms < ?1",
+            params![cutoff_ms],
+        )
+        .map_err(err)?;
+    Ok(changed)
+}
+
+/// AO-3 (Q-AO-12): one Inbox `failed` row per
+/// budget breach, deduped on `source_event_id` by
+/// the `insert_inbox` INSERT OR IGNORE — a second
+/// breach of the same kind + scope writes nothing.
+pub fn insert_inbox_failed(
+    conn: &mut Connection,
+    source_event_id: &str,
+) -> Result<(), String> {
+    let tx = conn.transaction().map_err(err)?;
+    let now = now_ms() as i64;
+    insert_inbox(&tx, "failed", None, None, None, source_event_id, now)?;
+    tx.commit().map_err(err)?;
+    Ok(())
 }
 
 /// `agent_timers` row (see SCHEMA_V23). Status

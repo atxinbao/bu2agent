@@ -70,6 +70,8 @@ pub mod project_store;
 pub mod location_store;
 pub mod worktree_store;
 pub mod worker;
+pub mod gateway_lock;
+pub mod wake_driver;
 pub mod code_search;
 pub mod mail_source;
 pub mod mail_sync;

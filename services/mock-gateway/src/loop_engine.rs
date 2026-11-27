@@ -166,6 +166,19 @@ pub struct LoopRecord {
     pub unknown_reads: Vec<usize>,
     pub late_model_arrivals_ms: Vec<u64>,
     pub final_digest: Option<ContentDigest>,
+    /// AO-3 (Q-AO-09): an unattended wake run — the
+    /// background whitelist gate applies to its tool
+    /// proposals. Old JSONL rows carry no flag and
+    /// load as foreground (false).
+    #[serde(default)]
+    pub background: bool,
+    /// AO-3 (Q-AO-12): estimated tokens spent by this
+    /// run (AO-4 estimator over input messages +
+    /// reply text), accumulated per model round.
+    /// Memory of the estimate only — the loop never
+    /// sees API usage data. Old rows load as 0.
+    #[serde(default)]
+    pub estimated_tokens: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -581,6 +594,48 @@ pub fn loop_tool_requires_approval(tool: &str) -> bool {
         tool,
         "fs.write" | "reminders.set_completed" | "worker.run"
     )
+}
+
+/// AO-3 (Q-AO-12): render a round's input messages
+/// to plain text for the token estimator. The wire
+/// JSON would also do, but the estimate is defined
+/// over content, not envelope bytes.
+fn messages_estimate_text(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for message in messages {
+        match message {
+            Message::User(text) => out.push_str(text),
+            Message::AssistantCalls { proposals, content } => {
+                if let Some(content) = content {
+                    out.push_str(content);
+                }
+                for proposal in proposals {
+                    out.push_str(&proposal.tool);
+                    out.push_str(&serde_json::to_string(&proposal.args).unwrap_or_default());
+                }
+            }
+            Message::Tool { result, .. } => out.push_str(&result.body),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// AO-3 (Q-AO-12): render a model reply to plain
+/// text for the token estimator.
+fn reply_estimate_text(reply: &Result<ModelReply, ModelError>) -> String {
+    match reply {
+        Ok(ModelReply::Final(text)) => text.clone(),
+        Ok(ModelReply::Calls { proposals, content }) => {
+            let mut out = content.clone().unwrap_or_default();
+            for proposal in proposals {
+                out.push_str(&proposal.tool);
+                out.push_str(&serde_json::to_string(&proposal.args).unwrap_or_default());
+            }
+            out
+        }
+        Err(_) => String::new(),
+    }
 }
 
 pub fn normalize(tool: &str, args: &Value) -> Result<BTreeMap<String, String>, ErrorCode> {
@@ -1179,7 +1234,7 @@ impl LoopEngine {
     }
 
     pub fn start(&self, request: StartLoop) -> Result<LoopView, LoopError> {
-        self.start_with_kind(request, "main", None, None)
+        self.start_with_kind(request, "main", None, None, false)
     }
 
     /// AO-4 (J4): start a main loop with memory
@@ -1192,7 +1247,20 @@ impl LoopEngine {
         request: StartLoop,
         memory: Option<crate::memory_context::MemoryContext>,
     ) -> Result<LoopView, LoopError> {
-        self.start_with_kind(request, "main", None, memory)
+        self.start_with_kind(request, "main", None, memory, false)
+    }
+
+    /// AO-3 (Q-AO-09): start a main loop as an
+    /// unattended wake run — kind stays "main" so
+    /// AO-4 memory loading works unchanged; the
+    /// `background` flag is what the whitelist gate
+    /// and the token cap key on.
+    pub fn start_background_with_memory(
+        &self,
+        request: StartLoop,
+        memory: Option<crate::memory_context::MemoryContext>,
+    ) -> Result<LoopView, LoopError> {
+        self.start_with_kind(request, "main", None, memory, true)
     }
 
     /// ORC-4: start a loop of the given kind, with an
@@ -1212,6 +1280,7 @@ impl LoopEngine {
         kind: &str,
         model_override: Option<Arc<dyn LoopModel>>,
         memory: Option<crate::memory_context::MemoryContext>,
+        background: bool,
     ) -> Result<LoopView, LoopError> {
         let model = model_override
             .as_ref()
@@ -1251,6 +1320,8 @@ impl LoopEngine {
             unknown_reads: vec![],
             late_model_arrivals_ms: vec![],
             final_digest: None,
+            background,
+            estimated_tokens: 0,
         };
         let memory_session_id = request.session_id.clone();
         let (messages, memory_loaded) = match &memory {
@@ -1805,12 +1876,35 @@ impl LoopEngine {
         }
         let exhausted = live.record.used_ms >= live.record.budget_ms;
         match work {
-            Work::Model { closing, .. } => {
+            Work::Model { closing, messages, .. } => {
+                // AO-3 (Q-AO-12): per-run token estimate.
+                // The loop never sees API usage data, so
+                // the 100k/run cap is enforced on the AO-4
+                // estimator over the input messages plus
+                // the reply text, accumulated per model
+                // round. The fail below is background-only;
+                // foreground/research loops only accumulate.
+                if let Some(WorkResult::Model(reply)) = &result {
+                    let input = messages_estimate_text(messages);
+                    let output = reply_estimate_text(reply);
+                    live.record.estimated_tokens +=
+                        crate::memory_context::estimate_tokens(&input)
+                            + crate::memory_context::estimate_tokens(&output);
+                }
                 if exhausted {
                     live.finish(LoopStatus::Failed, Some(ErrorCode::BudgetExceeded));
                     if result.is_some() {
                         live.record.late_model_arrivals_ms.push(now());
                     }
+                } else if live.record.background
+                    && live.record.estimated_tokens > crate::wake_driver::WAKE_RUN_TOKEN_CAP
+                {
+                    // AO-3 (Q-AO-12): the run spent past its
+                    // 100k estimate — stop it. The waiter maps
+                    // Failed + BudgetExceeded + an over-cap
+                    // estimate to the event-failed path plus
+                    // its own Inbox row (wake-token-*).
+                    live.finish(LoopStatus::Failed, Some(ErrorCode::BudgetExceeded));
                 } else if timeout
                     || matches!(result, Some(WorkResult::Model(Err(ModelError::Timeout))))
                 {
@@ -1867,6 +1961,28 @@ impl LoopEngine {
                                     && !matches!(
                                         proposal.tool.as_str(),
                                         "code.search" | "fs.read" | "git.read"
+                                    ) {
+                                    Some(ErrorCode::InvalidTool)
+                                } else {
+                                    error
+                                };
+                                // AO-3 (Q-AO-09): the background
+                                // read-only hard gate, same shape
+                                // as the research gate above. A
+                                // wake-run proposal outside the
+                                // read + search whitelist is
+                                // recorded Failed + InvalidTool,
+                                // never dispatched, never parked
+                                // for approval. The three denied
+                                // tools are exactly the three
+                                // that require approval
+                                // (loop_tool_requires_approval),
+                                // so a background loop can never
+                                // park on AwaitingApproval.
+                                let error = if live.record.background
+                                    && error.is_none()
+                                    && !crate::wake_driver::background_tool_allowed(
+                                        proposal.tool.as_str(),
                                     ) {
                                     Some(ErrorCode::InvalidTool)
                                 } else {

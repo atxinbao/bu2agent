@@ -33,7 +33,27 @@ async fn main() {
         .await
         .expect("bind mock gateway listener");
     println!("mock-gateway listening on http://{addr}");
-    mock_gateway::server::serve(listener, state)
-        .await
-        .expect("serve mock gateway");
+    // AO-3 (AO3-J1): the gateway writes its own lockfile
+    // on startup, whoever started it, so the shell can
+    // attach to a launchd/terminal gateway. Only when no
+    // live lock exists — never clobber a live gateway's
+    // lock. Best-effort: a failed write must not stop
+    // the gateway.
+    let lock_pid = std::process::id();
+    let lock_port = listener.local_addr().map(|a| a.port()).unwrap_or(3001);
+    if mock_gateway::gateway_lock::live_lock().is_none() {
+        let lock = mock_gateway::gateway_lock::GatewayLock {
+            pid: lock_pid,
+            port: lock_port,
+            started_at_ms: mock_gateway::gateway_lock::now_ms(),
+        };
+        if let Err(detail) = mock_gateway::gateway_lock::write_lock(&lock) {
+            eprintln!("warning: gateway lockfile write failed: {detail}");
+        }
+    }
+    let served = mock_gateway::server::serve(listener, state).await;
+    // Graceful stop (Ctrl-C): remove the lock, but only
+    // if it still names this process.
+    mock_gateway::gateway_lock::remove_lock_if_ours(lock_pid);
+    served.expect("serve mock gateway");
 }

@@ -162,7 +162,11 @@ pub fn insert_memory(conn: &mut Connection, row: &MemoryRow) -> Result<(), Strin
     Ok(())
 }
 
-fn insert_memory_tx(tx: &Transaction, row: &MemoryRow) -> Result<(), String> {
+/// AO-3: the tx variant of `insert_memory`, so the
+/// wake success path can commit the memory
+/// writeback, the Outbox row and the event-done mark
+/// in one transaction.
+pub(crate) fn insert_memory_tx(tx: &Transaction, row: &MemoryRow) -> Result<(), String> {
     let table = table_for(&row.layer)?;
     tx.execute(
         &format!(
