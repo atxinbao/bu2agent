@@ -199,11 +199,13 @@ fn build_state(dir: &Path, deepseek_base_url: &str) -> AppState {
     )
     .with_tasks_path(dir.join("tasks.jsonl"))
     .with_task_drafts_dir(dir.join("drafts"))
-    .with_deepseek(DeepSeekClient::new(DeepSeekConfig {
-        base_url: deepseek_base_url.to_string(),
-        model: "fixture".to_string(),
-        api_key: Some("test-key".to_string()),
-    }))
+    .with_deepseek(DeepSeekClient::new(
+        DeepSeekConfig {
+            base_url: deepseek_base_url.to_string(),
+            model: "fixture".to_string(),
+        },
+        mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("test-key"),
+    ))
     .with_auto_drive(false)
     .with_executions_path(dir.join("executions.jsonl"))
     .with_effects_path(dir.join("effects.jsonl"))

@@ -7,8 +7,6 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
-use agent_desktop::credential_store::redact;
-
 use crate::deepseek::DeepSeekConfig;
 use crate::model_store::{append_model_state, ModelStateLine, StagedModel};
 use crate::routes_common::{bad_request, now_ms};
@@ -29,7 +27,9 @@ pub(crate) async fn health() -> Json<serde_json::Value> {
 // ****last-4 redaction the Settings key status uses.
 
 fn persist_model_line(state: &AppState, line: &ModelStateLine) {
-    let Some(path) = &state.model_state_path else { return };
+    let Some(path) = &state.model_state_path else {
+        return;
+    };
     append_model_state(path, line);
 }
 
@@ -65,27 +65,44 @@ fn model_restart_needed(
     env_model: Option<&str>,
     env_base_url: Option<&str>,
 ) -> bool {
-    let model_pending = staged.model.as_ref().is_some_and(|m| {
-        m != &running.model && env_model.is_none_or(|e| e.is_empty())
-    });
-    let base_pending = staged.base_url.as_ref().is_some_and(|u| {
-        u != &running.base_url && env_base_url.is_none_or(|e| e.is_empty())
-    });
+    let model_pending = staged
+        .model
+        .as_ref()
+        .is_some_and(|m| m != &running.model && env_model.is_none_or(|e| e.is_empty()));
+    let base_pending = staged
+        .base_url
+        .as_ref()
+        .is_some_and(|u| u != &running.base_url && env_base_url.is_none_or(|e| e.is_empty()));
     model_pending || base_pending
 }
 
 fn model_view(state: &AppState) -> ModelView {
     let running = state.deepseek.config();
-    let staged = state.model_staged.lock().expect("model staged lock").clone().unwrap_or_default();
-    let model = staged.model.clone().unwrap_or_else(|| running.model.clone());
-    let base_url = staged.base_url.clone().unwrap_or_else(|| running.base_url.clone());
-    let env_model = std::env::var("DEEPSEEK_MODEL").ok().filter(|s| !s.is_empty());
-    let env_base = std::env::var("DEEPSEEK_BASE_URL").ok().filter(|s| !s.is_empty());
+    let staged = state
+        .model_staged
+        .lock()
+        .expect("model staged lock")
+        .clone()
+        .unwrap_or_default();
+    let model = staged
+        .model
+        .clone()
+        .unwrap_or_else(|| running.model.clone());
+    let base_url = staged
+        .base_url
+        .clone()
+        .unwrap_or_else(|| running.base_url.clone());
+    let env_model = std::env::var("DEEPSEEK_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let env_base = std::env::var("DEEPSEEK_BASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty());
     let restart_needed =
         model_restart_needed(running, &staged, env_model.as_deref(), env_base.as_deref());
-    let (key_configured, key_redacted) = match &running.api_key {
-        Some(key) => (true, Some(redact(key))),
-        None => (false, None),
+    let (key_configured, key_redacted) = {
+        let broker = state.deepseek.broker();
+        (broker.has_key(), broker.redacted_key())
     };
     let (planner_model, executor_model) =
         crate::model_store::resolve_role_models(&staged, &running.model);
@@ -208,7 +225,6 @@ mod model_merge_tests {
         DeepSeekConfig {
             base_url: "https://api.deepseek.com".to_string(),
             model: "deepseek-flash".to_string(),
-            api_key: None,
         }
     }
 
@@ -227,12 +243,11 @@ mod model_merge_tests {
         let merged = merge_staged_config(running(), &Some(staged()), None, None);
         assert_eq!(merged.model, "deepseek-chat");
         assert_eq!(merged.base_url, "https://staged.example.com");
-        assert_eq!(merged.api_key, None);
     }
 
     #[test]
     fn merge_env_wins_over_staged() {
-        // The caller (from_env_and_keychain) already put the
+        // The caller (from_env) already put the
         // env values into config; merge only decides whether
         // staged may override. With env present, staged is
         // ignored and the env-carrying config stands.
@@ -320,7 +335,9 @@ pub(crate) async fn config_get(State(state): State<AppState>) -> Json<ConfigView
 // has the same record effect as a plain delete.
 
 fn persist_space_line(state: &AppState, line: &SpaceStateLine) {
-    let Some(path) = &state.space_state_path else { return };
+    let Some(path) = &state.space_state_path else {
+        return;
+    };
     append_space_state(path, line);
 }
 

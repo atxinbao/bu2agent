@@ -218,26 +218,24 @@ impl Harness {
             title: "Test reminder 2".to_string(),
             completed: false,
         });
-        let mut state = AppState::with_files_root_and_approvals(
-            files_root,
-            Some(dir.join("approvals.jsonl")),
-        )
-        .with_tasks_path(dir.join("tasks.jsonl"))
-        .with_task_drafts_dir(dir.join("drafts"))
-        .with_executions_path(dir.join("executions.jsonl"))
-        .with_effects_path(dir.join("effects.jsonl"))
-        .with_actions_path(dir.join("actions.jsonl"))
-        .with_connector_state_path(dir.join("connectors.jsonl"))
-        .with_vault_state_path(dir.join("vault.jsonl"))
-        .with_vault_secrets(Arc::new(MemoryCredentialStore::new()))
-        .with_device_backend(fake);
+        let mut state =
+            AppState::with_files_root_and_approvals(files_root, Some(dir.join("approvals.jsonl")))
+                .with_tasks_path(dir.join("tasks.jsonl"))
+                .with_task_drafts_dir(dir.join("drafts"))
+                .with_executions_path(dir.join("executions.jsonl"))
+                .with_effects_path(dir.join("effects.jsonl"))
+                .with_actions_path(dir.join("actions.jsonl"))
+                .with_connector_state_path(dir.join("connectors.jsonl"))
+                .with_vault_state_path(dir.join("vault.jsonl"))
+                .with_vault_secrets(Arc::new(MemoryCredentialStore::new()))
+                .with_device_backend(fake);
         if let Some(base) = model_url {
             state = state.with_deepseek(mock_gateway::deepseek::DeepSeekClient::new(
                 mock_gateway::deepseek::DeepSeekConfig {
                     base_url: base,
                     model: "fixture-3b".to_string(),
-                    api_key: Some("test-only-fake-key".to_string()),
                 },
+                mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("test-only-fake-key"),
             ));
         }
         state

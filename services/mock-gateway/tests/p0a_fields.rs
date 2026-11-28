@@ -117,23 +117,23 @@ impl Harness {
         model_url: Option<String>,
         origin: Option<&str>,
     ) -> AppState {
-        let mut state = AppState::with_files_root_and_approvals(
-            files_root,
-            Some(dir.join("approvals.jsonl")),
-        )
-        .with_tasks_path(dir.join("tasks.jsonl"))
-        .with_task_drafts_dir(dir.join("drafts"))
-        .with_executions_path(dir.join("executions.jsonl"))
-        .with_effects_path(dir.join("effects.jsonl"));
+        let mut state =
+            AppState::with_files_root_and_approvals(files_root, Some(dir.join("approvals.jsonl")))
+                .with_tasks_path(dir.join("tasks.jsonl"))
+                .with_task_drafts_dir(dir.join("drafts"))
+                .with_executions_path(dir.join("executions.jsonl"))
+                .with_effects_path(dir.join("effects.jsonl"));
         if let Some(origin) = origin {
             state = state.with_origin_device_id(origin.to_string());
         }
         if let Some(base) = model_url {
-            state = state.with_deepseek(DeepSeekClient::new(DeepSeekConfig {
-                base_url: base,
-                model: "fixture-3b".to_string(),
-                api_key: Some("test".to_string()),
-            }));
+            state = state.with_deepseek(DeepSeekClient::new(
+                DeepSeekConfig {
+                    base_url: base,
+                    model: "fixture-3b".to_string(),
+                },
+                mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("test"),
+            ));
         }
         state
     }
@@ -340,7 +340,9 @@ async fn task_execute_effect_carries_idempotency_key() {
         .effects()
         .await
         .into_iter()
-        .find(|e| e["capability"] == "tasks" && e["operation"] == "execute" && e["scope"] == task_id)
+        .find(|e| {
+            e["capability"] == "tasks" && e["operation"] == "execute" && e["scope"] == task_id
+        })
         .expect("task execute effect");
     assert_eq!(effect["execution_id"], execution_id);
     assert_eq!(effect["approval_id"], task_approval);

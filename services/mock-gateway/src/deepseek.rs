@@ -13,14 +13,24 @@
 //! returns the provider status (or None for transport errors),
 //! never the key, never a response body.
 //!
+//! AO-6 (Q-AO6-02): the key lives only in the credential
+//! broker (`DeepSeekCredentialBroker`, below), resolved once
+//! at startup. `DeepSeekConfig` carries no key — the loop
+//! layer, the planner slot and every `config()` reader see
+//! only base URL + model. The two POST funnels ask the
+//! broker for the key at call time; nothing else may read
+//! it (`key()` is crate-visible so the loop model can use
+//! it, but only the two funnels call it — see F1).
+//!
 //! Only a complete, non-empty answer enters the stream: a
 //! truncated or empty completion is a failure, never a
 //! complete answer.
 
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_desktop::credential_store::{CredentialStore, KeychainCredentialStore};
+use agent_desktop::credential_store::{redact, CredentialStore, KeychainCredentialStore};
 use serde::{Deserialize, Serialize};
 
 use crate::policy_store::NetworkRule;
@@ -34,22 +44,21 @@ pub const KEY_HANDLE: &str = "deepseek";
 const TIMEOUT_SECS: u64 = 30;
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 
+/// AO-6 (Q-AO6-02): the running model config carries no
+/// credential. The key lives only in the broker below;
+/// this struct is safe to clone, log and hand to the loop
+/// layer — it can never leak a key because it has none.
 #[derive(Debug, Clone)]
 pub struct DeepSeekConfig {
     pub base_url: String,
     pub model: String,
-    pub api_key: Option<String>,
 }
 
 impl DeepSeekConfig {
-    /// Env wins for the key; the keychain is the stored-key path.
     /// Base URL and model are env-overridable, defaulting to the
-    /// official endpoint and `deepseek-flash`.
-    pub fn from_env_and_keychain() -> Self {
-        let api_key = std::env::var("DEEPSEEK_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-            .or_else(|| KeychainCredentialStore::new().retrieve(KEY_HANDLE).ok());
+    /// official endpoint and `deepseek-flash`. The key is NOT
+    /// resolved here — see `DeepSeekCredentialBroker`.
+    pub fn from_env() -> Self {
         Self {
             base_url: std::env::var("DEEPSEEK_BASE_URL")
                 .ok()
@@ -59,7 +68,6 @@ impl DeepSeekConfig {
                 .ok()
                 .filter(|m| !m.is_empty())
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-            api_key,
         }
     }
 
@@ -68,12 +76,79 @@ impl DeepSeekConfig {
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
             model: DEFAULT_MODEL.to_string(),
-            api_key: None,
         }
     }
 
     fn completions_url(&self) -> String {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+    }
+}
+
+/// AO-6 (Q-AO6-02): the credential broker. The DeepSeek key,
+/// resolved once at startup (Q-AO6-01: startup-once, the
+/// AO3-J2 behaviour is preserved — a keychain locked at
+/// startup means keyless for the process lifetime), lives
+/// only in this struct's private field. The chat client and
+/// the loop model each hold a clone and ask it for the key
+/// at POST time; the loop engine, the planner slot and every
+/// `config()` reader never see it.
+///
+/// Deliberately no `Debug` derive: a derived `{:?}` would
+/// print the key. The manual impl below prints only whether
+/// a key is configured.
+#[derive(Clone)]
+pub struct DeepSeekCredentialBroker {
+    key: Option<String>,
+}
+
+impl fmt::Debug for DeepSeekCredentialBroker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeepSeekCredentialBroker")
+            .field("key_configured", &self.has_key())
+            .finish()
+    }
+}
+
+impl DeepSeekCredentialBroker {
+    /// Env wins for the key; the keychain is the stored-key path.
+    pub fn from_env_and_keychain() -> Self {
+        let key = std::env::var("DEEPSEEK_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .or_else(|| KeychainCredentialStore::new().retrieve(KEY_HANDLE).ok());
+        Self { key }
+    }
+
+    /// No key: the callers fall back (chat echoes, loops 503).
+    pub fn disabled() -> Self {
+        Self { key: None }
+    }
+
+    /// Test/fake injection only: production keys come from
+    /// env/keychain via `from_env_and_keychain`.
+    pub fn test_key(key: &str) -> Self {
+        Self {
+            key: Some(key.to_string()),
+        }
+    }
+
+    pub fn has_key(&self) -> bool {
+        self.key.as_deref().is_some_and(|k| !k.is_empty())
+    }
+
+    /// Only the two POST funnels may call this (chat client
+    /// below, loop model in `deepseek_loop.rs`). The key is
+    /// never handed to the loop engine, the planner, a log
+    /// line or a response.
+    pub(crate) fn key(&self) -> Option<&str> {
+        self.key.as_deref().filter(|k| !k.is_empty())
+    }
+
+    /// The same ****last-4 redaction the Settings key status
+    /// uses (see `model_view`): the full key never leaves
+    /// this struct.
+    pub(crate) fn redacted_key(&self) -> Option<String> {
+        self.key.as_deref().map(redact)
     }
 }
 
@@ -126,12 +201,19 @@ fn first_content(response: &ChatResponse) -> Option<String> {
     if choice.finish_reason != "stop" {
         return None;
     }
-    choice.message.content.clone().filter(|text| !text.trim().is_empty())
+    choice
+        .message
+        .content
+        .clone()
+        .filter(|text| !text.trim().is_empty())
 }
 
 #[derive(Debug, Clone)]
 pub struct DeepSeekClient {
     config: DeepSeekConfig,
+    /// AO-6 (Q-AO6-02): the broker holds the key; the config
+    /// does not. `config()` below returns the keyless config.
+    broker: DeepSeekCredentialBroker,
     http: reqwest::Client,
     /// Task 13: shared network-rules handle (the same Arc
     /// AppState holds, so rule edits apply live). None
@@ -140,13 +222,18 @@ pub struct DeepSeekClient {
 }
 
 impl DeepSeekClient {
-    pub fn new(config: DeepSeekConfig) -> Self {
+    pub fn new(config: DeepSeekConfig, broker: DeepSeekCredentialBroker) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .build()
             .unwrap_or_default();
-        Self { config, http, network_rules: None }
+        Self {
+            config,
+            broker,
+            http,
+            network_rules: None,
+        }
     }
 
     pub fn with_network_rules(mut self, rules: Arc<Mutex<Option<Vec<NetworkRule>>>>) -> Self {
@@ -173,8 +260,24 @@ impl DeepSeekClient {
         crate::policy_store::denied_rule(rules, url)
     }
 
+    /// AO-6 (Q-AO6-02): the running config — base URL +
+    /// model only. The key is not in this struct anymore,
+    /// so no reader of `config()` can ever see it.
     pub fn config(&self) -> &DeepSeekConfig {
         &self.config
+    }
+
+    /// AO-6 (Q-AO6-02): the broker, for call sites that
+    /// build a loop model from this client (planner slot).
+    /// They pass the broker through; they never read the key.
+    pub(crate) fn broker(&self) -> &DeepSeekCredentialBroker {
+        &self.broker
+    }
+
+    /// Whether a key is configured (chat replies / loops
+    /// run); the key itself is never exposed here.
+    pub fn has_key(&self) -> bool {
+        self.broker.has_key()
     }
 
     pub async fn reply(&self, user_text: &str) -> DeepseekOutcome {
@@ -243,7 +346,11 @@ impl DeepSeekClient {
         model: &str,
         user_text: &str,
     ) -> DeepseekOutcome {
-        let Some(key) = &self.config.api_key else {
+        // AO-6 (Q-AO6-02): the key comes from the broker at
+        // POST time. The deny check below still runs first,
+        // so a denied host never receives the request or the
+        // key (Task 13 discipline, unchanged).
+        let Some(key) = self.broker.key() else {
             return DeepseekOutcome::Disabled;
         };
         let denied = match &rules {
@@ -287,9 +394,11 @@ mod tests {
         let config = DeepSeekConfig {
             base_url: "https://api.deepseek.com/".to_string(),
             model: DEFAULT_MODEL.to_string(),
-            api_key: None,
         };
-        assert_eq!(config.completions_url(), "https://api.deepseek.com/chat/completions");
+        assert_eq!(
+            config.completions_url(),
+            "https://api.deepseek.com/chat/completions"
+        );
     }
 
     #[test]
@@ -328,7 +437,20 @@ mod tests {
     }
 
     #[test]
-    fn disabled_config_has_no_key() {
-        assert!(DeepSeekConfig::disabled().api_key.is_none());
+    fn disabled_broker_has_no_key() {
+        assert!(!DeepSeekCredentialBroker::disabled().has_key());
+        assert!(DeepSeekCredentialBroker::disabled().key().is_none());
+        assert!(DeepSeekCredentialBroker::test_key("test-key").has_key());
+    }
+
+    #[test]
+    fn broker_debug_never_prints_the_key() {
+        // AO-6 F1 (unit half): a derived Debug would print
+        // the key; the manual impl prints only the flag.
+        // Expected value computed here, not copied from the
+        // code's output: the struct name + key_configured.
+        let shown = format!("{:?}", DeepSeekCredentialBroker::test_key("sk-ao6-secret"));
+        assert_eq!(shown, "DeepSeekCredentialBroker { key_configured: true }");
+        assert!(!shown.contains("sk-ao6-secret"));
     }
 }

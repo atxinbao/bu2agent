@@ -114,26 +114,35 @@ impl Harness {
         model_url: Option<String>,
         loop_mode: bool,
     ) -> AppState {
-        let mut state = AppState::with_files_root_and_approvals(files_root, Some(dir.join("approvals.jsonl")))
-            .with_tasks_path(dir.join("tasks.jsonl"))
-            .with_task_drafts_dir(dir.join("drafts"))
-            .with_executions_path(dir.join("executions.jsonl"));
+        let mut state =
+            AppState::with_files_root_and_approvals(files_root, Some(dir.join("approvals.jsonl")))
+                .with_tasks_path(dir.join("tasks.jsonl"))
+                .with_task_drafts_dir(dir.join("drafts"))
+                .with_executions_path(dir.join("executions.jsonl"));
         if loop_mode {
             let config = DeepSeekConfig {
                 base_url: model_url.clone().unwrap(),
                 model: "fixture-3b".to_string(),
-                api_key: Some("fake-execution-key".into()),
             };
             state = state
-                .with_deepseek_backends(config, Some(dir.join("loops.jsonl")), None)
+                .with_deepseek_backends(
+                    config,
+                    mock_gateway::deepseek::DeepSeekCredentialBroker::test_key(
+                        "fake-execution-key",
+                    ),
+                    Some(dir.join("loops.jsonl")),
+                    None,
+                )
                 .expect("loop backends")
                 .with_auto_drive(false);
         } else if let Some(base) = model_url {
-            state = state.with_deepseek(DeepSeekClient::new(DeepSeekConfig {
-                base_url: base,
-                model: "fixture-3b".to_string(),
-                api_key: Some("fake-execution-key".into()),
-            }));
+            state = state.with_deepseek(DeepSeekClient::new(
+                DeepSeekConfig {
+                    base_url: base,
+                    model: "fixture-3b".to_string(),
+                },
+                mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("fake-execution-key"),
+            ));
         }
         state
     }

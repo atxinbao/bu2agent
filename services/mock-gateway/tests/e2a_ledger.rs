@@ -282,11 +282,13 @@ impl Harness {
         .with_git_path(git)
         .with_cargo_path(cargo);
         if let Some(base) = model_url {
-            state = state.with_deepseek(DeepSeekClient::new(DeepSeekConfig {
-                base_url: base,
-                model: "fixture-3b".to_string(),
-                api_key: Some("test-key".to_string()),
-            }));
+            state = state.with_deepseek(DeepSeekClient::new(
+                DeepSeekConfig {
+                    base_url: base,
+                    model: "fixture-3b".to_string(),
+                },
+                mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("test-key"),
+            ));
         }
         let state = state.with_sqlite_path(dir.join("gateway.sqlite3"));
         if fresh_import {

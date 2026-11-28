@@ -302,7 +302,7 @@ pub(crate) async fn tasks_run(
     Json(req): Json<TaskGetQuery>,
 ) -> impl IntoResponse {
     // No model, no run: refused outright, never an echo draft.
-    if state.deepseek.config().api_key.is_none() {
+    if !state.deepseek.has_key() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "model_not_configured"})),

@@ -922,11 +922,13 @@ impl TaskHarness {
                 .with_project_state_path(dir.join("projects.jsonl"))
                 .with_location_state_path(dir.join("locations.jsonl"))
                 .with_worktree_state_path(dir.join("worktrees.jsonl"))
-                .with_deepseek(DeepSeekClient::new(DeepSeekConfig {
-                    base_url: model_url,
-                    model: "fixture-3b".to_string(),
-                    api_key: Some("test-key".to_string()),
-                }));
+                .with_deepseek(DeepSeekClient::new(
+                    DeepSeekConfig {
+                        base_url: model_url,
+                        model: "fixture-3b".to_string(),
+                    },
+                    mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("test-key"),
+                ));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });

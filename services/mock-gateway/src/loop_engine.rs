@@ -1988,6 +1988,40 @@ impl LoopEngine {
                                 } else {
                                     error
                                 };
+                                // AO-6 (Q-AO6-03c/Q-AO6-04): the
+                                // code-gate deny, same shape as
+                                // the two gates above. A proposal
+                                // that writes into the runtime
+                                // library is recorded Failed +
+                                // InvalidTool — it never enters
+                                // the approval flow, so no
+                                // approval, not even one the user
+                                // grants on the spot, can ever
+                                // authorize it (deny beats
+                                // approval). The worker.run half
+                                // of the gate needs no check here:
+                                // normalize() already rejects any
+                                // command outside the five
+                                // allowlisted templates, so a
+                                // git-push proposal never reaches
+                                // this gate — it is Failed +
+                                // InvalidArguments at normalize,
+                                // and resolve_command() names it
+                                // `remote_write_denied` for any
+                                // non-loop path that reaches it.
+                                let error = if error.is_none()
+                                    && proposal.tool == "fs.write"
+                                    && normal
+                                        .as_ref()
+                                        .ok()
+                                        .and_then(|args| args.get("path"))
+                                        .is_some_and(|path| {
+                                            crate::operation_binding::is_runtime_library_path(path)
+                                        }) {
+                                    Some(ErrorCode::InvalidTool)
+                                } else {
+                                    error
+                                };
                                 let args = normal.ok();
                                 let call_id = live.record.calls.len() + 1;
                                 // 非法工具名不原样写盘，避免把模型任意文本带入审计。

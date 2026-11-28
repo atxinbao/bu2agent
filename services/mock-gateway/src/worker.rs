@@ -340,6 +340,11 @@ pub struct ResolvedCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandError {
     NotAllowlisted,
+    /// AO-6 (Q-AO6-03b): an explicitly denied remote-write
+    /// command (the git-push family). This is not "not
+    /// allowlisted" — the command is named and refused, so a
+    /// future allowlist expansion cannot silently admit it.
+    RemoteWriteDenied,
     BadParam(&'static str),
 }
 
@@ -347,9 +352,20 @@ impl CommandError {
     pub fn code(&self) -> &'static str {
         match self {
             CommandError::NotAllowlisted => "command_not_allowlisted",
+            CommandError::RemoteWriteDenied => "remote_write_denied",
             CommandError::BadParam(code) => code,
         }
     }
+}
+
+/// AO-6 (Q-AO6-03b): true for commands that write to a
+/// remote — the git-push family, in any separator/case
+/// spelling. The worker command vocabulary is a template
+/// name, never argv, so only exact template spellings
+/// matter here (`git-push`, `git push`, `git_push`, `push`).
+pub fn is_remote_write_command(command: &str) -> bool {
+    let normalized = command.trim().to_ascii_lowercase().replace([' ', '_'], "-");
+    matches!(normalized.as_str(), "git-push" | "push")
 }
 
 /// Validate a `git diff` path argument: worktree-relative,
@@ -493,6 +509,12 @@ pub fn resolve_command(
     timeout_ms: Option<u64>,
     location_root: Option<&Path>,
 ) -> Result<ResolvedCommand, CommandError> {
+    // AO-6 (Q-AO6-03b): the explicit deny runs before the
+    // allowlist, so a remote-write command gets the deny
+    // code instead of the generic not-allowlisted code.
+    if is_remote_write_command(command) {
+        return Err(CommandError::RemoteWriteDenied);
+    }
     // Per-template defaults (plan §3.3): reads 30s,
     // worktree-add / commit 60s, cargo test 600s.
     let default_timeout = match command {
@@ -1073,22 +1095,14 @@ pub(crate) fn unknown_effect_identity(
         "git-worktree-add" => {
             let absolute = argv.get(3).cloned().unwrap_or_else(|| run.cwd.clone());
             let scope = match location_root {
-                Some(root) => {
-                    relativize_to_root(root, &absolute).unwrap_or(absolute)
-                }
+                Some(root) => relativize_to_root(root, &absolute).unwrap_or(absolute),
                 None => absolute,
             };
-            (
-                "git".to_string(),
-                "worktree-add".to_string(),
-                scope,
-            )
+            ("git".to_string(), "worktree-add".to_string(), scope)
         }
         "git-commit" => {
             let scope = match location_root {
-                Some(root) => {
-                    relativize_to_root(root, &run.cwd).unwrap_or_else(|| run.cwd.clone())
-                }
+                Some(root) => relativize_to_root(root, &run.cwd).unwrap_or_else(|| run.cwd.clone()),
                 None => run.cwd.clone(),
             };
             ("git".to_string(), "commit".to_string(), scope)
@@ -1645,9 +1659,7 @@ async fn completion_effect(
             let cwd = Path::new(&run.cwd);
             let parent_head = git
                 .as_ref()
-                .and_then(|g| {
-                    git_read_sync(state, g, &["-C", &run.cwd, "rev-parse", "HEAD"], cwd)
-                })
+                .and_then(|g| git_read_sync(state, g, &["-C", &run.cwd, "rev-parse", "HEAD"], cwd))
                 .unwrap_or_default();
             let params = std::collections::BTreeMap::from([
                 ("path".to_string(), scope.clone()),
@@ -1666,20 +1678,11 @@ async fn completion_effect(
                             Path::new(&absolute),
                         )
                     })
-                    .map(|head_sha| {
-                        serde_json::json!({"kind": "worktree", "head_sha": head_sha})
-                    })
+                    .map(|head_sha| serde_json::json!({"kind": "worktree", "head_sha": head_sha}))
             } else {
                 None
             };
-            (
-                "git",
-                "worktree-add",
-                scope,
-                digest,
-                baseline,
-                None,
-            )
+            ("git", "worktree-add", scope, digest, baseline, None)
         }
         "git-commit" => {
             let scope = location_root
@@ -2118,6 +2121,32 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn remote_write_commands_get_the_deny_code() {
+        // AO-6 (Q-AO6-03b): the push family is denied by
+        // name, not by "not allowlisted". Expected values
+        // are the approved deny code, read from the plan.
+        let git = Path::new("/usr/bin/git");
+        let cwd = std::env::temp_dir();
+        for command in ["git-push", "git push", "git_push", "GIT-PUSH", "push"] {
+            let err = resolve_command(command, None, git, &cwd, None, None)
+                .expect_err(&format!("{command} must be denied"));
+            assert_eq!(err, CommandError::RemoteWriteDenied, "{command}");
+            assert_eq!(err.code(), "remote_write_denied", "{command}");
+        }
+        // Near-misses stay on the generic code: a push to a
+        // named remote is not a template name at all.
+        assert_eq!(
+            resolve_command("git-push origin", None, git, &cwd, None, None),
+            Err(CommandError::NotAllowlisted),
+        );
+        // The matcher itself, spelling by spelling.
+        assert!(is_remote_write_command("git-push"));
+        assert!(is_remote_write_command("git push"));
+        assert!(!is_remote_write_command("git-commit"));
+        assert!(!is_remote_write_command("git worktree add"));
     }
 
     #[test]

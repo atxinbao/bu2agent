@@ -106,15 +106,18 @@ fn build_state(
     files_root: std::path::PathBuf,
     model_url: Option<String>,
 ) -> AppState {
-    let mut state = AppState::with_files_root_and_approvals(files_root, Some(dir.join("approvals.jsonl")))
-        .with_tasks_path(dir.join("tasks.jsonl"))
-        .with_task_drafts_dir(dir.join("drafts"));
+    let mut state =
+        AppState::with_files_root_and_approvals(files_root, Some(dir.join("approvals.jsonl")))
+            .with_tasks_path(dir.join("tasks.jsonl"))
+            .with_task_drafts_dir(dir.join("drafts"));
     if let Some(base) = model_url {
-        state = state.with_deepseek(DeepSeekClient::new(DeepSeekConfig {
-            base_url: base,
-            model: "fixture-3b".to_string(),
-            api_key: Some("fixture-not-real".to_string()),
-        }));
+        state = state.with_deepseek(DeepSeekClient::new(
+            DeepSeekConfig {
+                base_url: base,
+                model: "fixture-3b".to_string(),
+            },
+            mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("fixture-not-real"),
+        ));
     }
     state
 }

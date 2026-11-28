@@ -13,13 +13,29 @@
 #[tokio::main]
 async fn main() {
     // 壳回归专用参数跳过凭据读取，正常启动仍按 env、Keychain 顺序取 key。
-    let config = if std::env::args().any(|arg| arg == "--mock-chat") {
-        mock_gateway::deepseek::DeepSeekConfig::disabled()
+    // AO-6 (Q-AO6-01/Q-AO6-02): the config is keyless; the broker holds
+    // the key. Both are resolved once here and passed in
+    // together — nothing downstream re-resolves credentials.
+    let (config, broker) = if std::env::args().any(|arg| arg == "--mock-chat") {
+        (
+            mock_gateway::deepseek::DeepSeekConfig::disabled(),
+            mock_gateway::deepseek::DeepSeekCredentialBroker::disabled(),
+        )
     } else {
-        mock_gateway::deepseek::DeepSeekConfig::from_env_and_keychain()
+        (
+            mock_gateway::deepseek::DeepSeekConfig::from_env(),
+            mock_gateway::deepseek::DeepSeekCredentialBroker::from_env_and_keychain(),
+        )
     };
-    println!("chat backend: {}", if config.api_key.is_some() { "deepseek" } else { "mock echo (no key configured or test mode)" });
-    let state = mock_gateway::server::AppState::from_deepseek_config(config);
+    println!(
+        "chat backend: {}",
+        if broker.has_key() {
+            "deepseek"
+        } else {
+            "mock echo (no key configured or test mode)"
+        }
+    );
+    let state = mock_gateway::server::AppState::from_deepseek_config(config, broker);
     // P0-E fail-closed startup: if the recovery scan could not
     // establish this process's worker identity, the gateway
     // must not open with a half-scanned assignment table.

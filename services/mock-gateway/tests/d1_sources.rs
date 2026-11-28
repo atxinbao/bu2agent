@@ -103,8 +103,8 @@ fn build_state_inner(
         mock_gateway::deepseek::DeepSeekConfig {
             base_url: "http://127.0.0.1:1".to_string(),
             model: "fixture".to_string(),
-            api_key: Some("fake-d1-key".to_string()),
         },
+        mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("fake-d1-key"),
     ))
     .with_auto_drive(false)
     .with_executions_path(dir.join("executions.jsonl"))
@@ -223,11 +223,9 @@ impl Harness {
 
     fn row_count(&self, table: &str) -> i64 {
         let conn = self.db();
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM {table}"),
-            [],
-            |row| row.get(0),
-        )
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
         .unwrap()
     }
 

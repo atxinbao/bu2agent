@@ -116,7 +116,7 @@ use crate::notes_source::NotesSource;
 use crate::calendar_backend::{default_calendar_backend, CalendarBackend};
 use crate::voice_store::{load_voice_state, merged_custom_voices, CustomVoice};
 use agent_desktop::credential_store::{CredentialStore, KeychainCredentialStore};
-use crate::deepseek::{DeepSeekClient, DeepSeekConfig};
+use crate::deepseek::{DeepSeekClient, DeepSeekConfig, DeepSeekCredentialBroker};
 use crate::may_execute_tool;
 
 
@@ -434,7 +434,10 @@ pub struct AppState {
 
 impl Default for AppState {
     fn default() -> Self {
-        Self::from_deepseek_config(DeepSeekConfig::disabled())
+        Self::from_deepseek_config(
+            DeepSeekConfig::disabled(),
+            DeepSeekCredentialBroker::disabled(),
+        )
     }
 }
 
@@ -453,7 +456,10 @@ pub fn resolve_origin_device_id(value: Option<String>) -> String {
 
 impl AppState {
     /// 正常启动共用一次凭据解析结果；测试构造器不读取环境凭据。
-    pub fn from_deepseek_config(config: DeepSeekConfig) -> Self {
+    /// AO-6 (Q-AO6-02): the broker carries the key; the config
+    /// is keyless. Both are resolved once, in main, and passed
+    /// in together — AppState never re-resolves credentials.
+    pub fn from_deepseek_config(config: DeepSeekConfig, broker: DeepSeekCredentialBroker) -> Self {
         let root = std::env::var("MOCK_FILES_ROOT").unwrap_or_else(|_| "mock-files".to_string());
         let approvals_path = std::env::var("MOCK_APPROVALS_PATH").ok().map(PathBuf::from);
         let mut state = AppState::with_files_root_and_approvals(PathBuf::from(root), approvals_path);
@@ -479,7 +485,7 @@ impl AppState {
         }
         let loops_path = std::env::var("MOCK_LOOPS_PATH").ok().map(PathBuf::from);
         let network_rules = state.policy_rules.clone();
-        state = state.with_deepseek_backends(config, loops_path, Some(network_rules))
+        state = state.with_deepseek_backends(config, broker, loops_path, Some(network_rules))
             .expect("invalid loop configuration or audit");
         if let Some(path) = model_path {
             state = state.with_model_state_path(path);
@@ -700,7 +706,7 @@ impl AppState {
         AppState {
             loop_fault: crate::loop_fault::LoopFault::default(),
             loops: Arc::new(LoopEngine::new(&root, None, None, None, Timeouts::default()).expect("memory loop engine")),
-            deepseek: DeepSeekClient::new(DeepSeekConfig::disabled()),
+            deepseek: DeepSeekClient::new(DeepSeekConfig::disabled(), DeepSeekCredentialBroker::disabled()),
             streams: Arc::new(Mutex::new(HashMap::new())),
             files_root: root,
             approvals: Arc::new(Mutex::new(approvals)),
@@ -840,10 +846,11 @@ impl AppState {
     pub fn with_deepseek_backends(
         self,
         config: DeepSeekConfig,
+        broker: DeepSeekCredentialBroker,
         path: Option<PathBuf>,
         network_rules: Option<Arc<Mutex<Option<Vec<NetworkRule>>>>>,
     ) -> Result<Self, String> {
-        let model = crate::deepseek_loop::DeepSeekLoopModel::new(config.clone())?
+        let model = crate::deepseek_loop::DeepSeekLoopModel::new(config.clone(), broker.clone())?
             .map(|m| {
                 let m = match &network_rules {
                     Some(rules) => m.with_network_rules(rules.clone()),
@@ -853,8 +860,8 @@ impl AppState {
             });
         let timeouts = self.loop_fault.timeouts();
         let deepseek = match &network_rules {
-            Some(rules) => DeepSeekClient::new(config).with_network_rules(rules.clone()),
-            None => DeepSeekClient::new(config),
+            Some(rules) => DeepSeekClient::new(config, broker).with_network_rules(rules.clone()),
+            None => DeepSeekClient::new(config, broker),
         };
         self.with_deepseek(deepseek)
             .with_loop_backends(path, model, None, timeouts)
@@ -4186,6 +4193,19 @@ pub(crate) fn dispatch_agent_tool(state: &AppState, req: ToolCallDto) -> axum::r
             let (Some(path), Some(text)) = (arg("path"), arg("text")) else {
                 return bad_request("fs.write requires path and text args");
             };
+            // AO-6 (Q-AO6-03c/Q-AO6-04): the dispatch-level
+            // deny. This arm is the shared funnel — the loop's
+            // execute_loop_tool fallthrough and the direct
+            // /agent/tool/call route both land here — so a
+            // runtime-library write is refused even if a valid
+            // approval were presented (deny beats approval).
+            if crate::operation_binding::is_runtime_library_path(&path) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({ "error": "path_denied" })),
+                )
+                    .into_response();
+            }
             match resolve_file(&state.files_root, &path) {
                 Err(_) => Err(bad_request("path escapes file root")),
                 Ok(full) => {

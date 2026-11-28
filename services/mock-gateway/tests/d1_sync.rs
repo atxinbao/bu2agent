@@ -150,8 +150,8 @@ fn build_state(dir: &Path, mail: Arc<dyn MailSource>) -> AppState {
         mock_gateway::deepseek::DeepSeekConfig {
             base_url: "http://127.0.0.1:1".to_string(),
             model: "fixture".to_string(),
-            api_key: Some("fake-d1-key".to_string()),
         },
+        mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("fake-d1-key"),
     ))
     .with_auto_drive(false)
     .with_executions_path(dir.join("executions.jsonl"))

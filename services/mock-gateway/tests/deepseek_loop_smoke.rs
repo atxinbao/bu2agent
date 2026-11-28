@@ -12,7 +12,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use mock_gateway::deepseek::{DeepSeekClient, DeepSeekConfig};
+use mock_gateway::deepseek::{DeepSeekClient, DeepSeekConfig, DeepSeekCredentialBroker};
 use mock_gateway::deepseek_loop::DeepSeekLoopModel;
 use mock_gateway::loop_engine::*;
 use mock_gateway::server::{app, AppState};
@@ -93,6 +93,7 @@ struct Harness {
     provider: Provider,
     tools: MemoryTools,
     config: DeepSeekConfig,
+    broker: DeepSeekCredentialBroker,
     url: String,
     client: reqwest::Client,
     servers: Vec<tokio::task::JoinHandle<()>>,
@@ -123,15 +124,18 @@ impl Harness {
         let config = DeepSeekConfig {
             base_url: format!("{base}/"),
             model: "fake-model-override".into(),
-            api_key: Some("fake-loop-key".into()),
         };
-        let model = DeepSeekLoopModel::new(config.clone()).unwrap().unwrap();
+        // AO-6: the key lives in the broker, never in the config.
+        let broker = DeepSeekCredentialBroker::test_key("fake-loop-key");
+        let model = DeepSeekLoopModel::new(config.clone(), broker.clone())
+            .unwrap()
+            .unwrap();
         let tools = MemoryTools::default();
         let state = AppState::with_files_root_and_approvals(
             dir.join("files"),
             Some(dir.join("approvals.jsonl")),
         )
-        .with_deepseek(DeepSeekClient::new(config.clone()))
+        .with_deepseek(DeepSeekClient::new(config.clone(), broker.clone()))
         .with_loop_backends(
             Some(dir.join("loops.jsonl")),
             Some(Arc::new(model)),
@@ -148,6 +152,7 @@ impl Harness {
             provider,
             tools,
             config,
+            broker,
             url,
             client: reqwest::Client::new(),
             servers: vec![fake, gateway],
@@ -591,7 +596,9 @@ async fn adapter_itself_enforces_http_deadline_without_engine_timer() {
         Timeouts::default(),
     )
     .await;
-    let model = DeepSeekLoopModel::new(h.config.clone()).unwrap().unwrap();
+    let model = DeepSeekLoopModel::new(h.config.clone(), h.broker.clone())
+        .unwrap()
+        .unwrap();
     let result = model
         .complete(
             vec![Message::User("test".into())],
@@ -876,7 +883,12 @@ async fn cancel_pending_http_response_archives_without_enqueuing_calls() {
 async fn configured_production_builder_enables_loop_and_keeps_chat_request_unchanged() {
     let mut h = Harness::new(vec![final_reply(), final_reply()]).await;
     let state = AppState::with_files_root_and_approvals(h.dir.join("files"), None)
-        .with_deepseek_backends(h.config.clone(), Some(h.dir.join("production-loops.jsonl")), None)
+        .with_deepseek_backends(
+            h.config.clone(),
+            h.broker.clone(),
+            Some(h.dir.join("production-loops.jsonl")),
+            None,
+        )
         .unwrap()
         .with_auto_drive(false);
     let (url, server) = serve(app(state)).await;
@@ -901,7 +913,12 @@ async fn configured_production_builder_enables_loop_and_keeps_chat_request_uncha
 async fn no_key_builder_keeps_loop_503_and_chat_echo() {
     let mut h = Harness::new(vec![]).await;
     let state = AppState::with_files_root_and_approvals(h.dir.join("files"), None)
-        .with_deepseek_backends(DeepSeekConfig::disabled(), None, None)
+        .with_deepseek_backends(
+            DeepSeekConfig::disabled(),
+            DeepSeekCredentialBroker::disabled(),
+            None,
+            None,
+        )
         .unwrap();
     let (url, server) = serve(app(state)).await;
     h.url = url;

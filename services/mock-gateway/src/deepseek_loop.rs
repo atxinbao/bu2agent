@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::deepseek::DeepSeekConfig;
-use crate::policy_store::NetworkRule;
+use crate::deepseek::{DeepSeekConfig, DeepSeekCredentialBroker};
 use crate::loop_engine::{
     BackendFuture, LoopModel, Message, ModelError, ModelReply, Proposal, WireCall,
 };
+use crate::policy_store::NetworkRule;
 
 /// pub(crate): P0-E snapshots digest the driving template, so
 /// the server's snapshot builder reads this constant rather
@@ -52,6 +52,10 @@ unknown 表示结果未确认，不能当作成功；后续读取只是观测，
 #[derive(Clone)]
 pub struct DeepSeekLoopModel {
     config: DeepSeekConfig,
+    /// AO-6 (Q-AO6-02): the broker holds the key; this
+    /// model's config is keyless. The key is asked for at
+    /// POST time in `complete_inner` and nowhere else.
+    broker: DeepSeekCredentialBroker,
     http: reqwest::Client,
     /// Task 13: shared network-rules handle, same as the
     /// chat client. None means no enforcement.
@@ -60,8 +64,13 @@ pub struct DeepSeekLoopModel {
 
 impl DeepSeekLoopModel {
     /// 使用启动时已经解析的配置，不再次查询环境或 Keychain。
-    pub fn new(config: DeepSeekConfig) -> Result<Option<Self>, String> {
-        if config.api_key.as_deref().is_none_or(str::is_empty) {
+    /// AO-6: the config is keyless; the broker carries the
+    /// key (resolved once at startup, Q-AO6-01).
+    pub fn new(
+        config: DeepSeekConfig,
+        broker: DeepSeekCredentialBroker,
+    ) -> Result<Option<Self>, String> {
+        if broker.key().is_none() {
             return Ok(None);
         }
         let http = reqwest::Client::builder()
@@ -70,7 +79,12 @@ impl DeepSeekLoopModel {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| "cannot initialize loop HTTP client".to_string())?;
-        Ok(Some(Self { config, http, network_rules: None }))
+        Ok(Some(Self {
+            config,
+            broker,
+            http,
+            network_rules: None,
+        }))
     }
 
     pub fn with_network_rules(mut self, rules: Arc<Mutex<Option<Vec<NetworkRule>>>>) -> Self {
@@ -177,13 +191,16 @@ impl DeepSeekLoopModel {
             "thinking": {"type":"disabled"},
             "stream": false
         });
+        // AO-6 (Q-AO6-02): the key comes from the broker at
+        // POST time; the model's own config is keyless.
+        // The deny check above still runs first (Task 13).
         let response = this
             .http
             .post(format!(
                 "{}/chat/completions",
                 this.config.base_url.trim_end_matches('/')
             ))
-            .bearer_auth(this.config.api_key.as_ref().ok_or(ModelError::Failed)?)
+            .bearer_auth(this.broker.key().ok_or(ModelError::Failed)?)
             .timeout(timeout.min(Duration::from_secs(30)))
             .json(&request)
             .send()

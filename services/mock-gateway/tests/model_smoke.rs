@@ -40,19 +40,24 @@ async fn model_chat_send_via_fake_deepseek() {
     // A stub provider that records hits and returns a canned
     // completion, so the task can assert that enforcement is
     // decided before any POST (deny = zero hits).
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub listener");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub listener");
     let stub_addr = listener.local_addr().expect("stub listener addr");
     let hits = Arc::new(AtomicUsize::new(0));
     let hits_task = hits.clone();
     let stub = tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
             let hits = hits_task.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
                 let _ = stream.read(&mut buf).await;
                 hits.fetch_add(1, Ordering::SeqCst);
-                let body = r#"{"choices":[{"message":{"content":"stub reply"},"finish_reason":"stop"}]}"#;
+                let body =
+                    r#"{"choices":[{"message":{"content":"stub reply"},"finish_reason":"stop"}]}"#;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -73,10 +78,13 @@ async fn model_chat_send_via_fake_deepseek() {
     let config = DeepSeekConfig {
         base_url: base_url.clone(),
         model: "deepseek-flash".to_string(),
-        api_key: Some("sk-test-fake".to_string()),
     };
     let rules = Arc::new(Mutex::new(None));
-    let client = DeepSeekClient::new(config).with_network_rules(rules.clone());
+    let client = DeepSeekClient::new(
+        config,
+        mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("sk-test-fake"),
+    )
+    .with_network_rules(rules.clone());
     let state = AppState::default().with_deepseek(client);
     let (addr, handle) = start_server(state).await;
 
@@ -201,7 +209,10 @@ async fn model_get_post_and_restart() {
         let staged = load_model_state(&path);
         let config = merge_staged_config(DeepSeekConfig::disabled(), &staged, None, None);
         let state = AppState::default()
-            .with_deepseek(DeepSeekClient::new(config))
+            .with_deepseek(DeepSeekClient::new(
+                config,
+                mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("sk-test-fake"),
+            ))
             .with_model_state_path(path.clone());
         let (addr, handle) = start_server(state).await;
         let (head, view) = get(addr).await;
@@ -218,13 +229,22 @@ async fn model_key_never_leaks() {
     let config = DeepSeekConfig {
         base_url: "https://api.deepseek.com".to_string(),
         model: "deepseek-flash".to_string(),
-        api_key: Some("sk-test-fake-key-1234".to_string()),
     };
-    let state = AppState::default().with_deepseek(DeepSeekClient::new(config));
+    let state = AppState::default().with_deepseek(DeepSeekClient::new(
+        config,
+        mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("sk-test-fake-key-1234"),
+    ));
     let (addr, handle) = start_server(state).await;
-    let (head, body) = raw(addr, "GET /model HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+    let (head, body) = raw(
+        addr,
+        "GET /model HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    )
+    .await;
     assert!(head.contains("200"), "{head}");
-    assert!(!body.contains("sk-test-fake-key-1234"), "key leaked in response");
+    assert!(
+        !body.contains("sk-test-fake-key-1234"),
+        "key leaked in response"
+    );
     let view: serde_json::Value = serde_json::from_str(&body).expect("GET /model body is JSON");
     assert_eq!(view["key_configured"], true);
     assert_eq!(view["key_redacted"], "****1234");

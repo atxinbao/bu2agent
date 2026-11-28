@@ -167,7 +167,6 @@ pub(crate) async fn agent_tool_call(
     dispatch_agent_tool(&state, req)
 }
 
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LoopIdDto {
@@ -415,12 +414,15 @@ pub(crate) fn start_research(
         let planner_config = crate::deepseek::DeepSeekConfig {
             base_url: config.base_url.clone(),
             model: crate::task_runner::planner_model_for(state),
-            api_key: config.api_key.clone(),
         };
-        match crate::deepseek_loop::DeepSeekLoopModel::new(planner_config) {
-            Ok(Some(model)) => Some(Arc::new(
-                model.with_network_rules(state.policy_rules.clone()),
-            ) as Arc<dyn crate::loop_engine::LoopModel>),
+        match crate::deepseek_loop::DeepSeekLoopModel::new(
+            planner_config,
+            state.deepseek.broker().clone(),
+        ) {
+            Ok(Some(model)) => Some(
+                Arc::new(model.with_network_rules(state.policy_rules.clone()))
+                    as Arc<dyn crate::loop_engine::LoopModel>,
+            ),
             _ => None,
         }
     };

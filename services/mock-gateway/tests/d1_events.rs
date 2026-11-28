@@ -97,8 +97,8 @@ fn build_state(dir: &Path, model: Arc<ScriptModel>) -> AppState {
         mock_gateway::deepseek::DeepSeekConfig {
             base_url: "http://127.0.0.1:1".to_string(),
             model: "fixture".to_string(),
-            api_key: Some("fake-d1-key".to_string()),
         },
+        mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("fake-d1-key"),
     ))
     .with_auto_drive(false)
     .with_executions_path(dir.join("executions.jsonl"))
@@ -647,9 +647,10 @@ async fn e5_fold_covers_policy_mandates_cursors() {
         events.iter().any(|e| e.event_type == "mandate.superseded"),
         "mandate.superseded on the log"
     );
-    for event in events.iter().filter(|e| {
-        e.aggregate_kind == "policy_version" || e.aggregate_kind == "mandate"
-    }) {
+    for event in events
+        .iter()
+        .filter(|e| e.aggregate_kind == "policy_version" || e.aggregate_kind == "mandate")
+    {
         let lower = event.payload_json.to_lowercase();
         for secret_shape in ["secret", "api_key", "password", "token"] {
             assert!(

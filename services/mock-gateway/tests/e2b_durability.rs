@@ -176,11 +176,13 @@ impl Harness {
         let root = dir.join("files");
         let model: Arc<dyn LoopModel> = match &real_loop_model_url {
             Some(base) => {
-                let model = DeepSeekLoopModel::new(DeepSeekConfig {
-                    base_url: base.clone(),
-                    model: "fixture-loop".to_string(),
-                    api_key: Some("fake-loop-key".to_string()),
-                })
+                let model = DeepSeekLoopModel::new(
+                    DeepSeekConfig {
+                        base_url: base.clone(),
+                        model: "fixture-loop".to_string(),
+                    },
+                    mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("fake-loop-key"),
+                )
                 .expect("loop model config")
                 .expect("loop model with key");
                 // No with_network_rules handle: enforcement for
@@ -1004,12 +1006,11 @@ async fn e2b_windows_t1() {
     let conn = h.db();
     let workers = sqlite_store::list_worker_sessions(&conn).expect("workers");
     assert!(!workers.is_empty());
+    assert!(workers.iter().all(|w| w.status == "ended"), "{workers:?}");
     assert!(
-        workers.iter().all(|w| w.status == "ended"),
-        "{workers:?}"
-    );
-    assert!(
-        workers.iter().all(|w| w.detail.as_deref() == Some("clean shutdown")),
+        workers
+            .iter()
+            .all(|w| w.detail.as_deref() == Some("clean shutdown")),
         "{workers:?}"
     );
     let assignments = sqlite_store::list_assignments(&conn).expect("assignments");

@@ -150,8 +150,8 @@ fn build_state(dir: &Path, model: Arc<ScriptModel>, token: Option<&str>) -> AppS
         mock_gateway::deepseek::DeepSeekConfig {
             base_url: "http://127.0.0.1:1".to_string(),
             model: "fixture".to_string(),
-            api_key: Some("fake-mcl3-key".to_string()),
         },
+        mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("fake-mcl3-key"),
     ))
     .with_auto_drive(false)
     .with_executions_path(dir.join("executions.jsonl"))

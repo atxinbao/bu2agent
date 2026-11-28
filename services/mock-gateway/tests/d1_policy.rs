@@ -132,11 +132,13 @@ fn build_state(
         Timeouts::default(),
     )
     .unwrap()
-    .with_deepseek(DeepSeekClient::new(DeepSeekConfig {
-        base_url: "http://127.0.0.1:1".to_string(),
-        model: "fixture".to_string(),
-        api_key: Some("fake-d1-key".to_string()),
-    }))
+    .with_deepseek(DeepSeekClient::new(
+        DeepSeekConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            model: "fixture".to_string(),
+        },
+        mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("fake-d1-key"),
+    ))
     .with_auto_drive(false)
     .with_executions_path(dir.join("executions.jsonl"))
     .with_effects_path(dir.join("effects.jsonl"))

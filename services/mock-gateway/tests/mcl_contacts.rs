@@ -135,24 +135,25 @@ impl ContactsSource for MutableFakeContactsSource {
         Ok(views.into_iter().skip(offset).take(limit).collect())
     }
 
-    fn contact_content(
-        &self,
-        native_id: &str,
-    ) -> Result<Option<ContactContent>, ContactsError> {
+    fn contact_content(&self, native_id: &str) -> Result<Option<ContactContent>, ContactsError> {
         let views = self.contacts.lock().unwrap();
-        Ok(views.iter().find(|v| v.native_id == native_id).map(|v| {
-            ContactContent {
+        Ok(views
+            .iter()
+            .find(|v| v.native_id == native_id)
+            .map(|v| ContactContent {
                 display_name: v.display_name.clone(),
                 organization: v.organization.clone(),
                 job_title: v.job_title.clone(),
                 phones: v.phones.clone(),
                 emails: v.emails.clone(),
-            }
-        }))
+            }))
     }
 
     fn create_contact(&self, content: &ContactContent) -> Result<String, ContactsError> {
-        let native_id = format!("fake-person-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+        let native_id = format!(
+            "fake-person-{}",
+            self.next_id.fetch_add(1, Ordering::SeqCst)
+        );
         self.contacts.lock().unwrap().push(ContactView {
             native_id: native_id.clone(),
             display_name: content.display_name.clone(),
@@ -262,8 +263,8 @@ fn build_state(
         mock_gateway::deepseek::DeepSeekConfig {
             base_url: "http://127.0.0.1:1".to_string(),
             model: "fixture".to_string(),
-            api_key: Some("fake-mcl2-key".to_string()),
         },
+        mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("fake-mcl2-key"),
     ))
     .with_auto_drive(false)
     .with_executions_path(dir.join("executions.jsonl"))

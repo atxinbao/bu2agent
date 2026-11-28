@@ -54,6 +54,29 @@ pub fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
 
+/// AO-6 (Q-AO6-03c): the runtime-library deny set — file
+/// paths the loop may never write, even with an approval.
+/// The two entries are the approved set, named one by one;
+/// do not widen it to the whole repository without a new
+/// approval (Q-AO6-03's wide alternative was not taken).
+/// Paths are compared against the normalized form
+/// (`normalize_path` above: no `..`, no backslash, no
+/// absolute path, components rejoined with `/`).
+pub const RUNTIME_LIBRARY_PREFIXES: &[&str] =
+    &["services/mock-gateway/src", "apps/shell/src-tauri/src"];
+
+/// AO-6 (Q-AO6-03c): true when the (already normalized)
+/// path names the runtime library itself or anything under
+/// it. A path that fails normalization is not denied here —
+/// `normalize_path` rejects it upstream, and the dispatch's
+/// `resolve_file` rejects it downstream.
+pub fn is_runtime_library_path(path: &str) -> bool {
+    let normalized = normalize_path(path).unwrap_or_else(|| path.to_string());
+    RUNTIME_LIBRARY_PREFIXES
+        .iter()
+        .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix}/")))
+}
+
 /// D1-6a: ISO8601 / RFC3339 timestamps without a date
 /// crate (the workspace has no chrono/time dependency,
 /// and this batch must not add one for two small
@@ -601,6 +624,33 @@ mod tests {
         assert_eq!(normalize_path("a//b"), Some("a/b".to_string()));
         assert_eq!(normalize_path("a/b/"), Some("a/b".to_string()));
         assert_eq!(normalize_path("report.md"), Some("report.md".to_string()));
+    }
+
+    #[test]
+    fn runtime_library_deny_set_is_exact() {
+        // AO-6 (Q-AO6-03c): the approved set, named path by
+        // path. Expected values are the approved prefixes
+        // themselves — read from the plan, not from the code.
+        assert!(is_runtime_library_path(
+            "services/mock-gateway/src/server.rs"
+        ));
+        assert!(is_runtime_library_path("services/mock-gateway/src"));
+        assert!(is_runtime_library_path("apps/shell/src-tauri/src/main.rs"));
+        assert!(is_runtime_library_path("apps/shell/src-tauri/src"));
+        assert!(!is_runtime_library_path(
+            "services/mock-gateway/tests/always_on.rs"
+        ));
+        assert!(!is_runtime_library_path("services/mock-gateway/Cargo.toml"));
+        assert!(!is_runtime_library_path("apps/shell/src-tauri/Cargo.toml"));
+        assert!(!is_runtime_library_path("apps/web/src/views/TasksView.tsx"));
+        assert!(!is_runtime_library_path("notes/hello.txt"));
+        // A sibling prefix must not match by string prefix.
+        assert!(!is_runtime_library_path("services/mock-gateway/src2/x.rs"));
+        assert!(!is_runtime_library_path("apps/shell/src-tauri/src2/x.rs"));
+        // Normalization collapses `.` before the check.
+        assert!(is_runtime_library_path(
+            "services/mock-gateway/./src/server.rs"
+        ));
     }
 
     #[test]

@@ -178,11 +178,13 @@ fn build_state(dir: &Path, model: Arc<ScriptModel>, deepseek_base_url: &str) -> 
         Timeouts::default(),
     )
     .unwrap()
-    .with_deepseek(DeepSeekClient::new(DeepSeekConfig {
-        base_url: deepseek_base_url.to_string(),
-        model: "fixture".to_string(),
-        api_key: Some("fake-d1-key".to_string()),
-    }))
+    .with_deepseek(DeepSeekClient::new(
+        DeepSeekConfig {
+            base_url: deepseek_base_url.to_string(),
+            model: "fixture".to_string(),
+        },
+        mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("fake-d1-key"),
+    ))
     .with_auto_drive(false)
     .with_executions_path(dir.join("executions.jsonl"))
     .with_effects_path(dir.join("effects.jsonl"))

@@ -46,15 +46,16 @@
 //! messages — the recorded model request is the
 //! honest observation point.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::{extract::State, routing::post, Json, Router};
-use mock_gateway::deepseek::{DeepSeekClient, DeepSeekConfig};
+use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
+use mock_gateway::deepseek::{DeepSeekClient, DeepSeekConfig, DeepSeekCredentialBroker};
 use mock_gateway::deepseek_loop::DeepSeekLoopModel;
-use mock_gateway::loop_engine::Timeouts;
+use mock_gateway::loop_engine::{args_digest, Timeouts};
 use mock_gateway::memory_store::{self, DreamSession, MemoryRow, MemorySource};
 use mock_gateway::server::{app, AppState};
 use mock_gateway::sqlite_store::{self, DB_SCHEMA_VERSION};
@@ -117,6 +118,55 @@ async fn start_recording_deepseek() -> (String, Arc<Mutex<Vec<Value>>>) {
     (format!("http://{addr}"), requests)
 }
 
+/// AO-6 (F1): like the recording fake, but it also
+/// records the `authorization` header of every model
+/// request — the only place the broker's key may ever
+/// appear on the wire. The header is stored apart
+/// from the body so the test can assert, separately,
+/// that the header carries the key and the body does
+/// not. A missing header records as "<missing>".
+#[derive(Clone)]
+struct HeaderRecordingFake {
+    requests: Arc<Mutex<Vec<Value>>>,
+    auth_headers: Arc<Mutex<Vec<String>>>,
+}
+
+async fn header_recording_completion(
+    State(shared): State<HeaderRecordingFake>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<missing>")
+        .to_string();
+    shared.auth_headers.lock().unwrap().push(auth);
+    shared.requests.lock().unwrap().push(body);
+    (
+        StatusCode::OK,
+        Json(
+            json!({"choices":[{"message":{"role":"assistant","content":"done","tool_calls":null},"finish_reason":"stop"}]}),
+        ),
+    )
+}
+
+async fn start_header_recording_deepseek() -> (String, Arc<Mutex<Vec<Value>>>, Arc<Mutex<Vec<String>>>) {
+    let fake = HeaderRecordingFake {
+        requests: Arc::new(Mutex::new(Vec::new())),
+        auth_headers: Arc::new(Mutex::new(Vec::new())),
+    };
+    let requests = fake.requests.clone();
+    let auth_headers = fake.auth_headers.clone();
+    let app = Router::new()
+        .route("/chat/completions", post(header_recording_completion))
+        .with_state(fake);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), requests, auth_headers)
+}
+
 /// AO-3: a scripted fake DeepSeek — it serves the
 /// given replies in order (one per model request,
 /// falling back to the recording fake's final-text
@@ -164,14 +214,15 @@ fn build_state(dir: &Path, deepseek_base_url: &str, auto_drive: bool) -> AppStat
     let config = DeepSeekConfig {
         base_url: deepseek_base_url.to_string(),
         model: "fixture".to_string(),
-        api_key: Some("test-key".to_string()),
     };
+    // AO-6: the key lives in the broker, never in the config.
+    let broker = DeepSeekCredentialBroker::test_key("test-key");
     // AO-4: the loop engine needs a model backend, or
     // loop_start 503s with loop_model_not_configured.
     // The model points at the (fake) DeepSeek URL, so
     // D1/D2 reach the recording fake; A/B/E tests never
     // start a loop, so this changes nothing for them.
-    let model = DeepSeekLoopModel::new(config.clone())
+    let model = DeepSeekLoopModel::new(config.clone(), broker.clone())
         .expect("loop model builds")
         .expect("test key configures a loop model");
     let state = AppState::with_files_root_and_approvals(
@@ -180,7 +231,7 @@ fn build_state(dir: &Path, deepseek_base_url: &str, auto_drive: bool) -> AppStat
     )
     .with_tasks_path(dir.join("tasks.jsonl"))
     .with_task_drafts_dir(dir.join("drafts"))
-    .with_deepseek(DeepSeekClient::new(config))
+    .with_deepseek(DeepSeekClient::new(config, broker))
     .with_loop_backends(
         Some(dir.join("loops.jsonl")),
         Some(std::sync::Arc::new(model)),
@@ -218,6 +269,11 @@ struct Harness {
     /// AO-4: bodies the recording fake DeepSeek saw
     /// (empty for `serve`, which drops connections).
     model_requests: Arc<Mutex<Vec<Value>>>,
+    /// AO-6 (F1): `authorization` headers the
+    /// header-recording fake saw, one per model
+    /// request, in order (empty for every harness
+    /// that does not use that fake).
+    model_auth_headers: Arc<Mutex<Vec<String>>>,
     /// AO-3: whether this harness leaves the loop
     /// auto-driver on (driven harnesses run wake Runs
     /// through the real spawn_driver + waiter path).
@@ -233,6 +289,23 @@ impl Harness {
         dir: PathBuf,
         deepseek_base_url: String,
         model_requests: Arc<Mutex<Vec<Value>>>,
+        auto_drive: bool,
+    ) -> Self {
+        Self::serve_from_with_headers(
+            dir,
+            deepseek_base_url,
+            model_requests,
+            Arc::new(Mutex::new(Vec::new())),
+            auto_drive,
+        )
+        .await
+    }
+
+    async fn serve_from_with_headers(
+        dir: PathBuf,
+        deepseek_base_url: String,
+        model_requests: Arc<Mutex<Vec<Value>>>,
+        model_auth_headers: Arc<Mutex<Vec<String>>>,
         auto_drive: bool,
     ) -> Self {
         std::fs::create_dir_all(dir.join("files")).unwrap();
@@ -252,6 +325,7 @@ impl Harness {
             server: Some(server),
             state: harness_state,
             model_requests,
+            model_auth_headers,
             auto_drive,
         }
     }
@@ -318,8 +392,32 @@ impl Harness {
         Self::serve_from(dir, deepseek_base_url, model_requests, true).await
     }
 
+    /// AO-6 (F1): the header-recording fake with the
+    /// auto-driver off — the loop only advances on
+    /// explicit `loop_resume` calls, so F1 drives the
+    /// chat funnel and the loop funnel one step at a
+    /// time and reads the headers the fake recorded.
+    async fn serve_header_recording() -> Self {
+        let dir = temp_dir("ao6");
+        let (deepseek_base_url, model_requests, model_auth_headers) =
+            start_header_recording_deepseek().await;
+        Self::serve_from_with_headers(
+            dir,
+            deepseek_base_url,
+            model_requests,
+            model_auth_headers,
+            false,
+        )
+        .await
+    }
+
     fn model_requests(&self) -> Vec<Value> {
         self.model_requests.lock().unwrap().clone()
+    }
+
+    /// AO-6 (F1): `authorization` headers, in order.
+    fn model_auth_headers(&self) -> Vec<String> {
+        self.model_auth_headers.lock().unwrap().clone()
     }
 
     /// AO-3: one event row, by id.
@@ -520,6 +618,73 @@ impl Harness {
             .unwrap();
         let status = resp.status();
         (status, resp.json().await.unwrap())
+    }
+
+    /// AO-6: POST any JSON body, read a JSON reply
+    /// (the decide + resume-with-approval calls).
+    async fn post_json(&self, path: &str, body: Value) -> (StatusCode, Value) {
+        let resp = self
+            .client
+            .post(format!("{}{path}", self.url))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, resp.json().await.unwrap())
+    }
+
+    /// AO-6: POST any JSON body, read the raw reply
+    /// text (the chat stream, whose body is SSE
+    /// records, not one JSON object).
+    async fn post_raw(&self, path: &str, body: Value) -> (StatusCode, String) {
+        let resp = self
+            .client
+            .post(format!("{}{path}", self.url))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, resp.text().await.unwrap())
+    }
+
+    /// AO-6: GET any path, read a JSON reply.
+    async fn get_json(&self, path: &str) -> (StatusCode, Value) {
+        let resp = self
+            .client
+            .get(format!("{}{path}", self.url))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, resp.json().await.unwrap())
+    }
+
+    /// AO-6: poll a loop's status until it reaches
+    /// `want` (up to 30 s); returns the last view
+    /// seen, so a timeout reads as the wrong status
+    /// in the caller's assert instead of hanging.
+    async fn wait_loop_status(&self, loop_id: &str, want: &str) -> Value {
+        for _ in 0..300 {
+            let (_, view) = self.loop_get(loop_id).await;
+            if view["status"] == want {
+                return view;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let (_, view) = self.loop_get(loop_id).await;
+        view
+    }
+
+    /// AO-6: Effect rows planned (effects.jsonl is
+    /// append-only; a missing file means zero rows).
+    fn effect_rows(&self) -> usize {
+        let path = self.dir.join("effects.jsonl");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return 0;
+        };
+        text.lines().filter(|line| !line.trim().is_empty()).count()
     }
 
     /// Restart the gateway on the same directory (same
@@ -1964,14 +2129,17 @@ async fn ao3_c5_stale_claim_recovers_fresh_claim_untouched() {
     {
         let mut conn = h.db();
         assert!(sqlite_store::claim_agent_event(&mut conn, "agent-event-1", now).unwrap());
-        assert!(sqlite_store::claim_agent_event(&mut conn, "agent-event-2", now - 700_000).unwrap());
+        assert!(
+            sqlite_store::claim_agent_event(&mut conn, "agent-event-2", now - 700_000).unwrap()
+        );
     }
-    assert_eq!(h.state.drive_wake_events(), 1, "only the stale one re-drives");
-    assert_eq!(h.event_row("agent-event-1").status, "claimed");
     assert_eq!(
-        h.wait_event_status("agent-event-2", "done").await,
-        "done"
+        h.state.drive_wake_events(),
+        1,
+        "only the stale one re-drives"
     );
+    assert_eq!(h.event_row("agent-event-1").status, "claimed");
+    assert_eq!(h.wait_event_status("agent-event-2", "done").await, "done");
     assert_eq!(h.event_row("agent-event-1").status, "claimed");
 
     // Age the first claim past the threshold too, and
@@ -2117,4 +2285,322 @@ async fn ao3_c8_daily_cap_holds_49th_event() {
     assert_eq!(h.state.drive_wake_events(), 0, "still capped");
     assert_eq!(h.count_inbox(), 1, "one row per day, deduped");
     assert_eq!(h.event_row("agent-event-49").status, "pending");
+}
+
+/// F1 (Q-AO6-02): the broker's key reaches the model
+/// only as an `Authorization: Bearer` header, and no
+/// loop-layer structure or log ever contains the full
+/// key. The test key is "test-key" (build_state's
+/// broker); the header it must produce is "Bearer
+/// test-key", and the redacted form in GET /model is
+/// "****-key" (the last four characters, by hand:
+/// "test-key" ends in "-key"). The chat funnel and
+/// the loop funnel are both driven against the same
+/// header-recording fake.
+#[tokio::test]
+async fn ao6_f1_broker_key_never_leaves_the_broker() {
+    let h = Harness::serve_header_recording().await;
+
+    // Chat funnel: one model request.
+    let (status, stream) = h
+        .post_raw(
+            "/chat/stream/start",
+            json!({"stream_id": "s1", "turn_id": "t1", "text": "你好"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{stream}");
+    assert!(
+        stream.contains("done"),
+        "reply must come from the model, not the echo: {stream}"
+    );
+
+    // Loop funnel: one model request, no tools.
+    let (status, started) = h.loop_start(json!({"prompt": "开始"})).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let loop_id = started["loop_id"].as_str().unwrap().to_string();
+    let (status, view) = h.loop_resume(&loop_id).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["status"], "completed");
+    assert_eq!(view["final_text"], "done");
+
+    // Two model requests, both carrying the key only
+    // as a Bearer header.
+    let headers = h.model_auth_headers();
+    assert_eq!(headers.len(), 2, "one chat request, one loop request");
+    for header in &headers {
+        assert_eq!(header, "Bearer test-key");
+    }
+    // No request body carries the key.
+    for body in h.model_requests() {
+        let text = serde_json::to_string(&body).unwrap();
+        assert!(!text.contains("test-key"), "key in request body: {text}");
+    }
+    // No loop-layer view carries the key.
+    let (_, view) = h.loop_get(&loop_id).await;
+    let view_text = serde_json::to_string(&view).unwrap();
+    assert!(!view_text.contains("test-key"), "key in loop view: {view_text}");
+    // GET /model shows the key only in its redacted
+    // form (existing behaviour, not a leak).
+    let (status, model) = h.get_json("/model").await;
+    assert_eq!(status, StatusCode::OK, "{model}");
+    assert_eq!(model["key_configured"], true);
+    assert_eq!(model["key_redacted"], "****-key");
+    let model_text = serde_json::to_string(&model).unwrap();
+    assert!(!model_text.contains("test-key"), "key in /model: {model_text}");
+}
+
+/// F2 (Q-AO6-04a): a foreground loop that proposes
+/// an ordinary-path write does not execute it — the
+/// approval record is built and the loop parks in
+/// AwaitingApproval. The approval record's existence
+/// is proven by the decide call: deciding an unknown
+/// id 404s, so a 200 means the record is there. (The
+/// plan's §3 open point, resolved during
+/// implementation: `request_loop_approval` writes no
+/// Inbox row — the observable is the approval record
+/// + the parked loop, not an Inbox row.)
+#[tokio::test]
+async fn ao6_f2_foreground_write_parks_for_approval() {
+    let write_reply = json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"fs_write","arguments":"{\"path\":\"notes/hello.txt\",\"text\":\"hello ao6\"}"}}]},"finish_reason":"tool_calls"}]});
+    let h = Harness::serve_scripted(vec![write_reply]).await;
+    let (status, started) = h.loop_start(json!({"prompt": "开始"})).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let loop_id = started["loop_id"].as_str().unwrap().to_string();
+    // One resume is one unit of work: the first
+    // makes the model call (the proposal lands, the
+    // loop is still running); the second processes
+    // the queued proposal and parks it.
+    let (status, running) = h.loop_resume(&loop_id).await;
+    assert_eq!(status, StatusCode::OK, "{running}");
+    assert_eq!(running["status"], "running");
+    let (status, parked) = h.loop_resume(&loop_id).await;
+    assert_eq!(status, StatusCode::OK, "{parked}");
+    assert_eq!(parked["status"], "awaiting_approval");
+    let calls = parked["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], "fs.write");
+    assert_eq!(calls[0]["status"], "awaiting_approval");
+    assert_eq!(calls[0]["submitted"], false);
+    let approval_id = calls[0]["approval_id"]
+        .as_str()
+        .expect("approval_id set")
+        .to_string();
+    let binding = calls[0]["binding"].clone();
+    assert!(binding.is_object(), "binding present: {binding}");
+    let digest = binding["args_sha256"].as_str().expect("args_sha256 set");
+    assert_eq!(digest.len(), 64, "sha256 hex: {digest}");
+    assert!(
+        digest.chars().all(|c| c.is_ascii_hexdigit()),
+        "sha256 hex: {digest}"
+    );
+    // The write has not landed.
+    assert!(!h.dir.join("files").join("notes/hello.txt").exists());
+    // The approval record exists: a decide on its id
+    // is accepted (an unknown id 404s).
+    let (status, decided) = h
+        .post_json(
+            "/approval/decide",
+            json!({"tool_call_id": approval_id, "status": "approved"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{decided}");
+    // Deciding alone does not resume the loop.
+    let (_, view) = h.loop_get(&loop_id).await;
+    assert_eq!(view["status"], "awaiting_approval");
+    assert!(!h.dir.join("files").join("notes/hello.txt").exists());
+}
+
+/// F3: the F2 park, decided, then resumed with the
+/// approval — the loop continues unbroken, the write
+/// lands, and the final text is produced.
+#[tokio::test]
+async fn ao6_f3_resume_after_approval_continues() {
+    let write_reply = json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"fs_write","arguments":"{\"path\":\"notes/hello.txt\",\"text\":\"hello ao6\"}"}}]},"finish_reason":"tool_calls"}]});
+    let h = Harness::serve_scripted(vec![write_reply]).await;
+    let (status, started) = h.loop_start(json!({"prompt": "开始"})).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let loop_id = started["loop_id"].as_str().unwrap().to_string();
+    // One resume is one unit of work: the first
+    // makes the model call (the proposal lands, the
+    // loop is still running); the second processes
+    // the queued proposal and parks it.
+    let (status, running) = h.loop_resume(&loop_id).await;
+    assert_eq!(status, StatusCode::OK, "{running}");
+    assert_eq!(running["status"], "running");
+    let (status, parked) = h.loop_resume(&loop_id).await;
+    assert_eq!(status, StatusCode::OK, "{parked}");
+    assert_eq!(parked["status"], "awaiting_approval");
+    let call = parked["calls"][0].clone();
+    let approval_id = call["approval_id"].as_str().unwrap().to_string();
+    let binding = call["binding"].clone();
+    let (status, decided) = h
+        .post_json(
+            "/approval/decide",
+            json!({"tool_call_id": approval_id, "status": "approved"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{decided}");
+    // This resume dispatches the write (one unit of
+    // work); the final model call needs one more step
+    // (the `deepseek_loop_smoke` decide precedent).
+    let (status, resumed) = h
+        .post_json(
+            "/agent/loop/resume",
+            json!({"loop_id": loop_id, "approval_id": approval_id, "binding": binding}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resumed}");
+    let (status, view) = h.loop_resume(&loop_id).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["status"], "completed");
+    assert_eq!(view["final_text"], "done");
+    let calls = view["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], "fs.write");
+    assert_eq!(calls[0]["submitted"], true);
+    let text =
+        std::fs::read_to_string(h.dir.join("files").join("notes/hello.txt")).expect("write landed");
+    assert_eq!(text, "hello ao6");
+    assert_eq!(h.model_requests().len(), 2, "proposal + final");
+}
+
+/// F4a (Q-AO6-03c/Q-AO6-04): a loop that proposes
+/// writing into the runtime library is refused at
+/// proposal time — Failed + InvalidTool, never
+/// parked, never dispatched, no Effect, the library
+/// file byte-identical.
+#[tokio::test]
+async fn ao6_f4a_runtime_library_write_denied() {
+    let runtime_path = "services/mock-gateway/src/server.rs";
+    let before = std::fs::read(std::env::current_dir().unwrap().join("src/server.rs"))
+        .expect("runtime library present");
+    let write_reply = json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"fs_write","arguments":"{\"path\":\"services/mock-gateway/src/server.rs\",\"text\":\"x\"}"}}]},"finish_reason":"tool_calls"}]});
+    let h = Harness::serve_scripted_driven(vec![write_reply]).await;
+    let (status, started) = h.loop_start(json!({"prompt": "开始"})).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let loop_id = started["loop_id"].as_str().unwrap().to_string();
+    let view = h.wait_loop_status(&loop_id, "completed").await;
+    assert_eq!(view["status"], "completed");
+    let calls = view["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], "fs.write");
+    assert_eq!(calls[0]["status"], "failed");
+    assert_eq!(calls[0]["error"], "invalid_tool");
+    assert_eq!(calls[0]["approval_id"], Value::Null);
+    assert_eq!(calls[0]["submitted"], false);
+    // The write never landed anywhere — not under
+    // the files root, and the real library file is
+    // byte-identical.
+    assert!(!h.dir.join("files").join(runtime_path).exists());
+    let after = std::fs::read(std::env::current_dir().unwrap().join("src/server.rs"))
+        .expect("runtime library present");
+    assert_eq!(before, after, "runtime library untouched");
+    assert_eq!(h.effect_rows(), 0, "no Effect planned");
+    assert_eq!(h.count_inbox(), 0, "no side-effect row");
+    assert_eq!(h.model_requests().len(), 2, "proposal + final");
+}
+
+/// F4b (Q-AO6-03b): a worker.run proposal for a
+/// remote-write command is refused at proposal time —
+/// Failed + InvalidArguments, never dispatched, no
+/// Effect. normalize() rejects any command outside
+/// the five allowlisted templates, so the explicit
+/// `remote_write_denied` code lives in
+/// resolve_command (for non-loop paths) and is pinned
+/// by a unit test there — the loop-level observable
+/// is the refusal itself.
+#[tokio::test]
+async fn ao6_f4b_git_push_refused() {
+    let push_reply = json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"worker_run","arguments":"{\"command\":\"git-push\",\"worktree_id\":\"wt-1\"}"}}]},"finish_reason":"tool_calls"}]});
+    let h = Harness::serve_scripted_driven(vec![push_reply]).await;
+    let (status, started) = h.loop_start(json!({"prompt": "开始"})).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let loop_id = started["loop_id"].as_str().unwrap().to_string();
+    let view = h.wait_loop_status(&loop_id, "completed").await;
+    assert_eq!(view["status"], "completed");
+    let calls = view["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], "worker.run");
+    assert_eq!(calls[0]["status"], "failed");
+    assert_eq!(calls[0]["error"], "invalid_arguments");
+    assert_eq!(calls[0]["approval_id"], Value::Null);
+    assert_eq!(calls[0]["submitted"], false);
+    assert_eq!(h.effect_rows(), 0, "no Effect planned");
+    assert_eq!(h.model_requests().len(), 2, "proposal + final");
+}
+
+/// F5 (Q-AO6-04): deny beats approval. The denied
+/// call never enters the approval flow (approval_id
+/// null, so no approval record exists — a decide
+/// against a fabricated id is refused 404 `unknown
+/// tool_call_id`); a resume carrying a fabricated
+/// approval is refused (409 `loop_is_terminal` on
+/// the completed loop, 403 `unexpected_approval` on
+/// a fresh loop that never issued an approval); the
+/// call stays Failed, the file stays absent, no
+/// Effect is planned.
+#[tokio::test]
+async fn ao6_f5_deny_beats_approval() {
+    let runtime_path = "services/mock-gateway/src/server.rs";
+    let write_reply = json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"fs_write","arguments":"{\"path\":\"services/mock-gateway/src/server.rs\",\"text\":\"x\"}"}}]},"finish_reason":"tool_calls"}]});
+    let h = Harness::serve_scripted_driven(vec![write_reply]).await;
+    let (status, started) = h.loop_start(json!({"prompt": "开始"})).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let loop_id = started["loop_id"].as_str().unwrap().to_string();
+    let view = h.wait_loop_status(&loop_id, "completed").await;
+    assert_eq!(view["status"], "completed");
+    let calls = view["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], "fs.write");
+    assert_eq!(calls[0]["status"], "failed");
+    assert_eq!(calls[0]["error"], "invalid_tool");
+    assert_eq!(calls[0]["approval_id"], Value::Null);
+    assert!(!h.dir.join("files").join(runtime_path).exists());
+    assert_eq!(h.effect_rows(), 0, "no Effect planned");
+
+    // No approval record exists to decide on.
+    let fabricated = "approval-ao6-fabricated";
+    let (status, decided) = h
+        .post_json(
+            "/approval/decide",
+            json!({"tool_call_id": fabricated, "status": "approved"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{decided}");
+    assert_eq!(decided["error"], "unknown tool_call_id");
+
+    // A resume carrying the fabricated approval
+    // cannot revive the denied call: the loop is
+    // terminal, the call stays Failed, nothing runs.
+    let binding = json!({"loop_id": loop_id, "call_id": 1, "tool": "fs.write", "args_sha256": args_digest("fs.write", &BTreeMap::from([("path".to_string(), runtime_path.to_string()), ("text".to_string(), "x".to_string())]))});
+    let (status, resumed) = h
+        .post_json(
+            "/agent/loop/resume",
+            json!({"loop_id": loop_id, "approval_id": fabricated, "binding": binding}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{resumed}");
+    assert_eq!(resumed["error"], "loop_is_terminal");
+    let (_, view) = h.loop_get(&loop_id).await;
+    assert_eq!(view["calls"][0]["status"], "failed");
+    assert!(!h.dir.join("files").join(runtime_path).exists());
+    assert_eq!(h.effect_rows(), 0, "still no Effect");
+
+    // A fresh loop that never issued an approval
+    // refuses a fabricated one outright (a second
+    // harness with the driver off, so the loop is
+    // still untouched when the resume lands).
+    let h2 = Harness::serve_scripted(vec![]).await;
+    let (status, started) = h2.loop_start(json!({"prompt": "开始"})).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let loop_id2 = started["loop_id"].as_str().unwrap().to_string();
+    let binding2 = json!({"loop_id": loop_id2, "call_id": 1, "tool": "fs.write", "args_sha256": args_digest("fs.write", &BTreeMap::from([("path".to_string(), "notes/hello.txt".to_string()), ("text".to_string(), "x".to_string())]))});
+    let (status, resumed) = h2
+        .post_json(
+            "/agent/loop/resume",
+            json!({"loop_id": loop_id2, "approval_id": fabricated, "binding": binding2}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{resumed}");
+    assert_eq!(resumed["error"], "unexpected_approval");
 }

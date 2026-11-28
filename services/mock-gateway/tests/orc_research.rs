@@ -328,8 +328,8 @@ fn build_state(dir: &Path, deepseek_base_url: &str) -> AppState {
         DeepSeekConfig {
             base_url: deepseek_base_url.to_string(),
             model: "fixture".to_string(),
-            api_key: Some("test-key".to_string()),
         },
+        mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("test-key"),
         Some(dir.join("loops.jsonl")),
         None,
     )

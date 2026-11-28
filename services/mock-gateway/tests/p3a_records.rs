@@ -474,8 +474,8 @@ async fn tasks_execute_accepts_and_validates_worktree_id() {
             mock_gateway::deepseek::DeepSeekConfig {
                 base_url: format!("http://{model_addr}"),
                 model: "fixture-3b".to_string(),
-                api_key: Some("test-only-fake-key".to_string()),
             },
+            mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("test-only-fake-key"),
         ));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -676,8 +676,8 @@ async fn loop_start_freezes_binding_into_snapshot() {
             mock_gateway::deepseek::DeepSeekConfig {
                 base_url: format!("http://{model_addr}"),
                 model: "fixture-3b".to_string(),
-                api_key: Some("test-only-fake-key".to_string()),
             },
+            mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("test-only-fake-key"),
             None,
             None,
         )

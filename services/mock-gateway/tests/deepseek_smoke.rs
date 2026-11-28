@@ -61,14 +61,18 @@ async fn start_fake_deepseek(
         body
     );
     let handle = tokio::spawn(async move {
-        let Ok((mut socket, _)) = listener.accept().await else { return };
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         // Read headers, then the body per Content-Length.
         let mut header_end = None;
         let mut content_length = 0usize;
         while header_end.is_none() {
-            let Ok(n) = socket.read(&mut chunk).await else { return };
+            let Ok(n) = socket.read(&mut chunk).await else {
+                return;
+            };
             if n == 0 {
                 return;
             }
@@ -87,7 +91,9 @@ async fn start_fake_deepseek(
         }
         let end = header_end.expect("header end") + content_length;
         while buf.len() < end {
-            let Ok(n) = socket.read(&mut chunk).await else { return };
+            let Ok(n) = socket.read(&mut chunk).await else {
+                return;
+            };
             if n == 0 {
                 return;
             }
@@ -139,10 +145,11 @@ fn configured_state(files_root: std::path::PathBuf, fake_addr: std::net::SocketA
     let config = DeepSeekConfig {
         base_url: format!("http://{fake_addr}"),
         model: "deepseek-flash".to_string(),
-        api_key: Some("test-key".to_string()),
     };
-    AppState::with_files_root_and_approvals(files_root, None)
-        .with_deepseek(DeepSeekClient::new(config))
+    AppState::with_files_root_and_approvals(files_root, None).with_deepseek(DeepSeekClient::new(
+        config,
+        mock_gateway::deepseek::DeepSeekCredentialBroker::test_key("test-key"),
+    ))
 }
 
 #[tokio::test]
@@ -179,8 +186,12 @@ async fn stream_start_returns_model_reply_when_configured() {
 #[tokio::test]
 async fn stream_start_echoes_without_key() {
     let files_root = temp_root("echo");
-    let state = AppState::with_files_root_and_approvals(files_root.clone(), None)
-        .with_deepseek(DeepSeekClient::new(DeepSeekConfig::disabled()));
+    let state = AppState::with_files_root_and_approvals(files_root.clone(), None).with_deepseek(
+        DeepSeekClient::new(
+            DeepSeekConfig::disabled(),
+            mock_gateway::deepseek::DeepSeekCredentialBroker::disabled(),
+        ),
+    );
     let (addr, server) = start_server(state).await;
 
     let (status, body) = post(
