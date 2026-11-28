@@ -4223,6 +4223,18 @@ pub(crate) fn dispatch_agent_tool(state: &AppState, req: ToolCallDto) -> axum::r
         }
         "fs.delete" => {
             let Some(path) = arg("path") else { return bad_request("fs.delete requires a path arg") };
+            // AO-6 follow-up (J4): the dispatch-level deny
+            // extends to delete — a runtime-library file is
+            // refused even if a valid approval were presented
+            // (deny beats approval), the same guard as the
+            // fs.write arm above.
+            if crate::operation_binding::is_runtime_library_path(&path) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({ "error": "path_denied" })),
+                )
+                    .into_response();
+            }
             match resolve_file(&state.files_root, &path) {
                 Err(_) => Err(bad_request("path escapes file root")),
                 Ok(full) => {

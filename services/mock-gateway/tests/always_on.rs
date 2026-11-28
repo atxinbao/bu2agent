@@ -2604,3 +2604,112 @@ async fn ao6_f5_deny_beats_approval() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{resumed}");
     assert_eq!(resumed["error"], "unexpected_approval");
 }
+
+/// F6a (AO-6 follow-up J4): a direct-route delete of a
+/// runtime-library file is refused at dispatch time —
+/// 403 `path_denied` — even with a valid, approved,
+/// digest-bound approval (deny beats approval, the
+/// same guard as the fs.write arm). The file survives,
+/// the real library file is byte-identical, and the
+/// bound Effect ends failed, never succeeded.
+#[tokio::test]
+async fn ao6_f6a_runtime_library_delete_denied() {
+    let runtime_path = "services/mock-gateway/src/server.rs";
+    let before = std::fs::read(std::env::current_dir().unwrap().join("src/server.rs"))
+        .expect("runtime library present");
+    let h = Harness::serve_scripted(vec![]).await;
+    // A stand-in library file under the harness files
+    // root, so the deny (not a 404) is what stops the
+    // delete.
+    let target = h.dir.join("files").join(runtime_path);
+    std::fs::create_dir_all(target.parent().unwrap()).expect("parent dirs");
+    std::fs::write(&target, "runtime").expect("stand-in library file");
+    let (status, requested) = h
+        .post_json(
+            "/approval/request",
+            json!({"tool": "fs.delete", "path": runtime_path}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{requested}");
+    assert_eq!(requested["requires_approval"], true);
+    let id = requested["tool_call_id"].as_str().unwrap().to_string();
+    let (status, decided) = h
+        .post_json(
+            "/approval/decide",
+            json!({"tool_call_id": id, "status": "approved"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{decided}");
+    let (status, called) = h
+        .post_json(
+            "/agent/tool/call",
+            json!({"tool": "fs.delete", "args": {"path": runtime_path}, "tool_call_id": id}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{called}");
+    assert_eq!(called["error"], "path_denied");
+    assert_eq!(std::fs::read_to_string(&target).expect("file survives"), "runtime");
+    let after = std::fs::read(std::env::current_dir().unwrap().join("src/server.rs"))
+        .expect("runtime library present");
+    assert_eq!(before, after, "runtime library untouched");
+    // The bound Effect was planned by the approval
+    // request, driven to started before dispatch, and
+    // ends failed on the refused dispatch — never
+    // succeeded.
+    assert_eq!(h.effect_rows(), 1, "one bound Effect row");
+    let conn = h.db();
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM effects WHERE operation = 'delete'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "failed");
+}
+
+/// F6b (AO-6 follow-up J4): the deny is scoped to the
+/// runtime library — an approved direct-route delete
+/// of an ordinary file still lands (200), the file is
+/// gone, and the bound Effect ends succeeded.
+#[tokio::test]
+async fn ao6_f6b_ordinary_delete_still_works() {
+    let h = Harness::serve_scripted(vec![]).await;
+    let target = h.dir.join("files").join("notes/todelete.txt");
+    std::fs::create_dir_all(target.parent().unwrap()).expect("parent dirs");
+    std::fs::write(&target, "bye").expect("ordinary file");
+    let (status, requested) = h
+        .post_json(
+            "/approval/request",
+            json!({"tool": "fs.delete", "path": "notes/todelete.txt"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{requested}");
+    let id = requested["tool_call_id"].as_str().unwrap().to_string();
+    let (status, decided) = h
+        .post_json(
+            "/approval/decide",
+            json!({"tool_call_id": id, "status": "approved"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{decided}");
+    let (status, called) = h
+        .post_json(
+            "/agent/tool/call",
+            json!({"tool": "fs.delete", "args": {"path": "notes/todelete.txt"}, "tool_call_id": id}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{called}");
+    assert_eq!(called["result"]["deleted"], true);
+    assert!(!target.exists(), "ordinary file deleted");
+    assert_eq!(h.effect_rows(), 1, "one bound Effect row");
+    let conn = h.db();
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM effects WHERE operation = 'delete'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "succeeded");
+}
